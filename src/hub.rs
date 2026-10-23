@@ -264,16 +264,15 @@ struct PushedBody {
     gone: bool,
 }
 
-async fn run<H: e2e::Host>(
-    hub: &Arc<Hub>,
-    host: &Arc<H>,
-    url: &str,
-    address: Option<&str>,
-) -> Result<(), String> {
-    let target = format!("{url}/v1/nido");
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Abre un WebSocket con el hub. Con `address`, a esa IP, pero con el nombre del hub para TLS
+/// (SNI y certificado) y para Host.
+async fn dial(url: &str, address: Option<&str>, path: &str) -> Result<Ws, String> {
+    let target = format!("{url}{path}");
     let connect = async {
         match address {
-            // A esa IP, pero con el nombre del hub para TLS (SNI y certificado) y para Host.
             Some(addr) => {
                 let tcp = tokio::net::TcpStream::connect(addr)
                     .await
@@ -289,7 +288,55 @@ async fn run<H: e2e::Host>(
     };
     let (ws, _) = tokio::time::timeout(Duration::from_secs(15), connect)
         .await
-        .map_err(|_| "no contesta".to_owned())??;
+        .map_err(|_| "el hub no contesta".to_owned())??;
+    Ok(ws)
+}
+
+impl Hub {
+    /// Un ida y vuelta con otro nido a través del hub (como un móvil): manda `first` y devuelve
+    /// su respuesta. Para unirse al grupo y sincronizarlo.
+    pub async fn exchange(&self, nido_id: &str, first: Vec<u8>) -> Result<Vec<u8>, String> {
+        let (url, address) = {
+            let c = self.config.borrow();
+            (c.url.clone(), c.address.clone())
+        };
+        let url = url.ok_or("no hay hub configurado")?;
+        let mut ws = dial(&url, address.as_deref(), &format!("/v1/app?nido={nido_id}")).await?;
+        ws.send(Message::Binary(first.into()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let reply = loop {
+            match tokio::time::timeout(Duration::from_secs(15), ws.next()).await {
+                Ok(Some(Ok(Message::Binary(b)))) => break b.to_vec(),
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                    return Err("el otro equipo cerró sin contestar".into());
+                }
+                Ok(Some(Err(e))) => return Err(e.to_string()),
+                Ok(Some(Ok(_))) => {}
+                Err(_) => return Err("el otro equipo no contesta".into()),
+            }
+        };
+        let _ = ws.close(None).await;
+        Ok(reply)
+    }
+
+    /// La URL del hub configurado (https://…), si hay.
+    pub fn url(&self) -> Option<String> {
+        self.config.borrow().url.clone().map(|u| {
+            u.replacen("wss://", "https://", 1)
+                .replacen("ws://", "http://", 1)
+        })
+    }
+}
+
+async fn run<H: e2e::Host>(
+    hub: &Arc<Hub>,
+    host: &Arc<H>,
+    url: &str,
+    address: Option<&str>,
+) -> Result<(), String> {
+    let ws = dial(url, address, "/v1/nido").await?;
     let (mut tx, mut rx) = ws.split();
 
     // Identificarse: firmar el reto con la clave Ed25519 de nido.

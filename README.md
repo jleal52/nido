@@ -65,6 +65,19 @@ Cómo funciona:
   su propio token, y `nido phones rm` lo deja fuera en el momento.
 - **En casa**, si nido escucha en la LAN, el móvil puede ir directo, por el mismo canal cifrado.
 
+### Varios equipos
+
+```sh
+nido group invite                # en un equipo del grupo: un código (10 minutos, una vez)
+nido group join '<código>'       # en el equipo nuevo, conectado al mismo hub
+nido group                       # los equipos del grupo; `nido group rm <id>` saca uno
+```
+
+Los equipos de un grupo comparten qué dispositivos están autorizados: un móvil o navegador
+emparejado con cualquiera sirve para todos, y quitarlo en uno lo quita en todos. Todos los equipos
+son iguales. Se sincronizan entre ellos por el hub, cifrado de extremo a extremo; el hub no ve la
+lista. El nombre de cada equipo es el del sistema, o el de `NIDO_NAME`.
+
 ## La API
 
 Solo se atiende en este equipo (`127.0.0.1`), con `Authorization: Bearer <token>`: el de

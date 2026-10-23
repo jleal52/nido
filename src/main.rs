@@ -44,6 +44,16 @@ enum HubCmd {
 }
 
 #[derive(Subcommand)]
+enum GroupCmd {
+    /// Un código para que otro equipo se una (vale 10 minutos y una vez).
+    Invite,
+    /// Unir este equipo al grupo de otro, con su código de `nido group invite`.
+    Join { code: String },
+    /// Sacar un equipo del grupo.
+    Rm { id: String },
+}
+
+#[derive(Subcommand)]
 enum PhonesCmd {
     /// Quita un teléfono: deja de poder entrar en el momento.
     Rm { id: String },
@@ -85,6 +95,11 @@ enum Cmd {
     Hub {
         #[command(subcommand)]
         action: Option<HubCmd>,
+    },
+    /// El grupo de equipos: juntos en la web y en la app. Sin más, los que hay.
+    Group {
+        #[command(subcommand)]
+        action: Option<GroupCmd>,
     },
     /// Teléfonos emparejados; `nido phones rm <id>` quita uno.
     Phones {
@@ -399,6 +414,45 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                         .map(|e| format!(" ({e})"))
                         .unwrap_or_default()
                 ),
+            }
+        }
+        Cmd::Group { action } => {
+            match action {
+                Some(GroupCmd::Invite) => {
+                    let r = api.call("POST", "/api/v1/group/invite", None)?;
+                    println!("En el otro equipo (ya conectado al mismo hub):\n");
+                    println!("  nido group join '{}'\n", r["uri"].as_str().unwrap_or(""));
+                    println!("Vale 10 minutos y una sola vez.");
+                    return Ok(());
+                }
+                Some(GroupCmd::Join { code }) => {
+                    api.call(
+                        "POST",
+                        "/api/v1/group/join",
+                        Some(&serde_json::json!({ "code": code })),
+                    )?;
+                    println!("Este equipo ya está en el grupo.");
+                }
+                Some(GroupCmd::Rm { id }) => {
+                    api.call("DELETE", &format!("/api/v1/group/members/{id}"), None)?;
+                    println!("Equipo sacado del grupo.");
+                }
+                None => {}
+            }
+            let r = api.call("GET", "/api/v1/group", None)?;
+            let members = r["members"].as_array().cloned().unwrap_or_default();
+            if members.len() <= 1 {
+                println!(
+                    "Este equipo está solo. Para juntar otro: `nido group invite` aquí y `nido group join` allí."
+                );
+            }
+            for m in members {
+                println!(
+                    "{}  {}{}",
+                    m["id"].as_str().unwrap_or(""),
+                    m["name"].as_str().unwrap_or(""),
+                    if m["self"] == true { "  (este)" } else { "" }
+                );
             }
         }
         Cmd::Phones { action: None } => {

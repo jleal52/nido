@@ -30,6 +30,10 @@ pub const MODE_PAIR: u8 = 1;
 pub const MODE_CONNECT: u8 = 2;
 pub const MODE_PAIR_WEB: u8 = 3;
 pub const MODE_CONNECT_WEB: u8 = 4;
+/// De nido a nido: unirse al grupo con el código de invitación (IKpsk1) y sincronizar entre
+/// miembros (IK).
+pub const MODE_GROUP_JOIN: u8 = 5;
+pub const MODE_GROUP_SYNC: u8 = 6;
 
 /// Tramas del túnel: `[tipo][flujo u32 BE][datos]`.
 pub const FRAME_OPEN: u8 = 1;
@@ -277,6 +281,16 @@ impl Phones {
         Ok(())
     }
 
+    pub fn remove_by_key(&mut self, key_b64: &str) -> std::io::Result<bool> {
+        let before = self.list.len();
+        self.list.retain(|p| p.key != key_b64);
+        let removed = self.list.len() != before;
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
     pub fn remove(&mut self, id: &str) -> std::io::Result<bool> {
         let before = self.list.len();
         self.list.retain(|p| p.id != id);
@@ -377,6 +391,19 @@ pub trait Host: Send + Sync + 'static {
     fn hub_info(&self) -> Option<(String, String)> {
         None
     }
+    /// El grupo de equipos, si lo hay.
+    fn group(&self) -> Option<&crate::group::Group> {
+        None
+    }
+    /// El grupo ha cambiado aquí: hay que contárselo a los demás equipos.
+    fn group_changed(&self) {}
+    /// Lo mismo, pero esperando a que se lo hayan contado (al emparejar: el dispositivo recibe la
+    /// lista de equipos y puede ir a cualquiera en el momento).
+    fn sync_group_now(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 #[derive(Deserialize)]
@@ -415,6 +442,8 @@ pub async fn serve<H: Host>(
             let pattern = if mode == MODE_PAIR { PAIR } else { PAIR_WEB };
             pair(&*host, pattern, msg1, &tx).await
         }
+        MODE_GROUP_JOIN => group_join(&*host, msg1, &tx).await,
+        MODE_GROUP_SYNC => group_sync(&*host, msg1, &tx).await,
         MODE_CONNECT | MODE_CONNECT_WEB => {
             let pattern = if mode == MODE_CONNECT {
                 CONNECT
@@ -468,15 +497,160 @@ async fn pair<H: Host>(host: &H, pattern: &'static str, msg1: &[u8], tx: &mpsc::
         }
     };
     eprintln!("nido: teléfono emparejado: {}", phone.name);
-    let reply = serde_json::json!({
+    if let Some(g) = host.group() {
+        g.add_device(&key, &phone.name);
+        let _ = tokio::time::timeout(Duration::from_secs(10), host.sync_group_now()).await;
+    }
+    let mut reply = serde_json::json!({
         "token": phone.token,
         "push_key": phone.push_key,
         "name": host.host_name(),
     });
+    add_group_info(host, &mut reply);
     let mut msg2 = vec![0u8; MAX_MSG];
     if let Ok(n) = hs.write_message(reply.to_string().as_bytes(), &mut msg2) {
         msg2.truncate(n);
         let _ = tx.send(msg2).await;
+    }
+}
+
+/// El hub, el id de este nido y los equipos del grupo, para el dispositivo.
+fn add_group_info<H: Host>(host: &H, reply: &mut serde_json::Value) {
+    if let Some((hub, id)) = host.hub_info() {
+        reply["hub"] = hub.into();
+        reply["nido"] = id.into();
+    }
+    if let Some(g) = host.group() {
+        reply["group"] = serde_json::to_value(g.members()).unwrap_or_default();
+    }
+}
+
+/// Otro equipo se une al grupo con el código de `nido group invite`.
+async fn group_join<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) {
+    let Some(g) = host.group() else { return };
+    let Some(secret) = g.current_invite() else {
+        return;
+    };
+    let Ok(mut hs) = builder(PAIR)
+        .local_private_key(&host.identity().private)
+        .and_then(|b| b.psk(1, &secret))
+        .and_then(|b| b.prologue(PROLOGUE))
+        .and_then(|b| b.build_responder())
+    else {
+        return;
+    };
+    let mut payload = vec![0u8; MAX_MSG];
+    let Ok(n) = hs.read_message(msg1, &mut payload) else {
+        return;
+    };
+    if !g.consume_invite(&secret) {
+        return;
+    }
+    #[derive(Deserialize)]
+    struct Join {
+        id: String,
+        name: String,
+        state: crate::group::State,
+    }
+    let Ok(join) = serde_json::from_slice::<Join>(&payload[..n]) else {
+        return;
+    };
+    let Some(key) = hs.get_remote_static().map(|k| B64.encode(k)) else {
+        return;
+    };
+    g.merge(&join.state);
+    g.add_member(&join.id, &key, &join.name);
+    eprintln!("nido: {} se ha unido al grupo", join.name);
+    let reply = serde_json::to_vec(&g.snapshot()).unwrap_or_default();
+    let mut msg2 = vec![0u8; MAX_MSG];
+    if let Ok(n) = hs.write_message(&reply, &mut msg2) {
+        msg2.truncate(n);
+        let _ = tx.send(msg2).await;
+    }
+    host.group_changed();
+}
+
+/// Otro equipo del grupo nos cuenta su estado; le devolvemos el junto.
+async fn group_sync<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) {
+    let Some(g) = host.group() else { return };
+    let Ok(mut hs) = builder(CONNECT)
+        .local_private_key(&host.identity().private)
+        .and_then(|b| b.prologue(PROLOGUE))
+        .and_then(|b| b.build_responder())
+    else {
+        return;
+    };
+    let mut payload = vec![0u8; MAX_MSG];
+    let Ok(n) = hs.read_message(msg1, &mut payload) else {
+        return;
+    };
+    // Solo un miembro del grupo (o uno que acabamos de sacar, para que se entere).
+    let Some(key) = hs.get_remote_static().map(|k| B64.encode(k)) else {
+        return;
+    };
+    if !g.snapshot().members.iter().any(|m| m.key == key) {
+        return;
+    }
+    let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload[..n]) else {
+        return;
+    };
+    let changed = g.merge(&theirs);
+    let reply = serde_json::to_vec(&g.snapshot()).unwrap_or_default();
+    let mut msg2 = vec![0u8; MAX_MSG];
+    if let Ok(n) = hs.write_message(&reply, &mut msg2) {
+        msg2.truncate(n);
+        let _ = tx.send(msg2).await;
+    }
+    if changed {
+        host.group_changed();
+    }
+}
+
+/// Lado del que inicia (de nido a otro nido): manda el primer mensaje y lee la respuesta. El
+/// transporte lo pone quien llama (el hub).
+pub struct Dial {
+    hs: snow::HandshakeState,
+}
+
+impl Dial {
+    /// `psk`: el secreto del código, al unirse; sin él, sincronizar entre miembros.
+    pub fn start(
+        id: &Identity,
+        remote: &[u8; 32],
+        psk: Option<&[u8; 32]>,
+        payload: &[u8],
+    ) -> Result<(Self, Vec<u8>), String> {
+        let mut b = builder(if psk.is_some() { PAIR } else { CONNECT })
+            .local_private_key(&id.private)
+            .and_then(|b| b.remote_public_key(remote))
+            .and_then(|b| b.prologue(PROLOGUE))
+            .map_err(|e| e.to_string())?;
+        if let Some(p) = psk {
+            b = b.psk(1, p).map_err(|e| e.to_string())?;
+        }
+        let mut hs = b.build_initiator().map_err(|e| e.to_string())?;
+        let mut msg = vec![0u8; MAX_MSG];
+        let n = hs
+            .write_message(payload, &mut msg)
+            .map_err(|e| e.to_string())?;
+        let mode = if psk.is_some() {
+            MODE_GROUP_JOIN
+        } else {
+            MODE_GROUP_SYNC
+        };
+        let mut first = vec![mode];
+        first.extend_from_slice(&msg[..n]);
+        Ok((Self { hs }, first))
+    }
+
+    pub fn finish(mut self, msg2: &[u8]) -> Result<Vec<u8>, String> {
+        let mut payload = vec![0u8; MAX_MSG];
+        let n = self
+            .hs
+            .read_message(msg2, &mut payload)
+            .map_err(|_| "el otro equipo no aceptó (¿código usado o caducado?)".to_owned())?;
+        payload.truncate(n);
+        Ok(payload)
     }
 }
 
@@ -500,13 +674,28 @@ async fn connect<H: Host>(
     let mut payload = vec![0u8; MAX_MSG];
     let n = hs.read_message(msg1, &mut payload).ok()?;
     let key = hs.get_remote_static()?.to_vec();
-    let phone_id = host
+    let hello: ConnectHello = serde_json::from_slice(&payload[..n]).unwrap_or_default();
+    let known = host
         .phones()
         .lock()
         .expect("teléfonos")
         .by_key(&key)
-        .map(|p| p.id.clone())?;
-    let hello: ConnectHello = serde_json::from_slice(&payload[..n]).unwrap_or_default();
+        .map(|p| p.id.clone());
+    // Un dispositivo emparejado con otro equipo del grupo: se apunta aquí con su propio token.
+    let phone_id = match known {
+        Some(id) => id,
+        None => {
+            let name = host.group().and_then(|g| g.device_name(&key))?;
+            let p = host
+                .phones()
+                .lock()
+                .expect("teléfonos")
+                .add(&key, &name, None)
+                .ok()?;
+            eprintln!("nido: {} entra por el grupo", p.name);
+            p.id
+        }
+    };
     if let Err(e) = host
         .phones()
         .lock()
@@ -515,10 +704,18 @@ async fn connect<H: Host>(
     {
         eprintln!("nido: no se pudo guardar el handle del teléfono: {e}");
     }
-    let reply = match host.hub_info() {
-        Some((hub, id)) => serde_json::json!({ "hub": hub, "nido": id }),
-        None => serde_json::json!({}),
-    };
+    // Su token y su clave de avisos de este equipo, y cómo llegar al resto del grupo.
+    let (token, push_key) = host
+        .phones()
+        .lock()
+        .expect("teléfonos")
+        .list()
+        .iter()
+        .find(|p| p.id == phone_id)
+        .map(|p| (p.token.clone(), p.push_key.clone()))?;
+    let mut reply =
+        serde_json::json!({ "name": host.host_name(), "token": token, "push_key": push_key });
+    add_group_info(host, &mut reply);
     let mut msg2 = vec![0u8; MAX_MSG];
     let n = hs
         .write_message(reply.to_string().as_bytes(), &mut msg2)

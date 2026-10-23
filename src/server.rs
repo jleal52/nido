@@ -48,6 +48,9 @@ pub struct AppState {
     pub tunnel_addr: std::sync::OnceLock<std::net::SocketAddr>,
     /// Direcciones por las que se llega a nido desde fuera (para el QR).
     pub direct: std::sync::OnceLock<Vec<String>>,
+    /// El grupo de equipos y el aviso de que hay que sincronizarlo.
+    pub group: crate::group::Group,
+    group_dirty: Notify,
 }
 
 impl e2e::Host for AppState {
@@ -66,7 +69,24 @@ impl e2e::Host for AppState {
     fn hub_info(&self) -> Option<(String, String)> {
         self.hub.pair_info()
     }
+    fn group(&self) -> Option<&crate::group::Group> {
+        Some(&self.group)
+    }
+    fn group_changed(&self) {
+        self.group_dirty.notify_one();
+    }
+    fn sync_group_now(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.sync_group())
+    }
     fn host_name(&self) -> String {
+        if let Some(n) = std::env::var("NIDO_NAME")
+            .ok()
+            .filter(|n| !n.trim().is_empty())
+        {
+            return n.trim().to_owned();
+        }
         std::fs::read_to_string("/etc/hostname")
             .map(|h| h.trim().to_owned())
             .ok()
@@ -142,6 +162,16 @@ impl AppState {
         let identity = e2e::Identity::load_or_create(&paths.config.join("hub.key"))
             .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
         let phones = e2e::Phones::load(paths.data.join("phones.json"));
+        let group = crate::group::Group::load(paths.data.join("group.json"), identity.public);
+        // Los dispositivos emparejados antes de haber grupo, también en él.
+        for p in phones.list() {
+            if !group.snapshot().devices.iter().any(|d| d.key == p.key)
+                && let Ok(k) =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &p.key)
+            {
+                group.add_device(&k, &p.name);
+            }
+        }
         Ok(Arc::new(Self {
             paths,
             launcher,
@@ -161,6 +191,8 @@ impl AppState {
             phones: std::sync::Mutex::new(phones),
             tunnel_addr: Default::default(),
             direct: Default::default(),
+            group,
+            group_dirty: Notify::new(),
         }))
     }
 
@@ -363,8 +395,131 @@ impl AppState {
     }
 }
 
+impl AppState {
+    /// Lo que el grupo ha dado de baja, fuera también de aquí.
+    fn apply_group(&self) {
+        for key in self.group.removed_devices() {
+            if let Ok(true) = self.phones.lock().expect("teléfonos").remove_by_key(&key) {
+                eprintln!("nido: un dispositivo quitado en el grupo, quitado aquí");
+            }
+        }
+    }
+
+    /// Cuenta el estado del grupo a cada equipo y junta lo que contesten. Si alguno sabía algo
+    /// nuevo, se repite una vez para que lo sepan todos.
+    async fn sync_group(&self) {
+        for _ in 0..2 {
+            let mut learned = false;
+            for m in self.group.others() {
+                let Ok(key) =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &m.key)
+                else {
+                    continue;
+                };
+                let Ok(key) = <[u8; 32]>::try_from(key) else {
+                    continue;
+                };
+                let ours = serde_json::to_vec(&self.group.snapshot()).unwrap_or_default();
+                let Ok((dial, first)) = e2e::Dial::start(&self.identity, &key, None, &ours) else {
+                    continue;
+                };
+                let reply = match self.hub.exchange(&m.id, first).await {
+                    Ok(r) => r,
+                    Err(_) => continue, // apagado o sin conexión: ya se pondrá al día
+                };
+                if let Ok(payload) = dial.finish(&reply)
+                    && let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload)
+                    && self.group.merge(&theirs)
+                {
+                    learned = true;
+                }
+            }
+            self.apply_group();
+            if !learned {
+                break;
+            }
+        }
+    }
+
+    /// Unirse al grupo de otro equipo con su código de `nido group invite`.
+    pub async fn join_group(&self, code: &str) -> Result<Vec<crate::group::MemberView>, String> {
+        let c = crate::group::parse_invite(code)?;
+        let Some((hub, self_id)) = self.hub.pair_info() else {
+            return Err("este equipo no está conectado al hub (nido hub)".into());
+        };
+        let host = |u: &str| {
+            u.split("://")
+                .nth(1)
+                .unwrap_or(u)
+                .trim_end_matches('/')
+                .to_owned()
+        };
+        if host(&hub) != host(&c.hub) {
+            return Err(format!(
+                "el otro equipo usa otro hub ({}); este usa {hub}",
+                c.hub
+            ));
+        }
+        let name = <Self as e2e::Host>::host_name(self);
+        let hello =
+            serde_json::json!({ "id": self_id, "name": name, "state": self.group.snapshot() });
+        let (dial, first) = e2e::Dial::start(
+            &self.identity,
+            &c.key,
+            Some(&c.secret),
+            hello.to_string().as_bytes(),
+        )?;
+        let reply = self.hub.exchange(&c.id, first).await?;
+        let payload = dial.finish(&reply)?;
+        let theirs: crate::group::State =
+            serde_json::from_slice(&payload).map_err(|e| e.to_string())?;
+        self.group.merge(&theirs);
+        self.group_dirty.notify_one();
+        Ok(self.group.members())
+    }
+}
+
+/// El grupo: apuntarse al conectar con el hub y sincronizar cuando cambia algo (y cada 5 min).
+fn spawn_group(state: Arc<AppState>) {
+    let st = state.clone();
+    tokio::spawn(async move {
+        let mut status = st.hub.status.subscribe();
+        loop {
+            let s = status.borrow_and_update().clone();
+            if s.connected
+                && let Some(id) = &s.id
+            {
+                st.group
+                    .set_self(id, &<AppState as e2e::Host>::host_name(&st));
+                st.group_dirty.notify_one();
+            }
+            if status.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = state.group_dirty.notified() => {
+                    // Los cambios suelen venir juntos: un momento y se manda todo.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            if state.hub.status.borrow().connected && !state.group.others().is_empty() {
+                state.sync_group().await;
+            } else {
+                state.apply_group();
+            }
+        }
+    });
+}
+
 /// Cada 2 s (o al pedirlo) vuelve a mirar el estado.
 pub fn spawn_scanner(state: Arc<AppState>) {
+    spawn_group(state.clone());
     // Los avisos al móvil, según los cambios que vea `scan`.
     if let Some(mut rx) = state.alerts_rx.lock().expect("avisos").take() {
         let st = state.clone();
@@ -412,6 +567,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/accounts/switch", post(api_switch_account))
         .route("/api/v1/e2e", get(ws_e2e))
         .route("/api/v1/pair", post(api_pair))
+        .route("/api/v1/group", get(api_group))
+        .route("/api/v1/group/invite", post(api_group_invite))
+        .route("/api/v1/group/join", post(api_group_join))
+        .route(
+            "/api/v1/group/members/{id}",
+            axum::routing::delete(api_group_remove),
+        )
         .route("/api/v1/phones", get(api_phones))
         .route(
             "/api/v1/phones/{id}",
@@ -1019,7 +1181,64 @@ async fn api_phones(State(st): State<Arc<AppState>>) -> Response {
     Json(st.phones.lock().expect("teléfonos").views()).into_response()
 }
 
+/// Los equipos del grupo (este incluido).
+async fn api_group(State(st): State<Arc<AppState>>) -> Response {
+    Json(serde_json::json!({ "members": st.group.members(), "connected": st.hub.status.borrow().connected }))
+        .into_response()
+}
+
+async fn api_group_invite(State(st): State<Arc<AppState>>) -> Response {
+    let (Some(hub), Some(id)) = (st.hub.url(), st.group.self_id()) else {
+        return error(
+            StatusCode::CONFLICT,
+            "para formar un grupo, este equipo tiene que estar conectado al hub (nido hub set …)",
+        );
+    };
+    let (uri, expires) = st.group.invite(&hub, &id);
+    Json(serde_json::json!({ "uri": uri, "expires": expires })).into_response()
+}
+
+#[derive(Deserialize)]
+struct JoinReq {
+    code: String,
+}
+
+async fn api_group_join(State(st): State<Arc<AppState>>, Json(req): Json<JoinReq>) -> Response {
+    match st.join_group(&req.code).await {
+        Ok(members) => Json(serde_json::json!({ "members": members })).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if st.group.self_id().as_deref() == Some(id.as_str()) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "para sacar este equipo, hazlo desde otro del grupo",
+        );
+    }
+    if st.group.remove_member(&id) {
+        st.group_dirty.notify_one();
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "ese equipo no está en el grupo")
+    }
+}
+
 async fn api_remove_phone(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    // Quitarlo aquí es quitarlo en todo el grupo.
+    let key = st
+        .phones
+        .lock()
+        .expect("teléfonos")
+        .list()
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.key.clone());
+    if let Some(k) = &key {
+        st.group.remove_device(k);
+        st.group_dirty.notify_one();
+    }
     match st.phones.lock().expect("teléfonos").remove(&id) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "ese teléfono no está emparejado"),

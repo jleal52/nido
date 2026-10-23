@@ -7,6 +7,7 @@ pub mod claude;
 pub mod client;
 pub mod e2e;
 pub mod emu;
+pub mod group;
 pub mod history;
 pub mod holder;
 pub mod hub;
