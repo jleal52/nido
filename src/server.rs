@@ -736,7 +736,15 @@ fn uuid_v4() -> String {
 }
 
 async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateRequest>) -> Response {
-    let cwd = req.cwd.unwrap_or_else(|| st.paths.home.clone());
+    // «~» es la carpeta de inicio de este equipo (cada uno del grupo tiene la suya).
+    let cwd = match req.cwd {
+        Some(c) if c == std::path::Path::new("~") => st.paths.home.clone(),
+        Some(c) => match c.strip_prefix("~") {
+            Ok(rest) => st.paths.home.join(rest),
+            Err(_) => c,
+        },
+        None => st.paths.home.clone(),
+    };
     if !cwd.is_dir() {
         return error(
             StatusCode::BAD_REQUEST,
