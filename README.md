@@ -12,7 +12,7 @@ equipo; todo lo que pasa entre ellos va **cifrado de extremo a extremo**.
 |---|---|
 | Linux con systemd | Funciona |
 | WSL 2 (con systemd) | Funciona |
-| macOS | Pendiente (arranque con launchd y leer procesos sin `/proc`) |
+| macOS | Funciona (con launchd; sin límite de memoria por sesión) |
 
 ## Uso
 
@@ -94,6 +94,16 @@ cargo build --release
 install -Dm755 target/release/nido ~/.local/bin/nido
 install -Dm644 contrib/nido.service ~/.config/systemd/user/nido.service
 systemctl --user daemon-reload && systemctl --user enable --now nido
+```
+
+En macOS, en lugar de systemd, un agente de launchd:
+
+```sh
+cargo build --release
+install -d ~/.local/bin ~/Library/LaunchAgents
+install -m755 target/release/nido ~/.local/bin/nido
+sed "s/USUARIO/$(whoami)/g" contrib/nido.plist > ~/Library/LaunchAgents/io.github.jleal52.nido.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.jleal52.nido.plist
 ```
 
 Por defecto escucha en `127.0.0.1:7690`. Para que el móvil llegue directo en casa, añade la
