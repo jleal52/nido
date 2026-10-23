@@ -480,11 +480,13 @@ async fn api_hub(State(st): State<Arc<AppState>>) -> Response {
 #[derive(Deserialize)]
 struct HubReq {
     url: Option<String>,
+    #[serde(default)]
+    address: Option<String>,
 }
 
 /// Pone (o quita, con `url: null`) el hub y reconecta.
 async fn api_set_hub(State(st): State<Arc<AppState>>, Json(req): Json<HubReq>) -> Response {
-    match st.hub.set_url(req.url) {
+    match st.hub.set_url(req.url, req.address) {
         Ok(()) => Json(st.hub.status.borrow().clone()).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, e),
     }

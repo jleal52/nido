@@ -12,7 +12,7 @@ use nido::{attach, auth, holder, import};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::watch;
 
-/// Gestor de sesiones de terminal (sobre todo Claude Code), por web y por terminal.
+/// Gestor de sesiones de terminal (sobre todo Claude Code): consola, y app y navegador por un canal cifrado.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -31,7 +31,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum HubCmd {
     /// Usar este hub (`wss://…`).
-    Set { url: String },
+    Set {
+        url: String,
+        /// Conectar a esta `ip:puerto` (si el nombre del hub aún no resuelve aquí).
+        #[arg(long)]
+        address: Option<String>,
+    },
     /// Dejar de usar el hub (la app solo llegará por la LAN o la VPN).
     Off,
     /// Mandar un aviso de prueba a los teléfonos.
@@ -358,11 +363,11 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
         Cmd::Hub { action } => {
             let r = match action {
                 None => api.call("GET", "/api/v1/hub", None)?,
-                Some(HubCmd::Set { url }) => {
+                Some(HubCmd::Set { url, address }) => {
                     api.call(
                         "POST",
                         "/api/v1/hub",
-                        Some(&serde_json::json!({ "url": url })),
+                        Some(&serde_json::json!({ "url": url, "address": address })),
                     )?;
                     // Que le dé tiempo a conectar antes de contar cómo va.
                     std::thread::sleep(std::time::Duration::from_secs(3));

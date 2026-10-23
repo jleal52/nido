@@ -32,6 +32,10 @@ pub struct HubConfig {
     /// `wss://…` (o `ws://` en pruebas); `None`, sin hub.
     #[serde(default)]
     pub url: Option<String>,
+    /// Dónde conectar (`ip:puerto`) si el nombre del hub aún no resuelve aquí (DNS recién
+    /// cambiado); el certificado se sigue comprobando contra el nombre de `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 impl HubConfig {
@@ -109,14 +113,25 @@ impl Hub {
     }
 
     /// Cambia el hub (o lo quita) y reconecta.
-    pub fn set_url(&self, url: Option<String>) -> Result<(), String> {
+    pub fn set_url(&self, url: Option<String>, address: Option<String>) -> Result<(), String> {
         let url = match url.filter(|u| !u.trim().is_empty()) {
             Some(u) => Some(
                 ws_url(&u).ok_or("la dirección del hub tiene que empezar por wss:// o https://")?,
             ),
             None => None,
         };
-        let cfg = HubConfig { url };
+        let address = address.filter(|a| !a.trim().is_empty());
+        if let Some(a) = &address
+            && a.parse::<std::net::SocketAddr>().is_err()
+        {
+            return Err(
+                "la dirección tiene que ser ip:puerto (por ejemplo 203.0.113.5:443)".into(),
+            );
+        }
+        let cfg = HubConfig {
+            address: address.filter(|_| url.is_some()),
+            url,
+        };
         cfg.save(&self.config_path).map_err(|e| e.to_string())?;
         self.config.send_replace(cfg);
         Ok(())
@@ -189,7 +204,10 @@ pub fn spawn<H: e2e::Host>(hub: Arc<Hub>, host: Arc<H>) {
         let mut cfg_rx = hub.config.subscribe();
         let mut wait = Duration::from_secs(2);
         loop {
-            let url = cfg_rx.borrow_and_update().url.clone();
+            let (url, address) = {
+                let c = cfg_rx.borrow_and_update();
+                (c.url.clone(), c.address.clone())
+            };
             hub.set_status(|s| {
                 *s = HubStatus {
                     url: url.clone(),
@@ -205,7 +223,7 @@ pub fn spawn<H: e2e::Host>(hub: Arc<Hub>, host: Arc<H>) {
             };
             let started = std::time::Instant::now();
             tokio::select! {
-                r = run(&hub, &host, &url) => {
+                r = run(&hub, &host, &url, address.as_deref()) => {
                     if let Err(e) = r {
                         eprintln!("nido: hub {url}: {e}");
                         hub.set_status(|s| s.error = Some(e));
@@ -246,14 +264,32 @@ struct PushedBody {
     gone: bool,
 }
 
-async fn run<H: e2e::Host>(hub: &Arc<Hub>, host: &Arc<H>, url: &str) -> Result<(), String> {
-    let (ws, _) = tokio::time::timeout(
-        Duration::from_secs(15),
-        tokio_tungstenite::connect_async(format!("{url}/v1/nido")),
-    )
-    .await
-    .map_err(|_| "no contesta".to_owned())?
-    .map_err(|e| e.to_string())?;
+async fn run<H: e2e::Host>(
+    hub: &Arc<Hub>,
+    host: &Arc<H>,
+    url: &str,
+    address: Option<&str>,
+) -> Result<(), String> {
+    let target = format!("{url}/v1/nido");
+    let connect = async {
+        match address {
+            // A esa IP, pero con el nombre del hub para TLS (SNI y certificado) y para Host.
+            Some(addr) => {
+                let tcp = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .map_err(|e| format!("{addr}: {e}"))?;
+                tokio_tungstenite::client_async_tls(target.as_str(), tcp)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            None => tokio_tungstenite::connect_async(target.as_str())
+                .await
+                .map_err(|e| e.to_string()),
+        }
+    };
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(15), connect)
+        .await
+        .map_err(|_| "no contesta".to_owned())??;
     let (mut tx, mut rx) = ws.split();
 
     // Identificarse: firmar el reto con la clave Ed25519 de nido.
