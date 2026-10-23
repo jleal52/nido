@@ -87,11 +87,17 @@ impl e2e::Host for AppState {
         {
             return n.trim().to_owned();
         }
-        std::fs::read_to_string("/etc/hostname")
-            .map(|h| h.trim().to_owned())
-            .ok()
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| "nido".into())
+        // El del sistema (en macOS no hay /etc/hostname), sin el dominio (Mac.local, Mac.casa…).
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname escribe como mucho `len` bytes en el buffer.
+        let n = if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0 {
+            buf.iter().position(|&b| b == 0).unwrap_or(buf.len())
+        } else {
+            0
+        };
+        let name = String::from_utf8_lossy(&buf[..n]).trim().to_owned();
+        let name = name.split('.').next().unwrap_or_default().to_owned();
+        if name.is_empty() { "nido".into() } else { name }
     }
 }
 

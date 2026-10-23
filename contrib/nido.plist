@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- nido en macOS: un agente de launchd que arranca el gestor al iniciar sesión y lo mantiene
+     vivo. Las sesiones no viven aquí: cada guardián va en su propia sesión (setsid) y sobrevive
+     a que el gestor se reinicie (AbandonProcessGroup). Cambia USUARIO por tu usuario. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.jleal52.nido</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/USUARIO/.local/bin/nido</string>
+		<string>serve</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/USUARIO/.local/bin:/Users/USUARIO/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>LANG</key>
+		<string>es_ES.UTF-8</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/USUARIO/Library/Logs/nido.log</string>
+</dict>
+</plist>

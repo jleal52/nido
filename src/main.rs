@@ -168,6 +168,8 @@ fn token_file() -> PathBuf {
 fn listen(addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
+    // Solo en Linux: escuchar en una IP que aún no existe (la de la VPN al arrancar).
+    #[cfg(target_os = "linux")]
     if addr.is_ipv4() {
         socket.set_freebind_v4(true)?;
     } else {

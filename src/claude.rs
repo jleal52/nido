@@ -51,8 +51,18 @@ impl Procfs {
         Self { root: root.into() }
     }
 
+    /// En macOS no hay `/proc`: se pregunta al núcleo (`sysctl`).
+    #[cfg(target_os = "macos")]
+    fn native(&self) -> bool {
+        self.root == Path::new("/proc")
+    }
+
     /// `pid → ppid` de todos los procesos.
     fn parents(&self) -> HashMap<u32, u32> {
+        #[cfg(target_os = "macos")]
+        if self.native() {
+            return mac::parents();
+        }
         let mut map = HashMap::new();
         let Ok(dir) = std::fs::read_dir(&self.root) else {
             return map;
@@ -99,13 +109,136 @@ impl Procfs {
     }
 
     pub fn comm(&self, pid: u32) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        if self.native() {
+            return mac::comm(pid);
+        }
         let s = std::fs::read_to_string(self.root.join(pid.to_string()).join("comm")).ok()?;
         Some(s.trim_end().to_owned())
     }
 
     pub fn env_var(&self, pid: u32, key: &str) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        if self.native() {
+            return mac::env_var(pid, key);
+        }
         let raw = std::fs::read(self.root.join(pid.to_string()).join("environ")).ok()?;
         raw.split(|&b| b == 0).find_map(|kv| {
+            let kv = std::str::from_utf8(kv).ok()?;
+            kv.strip_prefix(key)?.strip_prefix('=').map(str::to_owned)
+        })
+    }
+}
+
+/// Lo mismo que `/proc` en macOS, con `sysctl`: la lista de procesos (`KERN_PROC_ALL`) y los
+/// argumentos y el entorno de uno (`KERN_PROCARGS2`, solo de los procesos del mismo usuario).
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::collections::HashMap;
+
+    /// Todos los pids, y de cada uno su padre y su nombre (libproc).
+    fn all() -> Vec<(u32, u32, String)> {
+        // SAFETY: con buffer nulo, proc_listallpids devuelve cuántos hay.
+        let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        let mut pids = vec![0 as libc::pid_t; n as usize + 64];
+        let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: el buffer tiene sitio para `pids.len()` pids.
+        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        pids.truncate(n as usize);
+        pids.into_iter()
+            .filter_map(|pid| info(pid as u32))
+            .collect()
+    }
+
+    fn info(pid: u32) -> Option<(u32, u32, String)> {
+        // SAFETY: proc_bsdinfo es POD; proc_pidinfo escribe como mucho su tamaño.
+        let mut bsd: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let r = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut bsd as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if r != size {
+            return None;
+        }
+        let name: Vec<u8> = bsd
+            .pbi_comm
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        Some((pid, bsd.pbi_ppid, String::from_utf8(name).ok()?))
+    }
+
+    pub fn parents() -> HashMap<u32, u32> {
+        all().into_iter().map(|(p, pp, _)| (p, pp)).collect()
+    }
+
+    pub fn comm(pid: u32) -> Option<String> {
+        info(pid).map(|(_, _, n)| n)
+    }
+
+    /// `argc`, la ruta del ejecutable, los argumentos y el entorno, separados por ceros.
+    fn procargs(pid: u32) -> Option<Vec<u8>> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        let mut argmax: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: lee un entero.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut argmax as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; argmax.max(4096) as usize];
+        let mut size = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        // SAFETY: el buffer tiene `size` bytes.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return None;
+        }
+        buf.truncate(size);
+        Some(buf)
+    }
+
+    pub fn env_var(pid: u32, key: &str) -> Option<String> {
+        let raw = procargs(pid)?;
+        let argc = i32::from_ne_bytes(raw.get(..4)?.try_into().ok()?) as usize;
+        // Tras argc: la ruta, ceros de relleno, los argc argumentos y luego el entorno.
+        let mut parts = raw[4..].split(|&b| b == 0).filter(|p| !p.is_empty());
+        parts.next()?; // la ruta del ejecutable
+        for _ in 0..argc {
+            parts.next()?;
+        }
+        parts.find_map(|kv| {
             let kv = std::str::from_utf8(kv).ok()?;
             kv.strip_prefix(key)?.strip_prefix('=').map(str::to_owned)
         })
