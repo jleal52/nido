@@ -23,8 +23,13 @@ use tokio::sync::mpsc;
 pub const PAIR: &str = "Noise_IKpsk1_25519_ChaChaPoly_SHA256";
 pub const CONNECT: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 pub const PROLOGUE: &[u8] = b"nido-e2e-v1";
+/// Los mismos con AES-GCM, para el navegador (WebCrypto no tiene ChaCha20-Poly1305).
+pub const PAIR_WEB: &str = "Noise_IKpsk1_25519_AESGCM_SHA256";
+pub const CONNECT_WEB: &str = "Noise_IK_25519_AESGCM_SHA256";
 pub const MODE_PAIR: u8 = 1;
 pub const MODE_CONNECT: u8 = 2;
+pub const MODE_PAIR_WEB: u8 = 3;
+pub const MODE_CONNECT_WEB: u8 = 4;
 
 /// Tramas del túnel: `[tipo][flujo u32 BE][datos]`.
 pub const FRAME_OPEN: u8 = 1;
@@ -406,9 +411,17 @@ pub async fn serve<H: Host>(
         return;
     };
     match mode {
-        MODE_PAIR => pair(&*host, msg1, &tx).await,
-        MODE_CONNECT => {
-            if let Some((transport, phone)) = connect(&*host, msg1, &tx).await {
+        MODE_PAIR | MODE_PAIR_WEB => {
+            let pattern = if mode == MODE_PAIR { PAIR } else { PAIR_WEB };
+            pair(&*host, pattern, msg1, &tx).await
+        }
+        MODE_CONNECT | MODE_CONNECT_WEB => {
+            let pattern = if mode == MODE_CONNECT {
+                CONNECT
+            } else {
+                CONNECT_WEB
+            };
+            if let Some((transport, phone)) = connect(&*host, pattern, msg1, &tx).await {
                 tunnel(host, transport, phone, rx, tx).await;
             }
         }
@@ -416,11 +429,11 @@ pub async fn serve<H: Host>(
     }
 }
 
-async fn pair<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) {
+async fn pair<H: Host>(host: &H, pattern: &'static str, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) {
     let Some(psk) = host.pairing().current() else {
         return;
     };
-    let Ok(mut hs) = builder(PAIR)
+    let Ok(mut hs) = builder(pattern)
         .local_private_key(&host.identity().private)
         .and_then(|b| b.psk(1, &psk))
         .and_then(|b| b.prologue(PROLOGUE))
@@ -475,10 +488,11 @@ fn valid_handle(h: &str) -> bool {
 
 async fn connect<H: Host>(
     host: &H,
+    pattern: &'static str,
     msg1: &[u8],
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Option<(snow::TransportState, String)> {
-    let mut hs = builder(CONNECT)
+    let mut hs = builder(pattern)
         .local_private_key(&host.identity().private)
         .and_then(|b| b.prologue(PROLOGUE))
         .and_then(|b| b.build_responder())
@@ -917,7 +931,12 @@ mod tests {
                 ],
             })
         }
-        let v = serde_json::json!([run(CONNECT, None), run(PAIR, Some(&[9u8; 32]))]);
+        let v = serde_json::json!([
+            run(CONNECT, None),
+            run(PAIR, Some(&[9u8; 32])),
+            run(CONNECT_WEB, None),
+            run(PAIR_WEB, Some(&[9u8; 32])),
+        ]);
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/noise_vectors.json");
         let text = serde_json::to_string_pretty(&v).unwrap() + "\n";
         if std::env::var_os("NIDO_WRITE_VECTORS").is_some() {
