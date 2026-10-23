@@ -1,0 +1,15 @@
+[Unit]
+Description=nido: gestor de sesiones de terminal
+
+[Service]
+ExecStart=%h/.local/bin/nido serve
+Restart=on-failure
+RestartSec=2
+# claude y cswap están en ~/.local/bin; el gestor se lo pasa a cada guardián.
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+# Las sesiones no viven aquí: cada una es su propia unidad (nido-s-<id>), así que parar o
+# reiniciar el gestor no las toca.
+
+[Install]
+WantedBy=default.target
