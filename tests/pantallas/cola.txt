@@ -1,0 +1,17 @@
+  Running the already-approved prune on the runner · 31s
+  ⎿  $ ssh root@servidor '/usr/local/sbin/limpiar >> /var/log/limpiar.log 2>&1; df -h / | tail -1' (30s)
+     (ctrl+b to run in background)
+
+❯ 1. ya
+  2. dejala
+  3. ya
+  4. no subimos nada
+  5. otra-sesion
+  ctrl+x ctrl+s to send now
+
+✶ Imagining… (1m 14s · ↓ 2.8k tokens)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── general ─
+❯ Press up to edit queued messages
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · esc to interrupt · ↓ to manage

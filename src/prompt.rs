@@ -236,6 +236,12 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
     if want != 1 || found.len() < 2 {
         return None;
     }
+    // Con un menú de verdad no está la caja de escribir; si sigue debajo, la lista es otra cosa
+    // (un mensaje tuyo en cola, que Claude pinta con «❯» delante).
+    let edge = |l: &str| l.trim_start().starts_with("──────");
+    if (last + 1..lines.len()).any(|i| lines[i].trim_start().starts_with('❯') && edge(lines[i - 1])) {
+        return None;
+    }
     found.reverse();
 
     // Cada opción con lo que lleva debajo; la fila «Next»/«Submit»; lo que hay al final.
@@ -592,8 +598,10 @@ pub fn suggestion(screen: &str) -> Option<String> {
         return None;
     }
     let text = strip_sgr(after).trim().to_owned();
-    // Al abrir Claude: «Try "fix lint errors"», un ejemplo, no una propuesta.
-    if text.is_empty() || text.starts_with("Try \"") {
+    // Las ayudas de la caja, atenuadas igual: «Try "fix lint errors"» al abrir Claude, «Press up
+    // to edit queued messages» con mensajes en cola…
+    const HINTS: [&str; 3] = ["Try \"", "Press up to", "? for shortcuts"];
+    if text.is_empty() || HINTS.iter().any(|h| text.starts_with(h)) {
         return None;
     }
     Some(text)
@@ -930,8 +938,15 @@ mod tests {
         assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} esto lo escribo yo")), None);
         assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} ")), None);
         assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} \x1b[2mTry \"fix lint errors\"")), None);
+        assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} \x1b[7mP\x1b[2mress up to edit queued messages")), None);
+        assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} \x1b[2mPress up to edit queued messages")), None);
         // Un menú no es la caja de escribir.
         assert_eq!(suggestion(" Do you want to proceed?\n ❯ 1. Yes\n   2. No"), None);
+    }
+
+    #[test]
+    fn a_queued_message_with_a_list_is_not_a_menu() {
+        assert_eq!(screen("cola"), None);
     }
 
     #[test]
