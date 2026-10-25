@@ -15,6 +15,8 @@ use serde_json::Value;
 /// Recortes: la vista es para leer en el móvil, no un volcado.
 const MAX_INPUT: usize = 2000;
 const MAX_RESULT: usize = 3000;
+/// El resumen de la conversación (va plegado: se puede ver entero).
+const MAX_SUMMARY: usize = 40_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -320,6 +322,23 @@ fn parse_lines<'a>(
             .map(str::to_owned);
         let meta = d.get("isMeta").and_then(Value::as_bool) == Some(true);
         let content = d.get("message").and_then(|m| m.get("content"));
+        // El resumen que pone Claude Code al quedarse sin contexto: llega como un mensaje tuyo
+        // enorme. Un aviso, con el resumen plegado.
+        if kind == Some("user") && d.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+            let text = match content {
+                Some(Value::String(s)) => s.clone(),
+                Some(c) => result_text(c),
+                None => String::new(),
+            };
+            items.push(ChatItem::Notice {
+                id,
+                ts,
+                text: "Claude resumió la conversación para seguir (se le acababa el contexto)".into(),
+                status: Some("compact".into()),
+                result: Some(clip(text.trim(), MAX_SUMMARY)),
+            });
+            continue;
+        }
         match (kind, content) {
             (Some("user"), Some(Value::String(s))) if !meta => {
                 let text = strip_reminders(s);
@@ -781,6 +800,24 @@ mod tests {
         assert_eq!(list[1].title.as_deref(), Some("Arreglar el login"));
         assert_eq!(list[1].last_prompt.as_deref(), Some("arregla el login"));
         assert!(conversations(&config.path().join("no-existe"), 10).is_empty());
+    }
+
+    #[test]
+    fn compaction_summary_is_a_folded_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let summary = format!("This session is being continued from a previous conversation…\n{}", "x".repeat(5000));
+        std::fs::write(&path, line(serde_json::json!({"type":"user","uuid":"u1","isCompactSummary":true,
+            "isVisibleInTranscriptOnly":true,"message":{"content":summary}}))).unwrap();
+        let c = read_chunk(&path, 0, None).unwrap();
+        assert_eq!(c.items.len(), 1);
+        match &c.items[0] {
+            ChatItem::Notice { status: Some(s), result: Some(r), .. } => {
+                assert_eq!(s, "compact");
+                assert!(r.starts_with("This session") && r.len() > 5000);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
