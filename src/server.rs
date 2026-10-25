@@ -1645,7 +1645,9 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                         if let Some(plan) = menu.as_ref().and_then(|m| plan_text(&st.paths.home, m)) {
                             menu_v["plan"] = plan.into();
                         }
-                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v });
+                        // La siguiente petición que propone Claude, para mandarla con un botón.
+                        let suggestion = if menu.is_none() { prompt::suggestion(&text) } else { None };
+                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v, "suggestion": suggestion });
                         if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                             return;
                         }

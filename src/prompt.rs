@@ -453,6 +453,8 @@ pub struct Request {
     pub questions: Vec<QuestionAnswer>,
     /// La etiqueta de la opción (o su número).
     pub option: Option<String>,
+    /// Mandar la siguiente petición que propone Claude (el texto que se ve, para comprobarlo).
+    pub suggestion: Option<String>,
     /// Con un campo de texto, lo que se escribe; con otra opción (p. ej. «No» en un permiso), lo
     /// que se le manda a Claude después, como un mensaje.
     pub text: Option<String>,
@@ -570,6 +572,58 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Screen<R, W> {
     }
 }
 
+/// La siguiente petición que propone Claude al terminar: el texto atenuado en la caja de escribir
+/// (en la terminal, Tab lo escribe). Si no cabe, Claude lo corta con «…».
+pub fn suggestion(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let plain: Vec<String> = lines.iter().map(|l| strip_sgr(l)).collect();
+    // La caja es la última línea con «❯» entre dos rayas.
+    let i = (1..plain.len().saturating_sub(1)).rev().find(|&i| plain[i].trim_start().starts_with('❯'))?;
+    // Las rayas de la caja (la de arriba puede llevar dentro el nombre de la sesión).
+    let edge = |l: &str| l.trim_start().starts_with("──────");
+    if !edge(&plain[i - 1]) || !edge(&plain[i + 1]) {
+        return None;
+    }
+    // Atenuado justo detrás de «❯ »: lo propuesto, no lo que has escrito tú.
+    let raw = lines[i];
+    let after = &raw[raw.find('❯')? + '❯'.len_utf8()..];
+    let after = after.trim_start_matches(|c: char| c == ' ' || c == '\u{a0}');
+    if !after.starts_with("\x1b[2m") {
+        return None;
+    }
+    let text = strip_sgr(after).trim().to_owned();
+    // Al abrir Claude: «Try "fix lint errors"», un ejemplo, no una propuesta.
+    if text.is_empty() || text.starts_with("Try \"") {
+        return None;
+    }
+    Some(text)
+}
+
+/// Manda la siguiente petición que propone Claude (`expect`, como se ve en pantalla): Tab la
+/// escribe entera en la caja y Enter la envía.
+pub async fn send_suggestion<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    expect: &str,
+) -> Result<(), String> {
+    let now = suggestion(&scr.read().await?);
+    if now.as_deref() != Some(expect) {
+        return Err("Claude ya no propone eso".into());
+    }
+    scr.keys(b"\t").await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        tokio::time::sleep(STEP).await;
+        if suggestion(&scr.read().await?).is_none() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Claude no ha escrito la propuesta".into());
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    scr.keys(b"\r").await
+}
+
 /// Claude espera a que se renueve el límite para seguir solo («…Press esc to cancel the wait»).
 pub fn waiting_for_limit(screen: &str) -> bool {
     strip_sgr(screen).contains("esc to cancel the wait")
@@ -619,6 +673,9 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) -> Result<(), String> {
     if !req.questions.is_empty() {
         return questions(scr, &req.questions).await;
+    }
+    if let Some(s) = &req.suggestion {
+        return send_suggestion(scr, s).await;
     }
     let want = req.option.as_deref().ok_or("falta qué opción")?;
     let m = scr.menu().await?.ok_or("no hay ningún menú en pantalla")?;
@@ -859,6 +916,22 @@ mod tests {
         assert_eq!(m.kind, Kind::Limit);
         assert_eq!(m.title.as_deref(), Some("What do you want to do?"));
         assert!(waiting_for_limit("Claude Code will continue automatically at 5pm. Keep this session open; it may still pause for permission prompts. Press esc to cancel the wait."));
+    }
+
+    #[test]
+    fn suggested_next_prompt() {
+        let rule = "\x1b[38;2;136;136;136m────────────────────────\x1b[m";
+        let box_ = |line: &str| format!("✻ Brewed for 11s\n\n{rule}──── nido ─\n{line}\n{rule}\n  ⏵⏵ auto mode on");
+        assert_eq!(
+            suggestion(&box_("\x1b[m❯\u{a0} \x1b[2mok a shara-media, y borra tú feature/…")).as_deref(),
+            Some("ok a shara-media, y borra tú feature/…")
+        );
+        // Lo que has escrito tú (sin atenuar), la caja vacía o el ejemplo del principio: no.
+        assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} esto lo escribo yo")), None);
+        assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} ")), None);
+        assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} \x1b[2mTry \"fix lint errors\"")), None);
+        // Un menú no es la caja de escribir.
+        assert_eq!(suggestion(" Do you want to proceed?\n ❯ 1. Yes\n   2. No"), None);
     }
 
     #[test]
