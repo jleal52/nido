@@ -19,6 +19,8 @@ const CACHE: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Cambiar puede tener que renovar el token de la cuenta de destino.
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(90);
+/// El error cuando cswap no está: entonces la web y la app no enseñan las cuentas.
+const MISSING: &str = "no está cswap (claude-swap) en el PATH";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all(deserialize = "camelCase"))]
@@ -119,7 +121,7 @@ async fn cswap(args: &[&str], timeout: Duration) -> Result<String, String> {
         .await
         .map_err(|_| "cswap tardó demasiado en contestar".to_owned())?
         .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "no está cswap (claude-swap) en el PATH".to_owned(),
+            std::io::ErrorKind::NotFound => MISSING.to_owned(),
             _ => format!("no se pudo lanzar cswap: {e}"),
         })?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -176,6 +178,8 @@ pub struct View {
     /// Segundos desde que se le preguntó a cswap.
     pub age_s: Option<u64>,
     pub error: Option<String>,
+    /// Si cswap está en este equipo (la última vez que se lanzó).
+    pub installed: bool,
 }
 
 #[derive(Default)]
@@ -208,6 +212,7 @@ impl CacheInner {
                 .unwrap_or_default(),
             age_s: self.good.as_ref().map(|(t, _)| t.elapsed().as_secs()),
             error: self.error.as_ref().map(|(_, e)| e.clone()),
+            installed: self.error.as_ref().is_none_or(|(_, e)| e != MISSING),
         }
     }
 }
