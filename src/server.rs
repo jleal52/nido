@@ -18,7 +18,7 @@ use crate::claude::{self, Procfs};
 use crate::launch::{self, Launcher, Paths};
 use crate::proto::{self, Frame, Hello, HistoryRequest, Role, Size};
 use crate::registry::{ClaudeLink, Registry, RegistryError, Session, new_id, now, now_ms};
-use crate::{accounts, auth, e2e, hub, upload};
+use crate::{accounts, auth, e2e, hub, prompt, upload};
 
 pub struct AppState {
     pub paths: Paths,
@@ -35,6 +35,8 @@ pub struct AppState {
     last_status: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
     /// Uso de las cuentas de cswap (con caché).
     accounts: accounts::Cache,
+    /// Contestar un menú de Claude es teclear paso a paso: de uno en uno.
+    answering: Mutex<()>,
     /// La conexión con el hub: móviles sin VPN y avisos.
     pub hub: Arc<hub::Hub>,
     /// Lo que `scan` ve pasar (terminó, te necesita), para avisar al móvil.
@@ -189,6 +191,7 @@ impl AppState {
             refresh: Notify::new(),
             last_status: Default::default(),
             accounts: Default::default(),
+            answering: Mutex::new(()),
             hub,
             alerts,
             alerts_rx: std::sync::Mutex::new(Some(alerts_rx)),
@@ -597,6 +600,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sessions/order", post(api_order_sessions))
         .route("/api/v1/sessions/{id}/start", post(api_start))
         .route("/api/v1/sessions/{id}/seen", post(api_seen))
+        .route("/api/v1/sessions/{id}/answer", post(api_answer))
         .route("/api/v1/sessions/{id}/stop", post(api_stop))
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
         .route("/api/v1/sessions/{id}/history", get(api_history))
@@ -688,9 +692,47 @@ async fn api_switch_account(
         return error(StatusCode::BAD_REQUEST, "cuenta no válida");
     }
     match st.accounts.switch(target).await {
-        Ok(r) => Json(r).into_response(),
+        Ok(r) => {
+            // Las sesiones paradas por el límite de la cuenta anterior siguen con la nueva.
+            let resumed = if r.switched { resume_limited(&st).await } else { Vec::new() };
+            let mut v = serde_json::to_value(&r).unwrap_or_default();
+            v["resumed"] = resumed.into();
+            Json(v).into_response()
+        }
         Err(e) => error(StatusCode::BAD_GATEWAY, e),
     }
+}
+
+/// Las sesiones de Claude que van con la cuenta por defecto y se quedaron paradas por el límite
+/// (lo dice su transcripción, o el aviso en pantalla): quitar el aviso y decirles que sigan.
+/// Devuelve sus nombres.
+async fn resume_limited(st: &AppState) -> Vec<String> {
+    let sessions = st.views.borrow().sessions.clone();
+    let mut resumed = Vec::new();
+    for s in sessions {
+        let Some(c) = &s.claude else { continue };
+        if !s.alive || !c.running || c.account.is_some() {
+            continue;
+        }
+        let link = st.registry.lock().await.get(&s.id).and_then(|x| x.claude.clone());
+        let stopped = link
+            .and_then(|l| {
+                let config = l.config_dir.clone().unwrap_or_else(|| claude::default_config_dir(&st.paths.home));
+                crate::transcript::find(&config, &l.session_id)
+            })
+            .is_some_and(|p| crate::transcript::stopped_by_limit(&p));
+        let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
+        let Ok(stream) = holder_connect(st, &s.id, hello).await else { continue };
+        let (rd, wr) = stream.into_split();
+        let mut scr = prompt::Screen::new(rd, wr);
+        let _one = st.answering.lock().await;
+        match prompt::resume_after_limit(&mut scr, stopped).await {
+            Ok(true) => resumed.push(s.name.clone()),
+            Ok(false) => {}
+            Err(e) => eprintln!("nido: {} no se pudo retomar tras el límite: {e}", s.name),
+        }
+    }
+    resumed
 }
 
 async fn api_list(State(st): State<Arc<AppState>>) -> Response {
@@ -931,6 +973,30 @@ async fn stop_and_wait(st: &AppState, id: &str) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Contesta el menú que Claude tiene en pantalla (sus preguntas, un permiso, el plan…) pulsando
+/// las teclas que tocan; ver [`prompt::answer`].
+async fn api_answer(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<prompt::Request>,
+) -> Response {
+    let s = match find_session(&st, &id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let _one = st.answering.lock().await;
+    let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
+    let Ok(stream) = holder_connect(&st, &s.id, hello).await else {
+        return error(StatusCode::CONFLICT, "la sesión no está en marcha");
+    };
+    let (rd, wr) = stream.into_split();
+    let mut scr = prompt::Screen::new(rd, wr);
+    match prompt::answer(&mut scr, &req).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => error(StatusCode::CONFLICT, e),
     }
 }
 
@@ -1511,7 +1577,9 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                     screen_pending = false;
                     let text = String::from_utf8_lossy(&b).into_owned();
                     if last_screen.as_deref() != Some(text.as_str()) {
-                        let msg = serde_json::json!({ "type": "screen", "text": text });
+                        // El menú que haya (preguntas, permisos…), para contestarlo con botones.
+                        let menu = prompt::parse(&text);
+                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu });
                         if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                             return;
                         }

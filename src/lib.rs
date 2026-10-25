@@ -13,6 +13,7 @@ pub mod holder;
 pub mod hub;
 pub mod import;
 pub mod launch;
+pub mod prompt;
 pub mod proto;
 pub mod registry;
 pub mod server;

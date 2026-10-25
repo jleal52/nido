@@ -1,0 +1,40 @@
+
+[38;2;215;119;87m ▐[48;2;0;0;0m▛███▛█   [39;49;1mClaude Code [38;2;153;153;153;22mv2.1.310
+[38;2;215;119;87m▝▜[48;2;0;0;0m█████[49m█▀  [38;2;153;153;153mOpus 5.5 with high effort · Claude Max
+[38;2;215;119;87m ▝▝   ▝▝   [38;2;153;153;153m/home/ana/proyecto · [38;2;78;186;101m/rc
+
+
+[38;2;153;153;153;48;2;55;55;55m❯ [38;2;255;255;255mEs una prueba de la interfaz. Usa AskUserQuestion UNA vez con dos preguntas: 1) color favorito (rojo, verde, azul; [39m   
+  [38;2;255;255;255muna sola), con header Color; 2) que frutas te gustan (manzana, pera, uva; multiSelect), header Frutas. No hagas nada [39m 
+  [38;2;255;255;255mmas.[39m                                                                                                                  
+[38;2;153;153;153;49m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+← [38;2;0;0;0;48;2;177;185;249m ☐ Color  [m☐ Frutas  ✔ Submit  →
+
+[38;2;255;255;255;1m¿Cuál es tu color favorito?
+
+[38;2;177;185;249;22m❯ [38;2;153;153;153m1. [38;2;177;185;249mRojo
+     [38;2;153;153;153mEl color rojo
+  2. [mVerde
+     [38;2;153;153;153mEl color verde
+  3. [mAzul
+     [38;2;153;153;153mEl color azul
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [m5. Chat about this
+
+[38;2;153;153;153mEnter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+[m                                                  
+
+
+
+[38;2;136;136;136m───────────────────────────────────────────────────────────────────────────────────────────────────── prueba-preguntas ─

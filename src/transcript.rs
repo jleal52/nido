@@ -51,6 +51,15 @@ pub enum ChatItem {
         input: String,
         result: Option<String>,
         is_error: bool,
+        /// Las preguntas de AskUserQuestion, enteras (para contestarlas con un formulario).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ask: Option<Value>,
+        /// El plan de ExitPlanMode, en Markdown.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
+        /// Lo que se contestó a AskUserQuestion: pregunta → respuesta.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        answers: Option<Value>,
     },
 }
 
@@ -60,6 +69,8 @@ pub struct ToolResult {
     pub tool_id: String,
     pub result: String,
     pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answers: Option<Value>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -180,6 +191,39 @@ fn tool_input(name: &str, input: &Value) -> String {
         &text.unwrap_or_else(|| serde_json::to_string_pretty(input).unwrap_or_default()),
         MAX_INPUT,
     )
+}
+
+/// Las preguntas de AskUserQuestion con lo que hace falta para el formulario (los textos largos,
+/// recortados uno a uno: recortar el JSON entero lo dejaría sin cerrar).
+fn ask_data(input: &Value) -> Option<Value> {
+    let questions = input.get("questions")?.as_array()?;
+    let s = |v: &Value, k: &str, max: usize| v.get(k).and_then(Value::as_str).map(|t| clip(t, max));
+    let qs: Vec<Value> = questions
+        .iter()
+        .map(|q| {
+            let options: Vec<Value> = q
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|o| o.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|o| {
+                    serde_json::json!({
+                        "label": s(o, "label", 300),
+                        "description": s(o, "description", 1000),
+                        "preview": s(o, "preview", 4000),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "question": s(q, "question", 1000),
+                "header": s(q, "header", 100),
+                "multiSelect": q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+                "options": options,
+            })
+        })
+        .collect();
+    Some(serde_json::json!({ "questions": qs }))
 }
 
 fn result_text(content: &Value) -> String {
@@ -312,19 +356,23 @@ fn parse_lines<'a>(
                                 .unwrap_or_default();
                             let result = result_text(b.get("content").unwrap_or(&Value::Null));
                             let is_error = b.get("is_error").and_then(Value::as_bool) == Some(true);
+                            let answers = d.pointer("/toolUseResult/answers").filter(|a| a.is_object()).cloned();
                             match tools.get(tool_id).and_then(|&i| items.get_mut(i)) {
                                 Some(ChatItem::Tool {
                                     result: r,
                                     is_error: e,
+                                    answers: a,
                                     ..
                                 }) => {
                                     *r = Some(result);
                                     *e = is_error;
+                                    *a = answers;
                                 }
                                 _ => results.push(ToolResult {
                                     tool_id: tool_id.to_owned(),
                                     result,
                                     is_error,
+                                    answers,
                                 }),
                             }
                         }
@@ -357,7 +405,17 @@ fn parse_lines<'a>(
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .trim();
-                            if !text.is_empty() {
+                            if text.is_empty() {
+                            } else if is_limit(&d) {
+                                // «You've hit your weekly limit · resets…»: no lo dice Claude.
+                                items.push(ChatItem::Notice {
+                                    id: bid,
+                                    ts: ts.clone(),
+                                    text: text.to_owned(),
+                                    status: Some("limit".into()),
+                                    result: None,
+                                });
+                            } else {
                                 items.push(ChatItem::Assistant {
                                     id: bid,
                                     ts: ts.clone(),
@@ -378,6 +436,10 @@ fn parse_lines<'a>(
                                 .unwrap_or_default()
                                 .to_owned();
                             tools.insert(tool_id.clone(), items.len());
+                            let ask = (name == "AskUserQuestion").then(|| ask_data(&input)).flatten();
+                            let plan = (name == "ExitPlanMode")
+                                .then(|| input.get("plan").and_then(Value::as_str).map(|p| clip(p, 30_000)))
+                                .flatten();
                             items.push(ChatItem::Tool {
                                 id: bid,
                                 ts: ts.clone(),
@@ -387,6 +449,9 @@ fn parse_lines<'a>(
                                 name,
                                 result: None,
                                 is_error: false,
+                                ask,
+                                plan,
+                                answers: None,
                             });
                         }
                         _ => {}
@@ -396,6 +461,41 @@ fn parse_lines<'a>(
             _ => {}
         }
     }
+}
+
+/// El aviso de que se acabó el límite de uso: un mensaje que pone Claude Code, no el modelo.
+fn is_limit(d: &Value) -> bool {
+    d.get("error").and_then(Value::as_str) == Some("rate_limit")
+}
+
+/// La conversación se quedó parada por el límite de uso: lo último que hay en ella es ese aviso.
+pub fn stopped_by_limit(path: &Path) -> bool {
+    const TAIL: u64 = 512 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    for line in text.lines().rev() {
+        let Ok(d) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if !matches!(d.get("type").and_then(Value::as_str), Some("user" | "assistant"))
+            || d.get("isSidechain").and_then(Value::as_bool) == Some(true)
+            || d.get("isMeta").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        return is_limit(&d);
+    }
+    false
 }
 
 /// Lee desde `offset` hasta la última línea completa (Claude puede estar escribiendo la
@@ -518,9 +618,65 @@ mod tests {
             [ToolResult {
                 tool_id: "t-9".into(),
                 result: "tarde".into(),
-                is_error: true
+                is_error: true,
+                answers: None,
             }]
         );
+    }
+
+    #[test]
+    fn usage_limit_is_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let hit = serde_json::json!({"type":"assistant","uuid":"a1","error":"rate_limit","isApiErrorMessage":true,
+            "message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your weekly limit · resets Oct 19, 7am (Europe/Madrid)"}]}});
+        std::fs::write(&path, line(hit) + &line(serde_json::json!({"type":"system","subtype":"x"}))).unwrap();
+        let c = read_chunk(&path, 0, None).unwrap();
+        assert!(matches!(&c.items[0], ChatItem::Notice { status: Some(s), .. } if s == "limit"));
+        assert!(stopped_by_limit(&path));
+        // Al seguir la conversación, ya no.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line(serde_json::json!({"type":"user","uuid":"u1","message":{"content":"continúa"}})).as_bytes()).unwrap();
+        drop(f);
+        assert!(!stopped_by_limit(&path));
+    }
+
+    #[test]
+    fn questions_plans_and_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let long = "x".repeat(5000);
+        let ask = serde_json::json!({"type":"assistant","uuid":"a1","message":{"content":[
+            {"type":"tool_use","id":"q-1","name":"AskUserQuestion","input":{"questions":[
+                {"question":"¿Color?","header":"Color","multiSelect":false,"options":[
+                    {"label":"Rojo","description":long},{"label":"Verde","description":"El verde"}]}]}},
+            {"type":"tool_use","id":"p-1","name":"ExitPlanMode","input":{"plan":"# Plan\n\n1. Uno"}}]}});
+        std::fs::write(&path, line(ask)).unwrap();
+        let c = read_chunk(&path, 0, None).unwrap();
+        match &c.items[0] {
+            ChatItem::Tool { ask: Some(a), result: None, .. } => {
+                let q = &a["questions"][0];
+                assert_eq!(q["question"], "¿Color?");
+                assert_eq!(q["multiSelect"], false);
+                assert_eq!(q["options"][1]["label"], "Verde");
+                // Recortado el texto, no el JSON.
+                assert!(q["options"][0]["description"].as_str().unwrap().len() < 1100);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(&c.items[1], ChatItem::Tool { plan: Some(p), .. } if p.starts_with("# Plan")));
+
+        // La respuesta llega después: con lo contestado.
+        let answer = serde_json::json!({"type":"user","uuid":"u1","message":{"content":[
+            {"type":"tool_result","tool_use_id":"q-1","content":"Your questions have been answered"}]},
+            "toolUseResult":{"questions":[],"answers":{"¿Color?":"Verde"}}});
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line(answer).as_bytes()).unwrap();
+        drop(f);
+        let next = read_chunk(&path, c.offset, None).unwrap();
+        assert_eq!(next.results[0].answers, Some(serde_json::json!({"¿Color?":"Verde"})));
+        let all = read_chunk(&path, 0, None).unwrap();
+        assert!(matches!(&all.items[0], ChatItem::Tool { answers: Some(a), .. } if a["¿Color?"] == "Verde"));
     }
 
     #[test]

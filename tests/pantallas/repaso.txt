@@ -1,0 +1,14 @@
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Frutas  ☒ Color  ✔ Submit  →
+
+Review your answers
+
+ ● ¿Qué frutas te gustan?
+   → Pera, kiwi
+ ● ¿Cuál es tu color favorito?
+   → Rojo
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel

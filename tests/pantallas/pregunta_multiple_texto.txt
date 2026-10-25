@@ -1,0 +1,14 @@
+←  ☒ Frutas  ☒ Color  ✔ Submit  →
+
+¿Qué frutas te gustan?
+
+  1. [ ] Manzana
+         Manzana
+  2. [✔] Pera
+         Pera
+  3. [✔] kiwi
+❯    Next
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in Vim · Esc to cancel

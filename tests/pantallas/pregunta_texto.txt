@@ -1,0 +1,13 @@
+ ☐ Color
+
+¿Cuál es tu color favorito?
+
+  1. Rojo
+     Color rojo
+  2. Verde
+     Color verde
+❯ 3. morado claro
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel
