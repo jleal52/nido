@@ -380,6 +380,8 @@ fn parse_lines<'a>(
                     }
                 }
                 let text = text.join("\n").trim().to_owned();
+                // «[Request interrupted by user…]» lo pone Claude Code, no tú.
+                let text = if text.starts_with("[Request interrupted") { String::new() } else { text };
                 if let Some(notice) = task_notice(&text, &id, &ts) {
                     items.push(notice);
                 } else if !text.is_empty() || images > 0 {

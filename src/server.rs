@@ -1445,6 +1445,30 @@ struct LiveQuery {
     limit: Option<usize>,
 }
 
+/// El plan que Claude pide aprobar: el fichero que nombra el menú (`~/.claude/plans/<nombre>.md`).
+/// Solo se lee si es un `.md` dentro de una carpeta `plans`.
+fn plan_text(home: &std::path::Path, m: &prompt::Menu) -> Option<String> {
+    if m.kind != prompt::Kind::Plan {
+        return None;
+    }
+    let hint = m.hint.as_deref()?;
+    let token = hint
+        .split(|c: char| c.is_whitespace() || c == '·')
+        .find(|t| t.contains("/plans/") && t.ends_with(".md"))?;
+    let path = match token.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(token),
+    };
+    if !path.is_absolute()
+        || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        || path.parent()?.file_name()? != "plans"
+    {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(text.chars().take(30_000).collect())
+}
+
 async fn ws_live(
     ws: WebSocketUpgrade,
     State(st): State<Arc<AppState>>,
@@ -1579,7 +1603,12 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                     if last_screen.as_deref() != Some(text.as_str()) {
                         // El menú que haya (preguntas, permisos…), para contestarlo con botones.
                         let menu = prompt::parse(&text);
-                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu });
+                        let mut menu_v = serde_json::to_value(&menu).unwrap_or_default();
+                        // Para aprobar el plan, el plan en sí (el de la transcripción puede ser viejo).
+                        if let Some(plan) = menu.as_ref().and_then(|m| plan_text(&st.paths.home, m)) {
+                            menu_v["plan"] = plan.into();
+                        }
+                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v });
                         if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                             return;
                         }
