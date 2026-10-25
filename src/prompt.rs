@@ -153,6 +153,43 @@ fn strip_sgr(s: &str) -> String {
     out
 }
 
+/// El texto empieza atenuado (SGR 2), mirando todas las secuencias de color que tenga delante
+/// (`ESC[39;2m`, `ESC[7mP…`: el cursor encima de la primera letra no cuenta). El 2 de un color
+/// RGB (`38;2;r;g;b`) no es atenuado.
+fn starts_dim(s: &str) -> bool {
+    let mut dim = false;
+    let mut rest = s;
+    loop {
+        let Some(seq) = rest.strip_prefix("\x1b[") else { break };
+        let Some(end) = seq.find(|c: char| c.is_ascii_alphabetic()) else { break };
+        if &seq[end..end + 1] == "m" {
+            let ps: Vec<&str> = seq[..end].split(';').collect();
+            let mut i = 0;
+            while i < ps.len() {
+                match ps[i] {
+                    "38" | "48" | "58" => i += if ps.get(i + 1) == Some(&"2") { 5 } else { 2 },
+                    "" | "0" | "22" => dim = false,
+                    "2" => dim = true,
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        rest = &seq[end + 1..];
+    }
+    if dim {
+        return true;
+    }
+    // El cursor (inverso) sobre la primera letra y luego atenuado.
+    if let Some(after) = rest.strip_prefix(|_: char| true)
+        && after.starts_with("\x1b[")
+        && s.contains("\x1b[7m")
+    {
+        return starts_dim(after);
+    }
+    false
+}
+
 /// Columna (en caracteres) del primer carácter que no es espacio.
 fn indent(l: &str) -> usize {
     l.chars().take_while(|c| *c == ' ').count()
@@ -461,6 +498,8 @@ pub struct Request {
     pub option: Option<String>,
     /// Mandar la siguiente petición que propone Claude (el texto que se ve, para comprobarlo).
     pub suggestion: Option<String>,
+    /// Mandar un mensaje (lo que escribes en la caja del chat, con las rutas de los adjuntos).
+    pub message: Option<String>,
     /// Con un campo de texto, lo que se escribe; con otra opción (p. ej. «No» en un permiso), lo
     /// que se le manda a Claude después, como un mensaje.
     pub text: Option<String>,
@@ -594,7 +633,7 @@ pub fn suggestion(screen: &str) -> Option<String> {
     let raw = lines[i];
     let after = &raw[raw.find('❯')? + '❯'.len_utf8()..];
     let after = after.trim_start_matches(|c: char| c == ' ' || c == '\u{a0}');
-    if !after.starts_with("\x1b[2m") {
+    if !starts_dim(after) {
         return None;
     }
     let text = strip_sgr(after).trim().to_owned();
@@ -605,6 +644,102 @@ pub fn suggestion(screen: &str) -> Option<String> {
         return None;
     }
     Some(text)
+}
+
+/// Lo escrito en la caja de Claude (lo atenuado no cuenta: es una propuesta o una ayuda), o
+/// `None` si no se ve la caja (hay un menú, o no es Claude).
+pub fn input_box(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let plain: Vec<String> = lines.iter().map(|l| strip_sgr(l)).collect();
+    let edge = |l: &str| l.trim_start().starts_with("──────");
+    // La raya de abajo es la última; la de arriba, la anterior. Entre ellas, lo escrito.
+    let bottom = plain.iter().rposition(|l| edge(l))?;
+    let top = plain[..bottom].iter().rposition(|l| edge(l))?;
+    let first = plain.get(top + 1)?;
+    if bottom == top + 1 || !first.trim_start().starts_with('❯') {
+        return None;
+    }
+    let raw = lines[top + 1];
+    let after = raw[raw.find('❯')? + '❯'.len_utf8()..].trim_start_matches([' ', '\u{a0}']);
+    if starts_dim(after) {
+        return Some(String::new());
+    }
+    let mut text: Vec<String> = Vec::new();
+    for (k, l) in plain[top + 1..bottom].iter().enumerate() {
+        let l = if k == 0 { l.trim_start().trim_start_matches('❯') } else { l.as_str() };
+        text.push(l.trim_matches([' ', '\u{a0}']).to_owned());
+    }
+    Some(text.join(" ").trim().to_owned())
+}
+
+/// Manda un mensaje a Claude: lo pega, espera a que la caja se quede quieta (con adjuntos,
+/// Claude tarda en cambiar las rutas por «[Image #1]»; un Enter que llega antes se pierde) y
+/// pulsa Enter; si la caja no se vacía, lo vuelve a pulsar.
+pub async fn send_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    text: &str,
+) -> Result<(), String> {
+    let text = text.trim();
+    if !text.is_empty() {
+        let mut paste = b"\x1b[200~".to_vec();
+        paste.extend_from_slice(text.replace("\r\n", "\n").as_bytes());
+        paste.extend_from_slice(b"\x1b[201~");
+        // Si Claude no lo coge (p. ej. aún arrancando), la caja sigue vacía: se pega otra vez.
+        let mut written = false;
+        for _ in 0..2 {
+            if input_box(&scr.read().await?).is_some_and(|t| !t.is_empty()) {
+                return Err("en la caja de Claude ya hay algo escrito".into());
+            }
+            scr.keys(&paste).await?;
+            // Quieta: dos lecturas seguidas iguales, con algo escrito.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut last: Option<String> = None;
+            loop {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let now = input_box(&scr.read().await?);
+                let has = now.as_deref().is_some_and(|t| !t.is_empty());
+                if has && now == last {
+                    written = true;
+                    break;
+                }
+                // Sin nada al cabo de 2 s: no lo ha cogido.
+                if !has && tokio::time::Instant::now() + Duration::from_secs(3) >= deadline {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    written = has;
+                    break;
+                }
+                last = now;
+            }
+            if written {
+                break;
+            }
+        }
+        if !written {
+            return Err("Claude no ha cogido el texto (¿está arrancando?)".into());
+        }
+    }
+    for _ in 0..3 {
+        scr.keys(b"\r").await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(STEP).await;
+            match input_box(&scr.read().await?) {
+                // Vacía (enviado, o en cola si Claude trabajaba) o ya no está la caja.
+                None => return Ok(()),
+                Some(t) if t.is_empty() => return Ok(()),
+                Some(_) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    if text.is_empty() {
+        return Ok(()); // un Enter suelto (confirmar algo): no había nada que vaciar
+    }
+    Err("Claude no ha cogido el mensaje: sigue en su caja".into())
 }
 
 /// Manda la siguiente petición que propone Claude (`expect`, como se ve en pantalla): Tab la
@@ -684,6 +819,9 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
     if let Some(s) = &req.suggestion {
         return send_suggestion(scr, s).await;
+    }
+    if let Some(m) = &req.message {
+        return send_message(scr, m).await;
     }
     let want = req.option.as_deref().ok_or("falta qué opción")?;
     let m = scr.menu().await?.ok_or("no hay ningún menú en pantalla")?;
@@ -947,6 +1085,21 @@ mod tests {
     #[test]
     fn a_queued_message_with_a_list_is_not_a_menu() {
         assert_eq!(screen("cola"), None);
+    }
+
+    #[test]
+    fn what_is_written_in_the_box() {
+        let rule = "────────────────────────";
+        let b = |inner: &str| format!("✻ Brewed\n\n{rule}──── nido ─\n{inner}\n{rule}\n  ⏵⏵ auto mode on");
+        assert_eq!(input_box(&b("❯\u{a0}[Image #3] [Image #4]al mandar yo un mensaje con\n  puntos, el parser")).as_deref(),
+            Some("[Image #3] [Image #4]al mandar yo un mensaje con puntos, el parser"));
+        assert_eq!(input_box(&b("❯\u{a0}")).as_deref(), Some(""));
+        assert_eq!(input_box(&b("\x1b[m❯\u{a0} \x1b[2mleer el fichero")).as_deref(), Some(""));
+        assert_eq!(input_box(&b("\x1b[m❯\u{a0} \x1b[7mP\x1b[2mress up to edit queued messages")).as_deref(), Some(""));
+        assert_eq!(input_box(&b("\x1b[38;2;153;153;153m❯\u{a0} \x1b[39;2mPress up to edit queued messages")).as_deref(), Some(""));
+        // Un color RGB con un 2 dentro no es atenuado.
+        assert_eq!(input_box(&b("\x1b[m❯\u{a0} \x1b[38;2;200;200;200mhola")).as_deref(), Some("hola"));
+        assert_eq!(input_box(&std::fs::read_to_string(format!("{}/tests/pantallas/permiso.txt", env!("CARGO_MANIFEST_DIR"))).unwrap()), None);
     }
 
     #[test]
