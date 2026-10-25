@@ -591,6 +591,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/hub", get(api_hub).post(api_set_hub))
         .route("/api/v1/push/test", post(api_push_test))
         .route("/api/v1/sessions", get(api_list).post(api_create))
+        .route("/api/v1/conversations", get(api_conversations))
         .route(
             "/api/v1/sessions/{id}",
             axum::routing::patch(api_update).delete(api_delete),
@@ -783,16 +784,52 @@ fn uuid_v4() -> String {
     )
 }
 
-async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateRequest>) -> Response {
-    // «~» es la carpeta de inicio de este equipo (cada uno del grupo tiene la suya).
-    let cwd = match req.cwd {
-        Some(c) if c == std::path::Path::new("~") => st.paths.home.clone(),
+/// «~» es la carpeta de inicio de este equipo (cada uno del grupo tiene la suya).
+fn expand_home(home: &std::path::Path, cwd: Option<PathBuf>) -> PathBuf {
+    match cwd {
+        Some(c) if c == std::path::Path::new("~") => home.to_owned(),
         Some(c) => match c.strip_prefix("~") {
-            Ok(rest) => st.paths.home.join(rest),
+            Ok(rest) => home.join(rest),
             Err(_) => c,
         },
-        None => st.paths.home.clone(),
-    };
+        None => home.to_owned(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConversationsQuery {
+    cwd: Option<PathBuf>,
+}
+
+/// Las conversaciones de Claude guardadas en una carpeta, para retomar una en una sesión nueva.
+/// Cada una dice en qué sesión de nido está ya, si está en alguna.
+async fn api_conversations(State(st): State<Arc<AppState>>, Query(q): Query<ConversationsQuery>) -> Response {
+    let cwd = expand_home(&st.paths.home, q.cwd);
+    let dir = crate::transcript::project_dir(&claude::default_config_dir(&st.paths.home), &cwd);
+    let list = tokio::task::spawn_blocking(move || crate::transcript::conversations(&dir, 30))
+        .await
+        .unwrap_or_default();
+    let by_sid: std::collections::HashMap<String, String> = st
+        .registry
+        .lock()
+        .await
+        .sessions()
+        .iter()
+        .filter_map(|s| Some((s.claude.as_ref()?.session_id.clone(), s.name.clone())))
+        .collect();
+    let out: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|c| {
+            let mut v = serde_json::to_value(&c).unwrap_or_default();
+            v["session"] = by_sid.get(&c.id).cloned().into();
+            v
+        })
+        .collect();
+    Json(serde_json::json!({ "cwd": cwd, "conversations": out })).into_response()
+}
+
+async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateRequest>) -> Response {
+    let cwd = expand_home(&st.paths.home, req.cwd);
     if !cwd.is_dir() {
         return error(
             StatusCode::BAD_REQUEST,

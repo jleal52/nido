@@ -500,6 +500,137 @@ pub fn stopped_by_limit(path: &Path) -> bool {
     false
 }
 
+/// Una conversación de Claude guardada, para retomarla.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Conversation {
+    pub id: String,
+    /// El nombre que se le puso (`/rename`) o el que le sacó Claude.
+    pub title: Option<String>,
+    /// Lo último que escribiste.
+    pub last_prompt: Option<String>,
+    /// Última vez que cambió (ms desde 1970).
+    pub modified: u64,
+    pub size: u64,
+}
+
+/// La carpeta de `<config>/projects` de un directorio: Claude Code cambia por «-» todo lo que no
+/// sea letra o número.
+pub fn project_dir(config_dir: &Path, cwd: &Path) -> PathBuf {
+    let name: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    config_dir.join("projects").join(name)
+}
+
+/// Las conversaciones de un directorio, de la más reciente a la más antigua (como mucho `limit`).
+/// Solo se lee el final de cada fichero: ahí están el título y lo último que escribiste.
+pub fn conversations(dir: &Path, limit: usize) -> Vec<Conversation> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(PathBuf, u64, u64)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension()? != "jsonl" {
+                return None;
+            }
+            let m = e.metadata().ok()?;
+            let modified = m
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis() as u64;
+            Some((p, modified, m.len()))
+        })
+        .collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files
+        .into_iter()
+        .take(limit)
+        .filter_map(|(p, modified, size)| {
+            let id = p.file_stem()?.to_str()?.to_owned();
+            let (mut title, last_prompt, has_messages) = summary(&p);
+            if !has_messages {
+                return None; // abierta y cerrada sin escribir nada
+            }
+            // El nombre puesto a mano manda (Claude Code lo guarda también aparte).
+            let custom = std::fs::read(dir.join(&id).join("custom-title.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|v| v.get("customTitle")?.as_str().map(str::to_owned));
+            if custom.is_some() {
+                title = custom;
+            }
+            Some(Conversation { id, title, last_prompt, modified, size })
+        })
+        .collect()
+}
+
+/// Del final de una transcripción: (título, lo último que escribiste, si tiene mensajes).
+fn summary(path: &Path) -> (Option<String>, Option<String>, bool) {
+    const TAIL: u64 = 256 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (None, None, false);
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(TAIL);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return (None, None, false);
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return (None, None, false);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let (mut custom, mut ai, mut prompt, mut user) = (None, None, None, None);
+    let mut messages = false;
+    // La primera línea puede venir cortada (si no se empezó por el principio): se salta sola.
+    for line in text.lines() {
+        let Ok(d) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let field = |k: &str| d.get(k).and_then(Value::as_str).map(str::to_owned);
+        match d.get("type").and_then(Value::as_str) {
+            Some("custom-title") => custom = field("customTitle").or(custom),
+            Some("ai-title") => ai = field("aiTitle").or(ai),
+            Some("last-prompt") => prompt = field("lastPrompt").or(prompt),
+            Some("assistant") => messages = true,
+            Some("user") => {
+                messages = true;
+                let content = d.pointer("/message/content");
+                let raw = match content {
+                    Some(Value::String(t)) => Some(t.clone()),
+                    // En bloques: solo si es texto tuyo (no el resultado de una herramienta).
+                    Some(Value::Array(blocks)) => {
+                        let texts: Vec<&str> = blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                            .filter_map(|b| b.get("text").and_then(Value::as_str))
+                            .collect();
+                        (!texts.is_empty()).then(|| texts.join("\n"))
+                    }
+                    _ => None,
+                };
+                if d.get("isMeta").and_then(Value::as_bool) != Some(true)
+                    && let Some(t) = raw
+                {
+                    let t = strip_reminders(&t);
+                    if !t.is_empty() && !t.starts_with('<') && !t.starts_with("[Request interrupted") {
+                        user = Some(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let one_line = |s: String| clip(s.split_whitespace().collect::<Vec<_>>().join(" ").as_str(), 200);
+    (custom.or(ai), prompt.or(user).map(one_line), messages || start > 0)
+}
+
 /// Lee desde `offset` hasta la última línea completa (Claude puede estar escribiendo la
 /// siguiente). Si se lee desde el principio (`offset = 0`, o el fichero se rehízo), con `limit`
 /// devuelve solo los últimos `limit` mensajes.
@@ -624,6 +755,32 @@ mod tests {
                 answers: None,
             }]
         );
+    }
+
+    #[test]
+    fn lists_conversations_newest_first() {
+        let config = tempfile::tempdir().unwrap();
+        let dir = project_dir(config.path(), Path::new("/home/ana/mi.proyecto"));
+        assert!(dir.ends_with("projects/-home-ana-mi-proyecto"));
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let old = line(serde_json::json!({"type":"user","uuid":"u1","message":{"content":"arregla el login"}}))
+            + &line(serde_json::json!({"type":"ai-title","aiTitle":"Arreglar el login"}));
+        std::fs::write(dir.join("a.jsonl"), old).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let new = line(serde_json::json!({"type":"custom-title","customTitle":"viejo"}))
+            + &line(serde_json::json!({"type":"user","uuid":"u1","message":{"content":"primero"}}))
+            + &line(serde_json::json!({"type":"last-prompt","lastPrompt":"lo último\nque escribí"}));
+        std::fs::write(dir.join("b.jsonl"), new).unwrap();
+        std::fs::write(dir.join("b").join("custom-title.json"), r#"{"customTitle":"monitor"}"#).unwrap();
+        // Abierta y cerrada sin escribir: no sale.
+        std::fs::write(dir.join("c.jsonl"), line(serde_json::json!({"type":"permission-mode"}))).unwrap();
+        let list = conversations(&dir, 10);
+        assert_eq!(list.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(list[0].title.as_deref(), Some("monitor"));
+        assert_eq!(list[0].last_prompt.as_deref(), Some("lo último que escribí"));
+        assert_eq!(list[1].title.as_deref(), Some("Arreglar el login"));
+        assert_eq!(list[1].last_prompt.as_deref(), Some("arregla el login"));
+        assert!(conversations(&config.path().join("no-existe"), 10).is_empty());
     }
 
     #[test]
