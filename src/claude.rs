@@ -316,6 +316,55 @@ pub fn resume_argv(link: &ClaudeLink) -> (Vec<String>, Vec<(String, String)>) {
     (argv, env)
 }
 
+/// Las opciones propias con las que se lanzó `claude` (`--model haiku`, `--mcp-config x`…), para
+/// conservarlas al retomar. Fuera las que eligen la conversación o el nombre (al retomar las pone
+/// nido) y lo que no es una opción (el mensaje inicial). `argv` es la orden de la sesión.
+pub fn extra_args(argv: &[String]) -> Vec<String> {
+    if argv.first().map(|a| a.rsplit('/').next().unwrap_or(a)) != Some("claude") {
+        return Vec::new();
+    }
+    // Opciones que llevan valor detrás (las demás son interruptores).
+    const DROP_WITH_VALUE: [&str; 5] = ["--resume", "-r", "--session-id", "-n", "--name"];
+    const DROP_FLAGS: [&str; 3] = ["--continue", "-c", "--fork-session"];
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        let a = &argv[i];
+        if DROP_WITH_VALUE.contains(&a.as_str()) {
+            i += 2;
+            continue;
+        }
+        if DROP_FLAGS.contains(&a.as_str()) || a.starts_with("--resume=") || a.starts_with("--session-id=") {
+            i += 1;
+            continue;
+        }
+        if !a.starts_with('-') {
+            // Un texto suelto: el mensaje inicial (o el valor de una opción, que ya se copió).
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        // Su valor, si lo lleva aparte (lo siguiente no es otra opción).
+        if !a.contains('=') && argv.get(i + 1).is_some_and(|v| !v.starts_with('-')) && takes_value(a) {
+            out.push(argv[i + 1].clone());
+            i += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Opciones de `claude` que llevan un valor detrás (las que suelen usarse al lanzar una sesión).
+fn takes_value(opt: &str) -> bool {
+    [
+        "--model", "--mcp-config", "--permission-mode", "--settings", "--add-dir", "--agent",
+        "--append-system-prompt", "--system-prompt", "--allowedTools", "--allowed-tools",
+        "--disallowedTools", "--disallowed-tools", "--effort", "--fallback-model", "--plugin-dir",
+        "--setting-sources", "--agents", "--betas",
+    ]
+    .contains(&opt)
+}
+
 /// Comillas simples de shell (para escribir la orden dentro de una shell al restaurar).
 fn sh_quote(s: &str) -> String {
     if !s.is_empty()
@@ -389,6 +438,19 @@ mod tests {
         assert_eq!(found.info.status.as_deref(), Some("busy"));
         assert_eq!(found.config_dir, Some(profile));
         assert!(find_claude(&procfs, 150, &home).is_none());
+    }
+
+    #[test]
+    fn keeps_own_claude_options_when_resuming() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            extra_args(&v(&["claude", "--model", "haiku", "--mcp-config", "/x/cfg.json", "--strict-mcp-config"])),
+            v(&["--model", "haiku", "--mcp-config", "/x/cfg.json", "--strict-mcp-config"])
+        );
+        // Lo que elige la conversación lo pone nido; el mensaje inicial no se repite.
+        assert_eq!(extra_args(&v(&["claude", "--resume", "abc", "--model=opus", "hola"])), v(&["--model=opus"]));
+        assert_eq!(extra_args(&v(&["claude", "--session-id", "u", "-n", "api"])), Vec::<String>::new());
+        assert_eq!(extra_args(&v(&["npm", "run", "dev"])), Vec::<String>::new());
     }
 
     #[test]

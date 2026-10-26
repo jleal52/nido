@@ -260,7 +260,9 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
             if link.inside_shell {
                 initial_input = Some(format!("{}\r", claude::resume_line(link)).into_bytes());
             } else {
-                let (resume, resume_env) = claude::resume_argv(link);
+                let (mut resume, resume_env) = claude::resume_argv(link);
+                // Las opciones propias con las que se lanzó (`--model`, `--mcp-config`…), también.
+                resume.extend(claude::extra_args(&session.argv));
                 argv = resume;
                 env.extend(resume_env);
             }
