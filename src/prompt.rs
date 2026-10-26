@@ -486,6 +486,92 @@ fn unnumbered(lines: &[&str]) -> Option<Menu> {
     })
 }
 
+// ---------- Lo que sigue en marcha en segundo plano ----------
+
+/// Lo que Claude tiene trabajando aparte aunque él esté esperando: subagentes y órdenes en
+/// segundo plano (abajo en su pantalla: «● main / ◯ general-purpose  Tarea  20m 51s · ↓ …» y
+/// «· 2 shells» en la línea de estado).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Background {
+    pub agents: Vec<Agent>,
+    pub shells: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Agent {
+    /// `general-purpose`, `Explore`…
+    pub kind: String,
+    /// Lo que está haciendo (recortado si la pantalla es estrecha).
+    pub task: String,
+    /// Cuánto lleva, en segundos.
+    pub elapsed: u64,
+}
+
+/// «20m 51s», «1h 2m 3s», «45s» → segundos.
+fn duration_secs(s: &str) -> Option<u64> {
+    let mut total = 0;
+    let mut any = false;
+    for part in s.split_whitespace() {
+        let (n, unit) = part.split_at(part.find(|c: char| !c.is_ascii_digit())?);
+        let n: u64 = n.parse().ok()?;
+        total += n * match unit {
+            "h" => 3600,
+            "m" => 60,
+            "s" => 1,
+            _ => return None,
+        };
+        any = true;
+    }
+    any.then_some(total)
+}
+
+pub fn background(screen: &str) -> Option<Background> {
+    let plain = strip_sgr(screen);
+    let lines: Vec<&str> = plain.lines().collect();
+    let mut bg = Background::default();
+    // Las órdenes: «· 1 shell ·» en la línea de estado (la de «auto mode», «↓ to manage»…).
+    if let Some(status) = lines.iter().rev().find(|l| l.contains("to manage") || l.contains("shift+tab to cycle")) {
+        for part in status.split('·') {
+            let p = part.trim();
+            if let Some(n) = p.strip_suffix(" shells").or_else(|| p.strip_suffix(" shell")) {
+                bg.shells = n.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    // Los subagentes, debajo de «● main».
+    if let Some(main) = lines.iter().rposition(|l| l.trim() == "● main") {
+        for l in &lines[main + 1..] {
+            let t = l.trim();
+            let Some(rest) = t.strip_prefix('◯').or_else(|| t.strip_prefix('●')) else {
+                if t.is_empty() {
+                    continue;
+                }
+                break;
+            };
+            // «general-purpose  Tarea   20m 51s · ↓ 622.2k tokens» (o, estrecha, «Tarea… 7m 29s»).
+            let rest = rest.trim();
+            let before_tokens = rest.split(" · ").next().unwrap_or(rest).trim_end();
+            let words: Vec<&str> = before_tokens.split_whitespace().collect();
+            let mut k = words.len();
+            while k > 0 && duration_secs(words[k - 1]).is_some() {
+                k -= 1;
+            }
+            let elapsed = duration_secs(&words[k..].join(" ")).unwrap_or(0);
+            let head = words[..k].join(" ");
+            let (kind, task) = match rest.split_once("  ") {
+                Some((kind, _)) => {
+                    let kind = kind.trim().to_owned();
+                    let task = head.strip_prefix(&kind).unwrap_or(&head).trim().to_owned();
+                    (kind, task)
+                }
+                None => (head.clone(), String::new()),
+            };
+            bg.agents.push(Agent { kind, task, elapsed });
+        }
+    }
+    (!bg.agents.is_empty() || bg.shells > 0).then_some(bg)
+}
+
 // ---------- Formularios de un servidor MCP ----------
 
 /// Un servidor MCP pide datos o confirmación («MCP server "x" requests your input»): un mensaje,
@@ -857,6 +943,11 @@ const DOWN: &[u8] = b"\x1b[B";
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Screen<R, W> {
     pub fn new(rd: R, wr: W) -> Self {
         Self { rd, wr }
+    }
+
+    /// La pantalla tal cual (con colores).
+    pub async fn screen(&mut self) -> Result<String, String> {
+        self.read().await
     }
 
     async fn read(&mut self) -> Result<String, String> {
@@ -1462,6 +1553,25 @@ mod tests {
         assert_eq!(cur, FormCursor::Field(0));
         let open = "      Entorno: ▾\n        ❯ ◯ dev\n          ◉ pre\n          ◯ prod";
         assert_eq!(choice_options(open), (vec!["dev".into(), "pre".into(), "prod".into()], Some(0)));
+    }
+
+    #[test]
+    fn subagents_and_shells_in_the_background() {
+        let wide = "❯ \n────\n  ⏵⏵ auto mode on · 3 shells · ↓ to manage\n  \n\x1b[1m  ● main\n\x1b[38;2;153;153;153;22m  ◯ general-purpose  Rerunning e2e and test battery                    20m 51s · ↓ 622.2k tokens\n  ◯ general-purpose\x1b[m  \x1b[38;2;153;153;153mAdding grace tests\x1b[m                 \x1b[38;2;153;153;153m1h 2m 4s · ↓ 209.4k tokens";
+        let bg = background(wide).unwrap();
+        assert_eq!(bg.shells, 3);
+        assert_eq!(
+            bg.agents,
+            [
+                Agent { kind: "general-purpose".into(), task: "Rerunning e2e and test battery".into(), elapsed: 20 * 60 + 51 },
+                Agent { kind: "general-purpose".into(), task: "Adding grace tests".into(), elapsed: 3724 },
+            ]
+        );
+        let narrow = "  ⏵⏵ auto mode on (shift+tab to cycle) · ↓ to manage\n  ● main\n  ◯ general-purpose  Extending… 7m 29s · ↓ 688.5k tokens";
+        let bg = background(narrow).unwrap();
+        assert_eq!((bg.shells, bg.agents[0].task.as_str(), bg.agents[0].elapsed), (0, "Extending…", 449));
+        assert_eq!(background("  ⏵⏵ auto mode on · 1 shell · ↓ to manage").unwrap().shells, 1);
+        assert_eq!(background("❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)"), None);
     }
 
     #[test]

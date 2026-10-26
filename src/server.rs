@@ -37,6 +37,9 @@ pub struct AppState {
     accounts: accounts::Cache,
     /// Contestar un menú de Claude es teclear paso a paso: de uno en uno.
     answering: Mutex<()>,
+    /// Lo que cada sesión de Claude tiene en segundo plano (subagentes, órdenes), según su
+    /// pantalla; lo pone al día `spawn_background` cada pocos segundos.
+    background: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
     /// La conexión con el hub: móviles sin VPN y avisos.
     pub hub: Arc<hub::Hub>,
     /// Lo que `scan` ve pasar (terminó, te necesita), para avisar al móvil.
@@ -148,6 +151,9 @@ pub struct SessionView {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClaudeView {
+    /// Subagentes y órdenes en segundo plano (`agents`, `shells`, y desde cuándo: `since`, en ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<serde_json::Value>,
     pub session_id: String,
     /// Corriendo ahora (si no, es la última conversación conocida, para retomarla).
     pub running: bool,
@@ -192,6 +198,7 @@ impl AppState {
             last_status: Default::default(),
             accounts: Default::default(),
             answering: Mutex::new(()),
+            background: Default::default(),
             hub,
             alerts,
             alerts_rx: std::sync::Mutex::new(Some(alerts_rx)),
@@ -278,6 +285,9 @@ impl AppState {
                 unread: finished > s.seen,
                 alive,
                 claude: link.map(|l| ClaudeView {
+                    background: found
+                        .as_ref()
+                        .and_then(|_| self.background.lock().expect("segundo plano").get(&s.id).cloned()),
                     session_id: l.session_id,
                     running: found.is_some(),
                     status: found.as_ref().and_then(|f| f.info.status.clone()),
@@ -526,9 +536,76 @@ fn spawn_group(state: Arc<AppState>) {
     });
 }
 
+/// Lo de segundo plano como se manda: cada cosa con desde cuándo (ms) en vez de cuánto lleva.
+pub fn background_json(bg: &prompt::Background) -> serde_json::Value {
+    let now = now_ms();
+    let since = |secs: u64| now.saturating_sub(secs * 1000);
+    let agents: Vec<serde_json::Value> = bg
+        .agents
+        .iter()
+        .map(|a| serde_json::json!({ "kind": a.kind, "task": a.task, "since": since(a.elapsed) }))
+        .collect();
+    let oldest = bg.agents.iter().map(|a| a.elapsed).max();
+    serde_json::json!({ "agents": agents, "shells": bg.shells, "since": oldest.map(since) })
+}
+
+/// Cada 10 s mira la pantalla de las sesiones con Claude en marcha: si tiene subagentes u órdenes
+/// en segundo plano (aunque él esté esperando, siguen trabajando).
+fn spawn_background(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let sessions = state.views.borrow().sessions.clone();
+            let mut seen = std::collections::HashMap::new();
+            for s in sessions {
+                if !s.alive || !s.claude.as_ref().is_some_and(|c| c.running) {
+                    continue;
+                }
+                let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
+                let Ok(stream) = holder_connect(&state, &s.id, hello).await else { continue };
+                let (rd, wr) = stream.into_split();
+                let mut scr = prompt::Screen::new(rd, wr);
+                let Ok(Ok(text)) = tokio::time::timeout(Duration::from_secs(3), scr.screen()).await else { continue };
+                if let Some(bg) = prompt::background(&text) {
+                    seen.insert(s.id.clone(), background_json(&bg));
+                }
+            }
+            let changed = {
+                let mut cur = state.background.lock().expect("segundo plano");
+                // Sin cambios de qué hay (el «desde» se mueve un poco en cada lectura): no se avisa.
+                let shape = |m: &std::collections::HashMap<String, serde_json::Value>| {
+                    let mut v: Vec<String> = m
+                        .iter()
+                        .map(|(k, b)| {
+                            let tasks: Vec<&str> = b["agents"]
+                                .as_array()
+                                .map(|a| a.iter().filter_map(|x| x["task"].as_str()).collect())
+                                .unwrap_or_default();
+                            format!("{k}:{}:{}", b["shells"], tasks.join("|"))
+                        })
+                        .collect();
+                    v.sort();
+                    v
+                };
+                let changed = shape(&cur) != shape(&seen);
+                if changed {
+                    *cur = seen;
+                }
+                changed
+            };
+            if changed {
+                state.refresh.notify_one();
+            }
+        }
+    });
+}
+
 /// Cada 2 s (o al pedirlo) vuelve a mirar el estado.
 pub fn spawn_scanner(state: Arc<AppState>) {
     spawn_group(state.clone());
+    spawn_background(state.clone());
     // Los avisos al móvil, según los cambios que vea `scan`.
     if let Some(mut rx) = state.alerts_rx.lock().expect("avisos").take() {
         let st = state.clone();
@@ -1649,7 +1726,9 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                         let suggestion = if menu.is_none() { prompt::suggestion(&text) } else { None };
                         // Un servidor MCP pide confirmación o datos (con su formulario).
                         let form = prompt::form(&text);
-                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v, "suggestion": suggestion, "form": form });
+                        // Subagentes y órdenes en segundo plano.
+                        let background = prompt::background(&text).map(|b| background_json(&b));
+                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v, "suggestion": suggestion, "form": form, "background": background });
                         if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                             return;
                         }
