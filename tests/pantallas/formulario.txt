@@ -1,0 +1,40 @@
+
+[38;2;215;119;87m ▐[48;2;0;0;0m▛███▛█   [39;49;1mClaude Code [38;2;153;153;153;22mv2.1.310
+[38;2;215;119;87m▝▜[48;2;0;0;0m█████[49m█▀  [38;2;153;153;153mHaiku 5.5 · Claude Max
+[38;2;215;119;87m ▝▝   ▝▝   [38;2;153;153;153m/home/ana/proyecto · [38;2;78;186;101m/rc
+
+
+[38;2;153;153;153;48;2;55;55;55m❯ [38;2;255;255;255mPrueba: llama a la herramienta borrar_indice con nombre bp_assignee_1. Nada mas.[39m                                      
+
+[38;2;153;153;153;49m● [mCalling prueba[38;2;153;153;153m · 13s[m…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;2;177;185;249m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [1mMCP server “prueba” requests your input
+
+  [38;2;153;153;153;22mYou are about to drop the index named **bp_assignee_1** from the collection **prueba**.
+
+  This operation will permanently remove the index and might affect the performance of queries relying on this inde…
+
+[m  [38;2;255;107;128m❯[m [38;2;255;107;128m*[m [38;2;255;107;128;1mWould you like to confirm?[22m: [38;2;153;153;153m☐
+        Would you like to confirm?
+
+[m  [38;2;78;186;101m [38;2;153;153;153m Accept  [38;2;255;107;128m [38;2;153;153;153m Decline
+
+  [3mEsc to cancel · ↑/↓ to navigate · Backspace to unset · Space to toggle

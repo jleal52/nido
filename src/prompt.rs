@@ -486,6 +486,330 @@ fn unnumbered(lines: &[&str]) -> Option<Menu> {
     })
 }
 
+// ---------- Formularios de un servidor MCP ----------
+
+/// Un servidor MCP pide datos o confirmación («MCP server "x" requests your input»): un mensaje,
+/// unos campos y los botones Accept / Decline. Suelen ser acciones peligrosas (borrar un
+/// índice…), así que la web y la app piden confirmarlo dos veces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Form {
+    pub server: String,
+    /// El mensaje, tal como se ve (Claude Code lo recorta si es largo).
+    pub message: String,
+    pub fields: Vec<Field>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Field {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub required: bool,
+    /// Ya tiene valor.
+    pub filled: bool,
+    /// Lo que se ve: «☐», «☒», «▸ prod», «not set», un texto…
+    pub value: String,
+    /// `bool`, `choice` o `text` cuando se nota en pantalla (si no, `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    #[serde(skip)]
+    focused: bool,
+}
+
+/// Dónde está el cursor en un formulario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormCursor {
+    Field(usize),
+    /// En los botones; `true` si en Accept.
+    Buttons(bool),
+}
+
+/// El formulario que hay en pantalla, con dónde está el cursor y la ayuda de abajo.
+fn form_state(screen: &str) -> Option<(Form, FormCursor, String)> {
+    let plain = strip_sgr(screen);
+    let lines: Vec<&str> = plain.lines().map(str::trim_end).collect();
+    let head = lines.iter().rposition(|l| l.trim_start().starts_with("MCP server") && l.contains("requests your input"))?;
+    let h = indent(lines[head]);
+    let server = lines[head]
+        .split(['“', '”', '"'])
+        .nth(1)
+        .unwrap_or("")
+        .to_owned();
+    let col = |l: &str, c: usize| l.chars().nth(c);
+    let mut message: Vec<&str> = Vec::new();
+    let mut fields: Vec<Field> = Vec::new();
+    let mut cursor = None;
+    let mut hint = String::new();
+    let mut buttons = false;
+    for l in &lines[head + 1..] {
+        if l.trim().is_empty() {
+            continue;
+        }
+        let t = l.trim();
+        if t.starts_with("Esc to cancel") {
+            hint = t.to_owned();
+            break;
+        }
+        let arrow = col(l, h) == Some('❯');
+        let rest = t.trim_start_matches('❯').trim();
+        if rest.starts_with("Accept") && rest.contains("Decline") || rest.starts_with("Accept") && l.contains("❯ Decline") {
+            buttons = true;
+            if arrow {
+                cursor = Some(FormCursor::Buttons(true));
+            } else if t.contains("❯ Decline") || t.contains("❯Decline") {
+                cursor = Some(FormCursor::Buttons(false));
+            }
+            continue;
+        }
+        let marker = col(l, h + 2);
+        let is_field = matches!(col(l, h), Some('❯' | ' '))
+            && col(l, h + 1) == Some(' ')
+            && matches!(marker, Some('*' | '✔' | ' '))
+            && col(l, h + 3) == Some(' ')
+            && col(l, h + 4).is_some_and(|c| c != ' ')
+            && t.contains(':');
+        if is_field && !buttons {
+            let body: String = l.chars().skip(h + 4).collect();
+            let (label, value) = match body.find(": ") {
+                Some(i) => (body[..i].to_owned(), body[i + 2..].trim().to_owned()),
+                None => (body.trim_end_matches(':').to_owned(), String::new()),
+            };
+            let kind = if value.starts_with(['☐', '☒']) {
+                Some("bool")
+            } else if value.starts_with(['▸', '▾']) {
+                Some("choice")
+            } else if value.starts_with("Type something") {
+                Some("text")
+            } else {
+                None
+            };
+            if arrow {
+                cursor = Some(FormCursor::Field(fields.len()));
+            }
+            fields.push(Field {
+                label,
+                description: None,
+                // El asterisco desaparece al rellenarlo (pasa a ✔): obligatorio solo se sabe si falta.
+                required: marker == Some('*'),
+                filled: marker == Some('✔'),
+                value,
+                kind,
+                focused: arrow,
+            });
+            continue;
+        }
+        if fields.is_empty() {
+            if indent(l) == h {
+                message.push(t);
+            }
+        } else if indent(l) >= h + 6 && !t.starts_with(['◯', '◉', '❯']) {
+            let f = fields.last_mut().expect("campo");
+            if f.description.is_none() {
+                f.description = Some(t.to_owned());
+            }
+        }
+    }
+    if fields.is_empty() || !buttons {
+        return None;
+    }
+    Some((
+        Form { server, message: message.join("\n"), fields },
+        cursor.unwrap_or(FormCursor::Field(0)),
+        hint,
+    ))
+}
+
+/// El formulario de un servidor MCP que haya en pantalla.
+pub fn form(screen: &str) -> Option<Form> {
+    form_state(screen).map(|(f, _, _)| f)
+}
+
+/// Las opciones de una lista desplegada (`◯ dev`, `◉ pre`…), y en cuál está el cursor.
+fn choice_options(screen: &str) -> (Vec<String>, Option<usize>) {
+    let plain = strip_sgr(screen);
+    let mut opts = Vec::new();
+    let mut at = None;
+    for l in plain.lines() {
+        let t = l.trim();
+        let (cur, t) = match t.strip_prefix('❯') {
+            Some(r) => (true, r.trim_start()),
+            None => (false, t),
+        };
+        if let Some(label) = t.strip_prefix('◯').or_else(|| t.strip_prefix('◉')) {
+            if cur {
+                at = Some(opts.len());
+            }
+            opts.push(label.trim().to_owned());
+        }
+    }
+    (opts, at)
+}
+
+/// Lo que se contesta a un formulario: aceptarlo (con lo que se quiera poner en sus campos de
+/// texto o lista, por su etiqueta) o rechazarlo.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FormAnswer {
+    pub accept: bool,
+    #[serde(default)]
+    pub values: std::collections::HashMap<String, String>,
+}
+
+const YES: [&str; 8] = ["yes", "sí", "si", "true", "confirm", "confirmar", "accept", "ok"];
+
+/// Contesta el formulario. Al aceptar, los obligatorios sin valor que son una confirmación se
+/// rellenan solos (la casilla marcada, o la opción «yes» de la lista); los de texto, con lo que
+/// venga en `values` (si falta, no se manda nada).
+pub async fn answer_form<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    ans: &FormAnswer,
+) -> Result<(), String> {
+    let (form0, _, _) = form_state(&scr.read().await?).ok_or("no hay ningún formulario en pantalla")?;
+    if ans.accept {
+        for (i, f) in form0.fields.iter().enumerate() {
+            let wanted = ans.values.get(&f.label).map(|v| v.trim()).filter(|v| !v.is_empty());
+            if f.filled && wanted.is_none() {
+                continue;
+            }
+            if !f.required && wanted.is_none() {
+                continue;
+            }
+            let hint = form_go(scr, FormCursor::Field(i)).await?;
+            let screen = scr.read().await?;
+            let (now, _, _) = form_state(&screen).ok_or("el formulario ha desaparecido")?;
+            let value = now.fields[i].value.clone();
+            if hint.contains("Space to toggle") || value.starts_with(['☐', '☒']) {
+                let want = wanted.is_none_or(|w| YES.contains(&w.to_lowercase().as_str()));
+                let checked = |v: &str| v.starts_with('☒');
+                if checked(&value) != want {
+                    scr.keys(b" ").await?;
+                    form_until(scr, |f, _| f.fields.get(i).is_some_and(|x| checked(&x.value) == want)).await?;
+                }
+            } else if hint.contains("to expand") || value.starts_with('▸') {
+                scr.keys(b"\x1b[C").await?;
+                let deadline = tokio::time::Instant::now() + WAIT;
+                let (opts, mut at) = loop {
+                    let (o, a) = choice_options(&scr.read().await?);
+                    if !o.is_empty() {
+                        break (o, a);
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(format!("no se despliega la lista de «{}»", f.label));
+                    }
+                    tokio::time::sleep(STEP).await;
+                };
+                let target = match wanted {
+                    Some(w) => opts.iter().position(|o| norm(o) == norm(w)),
+                    None => opts.iter().position(|o| YES.contains(&o.to_lowercase().as_str())),
+                }
+                .ok_or_else(|| format!("«{}»: no sé qué opción elegir ({})", f.label, opts.join(", ")))?;
+                for _ in 0..8 {
+                    let cur = at.unwrap_or(0);
+                    if cur == target {
+                        break;
+                    }
+                    scr.keys(if target > cur { DOWN } else { UP }).await?;
+                    tokio::time::sleep(STEP).await;
+                    at = choice_options(&scr.read().await?).1;
+                }
+                if at != Some(target) {
+                    return Err("no se pudo elegir la opción".into());
+                }
+                scr.keys(b" ").await?;
+                form_until(scr, |f, _| f.fields.get(i).is_some_and(|x| x.filled)).await?;
+            } else {
+                let Some(text) = wanted else {
+                    return Err(format!("falta «{}»", f.label));
+                };
+                if f.filled {
+                    // Lo que hubiera, fuera (Backspace lo deja sin valor).
+                    scr.keys(b"\x7f").await?;
+                    tokio::time::sleep(STEP).await;
+                }
+                scr.type_text(text).await?;
+                form_until(scr, |f, _| f.fields.get(i).is_some_and(|x| x.filled)).await?;
+            }
+        }
+    }
+    // Un Enter justo detrás de mover el cursor a veces se pierde: un respiro, y si el formulario
+    // sigue ahí con el cursor en el botón, otra vez.
+    for _ in 0..3 {
+        form_go(scr, FormCursor::Buttons(ans.accept)).await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        scr.keys(b"\r").await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(STEP).await;
+            if form_state(&scr.read().await?).is_none() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    Err("el formulario sigue ahí (¿falta algún campo obligatorio?)".into())
+}
+
+/// Hasta que el formulario cumpla `done`.
+async fn form_until<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    done: impl Fn(&Form, FormCursor) -> bool,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if let Some((f, c, _)) = form_state(&scr.read().await?)
+            && done(&f, c)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("el formulario no responde".into());
+        }
+        tokio::time::sleep(STEP).await;
+    }
+}
+
+/// Lleva el cursor del formulario a `to` (↑/↓ entre campos y botones; ←/→ entre Accept y
+/// Decline). Devuelve la ayuda de abajo al llegar (dice qué tipo de campo es).
+async fn form_go<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    to: FormCursor,
+) -> Result<String, String> {
+    for _ in 0..20 {
+        let (form, at, hint) = form_state(&scr.read().await?).ok_or("el formulario ha desaparecido")?;
+        let row = |c: FormCursor| match c {
+            FormCursor::Field(i) => i,
+            FormCursor::Buttons(_) => form.fields.len(),
+        };
+        if at == to {
+            return Ok(hint);
+        }
+        let key = match (at, to) {
+            (FormCursor::Buttons(_), FormCursor::Buttons(accept)) => {
+                if accept { b"\x1b[D" as &[u8] } else { b"\x1b[C" }
+            }
+            _ if row(to) > row(at) => DOWN,
+            _ if row(to) < row(at) => UP,
+            _ => return Ok(hint),
+        };
+        scr.keys(key).await?;
+        let before = at;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            tokio::time::sleep(STEP).await;
+            match form_state(&scr.read().await?) {
+                Some((_, c, _)) if c != before => break,
+                None => return Err("el formulario ha desaparecido".into()),
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("el cursor no se mueve".into());
+            }
+        }
+    }
+    Err("no se llega al campo".into())
+}
+
 // ---------- Contestar ----------
 
 /// Lo que se contesta: las preguntas de Claude (todas las que hizo a la vez, en orden) o una
@@ -500,6 +824,8 @@ pub struct Request {
     pub suggestion: Option<String>,
     /// Mandar un mensaje (lo que escribes en la caja del chat, con las rutas de los adjuntos).
     pub message: Option<String>,
+    /// Contestar el formulario de un servidor MCP.
+    pub form: Option<FormAnswer>,
     /// Con un campo de texto, lo que se escribe; con otra opción (p. ej. «No» en un permiso), lo
     /// que se le manda a Claude después, como un mensaje.
     pub text: Option<String>,
@@ -823,6 +1149,9 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if let Some(m) = &req.message {
         return send_message(scr, m).await;
     }
+    if let Some(f) = &req.form {
+        return answer_form(scr, f).await;
+    }
     let want = req.option.as_deref().ok_or("falta qué opción")?;
     let m = scr.menu().await?.ok_or("no hay ningún menú en pantalla")?;
     let i = want
@@ -1100,6 +1429,39 @@ mod tests {
         // Un color RGB con un 2 dentro no es atenuado.
         assert_eq!(input_box(&b("\x1b[m❯\u{a0} \x1b[38;2;200;200;200mhola")).as_deref(), Some("hola"));
         assert_eq!(input_box(&std::fs::read_to_string(format!("{}/tests/pantallas/permiso.txt", env!("CARGO_MANIFEST_DIR"))).unwrap()), None);
+    }
+
+    #[test]
+    fn mcp_form_with_a_checkbox() {
+        let text = std::fs::read_to_string(format!("{}/tests/pantallas/formulario.txt", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let (f, cur, hint) = form_state(&text).unwrap();
+        assert_eq!(f.server, "prueba");
+        assert!(f.message.starts_with("You are about to drop the index named **bp_assignee_1**"));
+        assert_eq!(f.fields.len(), 1);
+        let c = &f.fields[0];
+        assert_eq!((c.label.as_str(), c.required, c.filled, c.kind), ("Would you like to confirm?", true, false, Some("bool")));
+        assert_eq!(c.description.as_deref(), Some("Would you like to confirm?"));
+        assert_eq!(cur, FormCursor::Field(0));
+        assert!(hint.contains("Space to toggle"));
+        // No es un menú numerado.
+        assert_eq!(parse(&text), None);
+    }
+
+    #[test]
+    fn mcp_form_with_several_fields_and_a_list() {
+        let text = std::fs::read_to_string(format!("{}/tests/pantallas/formulario_varios.txt", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let f = form(&text).unwrap();
+        assert_eq!(f.fields.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(), ["Would you like to confirm?", "Motivo", "Entorno"]);
+        assert_eq!(f.fields[1].description.as_deref(), Some("Por qué lo borras"));
+        assert!(!f.fields[1].required && f.fields[1].value == "not set");
+        let lista = std::fs::read_to_string(format!("{}/tests/pantallas/formulario_lista.txt", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let (f, cur, _) = form_state(&lista).unwrap();
+        assert_eq!(f.server, "shara-dev");
+        assert_eq!(f.fields[0].kind, Some("choice"));
+        assert!(f.message.contains("(+2 more lines)"));
+        assert_eq!(cur, FormCursor::Field(0));
+        let open = "      Entorno: ▾\n        ❯ ◯ dev\n          ◉ pre\n          ◯ prod";
+        assert_eq!(choice_options(open), (vec!["dev".into(), "pre".into(), "prod".into()], Some(0)));
     }
 
     #[test]

@@ -1,0 +1,18 @@
+● Calling shara-dev 7 times, running 1 shell command · 2h 56m 26s…
+  ⎿  Fulfilling input required by 'tools/call' (round 1)
+──────────────────────────────────────────────────────────────────────────────────────────── shara-whatsapp ─
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  MCP server “shara-dev” requests your input
+
+  You are about to drop the index named **bp\_assigne…
+
+  This operation will permanently remove the index an…
+  … (+2 more lines)
+
+  ❯ * Would you like to confirm?: ▸ not set
+        Would you like to confirm?
+
+    Accept    Decline
+
+  Esc to cancel · ↑/↓ to navigate · Backspace to unset · → to expand
