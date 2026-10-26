@@ -40,6 +40,9 @@ pub struct AppState {
     /// Lo que cada sesión de Claude tiene en segundo plano (subagentes, órdenes), según su
     /// pantalla; lo pone al día `spawn_background` cada pocos segundos.
     background: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    /// Cuándo se avisó por última vez de que terminó cada sesión (para no avisar dos veces si
+    /// termina, sigue y vuelve a terminar en poco tiempo).
+    finished_pushed: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// La conexión con el hub: móviles sin VPN y avisos.
     pub hub: Arc<hub::Hub>,
     /// Lo que `scan` ve pasar (terminó, te necesita), para avisar al móvil.
@@ -124,6 +127,8 @@ struct Alert {
 /// Antes de avisar se espera un poco: si en ese tiempo la ves (en la web, en la app) o sigue
 /// sola, no hace falta.
 const ALERT_DELAY: Duration = Duration::from_secs(6);
+/// «Terminó» espera más: a menudo enseguida le llega algo (un subagente, otra sesión) y sigue.
+const FINISHED_DELAY: Duration = Duration::from_secs(20);
 
 /// Lo que la web recibe por el WebSocket de eventos: las sesiones (en su orden) y el orden de
 /// las carpetas.
@@ -199,6 +204,7 @@ impl AppState {
             accounts: Default::default(),
             answering: Mutex::new(()),
             background: Default::default(),
+            finished_pushed: Default::default(),
             hub,
             alerts,
             alerts_rx: std::sync::Mutex::new(Some(alerts_rx)),
@@ -392,7 +398,11 @@ impl AppState {
     }
 
     async fn alert(&self, a: Alert) {
-        tokio::time::sleep(ALERT_DELAY).await;
+        tokio::time::sleep(match a.kind {
+            AlertKind::Waiting => ALERT_DELAY,
+            AlertKind::Finished => FINISHED_DELAY,
+        })
+        .await;
         let (view, badge) = {
             let l = self.views.borrow();
             (
@@ -403,6 +413,21 @@ impl AppState {
         let Some(v) = view.filter(|v| still_alerting(v, a.kind)) else {
             return;
         };
+        // «Terminó» solo si de verdad ha terminado: no ha vuelto a trabajar y no le quedan
+        // subagentes en marcha (mirando su pantalla ahora). Sin leer sigue igual en la web y la app.
+        if a.kind == AlertKind::Finished {
+            if v.claude.as_ref().is_some_and(|c| c.status.as_deref() == Some("busy")) {
+                return;
+            }
+            if self.has_subagents(&v.id).await {
+                return;
+            }
+            let mut pushed = self.finished_pushed.lock().expect("avisos");
+            if pushed.get(&v.id).is_some_and(|t| t.elapsed() < FINISHED_DELAY) {
+                return;
+            }
+            pushed.insert(v.id.clone(), std::time::Instant::now());
+        }
         let body = match a.kind {
             AlertKind::Waiting => "Te necesita".to_owned(),
             AlertKind::Finished => match v.claude.as_ref().and_then(|c| c.title.clone()) {
@@ -411,6 +436,18 @@ impl AppState {
             },
         };
         self.push_all(&v.name, &body, &v.id, badge).await;
+    }
+}
+
+impl AppState {
+    /// Si la sesión tiene ahora subagentes en marcha (según su pantalla).
+    async fn has_subagents(&self, id: &str) -> bool {
+        let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
+        let Ok(stream) = holder_connect(self, id, hello).await else { return false };
+        let (rd, wr) = stream.into_split();
+        let mut scr = prompt::Screen::new(rd, wr);
+        let Ok(Ok(text)) = tokio::time::timeout(Duration::from_secs(3), scr.screen()).await else { return false };
+        prompt::background(&text).is_some_and(|b| !b.agents.is_empty())
     }
 }
 
