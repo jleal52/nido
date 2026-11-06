@@ -185,8 +185,22 @@ mod mac {
         all().into_iter().map(|(p, pp, _)| (p, pp)).collect()
     }
 
+    /// El nombre con el que se lanzó (`argv[0]`, sin ruta) y, si no se puede leer, el del
+    /// ejecutable. El instalador de Claude deja el binario con el nombre de su versión
+    /// (`~/.local/share/claude/versions/2.1.319`) y un enlace `claude`: el núcleo lo llama
+    /// «2.1.319», pero `argv[0]` sigue siendo `claude`.
     pub fn comm(pid: u32) -> Option<String> {
-        info(pid).map(|(_, _, n)| n)
+        argv0(pid).or_else(|| info(pid).map(|(_, _, n)| n))
+    }
+
+    fn argv0(pid: u32) -> Option<String> {
+        let raw = procargs(pid)?;
+        // Tras argc: la ruta del ejecutable, ceros de relleno y los argumentos.
+        let mut parts = raw.get(4..)?.split(|&b| b == 0).filter(|p| !p.is_empty());
+        parts.next()?;
+        let arg = std::str::from_utf8(parts.next()?).ok()?;
+        let name = arg.rsplit('/').next().unwrap_or(arg);
+        (!name.is_empty()).then(|| name.to_owned())
     }
 
     /// `argc`, la ruta del ejecutable, los argumentos y el entorno, separados por ceros.
