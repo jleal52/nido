@@ -1169,6 +1169,17 @@ async fn api_seen(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Re
     }
 }
 
+/// Arrancarla o pararla a mano decide si vuelve a arrancar al reiniciar el equipo o nido: se
+/// queda como la dejaste.
+async fn remember_running(st: &AppState, id: &str, running: bool) {
+    let mut reg = st.registry.lock().await;
+    if reg.get(id).is_some_and(|s| s.autostart != running)
+        && let Err(e) = reg.update(id, |s| s.autostart = running)
+    {
+        eprintln!("nido: no se pudo guardar el autoarranque de {id}: {e}");
+    }
+}
+
 async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let s = match find_session(&st, &id).await {
         Ok(s) => s,
@@ -1180,6 +1191,7 @@ async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
         }
         wait_alive(&st, &s.id).await;
     }
+    remember_running(&st, &s.id, true).await;
     st.refresh.notify_one();
     Json(serde_json::json!({ "ok": true })).into_response()
 }
@@ -1190,6 +1202,7 @@ async fn api_stop(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Re
         Err(r) => return r,
     };
     stop_and_wait(&st, &s.id).await;
+    remember_running(&st, &s.id, false).await;
     st.refresh.notify_one();
     Json(serde_json::json!({ "ok": true })).into_response()
 }
@@ -1206,6 +1219,7 @@ async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) ->
         return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     wait_alive(&st, &s.id).await;
+    remember_running(&st, &s.id, true).await;
     st.refresh.notify_one();
     Json(serde_json::json!({ "ok": true })).into_response()
 }
