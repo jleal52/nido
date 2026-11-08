@@ -103,6 +103,22 @@ async fn bind(socket: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Las marcas que deja Claude Code a sus hijos. Si `nido serve` arranca desde una sesión de
+/// Claude Code, el Claude de cada sesión las heredaría, se creería hijo de otra sesión y no
+/// guardaría ni la transcripción ni su estado (se pierden el chat y el `--resume`). Las de
+/// configuración (`CLAUDE_CONFIG_DIR`, `CLAUDE_EFFORT`…) se conservan.
+const CLAUDE_CODE_SESSION_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+];
+
 /// Mata al proceso y a su grupo: SIGHUP (como al cerrar un terminal) y, si no basta, SIGKILL.
 fn hang_up(pid: Option<u32>, signal: i32) {
     if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
@@ -133,7 +149,7 @@ pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
     cmd.cwd(&cfg.cwd);
-    for var in ["TMUX", "TMUX_PANE"] {
+    for var in ["TMUX", "TMUX_PANE"].iter().chain(CLAUDE_CODE_SESSION_VARS) {
         cmd.env_remove(var);
     }
     cmd.env("TERM", "xterm-256color");
