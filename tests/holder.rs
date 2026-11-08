@@ -201,3 +201,27 @@ async fn history_survives_clear_and_restart() {
     c.wait_exit().await;
     holder.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn claude_code_session_marks_do_not_reach_the_session() {
+    // Como si `nido serve` se hubiera arrancado desde una sesión de Claude Code.
+    // SAFETY: solo se añaden variables que ningún otro test lee.
+    unsafe {
+        std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/perfil/de/prueba");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let socket = cfg.socket.clone();
+    let holder = tokio::spawn(holder::run(cfg));
+
+    let (mut a, _) = Client::connect(&socket, Role::Driver, 80, 24).await;
+    a.type_line(r#"echo "marcas=${CLAUDECODE-no},${CLAUDE_CODE_CHILD_SESSION-no} perfil=$CLAUDE_CONFIG_DIR""#)
+        .await;
+    a.wait_for("marcas=no,no perfil=/perfil/de/prueba").await;
+
+    a.type_line("exit 0").await;
+    assert_eq!(a.wait_exit().await, Some(0));
+    assert_eq!(holder.await.unwrap().unwrap(), Some(0));
+}
