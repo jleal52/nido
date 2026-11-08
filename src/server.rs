@@ -316,8 +316,21 @@ impl AppState {
         });
     }
 
-    /// Al arrancar: vuelve a abrir las sesiones con autoarranque que no estén vivas.
+    /// Al arrancar el equipo: vuelve a abrir las sesiones con autoarranque que no estén vivas.
+    /// Solo una vez por arranque del equipo: si se reinicia nido (una actualización), las que
+    /// estén paradas se quedan paradas.
     pub async fn restore(&self) {
+        let marker = self.paths.state.join("restored-boot");
+        let boot = boot_id();
+        if boot.is_some() && std::fs::read_to_string(&marker).ok() == boot {
+            return;
+        }
+        if let Some(b) = &boot {
+            let _ = std::fs::create_dir_all(&self.paths.state);
+            if let Err(e) = std::fs::write(&marker, b) {
+                eprintln!("nido: no se pudo apuntar el arranque restaurado: {e}");
+            }
+        }
         let sessions: Vec<Session> = self.registry.lock().await.sessions().to_vec();
         for s in sessions.iter().filter(|s| s.autostart) {
             if !launch::is_alive(&self.paths, &s.id)
@@ -326,6 +339,33 @@ impl AppState {
                 eprintln!("nido: no se pudo restaurar {}: {e}", s.name);
             }
         }
+    }
+}
+
+/// Lo que distingue este arranque del equipo de los anteriores.
+fn boot_id() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::timeval>();
+        // SAFETY: kern.boottime es un timeval y el buffer tiene su tamaño.
+        let r = unsafe {
+            libc::sysctlbyname(
+                c"kern.boottime".as_ptr(),
+                (&mut tv as *mut libc::timeval).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (r == 0).then(|| format!("{}.{}", tv.tv_sec, tv.tv_usec))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
     }
 }
 
