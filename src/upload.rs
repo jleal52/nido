@@ -26,7 +26,7 @@ const KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
 pub fn default_dir() -> PathBuf {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(|| crate::sys::home().map(|h| h.join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
     cache.join("nido").join("uploads")
 }

@@ -25,8 +25,19 @@ snow = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "signal", "net", "io-util", "io-std", "fs"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+unicode-width = "0.2"
 vt100 = "0.18.1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 libc = "0.2"

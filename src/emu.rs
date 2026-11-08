@@ -53,6 +53,44 @@ fn find_clear_history(buf: &[u8], old: usize) -> bool {
     })
 }
 
+/// Parte cada línea en trozos de `cols` columnas de ancho visible (las secuencias de color no
+/// ocupan; los caracteres anchos, dos).
+fn split_rows(text: &str, cols: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let cols = usize::from(cols.max(1));
+    let mut out = String::with_capacity(text.len() + 16);
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut width = 0;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // CSI: hasta la letra final.
+                out.push(c);
+                if chars.peek() == Some(&'[') {
+                    for d in chars.by_ref() {
+                        out.push(d);
+                        if d.is_ascii_alphabetic() || d == '~' {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            let w = c.width().unwrap_or(0);
+            if w > 0 && width + w > cols {
+                out.push('\n');
+                width = 0;
+            }
+            out.push(c);
+            width += w;
+        }
+    }
+    out
+}
+
 impl Emu {
     pub fn new(cols: u16, rows: u16, history: History) -> Self {
         let capture = Capture {
@@ -87,6 +125,12 @@ impl Emu {
     pub fn size(&self) -> (u16, u16) {
         let (rows, cols) = self.parser.screen().size();
         (cols.get(), rows.get())
+    }
+
+    /// Dónde está el cursor (fila y columna, desde 1), para contestar `ESC[6n`.
+    pub fn cursor(&self) -> (u16, u16) {
+        let (row, col) = self.parser.screen().cursor_position();
+        (row + 1, col + 1)
     }
 
     /// Lo que hay que mandar a un terminal recién conectado para que vea lo mismo: borrar,
@@ -132,13 +176,20 @@ impl Emu {
         let _ = cap.history.flush();
     }
 
-    /// Solo la pantalla actual, con colores.
+    /// Solo la pantalla actual, con colores: una línea por fila.
     pub fn screen_text(&self) -> String {
         let mut out = String::new();
         let _ = self
             .parser
             .screen()
             .write_contents_formatted_basic(&mut out, BasicFormattedCaptureRange::Visible);
+        // vt100 junta una fila con la siguiente si el texto pasó solo a ella (ajuste automático).
+        // En Unix eso es una línea larga de verdad; ConPTY (Windows), en cambio, lo usa para
+        // ahorrarse saltos de línea: llena la fila (la raya de la caja de Claude) y sigue
+        // escribiendo. Allí se vuelve a partir por filas, como las pinta el programa.
+        if cfg!(windows) {
+            out = split_rows(&out, self.size().0);
+        }
         out.truncate(out.trim_end().len());
         out
     }
@@ -236,6 +287,14 @@ mod tests {
         e.process(b"b");
         let all = e.history_text(true);
         assert_eq!(all.matches("\u{1}reset").count(), 1, "{all:?}");
+    }
+
+    #[test]
+    fn split_rows_cuts_at_the_width_ignoring_colours() {
+        let joined = "\x1b[38;2;1;2;3m────\x1b[m❯ hola";
+        assert_eq!(split_rows(joined, 4), "\x1b[38;2;1;2;3m────\x1b[m\n❯ ho\nla");
+        assert_eq!(split_rows("ab\ncd", 4), "ab\ncd");
+        assert_eq!(split_rows("中文字", 4), "中文\n字");
     }
 
     #[test]

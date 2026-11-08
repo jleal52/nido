@@ -13,6 +13,7 @@ equipo; todo lo que pasa entre ellos va **cifrado de extremo a extremo**.
 | Linux con systemd | Funciona |
 | WSL 2 (con systemd) | Funciona |
 | macOS | Funciona (con launchd; sin límite de memoria por sesión) |
+| Windows 10/11 | Funciona (tarea al iniciar sesión; sin `nido attach`: las sesiones se ven en la web y la app) |
 
 ## Uso
 
@@ -105,6 +106,20 @@ install -m755 target/release/nido ~/.local/bin/nido
 sed "s/USUARIO/$(whoami)/g" contrib/nido.plist > ~/Library/LaunchAgents/io.github.jleal52.nido.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.jleal52.nido.plist
 ```
+
+En Windows (PowerShell), una tarea programada que arranca nido al iniciar sesión, con tu usuario
+y sin ventana (`nidow.exe` lo lanza sin consola):
+
+```powershell
+cargo build --release
+New-Item -ItemType Directory -Force ~\.local\bin | Out-Null
+Copy-Item target\release\nido.exe, target\release\nidow.exe ~\.local\bin\
+~\.local\bin\nido.exe service install --name Windows
+```
+
+En Windows escucha en `127.0.0.1:7691` (el 7690 puede ser del WSL del mismo equipo), el registro
+está en `~\.local\state\nido\serve.log` y `nido service uninstall` quita la tarea. Cerrar la
+sesión de Windows cierra las sesiones de nido; al volver a entrar se abren las de autoarranque.
 
 Por defecto escucha en `127.0.0.1:7690`. Para que el móvil llegue directo en casa, añade la
 dirección de la LAN con `NIDO_BIND` en un *drop-in* de la unidad

@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use tokio::sync::Mutex;
 
 /// Cuánto vale lo que dio la última llamada: cswap ya sirve de su almacén si el dato es reciente;
@@ -110,7 +109,7 @@ fn check(v: &serde_json::Value) -> Result<(), String> {
 
 /// `cswap <args…>`: su salida JSON (con error, cswap también deja en stdout un JSON que lo explica).
 async fn cswap(args: &[&str], timeout: Duration) -> Result<String, String> {
-    let mut cmd = Command::new("cswap");
+    let mut cmd = crate::sys::async_command("cswap");
     cmd.args(args)
         // La cuenta por defecto es la de `~/.claude`, no la de la sesión que lance esto.
         .env_remove("CLAUDE_CONFIG_DIR")

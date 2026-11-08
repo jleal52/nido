@@ -345,11 +345,14 @@ mod tests {
         assert_eq!(r.sessions(), [s.clone()]);
         assert_eq!(r.find("proyecto-api").unwrap().id, s.id);
         assert_eq!(r.find(&s.id).unwrap().name, "proyecto-api");
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

@@ -11,7 +11,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use serde::{Deserialize, Serialize};
-use tokio::net::UnixStream;
 use tokio::sync::{Mutex, Notify, watch};
 
 use crate::claude::{self, Procfs};
@@ -96,14 +95,7 @@ impl e2e::Host for AppState {
             return n.trim().to_owned();
         }
         // El del sistema (en macOS no hay /etc/hostname), sin el dominio (Mac.local, Mac.casa…).
-        let mut buf = [0u8; 256];
-        // SAFETY: gethostname escribe como mucho `len` bytes en el buffer.
-        let n = if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0 {
-            buf.iter().position(|&b| b == 0).unwrap_or(buf.len())
-        } else {
-            0
-        };
-        let name = String::from_utf8_lossy(&buf[..n]).trim().to_owned();
+        let name = crate::sys::hostname().unwrap_or_default().trim().to_owned();
         let name = name.split('.').next().unwrap_or_default().to_owned();
         if name.is_empty() { "nido".into() } else { name }
     }
@@ -321,8 +313,10 @@ impl AppState {
     /// estén paradas se quedan paradas.
     pub async fn restore(&self) {
         let marker = self.paths.state.join("restored-boot");
-        let boot = boot_id();
-        if boot.is_some() && std::fs::read_to_string(&marker).ok() == boot {
+        let boot = crate::sys::boot_id();
+        if let (Some(b), Ok(seen)) = (&boot, std::fs::read_to_string(&marker))
+            && crate::sys::same_boot(b, seen.trim())
+        {
             return;
         }
         if let Some(b) = &boot {
@@ -342,35 +336,12 @@ impl AppState {
     }
 }
 
-/// Lo que distingue este arranque del equipo de los anteriores.
-fn boot_id() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::timeval>();
-        // SAFETY: kern.boottime es un timeval y el buffer tiene su tamaño.
-        let r = unsafe {
-            libc::sysctlbyname(
-                c"kern.boottime".as_ptr(),
-                (&mut tv as *mut libc::timeval).cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (r == 0).then(|| format!("{}.{}", tv.tv_sec, tv.tv_usec))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-    }
-}
-
 fn runs_claude_directly(argv: &[String]) -> bool {
-    matches!(argv.first().map(String::as_str), Some("claude" | "cswap"))
+    argv.first().is_some_and(|a| {
+        let name = a.rsplit(['/', '\\']).next().unwrap_or(a).to_ascii_lowercase();
+        let name = name.strip_suffix(".exe").unwrap_or(&name);
+        matches!(name, "claude" | "cswap")
+    })
 }
 
 /// ¿Sigue mereciendo aviso? Si no la has visto y sigue igual.
@@ -484,7 +455,7 @@ impl AppState {
     async fn has_subagents(&self, id: &str) -> bool {
         let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
         let Ok(stream) = holder_connect(self, id, hello).await else { return false };
-        let (rd, wr) = stream.into_split();
+        let (rd, wr) = crate::ipc::split(stream);
         let mut scr = prompt::Screen::new(rd, wr);
         let Ok(Ok(text)) = tokio::time::timeout(Duration::from_secs(3), scr.screen()).await else { return false };
         prompt::background(&text).is_some_and(|b| !b.agents.is_empty())
@@ -642,7 +613,7 @@ fn spawn_background(state: Arc<AppState>) {
                 }
                 let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
                 let Ok(stream) = holder_connect(&state, &s.id, hello).await else { continue };
-                let (rd, wr) = stream.into_split();
+                let (rd, wr) = crate::ipc::split(stream);
                 let mut scr = prompt::Screen::new(rd, wr);
                 let Ok(Ok(text)) = tokio::time::timeout(Duration::from_secs(3), scr.screen()).await else { continue };
                 if let Some(bg) = prompt::background(&text) {
@@ -878,7 +849,7 @@ async fn resume_limited(st: &AppState) -> Vec<String> {
             .is_some_and(|p| crate::transcript::stopped_by_limit(&p));
         let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
         let Ok(stream) = holder_connect(st, &s.id, hello).await else { continue };
-        let (rd, wr) = stream.into_split();
+        let (rd, wr) = crate::ipc::split(stream);
         let mut scr = prompt::Screen::new(rd, wr);
         let _one = st.answering.lock().await;
         match prompt::resume_after_limit(&mut scr, stopped).await {
@@ -1157,7 +1128,10 @@ async fn api_order_folders(
 }
 
 async fn stop_and_wait(st: &AppState, id: &str) {
-    let _ = launch::stop(&st.paths, st.launcher, id);
+    // Bloquea un momento (en Windows espera a que el guardián recoja la orden): fuera del hilo
+    // de tokio.
+    let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
+    let _ = tokio::task::spawn_blocking(move || launch::stop(&paths, launcher, &sid)).await;
     // Hasta que el proceso termine del todo, no solo hasta que deje el socket.
     for _ in 0..240 {
         if !launch::is_alive(&st.paths, id) && !launch::holder_running(&st.paths, id) {
@@ -1183,7 +1157,7 @@ async fn api_answer(
     let Ok(stream) = holder_connect(&st, &s.id, hello).await else {
         return error(StatusCode::CONFLICT, "la sesión no está en marcha");
     };
-    let (rd, wr) = stream.into_split();
+    let (rd, wr) = crate::ipc::split(stream);
     let mut scr = prompt::Screen::new(rd, wr);
     match prompt::answer(&mut scr, &req).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -1288,8 +1262,8 @@ struct HistoryQuery {
     screen: bool,
 }
 
-async fn holder_connect(st: &AppState, id: &str, hello: Hello) -> std::io::Result<UnixStream> {
-    let mut stream = UnixStream::connect(st.paths.socket(id)).await?;
+async fn holder_connect(st: &AppState, id: &str, hello: Hello) -> std::io::Result<crate::ipc::Stream> {
+    let mut stream = crate::ipc::connect(&st.paths.socket(id)).await?;
     proto::write_frame(&mut stream, &Frame::Hello(hello)).await?;
     Ok(stream)
 }
@@ -1602,7 +1576,7 @@ async fn term(mut socket: WebSocket, st: Arc<AppState>, id: String, q: TermQuery
             return;
         }
     };
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = crate::ipc::split(stream);
     loop {
         tokio::select! {
             frame = proto::read_frame(&mut rd) => match frame {
@@ -1697,10 +1671,7 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
     let mut last_len: Option<u64> = None;
     let mut first = true;
 
-    let mut holder: Option<(
-        tokio::net::unix::OwnedReadHalf,
-        tokio::net::unix::OwnedWriteHalf,
-    )> = None;
+    let mut holder: Option<(crate::ipc::ReadHalf, crate::ipc::WriteHalf)> = None;
     let mut screen_due: Option<tokio::time::Instant> = Some(tokio::time::Instant::now());
     let mut screen_pending = false;
     let mut last_screen: Option<String> = None;
@@ -1773,7 +1744,7 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                     if holder.is_none() && launch::is_alive(&st.paths, &id) {
                         let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
                         if let Ok(stream) = holder_connect(&st, &id, hello).await {
-                            holder = Some(stream.into_split());
+                            holder = Some(crate::ipc::split(stream));
                             screen_due = Some(tokio::time::Instant::now());
                         }
                     }

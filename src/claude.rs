@@ -51,8 +51,9 @@ impl Procfs {
         Self { root: root.into() }
     }
 
-    /// En macOS no hay `/proc`: se pregunta al núcleo (`sysctl`).
-    #[cfg(target_os = "macos")]
+    /// En macOS no hay `/proc`: se pregunta al núcleo (`sysctl`). En Windows, a la instantánea
+    /// de procesos (Toolhelp).
+    #[cfg(any(target_os = "macos", windows))]
     fn native(&self) -> bool {
         self.root == Path::new("/proc")
     }
@@ -62,6 +63,10 @@ impl Procfs {
         #[cfg(target_os = "macos")]
         if self.native() {
             return mac::parents();
+        }
+        #[cfg(windows)]
+        if self.native() {
+            return crate::sys::win::parents();
         }
         let mut map = HashMap::new();
         let Ok(dir) = std::fs::read_dir(&self.root) else {
@@ -91,6 +96,11 @@ impl Procfs {
 
     /// El proceso y todos sus descendientes, del más cercano al más lejano.
     pub fn tree(&self, root: u32) -> Vec<u32> {
+        // En Windows, comprobando que cada hijo nació después que su padre (pids reusados).
+        #[cfg(windows)]
+        if self.native() {
+            return crate::sys::win::tree(root);
+        }
         let parents = self.parents();
         let mut out = vec![root];
         let mut i = 0;
@@ -113,6 +123,10 @@ impl Procfs {
         if self.native() {
             return mac::comm(pid);
         }
+        #[cfg(windows)]
+        if self.native() {
+            return crate::sys::win::comm(pid);
+        }
         let s = std::fs::read_to_string(self.root.join(pid.to_string()).join("comm")).ok()?;
         Some(s.trim_end().to_owned())
     }
@@ -121,6 +135,13 @@ impl Procfs {
         #[cfg(target_os = "macos")]
         if self.native() {
             return mac::env_var(pid, key);
+        }
+        // En Windows leer el entorno de otro proceso no es sencillo: sin `CLAUDE_CONFIG_DIR`
+        // propio por sesión, Claude se busca en `~/.claude`.
+        #[cfg(windows)]
+        if self.native() {
+            let _ = (pid, key);
+            return None;
         }
         let raw = std::fs::read(self.root.join(pid.to_string()).join("environ")).ok()?;
         raw.split(|&b| b == 0).find_map(|kv| {

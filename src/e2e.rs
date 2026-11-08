@@ -138,16 +138,11 @@ fn x25519_public(private: &[u8; 32]) -> [u8; 32] {
 
 /// Escribe un fichero que solo puede leer el usuario (0600), de una vez.
 fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut f = crate::sys::private(std::fs::OpenOptions::new().write(true).create(true).truncate(true))
         .open(&tmp)?;
     std::io::Write::write_all(&mut f, data)?;
     std::fs::rename(&tmp, path)

@@ -58,6 +58,8 @@ pub enum Frame {
     Exit(ExitInfo),
     HistoryRequest(HistoryRequest),
     History(Vec<u8>),
+    /// Que el guardián pare la sesión (en Windows, donde no hay SIGTERM).
+    Stop,
 }
 
 impl Frame {
@@ -71,6 +73,7 @@ impl Frame {
             Frame::Exit(_) => 6,
             Frame::HistoryRequest(_) => 7,
             Frame::History(_) => 8,
+            Frame::Stop => 9,
         }
     }
 
@@ -85,6 +88,7 @@ impl Frame {
             Frame::Input(b) | Frame::Output(b) | Frame::Snapshot(b) | Frame::History(b) => {
                 b.clone()
             }
+            Frame::Stop => Vec::new(),
         }
     }
 
@@ -101,6 +105,7 @@ impl Frame {
             6 => Frame::Exit(json(&payload)?),
             7 => Frame::HistoryRequest(json(&payload)?),
             8 => Frame::History(payload),
+            9 => Frame::Stop,
             k => {
                 let msg = format!("tipo de trama desconocido: {k}");
                 return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
@@ -109,7 +114,8 @@ impl Frame {
     }
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
+/// La trama entera, lista para escribir.
+pub fn encode(frame: &Frame) -> io::Result<Vec<u8>> {
     let payload = frame.payload();
     let len = u32::try_from(payload.len() + 1)
         .ok()
@@ -119,6 +125,11 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io:
     buf.extend_from_slice(&len.to_be_bytes());
     buf.push(frame.kind());
     buf.extend_from_slice(&payload);
+    Ok(buf)
+}
+
+pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
+    let buf = encode(frame)?;
     w.write_all(&buf).await?;
     w.flush().await
 }
@@ -168,6 +179,7 @@ mod tests {
                 screen: false,
             }),
             Frame::History(Vec::new()),
+            Frame::Stop,
         ];
         let (mut a, mut b) = tokio::io::duplex(1 << 16);
         for f in &frames {

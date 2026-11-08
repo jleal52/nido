@@ -1,19 +1,19 @@
 //! Guardián de una sesión: tiene el PTY y el proceso, el emulador con su historial, y atiende a
-//! los clientes por un socket unix. Pequeño a propósito: si falla, se lleva su sesión.
+//! los clientes por un socket unix (en Windows, una tubería con nombre). Pequeño a propósito: si
+//! falla, se lleva su sesión.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::os::fd::BorrowedFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::emu::Emu;
 use crate::history::History;
+use crate::ipc;
 use crate::proto::{self, ExitInfo, Frame, Hello, Role, Size};
 
 pub struct HolderConfig {
@@ -65,6 +65,8 @@ enum Cmd {
     Detach {
         client: u64,
     },
+    /// Que pare (la trama `Stop`: en Windows es como llega lo que en Unix es SIGTERM).
+    Stop,
 }
 
 fn pty_size(cols: u16, rows: u16) -> PtySize {
@@ -83,41 +85,70 @@ fn apply_size(master: &dyn MasterPty, emu: &mut Emu, size: Size) {
     }
 }
 
-/// Socket en un directorio solo nuestro; si queda uno viejo sin nadie detrás, se quita.
-async fn bind(socket: &Path) -> io::Result<UnixListener> {
-    if let Some(dir) = socket.parent() {
-        std::fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-    }
-    if socket.exists() {
-        if UnixStream::connect(socket).await.is_ok() {
-            let msg = format!("ya hay un guardián en {}", socket.display());
-            return Err(io::Error::new(io::ErrorKind::AddrInUse, msg));
-        }
-        std::fs::remove_file(socket)?;
-    }
-    let listener = UnixListener::bind(socket)?;
+/// Cuelga al proceso y a lo que haya lanzado. En Unix, SIGHUP a su grupo (como al cerrar un
+/// terminal) y, con `force`, SIGKILL. En Windows no hay señales: se termina el árbol entero.
+fn hang_up(pid: Option<u32>, force: bool) {
     #[cfg(unix)]
-    std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    Ok(listener)
-}
-
-/// Mata al proceso y a su grupo: SIGHUP (como al cerrar un terminal) y, si no basta, SIGKILL.
-fn hang_up(pid: Option<u32>, signal: i32) {
     if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+        let signal = if force { libc::SIGKILL } else { libc::SIGHUP };
         // El hijo es líder de su sesión (portable-pty hace setsid): -pid es su grupo.
         unsafe {
             libc::kill(-pid, signal);
             libc::kill(pid, signal);
         }
     }
+    #[cfg(windows)]
+    {
+        let _ = force;
+        if let Some(pid) = pid {
+            crate::sys::win::kill_tree(pid);
+        }
+    }
+}
+
+/// Lo que en Unix pide parar desde fuera: SIGTERM o SIGHUP. En Windows, nada (llega por la trama
+/// `Stop`).
+#[cfg(unix)]
+async fn stop_signal() -> io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+    })
+}
+
+#[cfg(windows)]
+async fn stop_signal() -> io::Result<impl std::future::Future<Output = ()>> {
+    Ok(std::future::pending::<()>())
+}
+
+/// Lo que se escribe al PTY. En Unix, un dup del maestro, nunca take_writer() (al soltarlo manda
+/// "\n" + ^D). En Windows (ConPTY) no hay descriptor: su escritor, que no manda nada al soltarlo.
+fn pty_writer(master: &dyn MasterPty) -> io::Result<Box<dyn Write + Send>> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::BorrowedFd;
+        let raw = master
+            .as_raw_fd()
+            .ok_or_else(|| io::Error::other("el PTY no tiene descriptor"))?;
+        // SAFETY: `raw` es el maestro de `master`, abierto mientras dura el guardián.
+        let fd = unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?;
+        Ok(Box::new(std::fs::File::from(fd)))
+    }
+    #[cfg(windows)]
+    {
+        master.take_writer().map_err(|e| io::Error::other(e.to_string()))
+    }
 }
 
 /// Arranca la sesión y la atiende hasta que el proceso termina (o llega SIGTERM). Devuelve el
 /// código de salida del proceso.
 pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
-    let listener = bind(&cfg.socket).await?;
+    let mut listener = ipc::Listener::bind(&cfg.socket).await?;
     let history = match &cfg.history_file {
         Some(path) => History::open(path, cfg.history_max)?,
         None => History::in_memory(cfg.history_max),
@@ -169,13 +200,8 @@ pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
         }
     });
 
-    // Escribir: un dup del maestro, nunca take_writer() (al soltarlo manda "\n" + ^D).
-    let raw = master
-        .as_raw_fd()
-        .ok_or_else(|| io::Error::other("el PTY no tiene descriptor"))?;
-    // SAFETY: `raw` es el maestro de `master`, abierto mientras dura esta función.
-    let fd = unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?;
-    let mut writer = std::fs::File::from(fd);
+    // Escribir, en otro hilo.
+    let mut writer = pty_writer(&*master)?;
     let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(256);
     std::thread::spawn(move || {
         while let Some(data) = in_rx.blocking_recv() {
@@ -201,24 +227,42 @@ pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
     let accept_cmds = cmd_tx.clone();
     let acceptor = tokio::spawn(async move {
         let mut next = 0u64;
-        while let Ok((stream, _)) = listener.accept().await {
-            next += 1;
-            tokio::spawn(serve_client(next, stream, accept_cmds.clone()));
+        loop {
+            match listener.accept().await {
+                Ok(stream) => {
+                    next += 1;
+                    tokio::spawn(serve_client(next, stream, accept_cmds.clone()));
+                }
+                Err(e) => {
+                    eprintln!("nido holder: no se pudo atender a un cliente: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
         }
     });
 
     let mut emu = Emu::new(cfg.cols, cfg.rows, history);
     let mut sizes: HashMap<u64, (Role, Size)> = HashMap::new();
     let mut flush = tokio::time::interval(Duration::from_secs(2));
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let stop = stop_signal().await?;
+    tokio::pin!(stop);
     let mut stopping: Option<tokio::time::Instant> = None;
+
+    // ConPTY (Windows) empieza preguntando dónde está el cursor y no pinta nada hasta saberlo; sin
+    // terminal de verdad detrás, contesta el guardián. Solo a esa primera pregunta: las demás las
+    // contesta el terminal del cliente (la web), como en Unix.
+    let mut answer_cursor = cfg!(windows);
 
     let code = loop {
         tokio::select! {
             out = out_rx.recv() => match out {
                 Some(data) => {
                     emu.process(&data);
+                    if answer_cursor && data.windows(4).any(|w| w == b"\x1b[6n") {
+                        answer_cursor = false;
+                        let (row, col) = emu.cursor();
+                        let _ = in_tx.send(format!("\x1b[{row};{col}R").into_bytes()).await;
+                    }
                     let _ = events.send(Event::Output(Arc::new(data)));
                 }
                 // EOF del PTY: el proceso terminó; el código llega por exit_rx.
@@ -263,19 +307,19 @@ pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
                 Cmd::Detach { client } => {
                     sizes.remove(&client);
                 }
+                Cmd::Stop => {
+                    hang_up(pid, false);
+                    stopping.get_or_insert_with(tokio::time::Instant::now);
+                }
             },
             _ = flush.tick() => {
                 let _ = emu.history_mut().flush();
                 if stopping.is_some_and(|t| t.elapsed() > Duration::from_secs(5)) {
-                    hang_up(pid, libc::SIGKILL);
+                    hang_up(pid, true);
                 }
             }
-            _ = term.recv() => {
-                hang_up(pid, libc::SIGHUP);
-                stopping.get_or_insert_with(tokio::time::Instant::now);
-            }
-            _ = hup.recv() => {
-                hang_up(pid, libc::SIGHUP);
+            () = &mut stop, if stopping.is_none() => {
+                hang_up(pid, false);
                 stopping.get_or_insert_with(tokio::time::Instant::now);
             }
         }
@@ -292,14 +336,16 @@ pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
     let _ = events.send(Event::Exit(code));
     emu.finish();
     acceptor.abort();
+    // El socket lo quita quien lo creó; en Unix se borra aquí (el listener ya se fue con la tarea).
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&cfg.socket);
     // Un momento para que los clientes reciban el Exit.
     tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(code)
 }
 
-async fn serve_client(client: u64, stream: UnixStream, cmds: mpsc::Sender<Cmd>) {
-    let (mut rd, mut wr) = stream.into_split();
+async fn serve_client(client: u64, stream: ipc::Stream, cmds: mpsc::Sender<Cmd>) {
+    let (mut rd, mut wr) = ipc::split(stream);
     let hello = match proto::read_frame(&mut rd).await {
         Ok(Some(Frame::Hello(h))) => h,
         _ => return,
@@ -335,6 +381,7 @@ async fn serve_client(client: u64, stream: UnixStream, cmds: mpsc::Sender<Cmd>) 
             let cmd = match frame {
                 Frame::Input(data) => Cmd::Input { client, data },
                 Frame::Resize(size) => Cmd::Resize { client, size },
+                Frame::Stop => Cmd::Stop,
                 Frame::HistoryRequest(req) => {
                     let (reply, wait) = oneshot::channel();
                     if reader_cmds

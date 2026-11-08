@@ -6,11 +6,20 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use nido::client::Api;
 use nido::launch::{self, Launcher, Paths};
-use nido::registry::Registry;
+use nido::registry::{self, Registry};
 use nido::server::{self, AppState};
-use nido::{attach, auth, holder, import};
+#[cfg(unix)]
+use nido::attach;
+use nido::{auth, holder, import};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::watch;
+
+/// El puerto de siempre. En Windows, otro: el WSL de ese mismo equipo ya puede tener el 7690 (y
+/// lo reenvía a Windows).
+#[cfg(not(windows))]
+const DEFAULT_ADDR: &str = "127.0.0.1:7690";
+#[cfg(windows)]
+const DEFAULT_ADDR: &str = "127.0.0.1:7691";
 
 /// Gestor de sesiones de terminal (sobre todo Claude Code): consola, y app y navegador por un canal cifrado.
 #[derive(Parser)]
@@ -20,7 +29,7 @@ struct Cli {
     #[arg(
         long,
         env = "NIDO_SERVER",
-        default_value = "127.0.0.1:7690",
+        default_value = DEFAULT_ADDR,
         global = true
     )]
     server: SocketAddr,
@@ -74,7 +83,7 @@ enum Cmd {
             long,
             env = "NIDO_BIND",
             value_delimiter = ',',
-            default_value = "127.0.0.1:7690"
+            default_value = DEFAULT_ADDR
         )]
         bind: Vec<SocketAddr>,
         /// Sin token de acceso (el control de Origin y Host se mantiene).
@@ -153,12 +162,34 @@ enum Cmd {
         /// Nombre de la sesión; sin él, se elige de una lista.
         name: Option<String>,
     },
+    /// En Windows: que nido arranque solo al iniciar sesión (una tarea programada).
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
+}
+
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Crea (o rehace) la tarea y la arranca ya.
+    Install {
+        /// Nombre del equipo en la web y la app.
+        #[arg(long, default_value = "Windows")]
+        name: String,
+        /// Dónde escucha; por defecto solo en este equipo (el resto entra por el hub).
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        bind: String,
+    },
+    /// Para nido y quita la tarea (las sesiones en marcha siguen hasta que se cierren).
+    Uninstall,
 }
 
 fn token_file() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .or_else(|| nido::sys::home().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("nido")
         .join("token")
@@ -196,9 +227,15 @@ fn main() -> ExitCode {
             no_restore,
         } => serve(paths, bind, no_auth, no_restore),
         Cmd::Holder { id } => run_holder(paths, &id),
+        #[cfg(windows)]
+        Cmd::Service { action } => match windows_service(action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(e),
+        },
         cmd => {
             // Órdenes de consola: con la salida cortada (`nido ls | head`), terminar sin más,
             // como cualquier herramienta de terminal. El gestor y el guardián siguen ignorándolo.
+            #[cfg(unix)]
             unsafe {
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             }
@@ -217,6 +254,7 @@ fn main() -> ExitCode {
 
 #[tokio::main]
 async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: bool) -> ExitCode {
+    nido::sys::keep_stdio_to_self();
     let token = if no_auth {
         None
     } else {
@@ -281,11 +319,24 @@ async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: b
                 .await
         }));
     }
-    let mut term =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut close = tokio::signal::windows::ctrl_close().expect("ctrl_close");
+        let mut shutdown = tokio::signal::windows::ctrl_shutdown().expect("ctrl_shutdown");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = close.recv() => {}
+            _ = shutdown.recv() => {}
+        }
     }
     // Parar el gestor no para las sesiones: cada una tiene su guardián.
     let _ = stop_tx.send(true);
@@ -297,6 +348,7 @@ async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: b
 
 #[tokio::main]
 async fn run_holder(paths: Paths, id: &str) -> ExitCode {
+    nido::sys::keep_stdio_to_self();
     let registry = match Registry::load(&paths.registry()) {
         Ok(r) => r,
         Err(e) => return fail(format!("registro: {e}")),
@@ -628,7 +680,7 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                 Some(c) => c,
                 None => std::env::current_dir()?,
             };
-            let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+            let cwd = nido::sys::canonical(&cwd);
             let body = serde_json::json!({
                 "name": name, "cwd": cwd, "account": account,
                 "autostart": !no_autostart, "command": command, "folder": folder,
@@ -737,6 +789,8 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
         }
         Cmd::Attach { name } => return attach_cmd(api, paths, name),
         Cmd::Serve { .. } | Cmd::Holder { .. } => unreachable!(),
+        #[cfg(windows)]
+        Cmd::Service { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -787,9 +841,23 @@ fn attach_cmd(api: &Api, paths: &Paths, name: Option<String>) -> io::Result<()> 
     // Engancharse es verla: deja de estar «sin leer» (y al soltarla, igual).
     let seen = format!("/api/v1/sessions/{}/seen", session.id);
     let _ = api.call("POST", &seen, None);
+    attach_run(api, paths, session, &seen)
+}
+
+/// En Windows, de momento, las sesiones se ven en la web y la app (la consola de Windows pide su
+/// propio modo crudo).
+#[cfg(windows)]
+fn attach_run(_api: &Api, _paths: &Paths, _session: &registry::Session, _seen: &str) -> io::Result<()> {
+    Err(io::Error::other(
+        "en Windows, nido attach aún no está: abre la sesión en la web o en la app",
+    ))
+}
+
+#[cfg(unix)]
+fn attach_run(api: &Api, paths: &Paths, session: &registry::Session, seen: &str) -> io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let outcome = rt.block_on(attach::run(&paths.socket(&session.id)));
-    let _ = api.call("POST", &seen, None);
+    let _ = api.call("POST", seen, None);
     let outcome = outcome?;
     match outcome {
         attach::Outcome::Detached => {
@@ -803,4 +871,130 @@ fn attach_cmd(api: &Api, paths: &Paths, name: Option<String>) -> io::Result<()> 
     }
     // La lectura de la terminal se queda bloqueada en su hilo: salir sin esperarla.
     std::process::exit(0);
+}
+
+/// La tarea que arranca nido al iniciar sesión: con tu usuario y tu escritorio (sin contraseña),
+/// sin ventana (`nidow.exe`), sin límite de tiempo y relanzándolo si se cae.
+#[cfg(windows)]
+fn windows_service(action: ServiceCmd) -> io::Result<()> {
+    const TASK: &str = "nido";
+    let schtasks = |args: &[&str]| -> io::Result<std::process::Output> {
+        nido::sys::command("schtasks.exe").args(args).output()
+    };
+    match action {
+        ServiceCmd::Uninstall => {
+            let _ = schtasks(&["/End", "/TN", TASK]);
+            let out = schtasks(&["/Delete", "/TN", TASK, "/F"])?;
+            if !out.status.success() {
+                return Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned()));
+            }
+            println!("Tarea quitada: nido ya no arrancará al iniciar sesión.");
+            Ok(())
+        }
+        ServiceCmd::Install { name, bind } => {
+            let dir = std::env::current_exe()?
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .ok_or_else(|| io::Error::other("no sé dónde está nido.exe"))?;
+            let nidow = dir.join("nidow.exe");
+            if !nidow.is_file() {
+                return Err(io::Error::other(format!(
+                    "falta {} (va junto a nido.exe)",
+                    nidow.display()
+                )));
+            }
+            let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+                (Ok(d), Ok(u)) => format!("{d}\\{u}"),
+                (_, Ok(u)) => u,
+                _ => return Err(io::Error::other("no sé qué usuario eres (USERNAME)")),
+            };
+            let esc = |s: &str| {
+                s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+            };
+            let args = format!("--env NIDO_NAME={} serve --bind {}", name, bind);
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>nido: gestor de sesiones de terminal (sobre todo Claude Code)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{cmd}</Command>
+      <Arguments>{args}</Arguments>
+      <WorkingDirectory>{wd}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+                user = esc(&user),
+                cmd = esc(&nidow.to_string_lossy()),
+                args = esc(&args),
+                wd = esc(&nido::sys::home().unwrap_or_else(|| dir.clone()).to_string_lossy()),
+            );
+            // schtasks quiere el XML en UTF-16 con BOM.
+            let mut bytes = vec![0xFF, 0xFE];
+            for u in xml.encode_utf16() {
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+            let file = std::env::temp_dir().join("nido-tarea.xml");
+            std::fs::write(&file, bytes)?;
+            let out = schtasks(&["/Create", "/TN", TASK, "/XML", &file.to_string_lossy(), "/F"]);
+            let _ = std::fs::remove_file(&file);
+            let out = out?;
+            if !out.status.success() {
+                return Err(io::Error::other(format!(
+                    "schtasks: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            let run = schtasks(&["/Run", "/TN", TASK])?;
+            if !run.status.success() {
+                return Err(io::Error::other(format!(
+                    "la tarea está creada pero no arrancó: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                )));
+            }
+            println!(
+                "nido arrancará solo al iniciar sesión (tarea «{TASK}»), y ya está en marcha: {bind}.\nRegistro: ~\\.local\\state\\nido\\serve.log"
+            );
+            Ok(())
+        }
+    }
 }
