@@ -194,6 +194,8 @@ fn spawn_detached(cmd: &mut Command) -> io::Result<std::process::Child> {
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
     match cmd.spawn() {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            // Si el gestor muere, esta sesión irá detrás: que conste.
+            eprintln!("nido: el trabajo del gestor no deja salir al guardián; la sesión depende de él");
             cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
             cmd.spawn()
         }

@@ -121,6 +121,10 @@ En Windows escucha en `127.0.0.1:7691` (el 7690 puede ser del WSL del mismo equi
 está en `~\.local\state\nido\serve.log` y `nido service uninstall` quita la tarea. Cerrar la
 sesión de Windows cierra las sesiones de nido; al volver a entrar se abren las de autoarranque.
 
+Para actualizarlo: Windows no deja reemplazar un `.exe` en marcha, pero sí renombrarlo. Renombra
+`nido.exe` y `nidow.exe` (p. ej. a `nido.old.exe`), copia los nuevos y reinicia la tarea
+(`schtasks /End /TN nido` y `schtasks /Run /TN nido`): el gestor se reinicia y las sesiones siguen.
+
 Por defecto escucha en `127.0.0.1:7690`. Para que el móvil llegue directo en casa, añade la
 dirección de la LAN con `NIDO_BIND` en un *drop-in* de la unidad
 (`~/.config/systemd/user/nido.service.d/bind.conf`): por ella solo se atiende el canal cifrado.
