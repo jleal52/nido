@@ -100,6 +100,9 @@ pub struct Account {
     /// La última medida, cuando `usage` falta porque es vieja.
     pub last_good: Option<Usage>,
     pub last_good_age_s: Option<f64>,
+    /// Por qué falló la última medida (si falló).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// Lo que se manda a la web.
@@ -374,6 +377,9 @@ impl Accounts {
                         .max(Duration::from_secs(after.unwrap_or(0)));
                     inner.timing.backoff.insert(number, wait);
                     inner.timing.next.insert(number, Instant::now() + wait);
+                    if !inner.timing.failing.contains_key(&number) {
+                        eprintln!("nido: Anthropic pide esperar con la cuenta {number} ({} s)", wait.as_secs());
+                    }
                     inner.timing.failing.insert(number, "Anthropic pide esperar".into());
                     return;
                 }
@@ -402,6 +408,9 @@ impl Accounts {
                     return;
                 }
                 Err(UsageError::Other(e)) => {
+                    if inner.timing.failing.get(&number) != Some(&e) {
+                        eprintln!("nido: no se pudo medir el uso de la cuenta {number}: {e}");
+                    }
                     inner.timing.failing.insert(number, e);
                     inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
                     return;
@@ -524,6 +533,7 @@ impl Accounts {
                     age_s: if fresh { age.map(|s| s as f64) } else { None },
                     last_good: if fresh { None } else { a.usage.clone() },
                     last_good_age_s: if fresh { None } else { age.map(|s| s as f64) },
+                    problem: inner.timing.failing.get(&a.number).cloned(),
                 }
             })
             .collect();
@@ -592,6 +602,8 @@ impl Accounts {
         // La sesión que tenía Claude es la más reciente de la cuenta que deja: se guarda.
         match (&from, old) {
             (Some(f), Some(old)) => {
+                // Sale de Claude: vale seguro.
+                set_relogin(&mut inner, f.number, false);
                 if let Err(e) = self.save_creds(f.number, &old) {
                     warnings.push(format!("no se pudo guardar la sesión de la cuenta {}: {e}", f.number));
                 }

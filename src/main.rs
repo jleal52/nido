@@ -639,6 +639,9 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                     Some("unavailable") => notes.push("sin datos recientes".to_owned()),
                     Some(s) => notes.push(s.to_owned()),
                 }
+                if let Some(p) = a["problem"].as_str() {
+                    notes.push(p.to_owned());
+                }
                 if usage["seven_day"]["ahead_of_pace"] == true {
                     notes.push("7d por encima del ritmo".to_owned());
                 }
