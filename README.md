@@ -118,36 +118,60 @@ cifrado). Desde fuera de este equipo solo responde el canal cifrado (`/api/v1/e2
 
 ## Instalar
 
-Se compila con Rust 1.88 o más nuevo ([rustup](https://rustup.rs)). En Linux hace falta systemd
-de usuario.
+Hay ejecutables para Linux (x86_64 y ARM64), macOS (Apple Silicon e Intel) y Windows (x86_64) en
+[Releases](https://github.com/jleal52/nido/releases). Cada versión trae `SHA256SUMS` para
+comprobarlos.
+
+**Linux** (y WSL 2), con systemd de usuario. Cambia `x86_64` por `aarch64` en ARM:
 
 ```sh
-git clone https://github.com/jleal52/nido && cd nido
-cargo build --release
-install -Dm755 target/release/nido ~/.local/bin/nido
+curl -fsSL https://github.com/jleal52/nido/releases/latest/download/nido-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+cd nido-x86_64-unknown-linux-gnu
+install -Dm755 nido ~/.local/bin/nido
 install -Dm644 contrib/nido.service ~/.config/systemd/user/nido.service
 systemctl --user daemon-reload && systemctl --user enable --now nido
 ```
 
-En macOS, en lugar de systemd, un agente de launchd:
+**macOS**, con un agente de launchd. Cambia `aarch64` por `x86_64` en un Mac con Intel:
 
 ```sh
-cargo build --release
+curl -fsSL https://github.com/jleal52/nido/releases/latest/download/nido-aarch64-apple-darwin.tar.gz | tar -xz
+cd nido-aarch64-apple-darwin
 install -d ~/.local/bin ~/Library/LaunchAgents
-install -m755 target/release/nido ~/.local/bin/nido
+install -m755 nido ~/.local/bin/nido
 sed "s/USUARIO/$(whoami)/g" contrib/nido.plist > ~/Library/LaunchAgents/io.github.jleal52.nido.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.jleal52.nido.plist
 ```
 
-En Windows (PowerShell), una tarea programada que arranca nido al iniciar sesión, con tu usuario
-y sin ventana (`nidow.exe` lo lanza sin consola):
+El ejecutable no está firmado por Apple. Bajado con `curl`, como arriba, macOS lo deja correr; si
+lo bajas con el navegador y no te deja abrirlo, quítale la marca de descarga con
+`xattr -d com.apple.quarantine ~/.local/bin/nido`.
+
+**Windows 10/11** (PowerShell), con una tarea programada que arranca nido al iniciar sesión, con
+tu usuario y sin ventana (`nidow.exe` lo lanza sin consola):
 
 ```powershell
-cargo build --release
+$zip = "$env:TEMP\nido.zip"
+Invoke-WebRequest https://github.com/jleal52/nido/releases/latest/download/nido-x86_64-pc-windows-msvc.zip -OutFile $zip
+Expand-Archive $zip -DestinationPath "$env:TEMP\nido" -Force
 New-Item -ItemType Directory -Force ~\.local\bin | Out-Null
-Copy-Item target\release\nido.exe, target\release\nidow.exe ~\.local\bin\
-~\.local\bin\nido.exe service install --name Windows
+Copy-Item "$env:TEMP\nido\nido*.exe" ~\.local\bin\
+~\.local\bin\nido.exe service install          # --name otro-nombre: como sale en la web y la app
 ```
+
+Para que `nido` funcione en cualquier terminal, añade `~/.local/bin` (en Windows,
+`%USERPROFILE%\.local\bin`) al `PATH` si no lo está.
+
+### Compilarlo tú
+
+Con Rust 1.88 o más nuevo ([rustup](https://rustup.rs)):
+
+```sh
+git clone https://github.com/jleal52/nido && cd nido
+cargo build --release      # deja target/release/nido (y en Windows, también nidow.exe)
+```
+
+y luego los mismos pasos de arriba con `target/release/nido` en lugar del ejecutable descargado.
 
 En Windows escucha en `127.0.0.1:7691` (el 7690 puede ser del WSL del mismo equipo), el registro
 está en `~\.local\state\nido\serve.log` y `nido service uninstall` quita la tarea. Cerrar la
