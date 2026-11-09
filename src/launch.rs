@@ -382,7 +382,10 @@ mod tests {
             cfg.argv
                 .ends_with(&["claude".to_string(), "--resume".into(), "sid-1".into()])
         );
-        assert_eq!(cfg.argv[1..4], ["-lic", "exec \"$@\"", "nido"]);
+        // En Windows no hay shell de login: la orden va tal cual.
+        if cfg!(unix) {
+            assert_eq!(cfg.argv[1..4], ["-lic", "exec \"$@\"", "nido"]);
+        }
         assert!(cfg.initial_input.is_none());
     }
 

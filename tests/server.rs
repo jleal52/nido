@@ -1,6 +1,9 @@
 //! El gestor de punta a punta: guardianes de verdad (el binario nido), sin systemd, en un
 //! directorio temporal.
 
+// Con bash, sockets Unix y señales: solo en Unix.
+#![cfg(unix)]
+
 use std::net::SocketAddr;
 use std::time::Duration;
 

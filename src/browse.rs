@@ -191,6 +191,8 @@ mod tests {
         }
         std::fs::write(root.join("fichero"), "x").unwrap();
         std::os::unix::fs::symlink(root.join("b"), root.join("enlace")).unwrap();
+        // En macOS el temporal es un enlace (`/var` → `/private/var`): se compara con la ruta real.
+        let root = std::fs::canonicalize(&root).unwrap();
         let l = list(Path::new("/nada"), root.to_str().unwrap()).unwrap();
         let names: Vec<_> = l.dirs.iter().map(|d| (d.name.as_str(), d.hidden)).collect();
         assert_eq!(names, [(".oculta", true), ("A", false), ("b", false), ("enlace", false)]);

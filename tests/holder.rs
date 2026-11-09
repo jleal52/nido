@@ -1,5 +1,8 @@
 //! El guardián de punta a punta, con bash en un directorio temporal.
 
+// Con bash, sockets Unix y señales: solo en Unix.
+#![cfg(unix)]
+
 use std::path::Path;
 use std::time::Duration;
 
