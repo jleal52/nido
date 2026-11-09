@@ -1,0 +1,20 @@
+  Read 1 file (ctrl+o to expand)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Combining  ☐ Minimum  ✔ Submit  →
+
+│ How should a coupon from coupons.json (WELCOME 10%, SUMMER26 20% with a 5000-cent minimum) combine
+│ with the existing applyDiscount percent discount in src/cart.js?
+
+❯ 1. Stack sequentially
+     Apply the existing discount first, then the coupon on the reduced total (10% + 20% = 28% off).
+  2. Add percentages
+     Add the percents together and apply once, capped at 100% (10% + 20% = 30% off).
+  3. Best one wins
+     Apply whichever of the two is larger. They never stack.
+  4. Mutually exclusive
+     A coupon can't be used if the existing discount applies. Reject it with an error.
+  5. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

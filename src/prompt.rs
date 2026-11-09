@@ -378,7 +378,8 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
         if is_tabs(lines[i - 1]) {
             break;
         }
-        title.push(lines[i - 1].trim());
+        // Claude pinta la pregunta con una barra a la izquierda («│ ¿Qué…»): no es del texto.
+        title.push(lines[i - 1].trim().trim_start_matches('│').trim_start());
         i -= 1;
     }
     title.reverse();
@@ -1545,6 +1546,21 @@ mod tests {
             m.hint.as_deref(),
             Some("Enter to select · ↑/↓ to navigate · Esc to cancel")
         );
+    }
+
+    #[test]
+    fn question_with_bar() {
+        let m = screen("pregunta_barra").unwrap();
+        assert_eq!(m.kind, Kind::Question);
+        assert_eq!(
+            m.title.as_deref(),
+            Some(
+                "How should a coupon from coupons.json (WELCOME 10%, SUMMER26 20% with a 5000-cent \
+                 minimum) combine with the existing applyDiscount percent discount in src/cart.js?"
+            )
+        );
+        assert!(m.shows_question("How should a coupon from coupons.json (WELCOME 10%, SUMMER26 20% with a 5000-cent minimum) combine with the existing applyDiscount percent discount in src/cart.js?"));
+        assert_eq!(labels(&m)[0], "Stack sequentially");
     }
 
     #[test]
