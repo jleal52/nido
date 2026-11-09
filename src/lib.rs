@@ -5,6 +5,7 @@ pub mod claude_store;
 #[cfg(unix)]
 pub mod attach;
 pub mod auth;
+pub mod browse;
 pub mod claude;
 pub mod client;
 pub mod e2e;

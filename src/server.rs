@@ -695,6 +695,7 @@ pub fn spawn_scanner(state: Arc<AppState>) {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/info", get(api_info))
+        .route("/api/v1/browse", get(api_browse))
         .route("/api/v1/accounts", get(api_accounts))
         .route("/api/v1/accounts/switch", post(api_switch_account))
         .route("/api/v1/accounts/login", post(api_login_start))
@@ -763,8 +764,30 @@ async fn api_info(State(st): State<Arc<AppState>>) -> Response {
         "api": 1,
         "auth": st.token.is_some(),
         "home": st.paths.home,
+        // Para la web y la app: cómo se escriben aquí las rutas y qué órdenes proponer.
+        "os": std::env::consts::OS,
+        "sep": std::path::MAIN_SEPARATOR.to_string(),
+        "roots": crate::browse::roots(),
+        "commands": crate::browse::commands(),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct BrowseQuery {
+    #[serde(default)]
+    path: String,
+}
+
+/// Las carpetas que hay dentro de una (para elegir dónde abrir una sesión). Solo carpetas y
+/// solo sus nombres: nada de ficheros ni de su contenido.
+async fn api_browse(State(st): State<Arc<AppState>>, Query(q): Query<BrowseQuery>) -> Response {
+    let home = st.paths.home.clone();
+    match tokio::task::spawn_blocking(move || crate::browse::list(&home, &q.path)).await {
+        Ok(Ok(l)) => Json(l).into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 async fn api_accounts(State(st): State<Arc<AppState>>) -> Response {
