@@ -61,6 +61,8 @@ Las cuentas de Claude las lleva nido: para entrar da un enlace a la página de C
 abrir en cualquier navegador, también el del móvil) y se pega el código que enseña al acabar. Si
 había cuentas de cswap (claude-swap), la primera vez se traen con sus números; después, mejor no
 usar cswap a la vez: cada uno renovaría las sesiones por su lado y las del otro dejarían de valer.
+Con `NIDO_ACCOUNTS=off`, un nido no toca las cuentas (para uno de pruebas o de demostración junto
+al de verdad).
 
 ### Desde Windows Terminal
 

@@ -200,7 +200,7 @@ impl Accounts {
             creds_dir: data.join("accounts"),
             http: oauth::client(),
             inner: Mutex::new(Inner { file: saved, timing: Timing::default() }),
-            view: std::sync::Mutex::new(View { installed: true, ..Default::default() }),
+            view: std::sync::Mutex::new(View { installed: !disabled(), ..Default::default() }),
             logins: Default::default(),
             kick: Notify::new(),
         })
@@ -209,6 +209,9 @@ impl Accounts {
 
     /// Mira el uso de vez en cuando, para siempre.
     pub fn spawn(self: &Arc<Self>, home: PathBuf) {
+        if disabled() {
+            return;
+        }
         let me = self.clone();
         tokio::spawn(async move {
             {
@@ -560,6 +563,9 @@ impl Accounts {
 
     /// Pasa Claude (`~/.claude`, el de todas las sesiones) a otra cuenta.
     pub async fn switch(&self, target: &str) -> Result<Switched, String> {
+        if disabled() {
+            return Err(OFF.into());
+        }
         if !valid_target(target) {
             return Err("cuenta no válida".into());
         }
@@ -654,6 +660,9 @@ impl Accounts {
     /// Acaba de entrar con el código que enseñó la página. Si la cuenta ya estaba, se le pone la
     /// sesión nueva (y, si es la activa, también a Claude).
     pub async fn login_finish(&self, state: Option<&str>, pasted: &str) -> Result<LoggedIn, String> {
+        if disabled() {
+            return Err(OFF.into());
+        }
         let (code, pasted_state) = oauth::parse_pasted(pasted)?;
         let state = match (pasted_state, state) {
             (Some(p), Some(s)) if p != s => {
@@ -729,6 +738,9 @@ impl Accounts {
 
     /// Olvida una cuenta guardada (no la activa).
     pub async fn remove(&self, number: u32) -> Result<(), String> {
+        if disabled() {
+            return Err(OFF.into());
+        }
         let (identity, _) = self.live_now().await;
         let live_uuid = identity.as_ref().and_then(|v| v["accountUuid"].as_str()).map(str::to_owned);
         let mut inner = self.inner.lock().await;
@@ -809,6 +821,14 @@ impl Accounts {
     }
 }
 
+
+/// `NIDO_ACCOUNTS=off`: nido no toca las cuentas de Claude (ni las mide, ni las trae de cswap,
+/// ni renueva sus sesiones). Para un nido de pruebas o de demostración junto al de verdad.
+pub fn disabled() -> bool {
+    std::env::var("NIDO_ACCOUNTS").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+}
+
+const OFF: &str = "las cuentas de Claude están desactivadas en este nido (NIDO_ACCOUNTS=off)";
 
 fn set_relogin(inner: &mut Inner, number: u32, v: bool) {
     if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == number) {
