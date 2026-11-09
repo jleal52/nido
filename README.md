@@ -27,9 +27,15 @@ nido stop|start|restart|rm <nombre>
 nido new api --folder trabajo    # carpetas lógicas, para agrupar
 nido mv api personal             # mover de carpeta (sin carpeta: `nido mv api`)
 nido import-tmux [--dry-run]     # registrar los Claude que corren en tmux
-nido accounts                    # uso de cada cuenta de Claude (vía cswap)
-nido accounts use 3              # pasar a la cuenta 3
+nido accounts                    # las cuentas de Claude y lo que gasta cada una
+nido accounts use 3              # pasar Claude (todas las sesiones) a la cuenta 3
+nido accounts login [3]          # entrar en una cuenta nueva, o volver a entrar en la 3
 ```
+
+Las cuentas de Claude las lleva nido: para entrar da un enlace a la página de Claude (se puede
+abrir en cualquier navegador, también el del móvil) y se pega el código que enseña al acabar. Si
+había cuentas de cswap (claude-swap), la primera vez se traen con sus números; después, mejor no
+usar cswap a la vez: cada uno renovaría las sesiones por su lado y las del otro dejarían de valer.
 
 ### Desde Windows Terminal
 
