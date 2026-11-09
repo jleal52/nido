@@ -1,146 +1,116 @@
-//! Las cuentas de Claude que reparte `cswap` (claude-swap) y lo que lleva gastado cada una.
+//! Las cuentas de Claude de este equipo: cuál usa Claude ahora, cambiar de una a otra, entrar en
+//! una nueva (o volver a entrar) y lo que lleva gastado cada una.
 //!
-//! Siempre a través de `cswap list --json`: la API de uso de Anthropic admite muy pocas
-//! peticiones por hora y cswap ya las reparte entre todas sus vistas con un almacén compartido.
-//! De su salida solo se toman los campos que se enseñan (nada de credenciales ni identificadores
-//! internos).
+//! - Cada cuenta guardada tiene su credencial (`<data>/accounts/<n>.json`, solo para el usuario) y
+//!   su identidad (`<data>/accounts.json`, sin secretos). La de la cuenta activa la lleva Claude
+//!   (ver `claude_store`): mientras está activa, la nuestra no se toca ni se renueva (renovarla
+//!   cambiaría el token que usan los Claude abiertos); al cambiar a otra, se guarda la suya.
+//! - El uso se pregunta a Anthropic poco (la API admite muy pocas peticiones por hora): la activa
+//!   cada pocos minutos y las demás menos; tras un «demasiadas peticiones», se espera más.
+//! - La primera vez se traen las cuentas de cswap (claude-swap), si lo hay, con sus números.
+//!
+//! A la web y a la app solo salen identidad y uso; nunca tokens.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use serde_json::Value;
+use tokio::sync::{Mutex, Notify};
 
-/// Cuánto vale lo que dio la última llamada: cswap ya sirve de su almacén si el dato es reciente;
-/// esto evita lanzar Python por cada navegador que mira.
-const CACHE: Duration = Duration::from_secs(60);
-/// Si cswap tiene que preguntar a la API puede tardar (o esperar a otro que pregunta).
-const TIMEOUT: Duration = Duration::from_secs(30);
-/// Cambiar puede tener que renovar el token de la cuenta de destino.
-const SWITCH_TIMEOUT: Duration = Duration::from_secs(90);
-/// El error cuando cswap no está: entonces la web y la app no enseñan las cuentas.
-const MISSING: &str = "no está cswap (claude-swap) en el PATH";
+use crate::claude_store::{Live, write_atomic};
+use crate::oauth::{self, RefreshError, Usage, UsageError};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all(deserialize = "camelCase"))]
-pub struct Window {
-    /// Solo en las ventanas por modelo (`Fable`…).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub pct: Option<f64>,
-    pub resets_at: Option<String>,
-    /// Dónde estaría el uso si se repartiera por igual en la semana.
-    #[serde(default)]
-    pub expected_pct: Option<f64>,
-    #[serde(default)]
-    pub ahead_of_pace: Option<bool>,
-    #[serde(default)]
-    pub will_last_to_reset: Option<bool>,
-    #[serde(default)]
-    pub projected_exhaustion_at: Option<String>,
+/// Cada cuánto se mira el uso de la cuenta activa, y el de las demás.
+const ACTIVE_EVERY: Duration = Duration::from_secs(180);
+const OTHERS_EVERY: Duration = Duration::from_secs(600);
+/// Tras un «demasiadas peticiones»: al menos esto, y el doble cada vez hasta el máximo.
+const AFTER_429: Duration = Duration::from_secs(360);
+const AFTER_429_MAX: Duration = Duration::from_secs(1800);
+/// Tras otro error (red…).
+const AFTER_ERROR: Duration = Duration::from_secs(120);
+/// Un dato más viejo que esto se enseña como «último bueno», no como el de ahora.
+const FRESH_S: u64 = 20 * 60;
+/// Renovar el token si caduca antes de esto.
+const EXPIRY_MARGIN_MS: u64 = 5 * 60 * 1000;
+/// Un inicio de sesión a medias vale esto.
+const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
+
+fn now_s() -> u64 {
+    oauth::now_ms() / 1000
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all(deserialize = "camelCase"))]
-pub struct Usage {
-    pub five_hour: Option<Window>,
-    pub seven_day: Option<Window>,
-    /// Límites semanales por modelo.
-    #[serde(default, rename(deserialize = "scoped"))]
-    pub models: Vec<Window>,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Saved {
+    number: u32,
+    email: String,
+    uuid: String,
+    #[serde(default)]
+    org_uuid: Option<String>,
+    #[serde(default)]
+    organization: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+    /// `oauthAccount` para `~/.claude.json`.
+    #[serde(default)]
+    identity: Value,
+    /// Hay que volver a entrar: la sesión guardada ya no vale.
+    #[serde(default)]
+    relogin: bool,
+    #[serde(default)]
+    usage: Option<Usage>,
+    /// Cuándo se midió `usage` (segundos desde 1970).
+    #[serde(default)]
+    usage_at: Option<u64>,
 }
 
+impl Saved {
+    fn is(&self, uuid: &str, org: Option<&str>) -> bool {
+        self.uuid == uuid && (org.is_none() || self.org_uuid.is_none() || self.org_uuid.as_deref() == org)
+    }
+
+    fn reference(&self) -> AccountRef {
+        AccountRef { number: self.number, email: Some(self.email.clone()) }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SavedFile {
+    accounts: Vec<Saved>,
+    /// Ya se miró si había cuentas de cswap que traer.
+    #[serde(default)]
+    cswap_imported: bool,
+}
+
+/// Una cuenta, como la ven la web y la app.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all(deserialize = "camelCase"))]
 pub struct Account {
     pub number: u32,
     pub email: Option<String>,
-    #[serde(default)]
     pub alias: Option<String>,
-    #[serde(default, rename(deserialize = "organizationName"))]
     pub organization: Option<String>,
-    #[serde(default)]
     pub active: bool,
-    #[serde(default)]
     pub disabled: bool,
-    /// `ok`, `token_expired`, `unavailable`…
-    #[serde(default, rename(deserialize = "usageStatus"))]
+    /// `ok`, `relogin_required` (hay que volver a entrar), `unavailable` (sin dato reciente).
     pub status: Option<String>,
     pub usage: Option<Usage>,
-    #[serde(default, rename(deserialize = "usageAgeSeconds"))]
     pub age_s: Option<f64>,
-    /// La última medida buena, cuando `usage` falta (dato viejo o cuenta con problemas).
-    #[serde(default, rename(deserialize = "lastGoodUsage"))]
+    /// La última medida, cuando `usage` falta porque es vieja.
     pub last_good: Option<Usage>,
-    #[serde(default, rename(deserialize = "lastGoodAgeSeconds"))]
     pub last_good_age_s: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Accounts {
+/// Lo que se manda a la web.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct View {
     pub accounts: Vec<Account>,
-}
-
-/// `{"schemaVersion":1,"accounts":[…]}` o `{"schemaVersion":1,"error":{…}}`.
-pub fn parse(json: &str) -> Result<Accounts, String> {
-    let v: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| format!("cswap devolvió algo que no es JSON: {e}"))?;
-    check(&v)?;
-    let accounts = serde_json::from_value(v.get("accounts").cloned().unwrap_or_default())
-        .map_err(|e| format!("cswap: no se entiende la lista de cuentas: {e}"))?;
-    Ok(Accounts { accounts })
-}
-
-/// `{"schemaVersion":1,"error":{…}}` → el mensaje; también una versión que no se conoce.
-fn check(v: &serde_json::Value) -> Result<(), String> {
-    if let Some(err) = v.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| err.to_string());
-        return Err(format!("cswap: {msg}"));
-    }
-    if v.get("schemaVersion").and_then(|s| s.as_u64()) != Some(1) {
-        return Err("cswap: versión de salida desconocida".into());
-    }
-    Ok(())
-}
-
-/// `cswap <args…>`: su salida JSON (con error, cswap también deja en stdout un JSON que lo explica).
-async fn cswap(args: &[&str], timeout: Duration) -> Result<String, String> {
-    let mut cmd = crate::sys::async_command("cswap");
-    cmd.args(args)
-        // La cuenta por defecto es la de `~/.claude`, no la de la sesión que lance esto.
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| "cswap tardó demasiado en contestar".to_owned())?
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => MISSING.to_owned(),
-            _ => format!("no se pudo lanzar cswap: {e}"),
-        })?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if stdout.trim().is_empty() {
-        return Err(format!("cswap terminó con {} sin decir nada", out.status));
-    }
-    Ok(stdout)
-}
-
-async fn run_cswap() -> Result<Accounts, String> {
-    parse(&cswap(&["list", "--json"], TIMEOUT).await?)
-}
-
-/// Número, correo o alias de una cuenta de cswap. Nunca empieza por `-` (no es una opción).
-pub fn valid_target(t: &str) -> bool {
-    !t.is_empty()
-        && t.len() <= 254
-        && !t.starts_with('-')
-        && t.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"@._+-".contains(&b))
+    /// Segundos desde la medida de la cuenta activa.
+    pub age_s: Option<u64>,
+    pub error: Option<String>,
+    /// Siempre: nido ya no necesita cswap (se queda para la web y la app de antes).
+    pub installed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,7 +120,6 @@ pub struct AccountRef {
     pub email: Option<String>,
 }
 
-/// Lo que contesta `cswap switch <cuenta> --json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Switched {
     pub switched: bool,
@@ -162,113 +131,706 @@ pub struct Switched {
     pub warnings: Vec<String>,
 }
 
-pub fn parse_switch(json: &str) -> Result<Switched, String> {
-    let v: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| format!("cswap devolvió algo que no es JSON: {e}"))?;
-    check(&v)?;
-    serde_json::from_value(v).map_err(|e| format!("cswap: no se entiende la respuesta: {e}"))
+/// Lo que devuelve acabar de entrar.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoggedIn {
+    pub number: u32,
+    pub email: String,
+    /// Cuenta nueva (si no, se ha vuelto a entrar en una que ya estaba).
+    pub new: bool,
+    /// Es la que usa Claude ahora.
+    pub active: bool,
 }
 
-/// Lo que se manda a la web: las cuentas (las últimas buenas, aunque la llamada falle) y, si la
-/// última llamada falló, por qué.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct View {
-    pub accounts: Vec<Account>,
-    /// Segundos desde que se le preguntó a cswap.
-    pub age_s: Option<u64>,
-    pub error: Option<String>,
-    /// Si cswap está en este equipo (la última vez que se lanzó).
-    pub installed: bool,
+/// Número, correo o alias. Nunca empieza por `-`.
+pub fn valid_target(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 254
+        && !t.starts_with('-')
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@._+-".contains(&b))
+}
+
+struct Pending {
+    verifier: String,
+    at: Instant,
 }
 
 #[derive(Default)]
-pub struct Cache {
-    data: Arc<std::sync::Mutex<CacheInner>>,
-    /// Solo una llamada a cswap a la vez; las demás esperan su resultado.
-    running: Arc<Mutex<()>>,
+struct Timing {
+    next: HashMap<u32, Instant>,
+    /// Espera tras el último «demasiadas peticiones» de cada cuenta.
+    backoff: HashMap<u32, Duration>,
+    /// La última medida falló (y por qué), para enseñarlo.
+    failing: HashMap<u32, String>,
 }
 
-#[derive(Default)]
-struct CacheInner {
-    good: Option<(Instant, Accounts)>,
-    error: Option<(Instant, String)>,
+struct Inner {
+    file: SavedFile,
+    timing: Timing,
 }
 
-impl CacheInner {
-    /// Lo último (bueno o fallido) es de hace menos de `CACHE`.
-    fn fresh(&self) -> bool {
-        let fresh = |t: &Instant| t.elapsed() < CACHE;
-        self.good.as_ref().is_some_and(|(t, _)| fresh(t))
-            || self.error.as_ref().is_some_and(|(t, _)| fresh(t))
+pub struct Accounts {
+    live: Live,
+    /// `<data>/accounts.json`.
+    file: PathBuf,
+    /// `<data>/accounts/`.
+    creds_dir: PathBuf,
+    http: reqwest::Client,
+    /// Todo lo que cambia cuentas o credenciales va de uno en uno.
+    inner: Mutex<Inner>,
+    view: std::sync::Mutex<View>,
+    logins: std::sync::Mutex<HashMap<String, Pending>>,
+    kick: Notify,
+}
+
+impl Accounts {
+    pub fn new(home: &Path, data: &Path) -> Arc<Self> {
+        let file = data.join("accounts.json");
+        let saved: SavedFile = std::fs::read(&file)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        Arc::new(Self {
+            live: Live::new(home),
+            file,
+            creds_dir: data.join("accounts"),
+            http: oauth::client(),
+            inner: Mutex::new(Inner { file: saved, timing: Timing::default() }),
+            view: std::sync::Mutex::new(View { installed: true, ..Default::default() }),
+            logins: Default::default(),
+            kick: Notify::new(),
+        })
     }
 
-    fn view(&self) -> View {
-        View {
-            accounts: self
-                .good
-                .as_ref()
-                .map(|(_, a)| a.accounts.clone())
-                .unwrap_or_default(),
-            age_s: self.good.as_ref().map(|(t, _)| t.elapsed().as_secs()),
-            error: self.error.as_ref().map(|(_, e)| e.clone()),
-            installed: self.error.as_ref().is_none_or(|(_, e)| e != MISSING),
+
+    /// Mira el uso de vez en cuando, para siempre.
+    pub fn spawn(self: &Arc<Self>, home: PathBuf) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            {
+                let mut inner = me.inner.lock().await;
+                if !inner.file.cswap_imported {
+                    let live_uuid = blocking({
+                        let live = me.live.clone();
+                        move || live.read_identity()
+                    })
+                    .await
+                    .and_then(|v| v["accountUuid"].as_str().map(str::to_owned));
+                    let n = me.import_cswap(&mut inner, &home, live_uuid.as_deref());
+                    inner.file.cswap_imported = true;
+                    if n > 0 {
+                        eprintln!("nido: {n} cuentas de Claude traídas de cswap");
+                    }
+                    me.save(&inner);
+                }
+            }
+            loop {
+                me.pass().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = me.kick.notified() => {}
+                }
+            }
+        });
+    }
+
+    pub fn view(&self) -> View {
+        self.view.lock().expect("vista").clone()
+    }
+
+    fn save(&self, inner: &Inner) {
+        let res = (|| {
+            if let Some(dir) = self.file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            write_atomic(&self.file, &serde_json::to_vec_pretty(&inner.file)?)
+        })();
+        if let Err(e) = res {
+            eprintln!("nido: no se pudo guardar {}: {e}", self.file.display());
         }
     }
-}
 
-async fn refresh(data: Arc<std::sync::Mutex<CacheInner>>, running: Arc<Mutex<()>>) {
-    let _one = running.lock().await;
-    if data.lock().unwrap().fresh() {
-        return; // lo acaba de traer otro
+    fn creds_path(&self, number: u32) -> PathBuf {
+        self.creds_dir.join(format!("{number}.json"))
     }
-    let res = run_cswap().await;
-    let mut c = data.lock().unwrap();
-    match res {
-        Ok(a) => {
-            c.good = Some((Instant::now(), a));
-            c.error = None;
+
+    fn load_creds(&self, number: u32) -> Option<Value> {
+        let raw = std::fs::read(self.creds_path(number)).ok()?;
+        serde_json::from_slice::<Value>(&raw).ok().filter(Value::is_object)
+    }
+
+    fn save_creds(&self, number: u32, oauth: &Value) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.creds_dir)?;
+        crate::sys::private_dir(&self.creds_dir)?;
+        write_atomic(&self.creds_path(number), &serde_json::to_vec(oauth)?)
+    }
+
+    /// La cuenta que usa Claude ahora (por su identidad en `~/.claude.json`) y su credencial.
+    async fn live_now(&self) -> (Option<Value>, Option<Value>) {
+        let live = self.live.clone();
+        blocking(move || (live.read_identity(), live.read_oauth().ok().flatten())).await
+    }
+
+    /// Una pasada: apunta la cuenta activa si es nueva y mide las que tocan.
+    async fn pass(&self) {
+        let (identity, live_oauth) = self.live_now().await;
+        let active_uuid = identity
+            .as_ref()
+            .and_then(|v| v["accountUuid"].as_str())
+            .map(str::to_owned);
+        let numbers: Vec<(u32, bool)> = {
+            let mut inner = self.inner.lock().await;
+            if let (Some(id), Some(_)) = (&identity, &live_oauth)
+                && adopt(&mut inner.file, id).is_some_and(|(_, changed)| changed)
+            {
+                self.save(&inner);
+            }
+            let now = Instant::now();
+            inner
+                .file
+                .accounts
+                .iter()
+                .map(|a| (a.number, Some(&a.uuid) == active_uuid.as_ref()))
+                .filter(|(n, _)| inner.timing.next.get(n).is_none_or(|t| *t <= now))
+                .collect()
+        };
+        for (number, active) in numbers {
+            self.measure(number, active, live_oauth.as_ref()).await;
         }
-        Err(e) => c.error = Some((Instant::now(), e)),
+        self.redraw(active_uuid.as_deref()).await;
     }
-}
 
-impl Cache {
-    /// Cambia la cuenta de `~/.claude` (la de todas las sesiones sin cuenta propia) y vuelve a
-    /// pedir el uso, que ahora tiene otra cuenta activa.
+    /// Mide el uso de una cuenta (renovando antes su token si es de las guardadas).
+    async fn measure(&self, number: u32, active: bool, live_oauth: Option<&Value>) {
+        let mut inner = self.inner.lock().await;
+        let Some(acc) = inner.file.accounts.iter().find(|a| a.number == number).cloned() else {
+            return;
+        };
+        // Si se reinició nido, no volver a preguntar lo que ya se sabe.
+        if let (std::collections::hash_map::Entry::Vacant(slot), Some(at)) =
+            (inner.timing.next.entry(number), acc.usage_at)
+        {
+            let every = if active { ACTIVE_EVERY } else { OTHERS_EVERY };
+            let age = Duration::from_secs(now_s().saturating_sub(at));
+            if age < every {
+                slot.insert(Instant::now() + (every - age));
+                return;
+            }
+        }
+        let token = if active {
+            // La de Claude: se lee, nunca se renueva aquí.
+            match live_oauth.filter(|o| !expiring(o, 60_000)) {
+                Some(o) => o["accessToken"].as_str().map(str::to_owned),
+                None => {
+                    inner.timing.next.insert(number, Instant::now() + Duration::from_secs(60));
+                    return;
+                }
+            }
+        } else {
+            if acc.relogin {
+                inner.timing.next.insert(number, Instant::now() + OTHERS_EVERY);
+                return;
+            }
+            match self.fresh_token(&mut inner, number, false).await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    inner.timing.failing.insert(number, e);
+                    inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
+                    self.save(&inner);
+                    return;
+                }
+            }
+        };
+        let Some(mut token) = token else { return };
+        let mut retried = false;
+        loop {
+            match oauth::usage(&self.http, &token).await {
+                Ok(v) => {
+                    let at = now_s();
+                    let usage = oauth::parse_usage(&v, at as f64);
+                    if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == number) {
+                        if usage.is_some() {
+                            a.usage = usage;
+                            a.usage_at = Some(at);
+                        }
+                        a.relogin = false;
+                    }
+                    inner.timing.failing.remove(&number);
+                    inner.timing.backoff.remove(&number);
+                    let every = if active { ACTIVE_EVERY } else { OTHERS_EVERY };
+                    inner.timing.next.insert(number, Instant::now() + every);
+                    self.save(&inner);
+                    return;
+                }
+                Err(UsageError::RateLimited(after)) => {
+                    let prev = inner.timing.backoff.get(&number).copied();
+                    let wait = prev
+                        .map_or(AFTER_429, |p| (p * 2).min(AFTER_429_MAX))
+                        .max(Duration::from_secs(after.unwrap_or(0)));
+                    inner.timing.backoff.insert(number, wait);
+                    inner.timing.next.insert(number, Instant::now() + wait);
+                    inner.timing.failing.insert(number, "Anthropic pide esperar".into());
+                    return;
+                }
+                Err(UsageError::Unauthorized) if !active && !retried => {
+                    // El token de acceso ya no vale aunque no haya caducado: renovarlo una vez.
+                    retried = true;
+                    match self.fresh_token(&mut inner, number, true).await {
+                        Ok(t) => token = t,
+                        Err(e) => {
+                            inner.timing.failing.insert(number, e);
+                            inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
+                            self.save(&inner);
+                            return;
+                        }
+                    }
+                }
+                Err(UsageError::Unauthorized) => {
+                    // La activa: Claude la renovará. Las demás: ya se renovó y sigue sin valer.
+                    if !active {
+                        if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == number) {
+                            a.relogin = true;
+                        }
+                        self.save(&inner);
+                    }
+                    inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
+                    return;
+                }
+                Err(UsageError::Other(e)) => {
+                    inner.timing.failing.insert(number, e);
+                    inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// El token de acceso de una cuenta guardada (no la activa), renovándolo si va a caducar (o
+    /// si `force`). Lo renovado se guarda antes de usarlo: el token de renovación viejo deja de
+    /// valer.
+    async fn fresh_token(&self, inner: &mut Inner, number: u32, force: bool) -> Result<String, String> {
+        let Some(mut creds) = self.load_creds(number) else {
+            set_relogin(inner, number, true);
+            return Err("no hay sesión guardada de esta cuenta".into());
+        };
+        if !force && !expiring(&creds, EXPIRY_MARGIN_MS) {
+            return creds["accessToken"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "la sesión guardada está incompleta".into());
+        }
+        let Some(refresh) = creds["refreshToken"].as_str().map(str::to_owned) else {
+            set_relogin(inner, number, true);
+            return Err("la sesión guardada no se puede renovar".into());
+        };
+        match oauth::refresh(&self.http, &refresh).await {
+            Ok(t) => {
+                t.apply(&mut creds);
+                self.save_creds(number, &creds)
+                    .map_err(|e| format!("no se pudo guardar la sesión renovada: {e}"))?;
+                set_relogin(inner, number, false);
+                Ok(t.access_token)
+            }
+            Err(RefreshError::Dead) => {
+                set_relogin(inner, number, true);
+                Err("la sesión ha caducado: hay que volver a entrar".into())
+            }
+            Err(RefreshError::Transient(e)) => Err(format!("no se pudo renovar la sesión: {e}")),
+        }
+    }
+
+    /// Rehace la vista para la web.
+    async fn redraw(&self, active_uuid: Option<&str>) {
+        let inner = self.inner.lock().await;
+        let now = now_s();
+        let mut accounts: Vec<Account> = inner
+            .file
+            .accounts
+            .iter()
+            .map(|a| {
+                let active = Some(a.uuid.as_str()) == active_uuid;
+                let age = a.usage_at.map(|t| now.saturating_sub(t));
+                let fresh = age.is_some_and(|s| s <= FRESH_S);
+                let status = if a.relogin && !active {
+                    "relogin_required"
+                } else if a.usage.is_some() && !fresh {
+                    "unavailable"
+                } else {
+                    "ok"
+                };
+                Account {
+                    number: a.number,
+                    email: Some(a.email.clone()),
+                    alias: a.alias.clone(),
+                    organization: a.organization.clone(),
+                    active,
+                    disabled: false,
+                    status: Some(status.into()),
+                    usage: if fresh { a.usage.clone() } else { None },
+                    age_s: if fresh { age.map(|s| s as f64) } else { None },
+                    last_good: if fresh { None } else { a.usage.clone() },
+                    last_good_age_s: if fresh { None } else { age.map(|s| s as f64) },
+                }
+            })
+            .collect();
+        accounts.sort_by_key(|a| a.number);
+        let age_s = inner
+            .file
+            .accounts
+            .iter()
+            .find(|a| Some(a.uuid.as_str()) == active_uuid)
+            .and_then(|a| a.usage_at)
+            .map(|t| now.saturating_sub(t));
+        *self.view.lock().expect("vista") = View { accounts, age_s, error: None, installed: true };
+    }
+
+    fn find<'a>(file: &'a SavedFile, target: &str) -> Option<&'a Saved> {
+        let t = target.trim();
+        if let Ok(n) = t.parse::<u32>() {
+            return file.accounts.iter().find(|a| a.number == n);
+        }
+        file.accounts
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(t) || a.alias.as_deref() == Some(t))
+    }
+
+    /// Pasa Claude (`~/.claude`, el de todas las sesiones) a otra cuenta.
     pub async fn switch(&self, target: &str) -> Result<Switched, String> {
         if !valid_target(target) {
             return Err("cuenta no válida".into());
         }
-        let res = {
-            // Que no coincida con una lectura de la lista.
-            let _one = self.running.lock().await;
-            let out = cswap(&["switch", target, "--json"], SWITCH_TIMEOUT).await;
-            let mut c = self.data.lock().unwrap();
-            c.good = c.good.take().map(|(_, a)| (Instant::now() - CACHE, a));
-            c.error = None;
-            out.and_then(|o| parse_switch(&o))
-        };
-        tokio::spawn(refresh(self.data.clone(), self.running.clone()));
-        res
+        let (identity, _) = self.live_now().await;
+        let cur_uuid = identity.as_ref().and_then(|v| v["accountUuid"].as_str()).map(str::to_owned);
+        let mut inner = self.inner.lock().await;
+        let to = Self::find(&inner.file, target).cloned().ok_or("no hay ninguna cuenta así")?;
+        let from = cur_uuid
+            .as_deref()
+            .and_then(|u| inner.file.accounts.iter().find(|a| a.uuid == u))
+            .cloned();
+        if from.as_ref().is_some_and(|f| f.number == to.number) {
+            return Ok(Switched {
+                switched: false,
+                from: Some(to.reference()),
+                to: Some(to.reference()),
+                message: Some(format!("La cuenta {} ya es la activa.", to.number)),
+                warnings: vec![],
+            });
+        }
+        if to.relogin {
+            return Err(format!(
+                "la sesión guardada de la cuenta {} ya no vale: vuelve a entrar en ella",
+                to.number
+            ));
+        }
+        // Antes de tocar nada de Claude: que la sesión de destino valga (renovarla si toca).
+        self.fresh_token(&mut inner, to.number, false).await.inspect_err(|_| self.save(&inner))?;
+        let creds = self.load_creds(to.number).ok_or("no hay sesión guardada de esa cuenta")?;
+        let live = self.live.clone();
+        let identity_to = to.identity.clone();
+        let old = blocking(move || -> std::io::Result<Option<Value>> {
+            let old = live.swap_oauth(&creds)?;
+            live.write_identity(&identity_to)?;
+            Ok(old)
+        })
+        .await
+        .map_err(|e| format!("no se pudo cambiar la cuenta de Claude: {e}"))?;
+        let mut warnings = Vec::new();
+        // La sesión que tenía Claude es la más reciente de la cuenta que deja: se guarda.
+        match (&from, old) {
+            (Some(f), Some(old)) => {
+                if let Err(e) = self.save_creds(f.number, &old) {
+                    warnings.push(format!("no se pudo guardar la sesión de la cuenta {}: {e}", f.number));
+                }
+            }
+            (None, Some(old)) if identity.is_some() => {
+                // Una cuenta que no estaba apuntada (entró con `claude /login`): se apunta.
+                let n = adopt(&mut inner.file, identity.as_ref().expect("identidad"));
+                if let Some((n, _)) = n {
+                    let _ = self.save_creds(n, &old);
+                }
+            }
+            _ => {}
+        }
+        if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == to.number) {
+            a.relogin = false;
+        }
+        // Las dos cuentas cambian de ritmo: medirlas ya.
+        inner.timing.next.remove(&to.number);
+        if let Some(f) = &from {
+            inner.timing.next.remove(&f.number);
+        }
+        self.save(&inner);
+        drop(inner);
+        self.kick.notify_one();
+        Ok(Switched {
+            switched: true,
+            from: from.map(|f| f.reference()),
+            to: Some(to.reference()),
+            message: None,
+            warnings,
+        })
     }
 
-    /// Si lo guardado es viejo se pide de nuevo; mientras, si hay algo, se devuelve eso (cswap
-    /// puede tardar decenas de segundos si tiene que preguntar a la API).
-    pub async fn get(&self) -> View {
-        let (fresh, have) = {
-            let c = self.data.lock().unwrap();
-            (c.fresh(), c.good.is_some())
+    /// Empieza a entrar en una cuenta: el enlace que hay que abrir.
+    pub fn login_start(&self, hint: Option<&str>) -> (String, String) {
+        let s = oauth::start(hint);
+        let mut logins = self.logins.lock().expect("entradas");
+        logins.retain(|_, p| p.at.elapsed() < LOGIN_TTL);
+        if logins.len() >= 8
+            && let Some(k) = logins.iter().min_by_key(|(_, p)| p.at).map(|(k, _)| k.clone())
+        {
+            logins.remove(&k);
+        }
+        logins.insert(s.state.clone(), Pending { verifier: s.verifier, at: Instant::now() });
+        (s.url, s.state)
+    }
+
+    /// Acaba de entrar con el código que enseñó la página. Si la cuenta ya estaba, se le pone la
+    /// sesión nueva (y, si es la activa, también a Claude).
+    pub async fn login_finish(&self, state: Option<&str>, pasted: &str) -> Result<LoggedIn, String> {
+        let (code, pasted_state) = oauth::parse_pasted(pasted)?;
+        let state = match (pasted_state, state) {
+            (Some(p), Some(s)) if p != s => {
+                return Err("ese código es de otro inicio de sesión: abre el enlace de este".into());
+            }
+            (Some(p), _) => p,
+            (None, Some(s)) => s.to_owned(),
+            (None, None) => return Err("falta el final del código (lo que va tras «#»): cópialo entero".into()),
         };
-        if !fresh {
-            let job = refresh(self.data.clone(), self.running.clone());
-            if have {
-                tokio::spawn(job);
-            } else {
-                job.await;
+        let pending = self
+            .logins
+            .lock()
+            .expect("entradas")
+            .remove(&state)
+            .filter(|p| p.at.elapsed() < LOGIN_TTL)
+            .ok_or("ese inicio de sesión ya no vale (caducó o ya se usó): vuelve a empezar")?;
+        let tokens = oauth::exchange(&self.http, &code, &state, &pending.verifier).await?;
+        let profile = oauth::profile(&self.http, &tokens.access_token).await?;
+        let identity = oauth::identity(&profile, &tokens).ok_or("Claude no dice de quién es la cuenta")?;
+        let creds = oauth::credential(&tokens, &profile);
+        let uuid = identity["accountUuid"].as_str().unwrap_or_default().to_owned();
+        let org = identity["organizationUuid"].as_str().map(str::to_owned);
+        let email = identity["emailAddress"].as_str().unwrap_or_default().to_owned();
+
+        let (live_identity, live_oauth) = self.live_now().await;
+        let live_uuid = live_identity.as_ref().and_then(|v| v["accountUuid"].as_str()).map(str::to_owned);
+        let mut inner = self.inner.lock().await;
+        let existing = inner.file.accounts.iter().position(|a| a.is(&uuid, org.as_deref()));
+        let number = match existing {
+            Some(i) => inner.file.accounts[i].number,
+            None => inner.file.accounts.iter().map(|a| a.number).max().unwrap_or(0) + 1,
+        };
+        let entry = Saved {
+            number,
+            email: email.clone(),
+            uuid: uuid.clone(),
+            org_uuid: org.clone(),
+            organization: identity["organizationName"].as_str().map(str::to_owned),
+            alias: existing.and_then(|i| inner.file.accounts[i].alias.clone()),
+            identity: identity.clone(),
+            relogin: false,
+            usage: existing.and_then(|i| inner.file.accounts[i].usage.clone()),
+            usage_at: existing.and_then(|i| inner.file.accounts[i].usage_at),
+        };
+        match existing {
+            Some(i) => inner.file.accounts[i] = entry,
+            None => inner.file.accounts.push(entry),
+        }
+        // Activa si es la que usa Claude o si Claude no tiene ninguna.
+        let active = live_uuid.as_deref() == Some(uuid.as_str()) || live_oauth.is_none();
+        let result = if active {
+            let live = self.live.clone();
+            let (c, id) = (creds.clone(), identity.clone());
+            blocking(move || -> std::io::Result<()> {
+                live.swap_oauth(&c)?;
+                live.write_identity(&id)
+            })
+            .await
+            .map_err(|e| format!("no se pudo poner la sesión a Claude: {e}"))
+        } else {
+            Ok(())
+        };
+        // Guardada también: si luego se cambia de cuenta, la de Claude la sustituye.
+        let saved = self.save_creds(number, &creds).map_err(|e| format!("no se pudo guardar la sesión: {e}"));
+        inner.timing.next.remove(&number);
+        self.save(&inner);
+        drop(inner);
+        result?;
+        saved?;
+        self.kick.notify_one();
+        Ok(LoggedIn { number, email, new: existing.is_none(), active })
+    }
+
+    /// Olvida una cuenta guardada (no la activa).
+    pub async fn remove(&self, number: u32) -> Result<(), String> {
+        let (identity, _) = self.live_now().await;
+        let live_uuid = identity.as_ref().and_then(|v| v["accountUuid"].as_str()).map(str::to_owned);
+        let mut inner = self.inner.lock().await;
+        let i = inner
+            .file
+            .accounts
+            .iter()
+            .position(|a| a.number == number)
+            .ok_or("no hay ninguna cuenta así")?;
+        if Some(&inner.file.accounts[i].uuid) == live_uuid.as_ref() {
+            return Err("es la que usa Claude ahora: cambia antes a otra".into());
+        }
+        inner.file.accounts.remove(i);
+        let _ = std::fs::remove_file(self.creds_path(number));
+        self.save(&inner);
+        drop(inner);
+        self.redraw(live_uuid.as_deref()).await;
+        Ok(())
+    }
+
+    /// Las cuentas de cswap (claude-swap): sus números, identidades y sesiones guardadas. La
+    /// activa no: su sesión buena es la de Claude.
+    fn import_cswap(&self, inner: &mut Inner, home: &Path, live_uuid: Option<&str>) -> usize {
+        let Some(root) = cswap_root(home) else { return 0 };
+        let Ok(raw) = std::fs::read(root.join("sequence.json")) else { return 0 };
+        let Ok(seq) = serde_json::from_slice::<Value>(&raw) else { return 0 };
+        let mut n = 0;
+        for (num, info) in seq["accounts"].as_object().into_iter().flatten() {
+            let (Ok(number), Some(email), Some(uuid)) =
+                (num.parse::<u32>(), info["email"].as_str(), info["uuid"].as_str())
+            else {
+                continue;
+            };
+            let org = info["organizationUuid"].as_str();
+            if inner.file.accounts.iter().any(|a| a.number == number || a.is(uuid, org)) {
+                continue;
+            }
+            let identity = std::fs::read(root.join("configs").join(format!(".claude-config-{number}-{email}.json")))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|mut v| v.get_mut("oauthAccount").map(Value::take))
+                .filter(|v| v["accountUuid"].as_str() == Some(uuid))
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "accountUuid": uuid,
+                        "emailAddress": email,
+                        "organizationUuid": org,
+                        "organizationName": info["organizationName"],
+                    })
+                });
+            let mut relogin = false;
+            if live_uuid != Some(uuid) {
+                match cswap_creds(&root, number, email) {
+                    Some(c) => {
+                        if let Err(e) = self.save_creds(number, &c) {
+                            eprintln!("nido: no se pudo guardar la sesión de la cuenta {number}: {e}");
+                            relogin = true;
+                        }
+                    }
+                    None => relogin = true,
+                }
+            }
+            inner.file.accounts.push(Saved {
+                number,
+                email: email.to_owned(),
+                uuid: uuid.to_owned(),
+                org_uuid: org.map(str::to_owned),
+                organization: info["organizationName"].as_str().map(str::to_owned),
+                alias: info["alias"].as_str().map(str::to_owned),
+                identity,
+                relogin,
+                usage: None,
+                usage_at: None,
+            });
+            n += 1;
+        }
+        n
+    }
+}
+
+
+fn set_relogin(inner: &mut Inner, number: u32, v: bool) {
+    if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == number) {
+        a.relogin = v;
+    }
+}
+
+/// La credencial caduca dentro de menos de `margin_ms` (o no dice cuándo).
+fn expiring(oauth: &Value, margin_ms: u64) -> bool {
+    oauth["expiresAt"]
+        .as_u64()
+        .is_none_or(|t| t <= oauth::now_ms() + margin_ms)
+}
+
+/// Apunta la cuenta de esta identidad si no estaba (o le pone la identidad al día). Devuelve su
+/// número y si algo ha cambiado.
+fn adopt(file: &mut SavedFile, identity: &Value) -> Option<(u32, bool)> {
+    let uuid = identity["accountUuid"].as_str()?;
+    let org = identity["organizationUuid"].as_str();
+    if let Some(a) = file.accounts.iter_mut().find(|a| a.is(uuid, org)) {
+        // Claude completa la identidad con el tiempo: quedarse con la suya.
+        let changed = a.identity != *identity;
+        if changed {
+            a.identity = identity.clone();
+            if let Some(e) = identity["emailAddress"].as_str() {
+                a.email = e.to_owned();
+            }
+            if let Some(o) = identity["organizationName"].as_str() {
+                a.organization = Some(o.to_owned());
             }
         }
-        self.data.lock().unwrap().view()
+        return Some((a.number, changed));
     }
+    let number = file.accounts.iter().map(|a| a.number).max().unwrap_or(0) + 1;
+    file.accounts.push(Saved {
+        number,
+        email: identity["emailAddress"].as_str().unwrap_or_default().to_owned(),
+        uuid: uuid.to_owned(),
+        org_uuid: org.map(str::to_owned),
+        organization: identity["organizationName"].as_str().map(str::to_owned),
+        alias: None,
+        identity: identity.clone(),
+        relogin: false,
+        usage: None,
+        usage_at: None,
+    });
+    Some((number, true))
+}
+
+fn cswap_root(home: &Path) -> Option<PathBuf> {
+    let xdg = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"));
+    [xdg.join("claude-swap"), home.join(".claude-swap-backup")]
+        .into_iter()
+        .find(|d| d.join("sequence.json").is_file())
+}
+
+/// La sesión guardada de una cuenta de cswap: un fichero en base64 o, en macOS, el llavero.
+fn cswap_creds(root: &Path, number: u32, email: &str) -> Option<Value> {
+    use base64::Engine;
+    let from_json = |raw: &str| -> Option<Value> {
+        let mut v: Value = serde_json::from_str(raw).ok()?;
+        v.get_mut("claudeAiOauth").map(Value::take).filter(Value::is_object)
+    };
+    let enc = root.join("credentials").join(format!(".creds-{number}-{email}.enc"));
+    if let Ok(b) = std::fs::read_to_string(&enc) {
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b.trim()).ok()?;
+        return from_json(&String::from_utf8(decoded).ok()?);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-a", &format!("account-{number}-{email}"), "-s", "claude-swap", "-w"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if out.status.success() {
+            return from_json(String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'));
+        }
+    }
+    None
+}
+
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(f).await.expect("tarea de fondo")
 }
 
 #[cfg(test)]
@@ -276,67 +838,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keeps_only_known_fields() {
-        let json = r#"{"schemaVersion":1,"activeAccountNumber":7,"accounts":[
-            {"number":7,"email":"a@b.c","organizationName":"Org","organizationUuid":"x","active":true,
-             "usageStatus":"ok","usageAgeSeconds":10.4,
-             "usage":{"fiveHour":{"pct":17.0,"resetsAt":"r5","countdown":"3h","clock":"20:09"},
-                      "sevenDay":{"pct":76.0,"resetsAt":"r7","expectedPct":18.3,"aheadOfPace":true,"willLastToReset":false},
-                      "scoped":[{"name":"Fable","pct":53.0,"resetsAt":"r7"}]}},
-            {"number":3,"email":"d@e.f","usageStatus":"token_expired","usage":null,"disabled":true,
-             "lastGoodUsage":{"fiveHour":{"pct":1.0,"resetsAt":null},"sevenDay":null},"lastGoodAgeSeconds":900}],
-            "unclaimedCredentials":["secreto"]}"#;
-        let a = parse(json).unwrap();
-        assert_eq!(a.accounts.len(), 2);
-        let first = &a.accounts[0];
-        assert!(first.active);
-        assert_eq!(first.organization.as_deref(), Some("Org"));
-        let u = first.usage.as_ref().unwrap();
-        assert_eq!(u.seven_day.as_ref().unwrap().ahead_of_pace, Some(true));
-        assert_eq!(u.models[0].name.as_deref(), Some("Fable"));
-        let second = &a.accounts[1];
-        assert!(second.disabled && second.usage.is_none());
-        assert_eq!(
-            second
-                .last_good
-                .as_ref()
-                .unwrap()
-                .five_hour
-                .as_ref()
-                .unwrap()
-                .pct,
-            Some(1.0)
-        );
-        let out = serde_json::to_string(&a).unwrap();
-        assert!(!out.contains("secreto") && !out.contains("organizationUuid"));
-        assert!(out.contains("\"five_hour\"") && out.contains("\"ahead_of_pace\":true"));
+    fn targets() {
+        assert!(valid_target("3"));
+        assert!(valid_target("ana@example.com"));
+        assert!(!valid_target("-3"));
+        assert!(!valid_target("a b"));
+        assert!(!valid_target(""));
     }
 
     #[test]
-    fn switch_result_and_targets() {
-        let r = parse_switch(
-            r#"{"schemaVersion":1,"switched":true,"from":{"number":7,"email":"a@b.c"},
-               "to":{"number":3,"email":"d@e.f"},"strategy":"explicit","reason":"switched",
-               "message":"Switched to Account-3 (d@e.f)","warnings":[]}"#,
+    fn adopt_adds_once_and_keeps_numbers() {
+        let mut f = SavedFile::default();
+        f.accounts.push(Saved { number: 7, uuid: "u7".into(), email: "x@example.com".into(), ..Default::default() });
+        let id = serde_json::json!({"accountUuid": "u1", "emailAddress": "ana@example.com", "organizationUuid": "o1"});
+        assert_eq!(adopt(&mut f, &id), Some((8, true)));
+        assert_eq!(adopt(&mut f, &id), Some((8, false)));
+        assert_eq!(f.accounts.len(), 2);
+        let id7 = serde_json::json!({"accountUuid": "u7", "emailAddress": "nuevo@example.com"});
+        assert_eq!(adopt(&mut f, &id7), Some((7, true)));
+        assert_eq!(f.accounts[0].email, "nuevo@example.com");
+    }
+
+    #[test]
+    fn imports_cswap_accounts() {
+        use base64::Engine;
+        let home = std::env::temp_dir().join(format!("nido-cswap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join(".claude-swap-backup");
+        std::fs::create_dir_all(root.join("configs")).unwrap();
+        std::fs::create_dir_all(root.join("credentials")).unwrap();
+        std::fs::write(
+            root.join("sequence.json"),
+            r#"{"accounts":{"2":{"email":"ana@example.com","uuid":"u2","organizationUuid":"o2","organizationName":"Ana"},
+                            "5":{"email":"luis@example.com","uuid":"u5","organizationUuid":"o5"}}}"#,
         )
         .unwrap();
-        assert!(r.switched);
-        assert_eq!(r.to.unwrap().number, 3);
-        assert!(
-            parse_switch(r#"{"schemaVersion":1,"error":{"message":"No account found"}}"#).is_err()
-        );
-        for ok in ["3", "a.b+c@d-e.com", "dev_1"] {
-            assert!(valid_target(ok), "{ok}");
-        }
-        for bad in ["", "-h", "--force", "3 4", "a;b", "$(x)"] {
-            assert!(!valid_target(bad), "{bad}");
-        }
-    }
-
-    #[test]
-    fn reports_cswap_errors() {
-        let e = parse(r#"{"schemaVersion":1,"error":{"code":"x","message":"sin cuentas"}}"#);
-        assert_eq!(e.unwrap_err(), "cswap: sin cuentas");
-        assert!(parse("Traceback…").is_err());
+        std::fs::write(
+            root.join("configs/.claude-config-2-ana@example.com.json"),
+            r#"{"theme":"x","oauthAccount":{"accountUuid":"u2","emailAddress":"ana@example.com","displayName":"Ana"}}"#,
+        )
+        .unwrap();
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"claudeAiOauth":{"accessToken":"a2","refreshToken":"r2","expiresAt":1}}"#);
+        std::fs::write(root.join("credentials/.creds-2-ana@example.com.enc"), creds).unwrap();
+        let data = home.join("data");
+        let acc = Accounts::new(&home, &data);
+        let mut inner = Inner { file: SavedFile::default(), timing: Timing::default() };
+        // La 5 es la activa: sin sesión guardada, pero apuntada.
+        assert_eq!(acc.import_cswap(&mut inner, &home, Some("u5")), 2);
+        let two = inner.file.accounts.iter().find(|a| a.number == 2).unwrap();
+        assert_eq!(two.identity["displayName"], "Ana");
+        assert!(!two.relogin);
+        assert_eq!(acc.load_creds(2).unwrap()["refreshToken"], "r2");
+        let five = inner.file.accounts.iter().find(|a| a.number == 5).unwrap();
+        assert!(!five.relogin);
+        assert!(acc.load_creds(5).is_none());
+        // Una segunda vez no repite nada.
+        assert_eq!(acc.import_cswap(&mut inner, &home, Some("u5")), 0);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

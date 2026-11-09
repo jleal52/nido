@@ -32,8 +32,8 @@ pub struct AppState {
     pub refresh: Notify,
     /// Último estado de Claude visto en cada sesión, para notar cuándo termina de trabajar.
     last_status: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
-    /// Uso de las cuentas de cswap (con caché).
-    accounts: accounts::Cache,
+    /// Las cuentas de Claude de este equipo y su uso.
+    accounts: Arc<accounts::Accounts>,
     /// Contestar un menú de Claude es teclear paso a paso: de uno en uno.
     answering: Mutex<()>,
     /// Lo que cada sesión de Claude tiene en segundo plano (subagentes, órdenes), según su
@@ -183,6 +183,7 @@ impl AppState {
                 group.add_device(&k, &p.name);
             }
         }
+        let accounts = accounts::Accounts::new(&paths.home, &paths.data);
         Ok(Arc::new(Self {
             paths,
             launcher,
@@ -193,7 +194,7 @@ impl AppState {
             views: watch::Sender::new(Listing::default()),
             refresh: Notify::new(),
             last_status: Default::default(),
-            accounts: Default::default(),
+            accounts,
             answering: Mutex::new(()),
             background: Default::default(),
             finished_pushed: Default::default(),
@@ -340,7 +341,7 @@ fn runs_claude_directly(argv: &[String]) -> bool {
     argv.first().is_some_and(|a| {
         let name = a.rsplit(['/', '\\']).next().unwrap_or(a).to_ascii_lowercase();
         let name = name.strip_suffix(".exe").unwrap_or(&name);
-        matches!(name, "claude" | "cswap")
+        name == "claude"
     })
 }
 
@@ -676,11 +677,8 @@ pub fn spawn_scanner(state: Arc<AppState>) {
     }
     // La conexión con el hub (si hay uno configurado).
     hub::spawn(state.hub.clone(), state.clone());
-    // El uso de las cuentas, pedido ya: la primera vez cswap puede tardar decenas de segundos.
-    let warm = state.clone();
-    tokio::spawn(async move {
-        warm.accounts.get().await;
-    });
+    // Las cuentas de Claude: lo que gasta cada una, mirado de vez en cuando.
+    state.accounts.spawn(state.paths.home.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -699,6 +697,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/info", get(api_info))
         .route("/api/v1/accounts", get(api_accounts))
         .route("/api/v1/accounts/switch", post(api_switch_account))
+        .route("/api/v1/accounts/login", post(api_login_start))
+        .route("/api/v1/accounts/login/finish", post(api_login_finish))
+        .route("/api/v1/accounts/{number}", axum::routing::delete(api_remove_account))
         .route("/api/v1/e2e", get(ws_e2e))
         .route("/api/v1/pair", post(api_pair))
         .route("/api/v1/group", get(api_group))
@@ -767,7 +768,49 @@ async fn api_info(State(st): State<Arc<AppState>>) -> Response {
 }
 
 async fn api_accounts(State(st): State<Arc<AppState>>) -> Response {
-    Json(st.accounts.get().await).into_response()
+    Json(st.accounts.view()).into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginStartReq {
+    /// Para volver a entrar en una cuenta: su correo (la página de Claude ya lo trae puesto).
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// Empieza a entrar en una cuenta de Claude: el enlace que hay que abrir (en cualquier
+/// navegador) y el estado para acabar con el código que enseñe la página.
+async fn api_login_start(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<LoginStartReq>>,
+) -> Response {
+    let hint = body.and_then(|Json(b)| b.email).filter(|e| accounts::valid_target(e));
+    let (url, state) = st.accounts.login_start(hint.as_deref());
+    Json(serde_json::json!({ "url": url, "state": state })).into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginFinishReq {
+    #[serde(default)]
+    state: Option<String>,
+    code: String,
+}
+
+async fn api_login_finish(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<LoginFinishReq>,
+) -> Response {
+    match st.accounts.login_finish(req.state.as_deref(), &req.code).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_remove_account(State(st): State<Arc<AppState>>, Path(number): Path<u32>) -> Response {
+    match st.accounts.remove(number).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
+    }
 }
 
 /// Cómo va la conexión con el hub.
@@ -873,8 +916,6 @@ struct CreateRequest {
     /// Orden y argumentos; vacía o ausente: Claude.
     #[serde(default)]
     command: Vec<String>,
-    /// Cuenta de cswap para Claude (`cswap run <cuenta> -- claude …`).
-    account: Option<String>,
     #[serde(default = "yes")]
     autostart: bool,
     /// Retomar una conversación que ya existe (importar desde tmux).
@@ -961,23 +1002,22 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
             format!("no existe la carpeta {}", cwd.display()),
         );
     }
-    let account = req.account.filter(|a| !a.trim().is_empty());
     let (argv, claude) = if let Some(sid) = req.claude_session_id {
         // Una conversación existente: el guardián la retoma (`claude --resume`).
         let link = ClaudeLink {
             session_id: sid,
             config_dir: req.config_dir,
-            account: account.clone(),
+            account: None,
             inside_shell: false,
         };
         (vec!["claude".to_owned()], Some(link))
     } else if req.command.is_empty() {
         let sid = uuid_v4();
-        let argv = claude::new_argv(&req.name, &sid, account.as_deref());
+        let argv = claude::new_argv(&req.name, &sid);
         let link = ClaudeLink {
             session_id: sid,
             config_dir: None,
-            account,
+            account: None,
             inside_shell: false,
         };
         (argv, Some(link))

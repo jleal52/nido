@@ -13,7 +13,7 @@ pub struct ClaudeLink {
     /// `CLAUDE_CONFIG_DIR` con el que corría (perfil de cswap); `None` es `~/.claude`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<PathBuf>,
-    /// Cuenta de cswap con la que se creó la sesión (`cswap run <cuenta> -- claude …`).
+    /// Cuenta de cswap con la que se creó la sesión (antiguo: ya no se crean así).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     /// Lanzado a mano dentro de una shell: al restaurar se abre la shell y se escribe en ella.

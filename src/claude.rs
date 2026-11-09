@@ -313,35 +313,19 @@ pub fn find_claude(procfs: &Procfs, root_pid: u32, home: &Path) -> Option<FoundC
     })
 }
 
-fn with_account(account: Option<&str>, claude_args: Vec<String>) -> Vec<String> {
-    let mut argv = Vec::new();
-    if let Some(acct) = account {
-        argv.extend(["cswap".into(), "run".into(), acct.to_owned(), "--".into()]);
-    }
-    argv.push("claude".into());
-    argv.extend(claude_args);
-    argv
-}
-
 /// Un Claude nuevo con la conversación ya identificada (`--session-id`) y con nombre.
-pub fn new_argv(name: &str, session_id: &str, account: Option<&str>) -> Vec<String> {
-    let args = vec![
-        "--session-id".into(),
-        session_id.into(),
-        "-n".into(),
-        name.into(),
-    ];
-    with_account(account, args)
+pub fn new_argv(name: &str, session_id: &str) -> Vec<String> {
+    ["claude", "--session-id", session_id, "-n", name]
+        .map(str::to_owned)
+        .to_vec()
 }
 
-/// Retomar la conversación con la misma cuenta. Devuelve la orden y las variables de entorno.
+/// Retomar la conversación. Devuelve la orden y las variables de entorno (su perfil de Claude,
+/// si no es `~/.claude`). La cuenta es la de Claude: las sesiones con cuenta propia de cswap (ya
+/// no se crean) siguen con la de todas.
 pub fn resume_argv(link: &ClaudeLink) -> (Vec<String>, Vec<(String, String)>) {
-    let argv = with_account(
-        link.account.as_deref(),
-        vec!["--resume".into(), link.session_id.clone()],
-    );
+    let argv = vec!["claude".into(), "--resume".into(), link.session_id.clone()];
     let env = match (&link.account, &link.config_dir) {
-        // Con cuenta de cswap, el perfil lo pone cswap.
         (None, Some(dir)) => vec![(
             "CLAUDE_CONFIG_DIR".into(),
             dir.to_string_lossy().into_owned(),
@@ -491,22 +475,8 @@ mod tests {
     #[test]
     fn launch_and_resume_commands() {
         assert_eq!(
-            new_argv("proyecto", "u-1", None),
+            new_argv("proyecto", "u-1"),
             ["claude", "--session-id", "u-1", "-n", "proyecto"]
-        );
-        assert_eq!(
-            new_argv("proyecto", "u-1", Some("2")),
-            [
-                "cswap",
-                "run",
-                "2",
-                "--",
-                "claude",
-                "--session-id",
-                "u-1",
-                "-n",
-                "proyecto"
-            ]
         );
         let link = ClaudeLink {
             session_id: "u-1".into(),
@@ -532,9 +502,6 @@ mod tests {
             ..link
         };
         assert_eq!(resume_argv(&with_acct).1, []);
-        assert_eq!(
-            resume_line(&with_acct),
-            "cswap run a@b.c -- claude --resume u-1"
-        );
+        assert_eq!(resume_line(&with_acct), "claude --resume u-1");
     }
 }

@@ -70,8 +70,12 @@ enum PhonesCmd {
 
 #[derive(Subcommand)]
 enum AccountsCmd {
-    /// Pasa todas las sesiones sin cuenta propia a esta cuenta (número, correo o alias).
+    /// Pasa Claude (todas las sesiones) a esta cuenta (número, correo o alias).
     Use { account: String },
+    /// Entrar en una cuenta de Claude nueva, o volver a entrar en una (con su número o correo).
+    Login { account: Option<String> },
+    /// Olvidar una cuenta guardada (no la activa).
+    Rm { number: u32 },
 }
 
 #[derive(Subcommand)]
@@ -115,7 +119,7 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<PhonesCmd>,
     },
-    /// Cuentas de Claude (cswap) y lo que lleva gastado cada una.
+    /// Cuentas de Claude y lo que lleva gastado cada una.
     Accounts {
         #[command(subcommand)]
         action: Option<AccountsCmd>,
@@ -126,9 +130,6 @@ enum Cmd {
         /// Carpeta (por defecto, la actual).
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// Cuenta de cswap para Claude.
-        #[arg(long)]
-        account: Option<String>,
         /// No reabrirla al arrancar el equipo.
         #[arg(long)]
         no_autostart: bool,
@@ -555,6 +556,52 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                 );
             }
         }
+        Cmd::Accounts {
+            action: Some(AccountsCmd::Login { account }),
+        } => {
+            // Volver a entrar: el correo de esa cuenta, para que la página ya lo traiga.
+            let email = match &account {
+                Some(a) => {
+                    let v = api.call("GET", "/api/v1/accounts", None)?;
+                    let found = v["accounts"].as_array().into_iter().flatten().find(|x| {
+                        a.parse::<u64>().ok() == x["number"].as_u64() || x["email"].as_str() == Some(a.as_str())
+                    });
+                    match found {
+                        Some(x) => x["email"].as_str().map(str::to_owned),
+                        None => return Err(std::io::Error::other(format!("no hay ninguna cuenta «{a}»"))),
+                    }
+                }
+                None => None,
+            };
+            let r = api.call(
+                "POST",
+                "/api/v1/accounts/login",
+                Some(&serde_json::json!({ "email": email })),
+            )?;
+            println!("Abre esta dirección en un navegador y entra en la cuenta de Claude:\n");
+            println!("  {}\n", r["url"].as_str().unwrap_or_default());
+            println!("Al acabar, la página enseña un código. Pégalo aquí:");
+            let mut code = String::new();
+            std::io::stdin().read_line(&mut code)?;
+            let done = api.call(
+                "POST",
+                "/api/v1/accounts/login/finish",
+                Some(&serde_json::json!({ "state": r["state"], "code": code.trim() })),
+            )?;
+            println!(
+                "{} {} ({}){}.",
+                if done["new"] == true { "Añadida la cuenta" } else { "Sesión renovada en la cuenta" },
+                done["number"],
+                done["email"].as_str().unwrap_or_default(),
+                if done["active"] == true { ", que es la que usa Claude" } else { "" }
+            );
+        }
+        Cmd::Accounts {
+            action: Some(AccountsCmd::Rm { number }),
+        } => {
+            api.call("DELETE", &format!("/api/v1/accounts/{number}"), None)?;
+            println!("Cuenta {number} olvidada.");
+        }
         Cmd::Accounts { action: None } => {
             let v = api.call("GET", "/api/v1/accounts", None)?;
             if let Some(e) = v["error"].as_str() {
@@ -586,7 +633,9 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                 }
                 match a["status"].as_str() {
                     Some("ok") | None => {}
-                    Some("token_expired") => notes.push("sesión caducada".to_owned()),
+                    Some("token_expired" | "relogin_required") => {
+                        notes.push("hay que volver a entrar (nido accounts login N)".to_owned())
+                    }
                     Some("unavailable") => notes.push("sin datos recientes".to_owned()),
                     Some(s) => notes.push(s.to_owned()),
                 }
@@ -671,7 +720,6 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
         Cmd::New {
             name,
             cwd,
-            account,
             no_autostart,
             folder,
             command,
@@ -682,7 +730,7 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             };
             let cwd = nido::sys::canonical(&cwd);
             let body = serde_json::json!({
-                "name": name, "cwd": cwd, "account": account,
+                "name": name, "cwd": cwd,
                 "autostart": !no_autostart, "command": command, "folder": folder,
             });
             let s = api.call("POST", "/api/v1/sessions", Some(&body))?;

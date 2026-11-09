@@ -1,6 +1,7 @@
 //! nido: gestor de sesiones de terminal (sobre todo Claude Code), por web y por terminal.
 
 pub mod accounts;
+pub mod claude_store;
 #[cfg(unix)]
 pub mod attach;
 pub mod auth;
@@ -13,6 +14,7 @@ pub mod history;
 pub mod holder;
 pub mod hub;
 pub mod import;
+pub mod oauth;
 pub mod ipc;
 pub mod launch;
 pub mod prompt;

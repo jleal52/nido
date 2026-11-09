@@ -345,7 +345,7 @@ mod tests {
             argv: if inside_shell {
                 vec!["bash".into()]
             } else {
-                claude::new_argv("proyecto", "sid-1", None)
+                claude::new_argv("proyecto", "sid-1")
             },
             env: vec![],
             autostart: true,
