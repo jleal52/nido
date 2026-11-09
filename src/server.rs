@@ -170,6 +170,7 @@ impl AppState {
         let uploads = paths.state.join("uploads");
         let hub = hub::Hub::new(paths.config.join("hub.json"));
         let (alerts, alerts_rx) = tokio::sync::mpsc::unbounded_channel();
+        let paths_config_pair = paths.config.join("pair-demo.json");
         let identity = e2e::Identity::load_or_create(&paths.config.join("hub.key"))
             .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
         let phones = e2e::Phones::load(paths.data.join("phones.json"));
@@ -202,7 +203,7 @@ impl AppState {
             alerts,
             alerts_rx: std::sync::Mutex::new(Some(alerts_rx)),
             identity,
-            pairing: Default::default(),
+            pairing: e2e::Pairing::load(paths_config_pair),
             phones: std::sync::Mutex::new(phones),
             tunnel_addr: Default::default(),
             direct: Default::default(),
@@ -702,7 +703,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/accounts/login/finish", post(api_login_finish))
         .route("/api/v1/accounts/{number}", axum::routing::delete(api_remove_account))
         .route("/api/v1/e2e", get(ws_e2e))
-        .route("/api/v1/pair", post(api_pair))
+        .route("/api/v1/pair", post(api_pair).delete(api_pair_stop))
         .route("/api/v1/group", get(api_group))
         .route("/api/v1/group/invite", post(api_group_invite))
         .route("/api/v1/group/join", post(api_group_join))
@@ -1487,16 +1488,41 @@ async fn e2e_socket(socket: WebSocket, st: Arc<AppState>) {
 }
 
 /// Un QR nuevo para emparejar un teléfono (el anterior deja de valer).
-async fn api_pair(State(st): State<Arc<AppState>>) -> Response {
+#[derive(Deserialize, Default)]
+struct PairReq {
+    /// Un código reutilizable que vale estos días (para demos), en vez del QR de una vez.
+    #[serde(default)]
+    days: Option<u64>,
+}
+
+async fn api_pair(State(st): State<Arc<AppState>>, body: Option<Json<PairReq>>) -> Response {
     let direct = st.direct.get().cloned().unwrap_or_default();
     let hub = st.hub.pair_info();
-    let offer = st.pairing.offer(
-        &st.identity,
-        &direct,
-        hub.as_ref().map(|(u, id)| (u.as_str(), id.as_str())),
-    );
-    Json(serde_json::json!({ "uri": offer.uri, "expires": offer.expires, "direct": direct, "hub": hub.map(|(u, _)| u) }))
-        .into_response()
+    let hub_ref = hub.as_ref().map(|(u, id)| (u.as_str(), id.as_str()));
+    let days = body.and_then(|Json(b)| b.days);
+    let offer = match days {
+        Some(d) => match st.pairing.offer_standing(&st.identity, &direct, hub_ref, d) {
+            Ok(o) => o,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("no se pudo guardar el código: {e}")),
+        },
+        None => st.pairing.offer(&st.identity, &direct, hub_ref),
+    };
+    Json(serde_json::json!({
+        "uri": offer.uri,
+        "expires": offer.expires,
+        "reusable": days.is_some(),
+        "direct": direct,
+        "hub": hub.map(|(u, _)| u),
+    }))
+    .into_response()
+}
+
+/// Retira el código reutilizable.
+async fn api_pair_stop(State(st): State<Arc<AppState>>) -> Response {
+    match st.pairing.stop_standing() {
+        Ok(had) => Json(serde_json::json!({ "stopped": had })).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_phones(State(st): State<Arc<AppState>>) -> Response {

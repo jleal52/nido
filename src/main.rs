@@ -103,7 +103,16 @@ enum Cmd {
     /// Lista las sesiones.
     Ls,
     /// Emparejar un teléfono con la app de nido: enseña un QR para escanear (vale 10 minutos).
-    Pair,
+    Pair {
+        /// Un código reutilizable durante estos días (máx. 90), para una demostración: quien lo
+        /// tenga puede manejar este equipo. Úsalo solo en un equipo de demo.
+        #[arg(long, value_name = "DÍAS", conflicts_with = "stop")]
+        days: Option<u64>,
+        /// Retira el código reutilizable (los dispositivos emparejados con él se quitan con
+        /// `nido phones rm`).
+        #[arg(long)]
+        stop: bool,
+    },
     /// El hub: para usar la app sin VPN y recibir avisos. Sin más, cómo va.
     Hub {
         #[command(subcommand)]
@@ -397,8 +406,20 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             .ok_or_else(|| io::Error::other(format!("no hay ninguna sesión {name:?}")))
     };
     match cmd {
-        Cmd::Pair => {
-            let r = api.call("POST", "/api/v1/pair", None)?;
+        Cmd::Pair { stop: true, .. } => {
+            let r = api.call("DELETE", "/api/v1/pair", None)?;
+            println!(
+                "{}",
+                if r["stopped"] == true {
+                    "Código reutilizable retirado. Los dispositivos ya emparejados siguen: `nido phones` y `nido phones rm <id>`."
+                } else {
+                    "No había ningún código reutilizable."
+                }
+            );
+        }
+        Cmd::Pair { days, .. } => {
+            let body = days.map(|d| serde_json::json!({ "days": d }));
+            let r = api.call("POST", "/api/v1/pair", body.as_ref())?;
             let uri = r["uri"].as_str().unwrap_or_default();
             let qr = qrcode::QrCode::new(uri.as_bytes()).map_err(io::Error::other)?;
             println!(
@@ -408,7 +429,19 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                     .light_color(qrcode::render::unicode::Dense1x2::Dark)
                     .build()
             );
-            println!("Escanéalo con la app de nido (Emparejar). Vale 10 minutos y una sola vez.");
+            if r["reusable"] == true {
+                let days = (r["expires"].as_u64().unwrap_or(0).saturating_sub(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                ) + 3_599)
+                    / 86_400;
+                println!(
+                    "Código REUTILIZABLE: vale para cualquier número de dispositivos durante {days} días.\nQuien lo tenga puede manejar este equipo. Retíralo con `nido pair --stop`."
+                );
+            } else {
+                println!("Escanéalo con la app de nido (Emparejar). Vale 10 minutos y una sola vez.");
+            }
             let direct: Vec<&str> = r["direct"]
                 .as_array()
                 .into_iter()

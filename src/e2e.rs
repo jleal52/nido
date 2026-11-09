@@ -314,10 +314,43 @@ struct Pending {
     expires: Instant,
 }
 
-/// El QR de emparejar en vigor (solo uno a la vez).
+/// Un código que vale varias veces y durante días (para una demostración: p. ej. la revisión
+/// de una tienda de apps). Se guarda en disco para que sobreviva a los reinicios.
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct Standing {
+    #[serde(with = "b64_32")]
+    psk: [u8; 32],
+    /// Segundos Unix en que caduca.
+    expires: u64,
+}
+
+mod b64_32 {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+
+    pub fn serialize<S: serde::Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&B64URL.encode(v))
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let t: String = serde::Deserialize::deserialize(d)?;
+        B64URL
+            .decode(t)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| serde::de::Error::custom("clave de 32 bytes"))
+    }
+}
+
+/// Lo más que dura un código reutilizable.
+pub const STANDING_MAX_DAYS: u64 = 90;
+
+/// El QR de emparejar en vigor (solo uno a la vez) y, si se ha pedido, uno reutilizable.
 #[derive(Default)]
 pub struct Pairing {
     pending: Mutex<Option<Pending>>,
+    standing: Mutex<Option<Standing>>,
+    /// Dónde se guarda el reutilizable.
+    file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,7 +360,35 @@ pub struct PairOffer {
     pub expires: u64,
 }
 
+fn pair_uri(id: &Identity, psk: &[u8; 32], expires: u64, direct: &[String], hub: Option<(&str, &str)>) -> String {
+    let mut uri = format!(
+        "nido://pair?k={}&s={}&x={expires}",
+        B64URL.encode(id.public),
+        B64URL.encode(psk)
+    );
+    if !direct.is_empty() {
+        uri.push_str(&format!("&u={}", B64URL.encode(direct.join(","))));
+    }
+    if let Some((h, n)) = hub {
+        uri.push_str(&format!("&h={}&n={n}", B64URL.encode(h)));
+    }
+    uri
+}
+
 impl Pairing {
+    /// Con el código reutilizable guardado en `file` (si lo hay y no ha caducado).
+    pub fn load(file: std::path::PathBuf) -> Self {
+        let standing = std::fs::read(&file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Standing>(&b).ok())
+            .filter(|s| s.expires > unix_now());
+        Self {
+            pending: Mutex::new(None),
+            standing: Mutex::new(standing),
+            file: Some(file),
+        }
+    }
+
     /// Un QR nuevo (el anterior deja de valer). `direct`: direcciones de nido para el móvil;
     /// `hub`: la del hub y el id de este nido en él, si hay.
     pub fn offer(&self, id: &Identity, direct: &[String], hub: Option<(&str, &str)>) -> PairOffer {
@@ -337,36 +398,101 @@ impl Pairing {
             expires: Instant::now() + PAIR_LIFE,
         });
         let expires = unix_now() + PAIR_LIFE.as_secs();
-        let mut uri = format!(
-            "nido://pair?k={}&s={}&x={expires}",
-            B64URL.encode(id.public),
-            B64URL.encode(psk)
-        );
-        if !direct.is_empty() {
-            uri.push_str(&format!("&u={}", B64URL.encode(direct.join(","))));
+        PairOffer {
+            uri: pair_uri(id, &psk, expires, direct, hub),
+            expires,
         }
-        if let Some((h, n)) = hub {
-            uri.push_str(&format!("&h={}&n={n}", B64URL.encode(h)));
-        }
-        PairOffer { uri, expires }
     }
 
-    fn current(&self) -> Option<[u8; 32]> {
-        let p = self.pending.lock().expect("emparejar");
-        p.as_ref()
+    /// Un código que vale para emparejar cualquier número de dispositivos durante `days` días
+    /// (sustituye al anterior). Quien lo tenga puede manejar este equipo: solo para demos.
+    pub fn offer_standing(
+        &self,
+        id: &Identity,
+        direct: &[String],
+        hub: Option<(&str, &str)>,
+        days: u64,
+    ) -> std::io::Result<PairOffer> {
+        let days = days.clamp(1, STANDING_MAX_DAYS);
+        let st = Standing {
+            psk: random::<32>(),
+            expires: unix_now() + days * 86_400,
+        };
+        if let Some(f) = &self.file {
+            if let Some(dir) = f.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = f.with_extension("tmp");
+            std::fs::write(&tmp, serde_json::to_vec(&st).map_err(std::io::Error::other)?)?;
+            crate::sys::private_file(&tmp)?;
+            std::fs::rename(&tmp, f)?;
+        }
+        let offer = PairOffer {
+            uri: pair_uri(id, &st.psk, st.expires, direct, hub),
+            expires: st.expires,
+        };
+        *self.standing.lock().expect("emparejar") = Some(st);
+        Ok(offer)
+    }
+
+    /// Retira el código reutilizable (los dispositivos ya emparejados siguen; se quitan aparte).
+    pub fn stop_standing(&self) -> std::io::Result<bool> {
+        let had = self.standing.lock().expect("emparejar").take().is_some();
+        if let Some(f) = &self.file {
+            match std::fs::remove_file(f) {
+                Ok(()) => return Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(had)
+    }
+
+    /// Hasta cuándo vale el reutilizable, si hay.
+    pub fn standing_expires(&self) -> Option<u64> {
+        self.standing
+            .lock()
+            .expect("emparejar")
+            .as_ref()
+            .filter(|s| s.expires > unix_now())
+            .map(|s| s.expires)
+    }
+
+    /// Los secretos que valen ahora: el del QR y el reutilizable.
+    fn current(&self) -> Vec<[u8; 32]> {
+        let mut out: Vec<[u8; 32]> = self
+            .pending
+            .lock()
+            .expect("emparejar")
+            .as_ref()
             .filter(|p| Instant::now() < p.expires)
             .map(|p| p.psk)
+            .into_iter()
+            .collect();
+        out.extend(
+            self.standing
+                .lock()
+                .expect("emparejar")
+                .as_ref()
+                .filter(|s| s.expires > unix_now())
+                .map(|s| s.psk),
+        );
+        out
     }
 
-    /// Gasta el secreto, si sigue siendo el mismo (solo tras un primer mensaje válido).
+    /// Gasta el secreto, si sigue siendo el mismo (solo tras un primer mensaje válido). El
+    /// reutilizable no se gasta.
     fn consume(&self, psk: &[u8; 32]) -> bool {
         let mut p = self.pending.lock().expect("emparejar");
         if p.as_ref().is_some_and(|x| &x.psk == psk) {
             *p = None;
-            true
-        } else {
-            false
+            return true;
         }
+        self.standing
+            .lock()
+            .expect("emparejar")
+            .as_ref()
+            .is_some_and(|s| &s.psk == psk && s.expires > unix_now())
     }
 }
 
@@ -454,20 +580,20 @@ pub async fn serve<H: Host>(
 }
 
 async fn pair<H: Host>(host: &H, pattern: &'static str, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) {
-    let Some(psk) = host.pairing().current() else {
-        return;
-    };
-    let Ok(mut hs) = builder(pattern)
-        .local_private_key(&host.identity().private)
-        .and_then(|b| b.psk(1, &psk))
-        .and_then(|b| b.prologue(PROLOGUE))
-        .and_then(|b| b.build_responder())
-    else {
-        return;
-    };
     let mut payload = vec![0u8; MAX_MSG];
-    // Con psk1 el primer mensaje ya depende del secreto: si no descifra, no era del QR.
-    let Ok(n) = hs.read_message(msg1, &mut payload) else {
+    // Con psk1 el primer mensaje ya depende del secreto: si no descifra con ninguno de los que
+    // valen (el del QR o el reutilizable), no era un código de este nido.
+    let found = host.pairing().current().into_iter().find_map(|psk| {
+        let mut hs = builder(pattern)
+            .local_private_key(&host.identity().private)
+            .and_then(|b| b.psk(1, &psk))
+            .and_then(|b| b.prologue(PROLOGUE))
+            .and_then(|b| b.build_responder())
+            .ok()?;
+        let n = hs.read_message(msg1, &mut payload).ok()?;
+        Some((psk, hs, n))
+    });
+    let Some((psk, mut hs, n)) = found else {
         return;
     };
     if !host.pairing().consume(&psk) {
@@ -979,6 +1105,42 @@ mod tests {
             Identity::load_or_create(&dir.path().join("hub.key")).is_err(),
             "nunca se sustituye"
         );
+    }
+
+    #[tokio::test]
+    async fn standing_code_pairs_many_survives_restart_and_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pair-demo.json");
+        let host = Arc::new(TestHost {
+            id: Identity::load_or_create(&dir.path().join("hub.key")).unwrap(),
+            pairing: Pairing::load(file.clone()),
+            phones: Mutex::new(Phones::load(dir.path().join("phones.json"))),
+            addr: None,
+        });
+        let server_key = host.id.public.to_vec();
+        let offer = host.pairing.offer_standing(&host.id, &[], None, 30).unwrap();
+        let psk = psk_of(&offer.uri);
+        assert!(offer.expires > unix_now() + 29 * 86_400);
+        // Vale para varios, y no estorba al QR de una vez.
+        assert!(Phone::new().pair(&host, &server_key, &psk).await.is_some());
+        let qr = psk_of(&host.pairing.offer(&host.id, &[], None).uri);
+        assert!(Phone::new().pair(&host, &server_key, &psk).await.is_some());
+        assert!(Phone::new().pair(&host, &server_key, &qr).await.is_some());
+
+        // Tras reiniciar sigue valiendo (está en disco, solo para el usuario).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let again = Pairing::load(file.clone());
+        assert_eq!(again.standing_expires(), Some(offer.expires));
+
+        // Retirado, ya no empareja.
+        assert!(host.pairing.stop_standing().unwrap());
+        assert!(!file.exists());
+        assert!(Phone::new().pair(&host, &server_key, &psk).await.is_none());
+        assert_eq!(host.phones.lock().unwrap().views().len(), 3);
     }
 
     #[tokio::test]

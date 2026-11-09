@@ -78,6 +78,7 @@ wsl.exe -d Debian -- nido attach
 
 ```sh
 nido pair                        # QR para emparejar un dispositivo (vale 10 minutos y una vez)
+nido pair --days 30              # código reutilizable 30 días, solo para equipos de demo (`--stop` lo retira)
 nido phones                      # dispositivos emparejados; `nido phones rm <id>` quita uno
 nido hub                         # cómo va la conexión con el hub
 nido hub set wss://hub.ejemplo   # usar un hub; `nido hub off` lo quita
