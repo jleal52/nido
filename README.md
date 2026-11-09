@@ -2,18 +2,43 @@
 
 Gestor de sesiones de terminal, pensado para Claude Code. Cada sesión es una terminal con su
 programa (casi siempre Claude) que sigue en marcha aunque cierres la terminal, y que se vuelve a
-abrir al reiniciar el equipo: Claude retoma su conversación.
+abrir al reiniciar el equipo: Claude retoma su conversación. Las manejas desde la consola, el
+navegador o el móvil, y si tienes varios equipos, desde un mismo sitio.
 
-Este repositorio es el **cliente** que corre en tu equipo: las sesiones, la API y la consola
-(`nido …`). Desde el móvil o el navegador se maneja con la app de nido, emparejándola con tu
-equipo; todo lo que pasa entre ellos va **cifrado de extremo a extremo**.
+**Funciona en Windows, macOS y Linux** (también en WSL 2).
 
-| Sistema | Estado |
+Este repositorio es la herramienta que se instala en cada equipo: las sesiones, la API y la
+consola (`nido …`). Desde el navegador o el móvil se maneja con la web o la app de nido,
+emparejándolas con tu equipo; todo lo que pasa entre ellos va **cifrado de extremo a extremo**.
+
+| Sistema | Cómo corre |
 |---|---|
-| Linux con systemd | Funciona |
-| WSL 2 (con systemd) | Funciona |
-| macOS | Funciona (con launchd; sin límite de memoria por sesión) |
-| Windows 10/11 | Funciona (tarea al iniciar sesión; sin `nido attach`: las sesiones se ven en la web y la app) |
+| Linux con systemd | Servicio de usuario de systemd |
+| WSL 2 (con systemd) | Igual que en Linux |
+| macOS | Agente de launchd (sin límite de memoria por sesión) |
+| Windows 10/11 | Tarea al iniciar sesión (sin `nido attach`: las sesiones se ven en la web y la app) |
+
+## Úsalo gratis con nido.utebo.info
+
+No hace falta montar nada: **[nido.utebo.info](https://nido.utebo.info)** es un hub público y
+gratuito con la web de nido. Tu equipo se conecta a él y tú entras desde cualquier navegador (o
+desde la app), sin abrir puertos ni tocar el router.
+
+Y es **privado**: el hub solo reenvía bytes cifrados entre tu equipo y tus dispositivos, que son
+los únicos que tienen las claves. No puede leer tus sesiones, lo que escribes ni lo que te
+contesta Claude. Lo que sí ve: qué equipos están conectados (por un identificador sacado de su
+clave, no por su nombre), cuántos dispositivos y cuánto tráfico, y el identificador para mandar
+avisos al teléfono (su contenido también va cifrado). La web la sirve el propio hub: guarda la
+versión que usaste y te avisa si alguna vez recibes otra distinta.
+
+```sh
+# Con nido ya instalado (ver «Instalar», más abajo):
+nido hub set wss://nido.utebo.info
+nido pair          # da un código nido://pair?… (vale 10 minutos y una vez)
+```
+
+Abre [nido.utebo.info](https://nido.utebo.info), pega el código y listo (en Windows, lo mismo
+con `nido.exe`). Para añadir otro equipo al mismo sitio, mira [Varios equipos](#varios-equipos).
 
 ## Uso
 
@@ -93,7 +118,8 @@ cifrado). Desde fuera de este equipo solo responde el canal cifrado (`/api/v1/e2
 
 ## Instalar
 
-Hace falta Rust 1.88 o más nuevo y systemd de usuario.
+Se compila con Rust 1.88 o más nuevo ([rustup](https://rustup.rs)). En Linux hace falta systemd
+de usuario.
 
 ```sh
 git clone https://github.com/jleal52/nido && cd nido
