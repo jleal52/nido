@@ -19,6 +19,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
+use crate::i18n::tr;
 use crate::server::AppState;
 
 /// Lee el token del fichero, o lo crea (0600) si no existe.
@@ -68,8 +69,7 @@ fn bearer(h: &HeaderMap) -> Option<&str> {
 }
 
 fn unauthorized() -> Response {
-    let body = serde_json::json!({ "error": "falta el token o no es válido" });
-    (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response()
+    crate::server::error(StatusCode::UNAUTHORIZED, "falta el token o no es válido")
 }
 
 pub async fn guard(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Response {
@@ -86,12 +86,12 @@ pub async fn guard(State(st): State<Arc<AppState>>, req: Request, next: Next) ->
     if !local {
         return (
             StatusCode::FORBIDDEN,
-            "La API de nido solo se atiende en este equipo",
+            tr("La API de nido solo se atiende en este equipo"),
         )
             .into_response();
     }
     if st.loopback_only && !header(h, header::HOST).is_some_and(host_is_loopback) {
-        return (StatusCode::FORBIDDEN, "Host no permitido").into_response();
+        return (StatusCode::FORBIDDEN, tr("Host no permitido")).into_response();
     }
     if let Some(token) = &st.token {
         let Some(given) = bearer(h) else {

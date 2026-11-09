@@ -75,7 +75,9 @@ pub struct Menu {
 enum Row {
     Opt(usize),
     /// «Next» o «Submit» de las de varias respuestas.
-    Nav { selected: bool },
+    Nav {
+        selected: bool,
+    },
 }
 
 impl Menu {
@@ -106,9 +108,16 @@ impl Menu {
             .position(|o| norm(&o.label) == w)
             .or_else(|| {
                 self.options.iter().position(|o| {
-                    let full = norm(&format!("{} {}", o.label, o.detail.as_deref().unwrap_or("")));
+                    let full = norm(&format!(
+                        "{} {}",
+                        o.label,
+                        o.detail.as_deref().unwrap_or("")
+                    ));
                     full.starts_with(&w)
-                        && full[w.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric())
+                        && full[w.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| !c.is_alphanumeric())
                 })
             })
     }
@@ -129,7 +138,10 @@ impl Menu {
 /// Minúsculas y los espacios juntos, para comparar lo de la pantalla (que puede venir partido en
 /// varias líneas) con lo que se pide.
 fn norm(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Sin los colores (la pantalla llega con secuencias SGR).
@@ -160,8 +172,12 @@ fn starts_dim(s: &str) -> bool {
     let mut dim = false;
     let mut rest = s;
     loop {
-        let Some(seq) = rest.strip_prefix("\x1b[") else { break };
-        let Some(end) = seq.find(|c: char| c.is_ascii_alphabetic()) else { break };
+        let Some(seq) = rest.strip_prefix("\x1b[") else {
+            break;
+        };
+        let Some(end) = seq.find(|c: char| c.is_ascii_alphabetic()) else {
+            break;
+        };
         if &seq[end..end + 1] == "m" {
             let ps: Vec<&str> = seq[..end].split(';').collect();
             let mut i = 0;
@@ -222,7 +238,12 @@ fn option_line(l: &str) -> Option<(bool, u32, usize, String)> {
     if text.is_empty() {
         return None;
     }
-    Some((selected, digits.parse().ok()?, col, text.trim_end().to_owned()))
+    Some((
+        selected,
+        digits.parse().ok()?,
+        col,
+        text.trim_end().to_owned(),
+    ))
 }
 
 /// «Next» o «Submit» solos en su línea (con o sin cursor).
@@ -236,9 +257,16 @@ fn nav_line(l: &str) -> Option<bool> {
 }
 
 fn is_hint(l: &str) -> bool {
-    ["Esc to cancel", "Enter to select", "Enter to confirm", "to navigate", "Tab to amend", "ctrl+g to edit"]
-        .iter()
-        .any(|h| l.contains(h))
+    [
+        "Esc to cancel",
+        "Enter to select",
+        "Enter to confirm",
+        "to navigate",
+        "Tab to amend",
+        "ctrl+g to edit",
+    ]
+    .iter()
+    .any(|h| l.contains(h))
 }
 
 const INPUTS: [&str; 2] = ["Type something", "Tell Claude what to change"];
@@ -276,7 +304,8 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
     // Con un menú de verdad no está la caja de escribir; si sigue debajo, la lista es otra cosa
     // (un mensaje tuyo en cola, que Claude pinta con «❯» delante).
     let edge = |l: &str| l.trim_start().starts_with("──────");
-    if (last + 1..lines.len()).any(|i| lines[i].trim_start().starts_with('❯') && edge(lines[i - 1])) {
+    if (last + 1..lines.len()).any(|i| lines[i].trim_start().starts_with('❯') && edge(lines[i - 1]))
+    {
         return None;
     }
     found.reverse();
@@ -366,7 +395,9 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
 
     // En una pregunta, el campo de texto es la última opción antes de «Chat about this» (aunque
     // ya se haya escrito en él y no diga «Type something»).
-    let chat = options.iter().position(|o| o.label.starts_with("Chat about this"));
+    let chat = options
+        .iter()
+        .position(|o| o.label.starts_with("Chat about this"));
     let question = !tabs.is_empty() || chat.is_some();
     if question {
         let last_choice = match chat {
@@ -387,9 +418,14 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
     } else if t.contains("Would you like to proceed") {
         Kind::Plan
     } else if options.iter().any(|o| {
-        ["limit to reset", "continue automatically", "limit reset", "Upgrade your plan"]
-            .iter()
-            .any(|p| o.label.contains(p))
+        [
+            "limit to reset",
+            "continue automatically",
+            "limit reset",
+            "Upgrade your plan",
+        ]
+        .iter()
+        .any(|p| o.label.contains(p))
     }) {
         Kind::Limit
     } else {
@@ -420,7 +456,10 @@ fn parse_tabs(l: &str) -> Vec<Tab> {
         match c {
             '☐' | '☒' | '✔' | '→' => {
                 if let Some((done, label)) = cur.take() {
-                    tabs.push(Tab { label: label.trim().to_owned(), done });
+                    tabs.push(Tab {
+                        label: label.trim().to_owned(),
+                        done,
+                    });
                 }
                 if c != '✔' && c != '→' {
                     cur = Some((c == '☒', String::new()));
@@ -434,7 +473,10 @@ fn parse_tabs(l: &str) -> Vec<Tab> {
         }
     }
     if let Some((done, label)) = cur {
-        tabs.push(Tab { label: label.trim().to_owned(), done });
+        tabs.push(Tab {
+            label: label.trim().to_owned(),
+            done,
+        });
     }
     tabs.retain(|t| !t.label.is_empty());
     tabs
@@ -443,8 +485,12 @@ fn parse_tabs(l: &str) -> Vec<Tab> {
 /// Menús sin números (confiar en la carpeta): la fila del cursor y las de su misma columna,
 /// con «Enter to confirm» debajo.
 fn unnumbered(lines: &[&str]) -> Option<Menu> {
-    let hint_at = lines.iter().rposition(|l| l.contains("Enter to confirm") || l.contains("Enter to select"))?;
-    let sel = (hint_at.saturating_sub(12)..hint_at).rev().find(|&i| lines[i].trim_start().starts_with('❯'))?;
+    let hint_at = lines
+        .iter()
+        .rposition(|l| l.contains("Enter to confirm") || l.contains("Enter to select"))?;
+    let sel = (hint_at.saturating_sub(12)..hint_at)
+        .rev()
+        .find(|&i| lines[i].trim_start().starts_with('❯'))?;
     let l = lines[sel];
     let t = l.trim_start().strip_prefix('❯')?;
     let col = indent(l) + 1 + t.chars().count() - t.trim_start().chars().count();
@@ -530,10 +576,17 @@ pub fn background(screen: &str) -> Option<Background> {
     let lines: Vec<&str> = plain.lines().collect();
     let mut bg = Background::default();
     // Las órdenes: «· 1 shell ·» en la línea de estado (la de «auto mode», «↓ to manage»…).
-    if let Some(status) = lines.iter().rev().find(|l| l.contains("to manage") || l.contains("shift+tab to cycle")) {
+    if let Some(status) = lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("to manage") || l.contains("shift+tab to cycle"))
+    {
         for part in status.split('·') {
             let p = part.trim();
-            if let Some(n) = p.strip_suffix(" shells").or_else(|| p.strip_suffix(" shell")) {
+            if let Some(n) = p
+                .strip_suffix(" shells")
+                .or_else(|| p.strip_suffix(" shell"))
+            {
                 bg.shells = n.trim().parse().unwrap_or(0);
             }
         }
@@ -566,7 +619,11 @@ pub fn background(screen: &str) -> Option<Background> {
                 }
                 None => (head.clone(), String::new()),
             };
-            bg.agents.push(Agent { kind, task, elapsed });
+            bg.agents.push(Agent {
+                kind,
+                task,
+                elapsed,
+            });
         }
     }
     (!bg.agents.is_empty() || bg.shells > 0).then_some(bg)
@@ -614,7 +671,9 @@ enum FormCursor {
 fn form_state(screen: &str) -> Option<(Form, FormCursor, String)> {
     let plain = strip_sgr(screen);
     let lines: Vec<&str> = plain.lines().map(str::trim_end).collect();
-    let head = lines.iter().rposition(|l| l.trim_start().starts_with("MCP server") && l.contains("requests your input"))?;
+    let head = lines.iter().rposition(|l| {
+        l.trim_start().starts_with("MCP server") && l.contains("requests your input")
+    })?;
     let h = indent(lines[head]);
     let server = lines[head]
         .split(['“', '”', '"'])
@@ -638,7 +697,9 @@ fn form_state(screen: &str) -> Option<(Form, FormCursor, String)> {
         }
         let arrow = col(l, h) == Some('❯');
         let rest = t.trim_start_matches('❯').trim();
-        if rest.starts_with("Accept") && rest.contains("Decline") || rest.starts_with("Accept") && l.contains("❯ Decline") {
+        if rest.starts_with("Accept") && rest.contains("Decline")
+            || rest.starts_with("Accept") && l.contains("❯ Decline")
+        {
             buttons = true;
             if arrow {
                 cursor = Some(FormCursor::Buttons(true));
@@ -699,7 +760,11 @@ fn form_state(screen: &str) -> Option<(Form, FormCursor, String)> {
         return None;
     }
     Some((
-        Form { server, message: message.join("\n"), fields },
+        Form {
+            server,
+            message: message.join("\n"),
+            fields,
+        },
         cursor.unwrap_or(FormCursor::Field(0)),
         hint,
     ))
@@ -740,7 +805,16 @@ pub struct FormAnswer {
     pub values: std::collections::HashMap<String, String>,
 }
 
-const YES: [&str; 8] = ["yes", "sí", "si", "true", "confirm", "confirmar", "accept", "ok"];
+const YES: [&str; 8] = [
+    "yes",
+    "sí",
+    "si",
+    "true",
+    "confirm",
+    "confirmar",
+    "accept",
+    "ok",
+];
 
 /// Contesta el formulario. Al aceptar, los obligatorios sin valor que son una confirmación se
 /// rellenan solos (la casilla marcada, o la opción «yes» de la lista); los de texto, con lo que
@@ -749,10 +823,15 @@ pub async fn answer_form<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     ans: &FormAnswer,
 ) -> Result<(), String> {
-    let (form0, _, _) = form_state(&scr.read().await?).ok_or("no hay ningún formulario en pantalla")?;
+    let (form0, _, _) =
+        form_state(&scr.read().await?).ok_or("no hay ningún formulario en pantalla")?;
     if ans.accept {
         for (i, f) in form0.fields.iter().enumerate() {
-            let wanted = ans.values.get(&f.label).map(|v| v.trim()).filter(|v| !v.is_empty());
+            let wanted = ans
+                .values
+                .get(&f.label)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
             if f.filled && wanted.is_none() {
                 continue;
             }
@@ -768,7 +847,10 @@ pub async fn answer_form<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 let checked = |v: &str| v.starts_with('☒');
                 if checked(&value) != want {
                     scr.keys(b" ").await?;
-                    form_until(scr, |f, _| f.fields.get(i).is_some_and(|x| checked(&x.value) == want)).await?;
+                    form_until(scr, |f, _| {
+                        f.fields.get(i).is_some_and(|x| checked(&x.value) == want)
+                    })
+                    .await?;
                 }
             } else if hint.contains("to expand") || value.starts_with('▸') {
                 scr.keys(b"\x1b[C").await?;
@@ -785,9 +867,17 @@ pub async fn answer_form<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 };
                 let target = match wanted {
                     Some(w) => opts.iter().position(|o| norm(o) == norm(w)),
-                    None => opts.iter().position(|o| YES.contains(&o.to_lowercase().as_str())),
+                    None => opts
+                        .iter()
+                        .position(|o| YES.contains(&o.to_lowercase().as_str())),
                 }
-                .ok_or_else(|| format!("«{}»: no sé qué opción elegir ({})", f.label, opts.join(", ")))?;
+                .ok_or_else(|| {
+                    format!(
+                        "«{}»: no sé qué opción elegir ({})",
+                        f.label,
+                        opts.join(", ")
+                    )
+                })?;
                 for _ in 0..8 {
                     let cur = at.unwrap_or(0);
                     if cur == target {
@@ -862,7 +952,8 @@ async fn form_go<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     to: FormCursor,
 ) -> Result<String, String> {
     for _ in 0..20 {
-        let (form, at, hint) = form_state(&scr.read().await?).ok_or("el formulario ha desaparecido")?;
+        let (form, at, hint) =
+            form_state(&scr.read().await?).ok_or("el formulario ha desaparecido")?;
         let row = |c: FormCursor| match c {
             FormCursor::Field(i) => i,
             FormCursor::Buttons(_) => form.fields.len(),
@@ -872,7 +963,11 @@ async fn form_go<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         let key = match (at, to) {
             (FormCursor::Buttons(_), FormCursor::Buttons(accept)) => {
-                if accept { b"\x1b[D" as &[u8] } else { b"\x1b[C" }
+                if accept {
+                    b"\x1b[D" as &[u8]
+                } else {
+                    b"\x1b[C"
+                }
             }
             _ if row(to) > row(at) => DOWN,
             _ if row(to) < row(at) => UP,
@@ -951,15 +1046,22 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Screen<R, W> {
     }
 
     async fn read(&mut self) -> Result<String, String> {
-        let req = Frame::HistoryRequest(HistoryRequest { all: false, screen: true });
-        proto::write_frame(&mut self.wr, &req).await.map_err(|_| "la sesión se ha cerrado")?;
+        let req = Frame::HistoryRequest(HistoryRequest {
+            all: false,
+            screen: true,
+        });
+        proto::write_frame(&mut self.wr, &req)
+            .await
+            .map_err(|_| "la sesión se ha cerrado")?;
         loop {
             let frame = tokio::time::timeout(WAIT, proto::read_frame(&mut self.rd))
                 .await
                 .map_err(|_| "la sesión no contesta")?;
             match frame {
                 Ok(Some(Frame::History(b))) => return Ok(String::from_utf8_lossy(&b).into_owned()),
-                Ok(Some(Frame::Exit(_)) | None) | Err(_) => return Err("la sesión se ha cerrado".into()),
+                Ok(Some(Frame::Exit(_)) | None) | Err(_) => {
+                    return Err("la sesión se ha cerrado".into());
+                }
                 Ok(Some(_)) => {}
             }
         }
@@ -976,7 +1078,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Screen<R, W> {
     }
 
     /// Hasta que la pantalla cumpla `done` (o `WAIT`): lo que hay entonces.
-    async fn until(&mut self, done: impl Fn(Option<&Menu>) -> bool) -> Result<(bool, Option<Menu>), String> {
+    async fn until(
+        &mut self,
+        done: impl Fn(Option<&Menu>) -> bool,
+    ) -> Result<(bool, Option<Menu>), String> {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
             let m = self.menu().await?;
@@ -1004,7 +1109,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Screen<R, W> {
             for _ in 0..at.abs_diff(row) {
                 self.keys(key).await?;
             }
-            let (_, now) = self.until(|x| x.and_then(Menu::selected_row) == Some(row)).await?;
+            let (_, now) = self
+                .until(|x| x.and_then(Menu::selected_row) == Some(row))
+                .await?;
             m = now.ok_or("el menú ha desaparecido")?;
         }
         Err("no se pudo llevar el cursor a la opción".into())
@@ -1040,7 +1147,9 @@ pub fn suggestion(screen: &str) -> Option<String> {
     let lines: Vec<&str> = screen.lines().collect();
     let plain: Vec<String> = lines.iter().map(|l| strip_sgr(l)).collect();
     // La caja es la última línea con «❯» entre dos rayas.
-    let i = (1..plain.len().saturating_sub(1)).rev().find(|&i| plain[i].trim_start().starts_with('❯'))?;
+    let i = (1..plain.len().saturating_sub(1))
+        .rev()
+        .find(|&i| plain[i].trim_start().starts_with('❯'))?;
     // Las rayas de la caja (la de arriba puede llevar dentro el nombre de la sesión).
     let edge = |l: &str| l.trim_start().starts_with("──────");
     if !edge(&plain[i - 1]) || !edge(&plain[i + 1]) {
@@ -1049,7 +1158,7 @@ pub fn suggestion(screen: &str) -> Option<String> {
     // Atenuado justo detrás de «❯ »: lo propuesto, no lo que has escrito tú.
     let raw = lines[i];
     let after = &raw[raw.find('❯')? + '❯'.len_utf8()..];
-    let after = after.trim_start_matches(|c: char| c == ' ' || c == '\u{a0}');
+    let after = after.trim_start_matches([' ', '\u{a0}']);
     if !starts_dim(after) {
         return None;
     }
@@ -1083,7 +1192,11 @@ pub fn input_box(screen: &str) -> Option<String> {
     }
     let mut text: Vec<String> = Vec::new();
     for (k, l) in plain[top + 1..bottom].iter().enumerate() {
-        let l = if k == 0 { l.trim_start().trim_start_matches('❯') } else { l.as_str() };
+        let l = if k == 0 {
+            l.trim_start().trim_start_matches('❯')
+        } else {
+            l.as_str()
+        };
         text.push(l.trim_matches([' ', '\u{a0}']).to_owned());
     }
     Some(text.join(" ").trim().to_owned())
@@ -1198,7 +1311,8 @@ pub async fn resume_after_limit<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) -> Result<bool, String> {
     let text = scr.read().await?;
     let menu = parse(&text);
-    let on_screen = menu.as_ref().is_some_and(|m| m.kind == Kind::Limit) || waiting_for_limit(&text);
+    let on_screen =
+        menu.as_ref().is_some_and(|m| m.kind == Kind::Limit) || waiting_for_limit(&text);
     if !stopped && !on_screen {
         return Ok(false);
     }
@@ -1260,7 +1374,8 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 scr.go(&m, row).await?;
             }
         }
-        scr.until(|x| x.and_then(Menu::selected_row) == Some(row)).await?;
+        scr.until(|x| x.and_then(Menu::selected_row) == Some(row))
+            .await?;
         scr.type_text(req.text.as_deref().unwrap_or("")).await?;
         scr.keys(b"\r").await?;
         return Ok(());
@@ -1292,7 +1407,9 @@ async fn questions<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     answers: &[QuestionAnswer],
 ) -> Result<(), String> {
     for qa in answers {
-        let (ok, m) = scr.until(|m| m.is_some_and(|m| m.shows_question(&qa.question))).await?;
+        let (ok, m) = scr
+            .until(|m| m.is_some_and(|m| m.shows_question(&qa.question)))
+            .await?;
         let m = match m {
             Some(m) if ok => m,
             _ => return Err(format!("en pantalla no está la pregunta «{}»", qa.question)),
@@ -1303,7 +1420,9 @@ async fn questions<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let i = m
                 .find(want)
                 .filter(|&i| !m.options[i].input)
-                .ok_or_else(|| format!("la pregunta «{}» no tiene la opción «{want}»", qa.question))?;
+                .ok_or_else(|| {
+                    format!("la pregunta «{}» no tiene la opción «{want}»", qa.question)
+                })?;
             chosen.push(i);
         }
         if chosen.is_empty() && text.is_none() {
@@ -1319,7 +1438,10 @@ async fn questions<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     let n = o.n.ok_or("opción sin número")?;
                     scr.keys(n.to_string().as_bytes()).await?;
                     let want = chosen.contains(&i);
-                    scr.until(|x| x.is_some_and(|x| x.options.get(i).and_then(|o| o.checked) == Some(want))).await?;
+                    scr.until(|x| {
+                        x.is_some_and(|x| x.options.get(i).and_then(|o| o.checked) == Some(want))
+                    })
+                    .await?;
                 }
             }
             // …luego el texto (a su fila con las flechas: el número solo la marcaría)…
@@ -1339,22 +1461,32 @@ async fn questions<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let i = m.input().ok_or("esta pregunta no admite texto")?;
             scr.pick(&m, i).await?;
             let row = m.row_of(i).ok_or("opción sin fila")?;
-            scr.until(|x| x.and_then(Menu::selected_row) == Some(row)).await?;
+            scr.until(|x| x.and_then(Menu::selected_row) == Some(row))
+                .await?;
             scr.type_text(text).await?;
             scr.keys(b"\r").await?;
         } else {
             scr.pick(&m, chosen[0]).await?;
         }
-        let (moved, _) = scr.until(|x| !x.is_some_and(|x| x.shows_question(&qa.question))).await?;
+        let (moved, _) = scr
+            .until(|x| !x.is_some_and(|x| x.shows_question(&qa.question)))
+            .await?;
         if !moved {
-            return Err(format!("Claude no ha pasado de la pregunta «{}»", qa.question));
+            return Err(format!(
+                "Claude no ha pasado de la pregunta «{}»",
+                qa.question
+            ));
         }
     }
     // Contestada la última de varias, sale el repaso: mandar.
     if let Some(m) = scr.menu().await?.filter(|m| m.kind == Kind::Review) {
-        let i = m.find("Submit answers").ok_or("no se encuentra «Submit answers»")?;
+        let i = m
+            .find("Submit answers")
+            .ok_or("no se encuentra «Submit answers»")?;
         scr.pick(&m, i).await?;
-        let (sent, _) = scr.until(|x| x.is_none_or(|x| x.kind != Kind::Review)).await?;
+        let (sent, _) = scr
+            .until(|x| x.is_none_or(|x| x.kind != Kind::Review))
+            .await?;
         if !sent {
             return Err("no se pudieron mandar las respuestas".into());
         }
@@ -1380,10 +1512,25 @@ mod tests {
         let m = screen("pregunta_varias").unwrap();
         assert_eq!(m.kind, Kind::Question);
         assert_eq!(m.title.as_deref(), Some("¿Cuál es tu color favorito?"));
-        assert_eq!(labels(&m), ["Rojo", "Verde", "Azul", "Type something.", "Chat about this"]);
+        assert_eq!(
+            labels(&m),
+            [
+                "Rojo",
+                "Verde",
+                "Azul",
+                "Type something.",
+                "Chat about this"
+            ]
+        );
         assert_eq!(m.options[0].detail.as_deref(), Some("El color rojo"));
         assert!(m.options[0].selected && m.options[3].input && !m.options[4].input);
-        assert_eq!(m.tabs.iter().map(|t| (t.label.as_str(), t.done)).collect::<Vec<_>>(), [("Color", false), ("Frutas", false)]);
+        assert_eq!(
+            m.tabs
+                .iter()
+                .map(|t| (t.label.as_str(), t.done))
+                .collect::<Vec<_>>(),
+            [("Color", false), ("Frutas", false)]
+        );
         assert!(!m.multi);
         assert_eq!(m.find("verde"), Some(1));
     }
@@ -1394,7 +1541,10 @@ mod tests {
         assert_eq!(m.kind, Kind::Question);
         assert_eq!(m.tabs.len(), 1);
         assert_eq!(m.input(), Some(2));
-        assert_eq!(m.hint.as_deref(), Some("Enter to select · ↑/↓ to navigate · Esc to cancel"));
+        assert_eq!(
+            m.hint.as_deref(),
+            Some("Enter to select · ↑/↓ to navigate · Esc to cancel")
+        );
     }
 
     #[test]
@@ -1409,8 +1559,14 @@ mod tests {
         let m = screen("pregunta_multiple").unwrap();
         assert_eq!(m.kind, Kind::Question);
         assert!(m.multi);
-        assert_eq!(labels(&m), ["Manzana", "Pera", "Type something", "Chat about this"]);
-        assert_eq!(m.options.iter().map(|o| o.checked).collect::<Vec<_>>(), [Some(false), Some(true), Some(false), None]);
+        assert_eq!(
+            labels(&m),
+            ["Manzana", "Pera", "Type something", "Chat about this"]
+        );
+        assert_eq!(
+            m.options.iter().map(|o| o.checked).collect::<Vec<_>>(),
+            [Some(false), Some(true), Some(false), None]
+        );
         assert_eq!(m.options[2].detail, None, "«Next» no es su descripción");
         assert_eq!(m.nav_row(), Some(3));
         assert_eq!(m.selected_row(), Some(0));
@@ -1448,11 +1604,17 @@ mod tests {
         assert_eq!(m.title.as_deref(), Some("Do you want to proceed?"));
         assert_eq!(m.options.len(), 4);
         assert_eq!(m.options[1].label, "Yes, and always allow access to");
-        assert_eq!(m.options[1].detail.as_deref(), Some("/home/ana/proyecto from this project"));
+        assert_eq!(
+            m.options[1].detail.as_deref(),
+            Some("/home/ana/proyecto from this project")
+        );
         assert_eq!(m.hint.as_deref(), Some("Esc to cancel · Tab to amend"));
         assert_eq!(m.find("Yes"), Some(0));
         assert_eq!(m.find("No"), Some(3));
-        assert_eq!(m.find("Yes, and always allow access to /home/ana/proyecto"), Some(1));
+        assert_eq!(
+            m.find("Yes, and always allow access to /home/ana/proyecto"),
+            Some(1)
+        );
         assert_eq!(m.find("4"), None);
     }
 
@@ -1460,9 +1622,19 @@ mod tests {
     fn plan() {
         let m = screen("plan").unwrap();
         assert_eq!(m.kind, Kind::Plan);
-        assert_eq!(labels(&m), ["Yes, and use auto mode", "Yes, manually approve edits", "Tell Claude what to change"]);
+        assert_eq!(
+            labels(&m),
+            [
+                "Yes, and use auto mode",
+                "Yes, manually approve edits",
+                "Tell Claude what to change"
+            ]
+        );
         assert!(m.options[2].input);
-        assert_eq!(m.options[2].detail.as_deref(), Some("shift+tab to approve with this feedback"));
+        assert_eq!(
+            m.options[2].detail.as_deref(),
+            Some("shift+tab to approve with this feedback")
+        );
     }
 
     #[test]
@@ -1481,25 +1653,48 @@ mod tests {
         let m = parse(s).unwrap();
         assert_eq!(m.kind, Kind::Limit);
         assert_eq!(m.title.as_deref(), Some("What do you want to do?"));
-        assert!(waiting_for_limit("Claude Code will continue automatically at 5pm. Keep this session open; it may still pause for permission prompts. Press esc to cancel the wait."));
+        assert!(waiting_for_limit(
+            "Claude Code will continue automatically at 5pm. Keep this session open; it may still pause for permission prompts. Press esc to cancel the wait."
+        ));
     }
 
     #[test]
     fn suggested_next_prompt() {
         let rule = "\x1b[38;2;136;136;136m────────────────────────\x1b[m";
-        let box_ = |line: &str| format!("✻ Brewed for 11s\n\n{rule}──── nido ─\n{line}\n{rule}\n  ⏵⏵ auto mode on");
+        let box_ = |line: &str| {
+            format!("✻ Brewed for 11s\n\n{rule}──── nido ─\n{line}\n{rule}\n  ⏵⏵ auto mode on")
+        };
         assert_eq!(
-            suggestion(&box_("\x1b[m❯\u{a0} \x1b[2mok a shara-media, y borra tú feature/…")).as_deref(),
+            suggestion(&box_(
+                "\x1b[m❯\u{a0} \x1b[2mok a shara-media, y borra tú feature/…"
+            ))
+            .as_deref(),
             Some("ok a shara-media, y borra tú feature/…")
         );
         // Lo que has escrito tú (sin atenuar), la caja vacía o el ejemplo del principio: no.
         assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} esto lo escribo yo")), None);
         assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} ")), None);
-        assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} \x1b[2mTry \"fix lint errors\"")), None);
-        assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} \x1b[7mP\x1b[2mress up to edit queued messages")), None);
-        assert_eq!(suggestion(&box_("\x1b[m❯\u{a0} \x1b[2mPress up to edit queued messages")), None);
+        assert_eq!(
+            suggestion(&box_("\x1b[m❯\u{a0} \x1b[2mTry \"fix lint errors\"")),
+            None
+        );
+        assert_eq!(
+            suggestion(&box_(
+                "\x1b[m❯\u{a0} \x1b[7mP\x1b[2mress up to edit queued messages"
+            )),
+            None
+        );
+        assert_eq!(
+            suggestion(&box_(
+                "\x1b[m❯\u{a0} \x1b[2mPress up to edit queued messages"
+            )),
+            None
+        );
         // Un menú no es la caja de escribir.
-        assert_eq!(suggestion(" Do you want to proceed?\n ❯ 1. Yes\n   2. No"), None);
+        assert_eq!(
+            suggestion(" Do you want to proceed?\n ❯ 1. Yes\n   2. No"),
+            None
+        );
     }
 
     #[test]
@@ -1510,27 +1705,71 @@ mod tests {
     #[test]
     fn what_is_written_in_the_box() {
         let rule = "────────────────────────";
-        let b = |inner: &str| format!("✻ Brewed\n\n{rule}──── nido ─\n{inner}\n{rule}\n  ⏵⏵ auto mode on");
-        assert_eq!(input_box(&b("❯\u{a0}[Image #3] [Image #4]al mandar yo un mensaje con\n  puntos, el parser")).as_deref(),
-            Some("[Image #3] [Image #4]al mandar yo un mensaje con puntos, el parser"));
+        let b = |inner: &str| {
+            format!("✻ Brewed\n\n{rule}──── nido ─\n{inner}\n{rule}\n  ⏵⏵ auto mode on")
+        };
+        assert_eq!(
+            input_box(&b(
+                "❯\u{a0}[Image #3] [Image #4]al mandar yo un mensaje con\n  puntos, el parser"
+            ))
+            .as_deref(),
+            Some("[Image #3] [Image #4]al mandar yo un mensaje con puntos, el parser")
+        );
         assert_eq!(input_box(&b("❯\u{a0}")).as_deref(), Some(""));
-        assert_eq!(input_box(&b("\x1b[m❯\u{a0} \x1b[2mleer el fichero")).as_deref(), Some(""));
-        assert_eq!(input_box(&b("\x1b[m❯\u{a0} \x1b[7mP\x1b[2mress up to edit queued messages")).as_deref(), Some(""));
-        assert_eq!(input_box(&b("\x1b[38;2;153;153;153m❯\u{a0} \x1b[39;2mPress up to edit queued messages")).as_deref(), Some(""));
+        assert_eq!(
+            input_box(&b("\x1b[m❯\u{a0} \x1b[2mleer el fichero")).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            input_box(&b(
+                "\x1b[m❯\u{a0} \x1b[7mP\x1b[2mress up to edit queued messages"
+            ))
+            .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            input_box(&b(
+                "\x1b[38;2;153;153;153m❯\u{a0} \x1b[39;2mPress up to edit queued messages"
+            ))
+            .as_deref(),
+            Some("")
+        );
         // Un color RGB con un 2 dentro no es atenuado.
-        assert_eq!(input_box(&b("\x1b[m❯\u{a0} \x1b[38;2;200;200;200mhola")).as_deref(), Some("hola"));
-        assert_eq!(input_box(&std::fs::read_to_string(format!("{}/tests/pantallas/permiso.txt", env!("CARGO_MANIFEST_DIR"))).unwrap()), None);
+        assert_eq!(
+            input_box(&b("\x1b[m❯\u{a0} \x1b[38;2;200;200;200mhola")).as_deref(),
+            Some("hola")
+        );
+        assert_eq!(
+            input_box(
+                &std::fs::read_to_string(format!(
+                    "{}/tests/pantallas/permiso.txt",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .unwrap()
+            ),
+            None
+        );
     }
 
     #[test]
     fn mcp_form_with_a_checkbox() {
-        let text = std::fs::read_to_string(format!("{}/tests/pantallas/formulario.txt", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let text = std::fs::read_to_string(format!(
+            "{}/tests/pantallas/formulario.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
         let (f, cur, hint) = form_state(&text).unwrap();
         assert_eq!(f.server, "prueba");
-        assert!(f.message.starts_with("You are about to drop the index named **bp_assignee_1**"));
+        assert!(
+            f.message
+                .starts_with("You are about to drop the index named **bp_assignee_1**")
+        );
         assert_eq!(f.fields.len(), 1);
         let c = &f.fields[0];
-        assert_eq!((c.label.as_str(), c.required, c.filled, c.kind), ("Would you like to confirm?", true, false, Some("bool")));
+        assert_eq!(
+            (c.label.as_str(), c.required, c.filled, c.kind),
+            ("Would you like to confirm?", true, false, Some("bool"))
+        );
         assert_eq!(c.description.as_deref(), Some("Would you like to confirm?"));
         assert_eq!(cur, FormCursor::Field(0));
         assert!(hint.contains("Space to toggle"));
@@ -1540,19 +1779,39 @@ mod tests {
 
     #[test]
     fn mcp_form_with_several_fields_and_a_list() {
-        let text = std::fs::read_to_string(format!("{}/tests/pantallas/formulario_varios.txt", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let text = std::fs::read_to_string(format!(
+            "{}/tests/pantallas/formulario_varios.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
         let f = form(&text).unwrap();
-        assert_eq!(f.fields.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(), ["Would you like to confirm?", "Motivo", "Entorno"]);
-        assert_eq!(f.fields[1].description.as_deref(), Some("Por qué lo borras"));
+        assert_eq!(
+            f.fields
+                .iter()
+                .map(|x| x.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Would you like to confirm?", "Motivo", "Entorno"]
+        );
+        assert_eq!(
+            f.fields[1].description.as_deref(),
+            Some("Por qué lo borras")
+        );
         assert!(!f.fields[1].required && f.fields[1].value == "not set");
-        let lista = std::fs::read_to_string(format!("{}/tests/pantallas/formulario_lista.txt", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let lista = std::fs::read_to_string(format!(
+            "{}/tests/pantallas/formulario_lista.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
         let (f, cur, _) = form_state(&lista).unwrap();
         assert_eq!(f.server, "shara-dev");
         assert_eq!(f.fields[0].kind, Some("choice"));
         assert!(f.message.contains("(+2 more lines)"));
         assert_eq!(cur, FormCursor::Field(0));
         let open = "      Entorno: ▾\n        ❯ ◯ dev\n          ◉ pre\n          ◯ prod";
-        assert_eq!(choice_options(open), (vec!["dev".into(), "pre".into(), "prod".into()], Some(0)));
+        assert_eq!(
+            choice_options(open),
+            (vec!["dev".into(), "pre".into(), "prod".into()], Some(0))
+        );
     }
 
     #[test]
@@ -1563,15 +1822,34 @@ mod tests {
         assert_eq!(
             bg.agents,
             [
-                Agent { kind: "general-purpose".into(), task: "Rerunning e2e and test battery".into(), elapsed: 20 * 60 + 51 },
-                Agent { kind: "general-purpose".into(), task: "Adding grace tests".into(), elapsed: 3724 },
+                Agent {
+                    kind: "general-purpose".into(),
+                    task: "Rerunning e2e and test battery".into(),
+                    elapsed: 20 * 60 + 51
+                },
+                Agent {
+                    kind: "general-purpose".into(),
+                    task: "Adding grace tests".into(),
+                    elapsed: 3724
+                },
             ]
         );
         let narrow = "  ⏵⏵ auto mode on (shift+tab to cycle) · ↓ to manage\n  ● main\n  ◯ general-purpose  Extending… 7m 29s · ↓ 688.5k tokens";
         let bg = background(narrow).unwrap();
-        assert_eq!((bg.shells, bg.agents[0].task.as_str(), bg.agents[0].elapsed), (0, "Extending…", 449));
-        assert_eq!(background("  ⏵⏵ auto mode on · 1 shell · ↓ to manage").unwrap().shells, 1);
-        assert_eq!(background("❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)"), None);
+        assert_eq!(
+            (bg.shells, bg.agents[0].task.as_str(), bg.agents[0].elapsed),
+            (0, "Extending…", 449)
+        );
+        assert_eq!(
+            background("  ⏵⏵ auto mode on · 1 shell · ↓ to manage")
+                .unwrap()
+                .shells,
+            1
+        );
+        assert_eq!(
+            background("❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)"),
+            None
+        );
     }
 
     #[test]

@@ -30,6 +30,9 @@ impl Api {
         s.set_read_timeout(Some(Duration::from_secs(30)))?;
         let body = body.map(|b| b.to_string()).unwrap_or_default();
         let mut req = format!("{method} {path} HTTP/1.0\r\nHost: {}\r\n", self.addr);
+        // La terminal habla español: los mensajes del gestor, también (la API, por defecto, en
+        // inglés para la app y la web).
+        req.push_str("Accept-Language: es\r\n");
         if let Some(t) = &self.token {
             req.push_str(&format!("Authorization: Bearer {t}\r\n"));
         }

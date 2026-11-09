@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::server::AppState;
+use crate::server::{AppState, error};
 
 /// Máximo por archivo.
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -114,8 +114,7 @@ pub async fn api_upload(
     body: Bytes,
 ) -> Response {
     if body.is_empty() {
-        let msg = serde_json::json!({ "error": "archivo vacío" });
-        return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
+        return error(StatusCode::BAD_REQUEST, "archivo vacío");
     }
     let ctype = headers
         .get(header::CONTENT_TYPE)
@@ -124,14 +123,11 @@ pub async fn api_upload(
     let dir = st.uploads.clone();
     match tokio::task::spawn_blocking(move || save(&dir, &name, &body)).await {
         Ok(Ok(path)) => Json(serde_json::json!({ "path": path })).into_response(),
-        Ok(Err(e)) => {
-            let msg = serde_json::json!({ "error": format!("no se pudo guardar: {e}") });
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
-        }
-        Err(e) => {
-            let msg = serde_json::json!({ "error": e.to_string() });
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
-        }
+        Ok(Err(e)) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("no se pudo guardar: {e}"),
+        ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 

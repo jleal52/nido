@@ -34,6 +34,25 @@ async fn call(
     .unwrap()
 }
 
+/// Una petición GET a mano, con estas cabeceras; devuelve la respuesta entera.
+async fn raw_get(addr: SocketAddr, path: &str, headers: &[&str]) -> String {
+    use std::io::{Read, Write};
+    let mut req = format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n");
+    for h in headers {
+        req.push_str(&format!("{h}\r\n"));
+    }
+    req.push_str("\r\n");
+    tokio::task::spawn_blocking(move || {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    })
+    .await
+    .unwrap()
+}
+
 async fn wait_for(mut cond: impl AsyncFnMut() -> bool) -> bool {
     for _ in 0..100 {
         if cond().await {
@@ -121,6 +140,31 @@ async fn sessions_end_to_end() {
     )
     .await;
     assert_eq!(code, 400, "nombre repetido");
+
+    // Los mensajes salen en inglés salvo que la petición prefiera español (la CLI lo pide).
+    let (_, e) = call(addr, "GET", "/api/v1/sessions/nadie/chat", None).await;
+    assert_eq!(e["error"], "no hay ninguna sesión \"nadie\"");
+    let bearer = format!("Authorization: Bearer {TOKEN}");
+    let en = raw_get(addr, "/api/v1/sessions/nadie/chat", &[&bearer]).await;
+    assert!(
+        en.ends_with(r#"{"error":"there is no session \"nadie\""}"#),
+        "{en}"
+    );
+    let es = raw_get(
+        addr,
+        "/api/v1/sessions/nadie/chat",
+        &[&bearer, "Accept-Language: es-ES,es;q=0.9"],
+    )
+    .await;
+    assert!(
+        es.ends_with(r#"{"error":"no hay ninguna sesión \"nadie\""}"#),
+        "{es}"
+    );
+    let fr = raw_get(addr, "/api/v1/sessions", &["Accept-Language: fr"]).await;
+    assert!(
+        fr.ends_with(r#"{"error":"the token is missing or not valid"}"#),
+        "{fr}"
+    );
 
     // Terminal por WebSocket.
     let url = format!("ws://{addr}/api/v1/sessions/{id}/term?role=driver&cols=80&rows=24");

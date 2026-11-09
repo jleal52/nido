@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, watch};
 
 use crate::claude::{self, Procfs};
+use crate::i18n::{self, tr};
 use crate::launch::{self, Launcher, Paths};
 use crate::proto::{self, Frame, Hello, HistoryRequest, Role, Size};
 use crate::registry::{ClaudeLink, Registry, RegistryError, Session, new_id, now, now_ms};
@@ -285,9 +286,13 @@ impl AppState {
                 unread: finished > s.seen,
                 alive,
                 claude: link.map(|l| ClaudeView {
-                    background: found
-                        .as_ref()
-                        .and_then(|_| self.background.lock().expect("segundo plano").get(&s.id).cloned()),
+                    background: found.as_ref().and_then(|_| {
+                        self.background
+                            .lock()
+                            .expect("segundo plano")
+                            .get(&s.id)
+                            .cloned()
+                    }),
                     session_id: l.session_id,
                     running: found.is_some(),
                     status: found.as_ref().and_then(|f| f.info.status.clone()),
@@ -340,7 +345,11 @@ impl AppState {
 
 fn runs_claude_directly(argv: &[String]) -> bool {
     argv.first().is_some_and(|a| {
-        let name = a.rsplit(['/', '\\']).next().unwrap_or(a).to_ascii_lowercase();
+        let name = a
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(a)
+            .to_ascii_lowercase();
         let name = name.strip_suffix(".exe").unwrap_or(&name);
         name == "claude"
     })
@@ -429,14 +438,20 @@ impl AppState {
         // «Terminó» solo si de verdad ha terminado: no ha vuelto a trabajar y no le quedan
         // subagentes en marcha (mirando su pantalla ahora). Sin leer sigue igual en la web y la app.
         if a.kind == AlertKind::Finished {
-            if v.claude.as_ref().is_some_and(|c| c.status.as_deref() == Some("busy")) {
+            if v.claude
+                .as_ref()
+                .is_some_and(|c| c.status.as_deref() == Some("busy"))
+            {
                 return;
             }
             if self.has_subagents(&v.id).await {
                 return;
             }
             let mut pushed = self.finished_pushed.lock().expect("avisos");
-            if pushed.get(&v.id).is_some_and(|t| t.elapsed() < FINISHED_DELAY) {
+            if pushed
+                .get(&v.id)
+                .is_some_and(|t| t.elapsed() < FINISHED_DELAY)
+            {
                 return;
             }
             pushed.insert(v.id.clone(), std::time::Instant::now());
@@ -455,11 +470,19 @@ impl AppState {
 impl AppState {
     /// Si la sesión tiene ahora subagentes en marcha (según su pantalla).
     async fn has_subagents(&self, id: &str) -> bool {
-        let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
-        let Ok(stream) = holder_connect(self, id, hello).await else { return false };
+        let hello = Hello {
+            role: Role::Viewer,
+            cols: 80,
+            rows: 24,
+        };
+        let Ok(stream) = holder_connect(self, id, hello).await else {
+            return false;
+        };
         let (rd, wr) = crate::ipc::split(stream);
         let mut scr = prompt::Screen::new(rd, wr);
-        let Ok(Ok(text)) = tokio::time::timeout(Duration::from_secs(3), scr.screen()).await else { return false };
+        let Ok(Ok(text)) = tokio::time::timeout(Duration::from_secs(3), scr.screen()).await else {
+            return false;
+        };
         prompt::background(&text).is_some_and(|b| !b.agents.is_empty())
     }
 }
@@ -613,11 +636,20 @@ fn spawn_background(state: Arc<AppState>) {
                 if !s.alive || !s.claude.as_ref().is_some_and(|c| c.running) {
                     continue;
                 }
-                let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
-                let Ok(stream) = holder_connect(&state, &s.id, hello).await else { continue };
+                let hello = Hello {
+                    role: Role::Viewer,
+                    cols: 80,
+                    rows: 24,
+                };
+                let Ok(stream) = holder_connect(&state, &s.id, hello).await else {
+                    continue;
+                };
                 let (rd, wr) = crate::ipc::split(stream);
                 let mut scr = prompt::Screen::new(rd, wr);
-                let Ok(Ok(text)) = tokio::time::timeout(Duration::from_secs(3), scr.screen()).await else { continue };
+                let Ok(Ok(text)) = tokio::time::timeout(Duration::from_secs(3), scr.screen()).await
+                else {
+                    continue;
+                };
                 if let Some(bg) = prompt::background(&text) {
                     seen.insert(s.id.clone(), background_json(&bg));
                 }
@@ -701,7 +733,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/accounts/switch", post(api_switch_account))
         .route("/api/v1/accounts/login", post(api_login_start))
         .route("/api/v1/accounts/login/finish", post(api_login_finish))
-        .route("/api/v1/accounts/{number}", axum::routing::delete(api_remove_account))
+        .route(
+            "/api/v1/accounts/{number}",
+            axum::routing::delete(api_remove_account),
+        )
         .route("/api/v1/e2e", get(ws_e2e))
         .route("/api/v1/pair", post(api_pair).delete(api_pair_stop))
         .route("/api/v1/group", get(api_group))
@@ -742,11 +777,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(upload::api_upload).layer(DefaultBodyLimit::max(upload::MAX_BYTES)),
         )
         .layer(middleware::from_fn_with_state(state.clone(), auth::guard))
+        // Por fuera de todo (también de `guard`): el idioma de los mensajes, según la petición.
+        .layer(middleware::from_fn(i18n::lang_layer))
         .with_state(state)
 }
 
+/// Un error para la app o la web, en el idioma de la petición.
 pub fn error(status: StatusCode, msg: impl Into<String>) -> Response {
-    (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
+    (
+        status,
+        Json(serde_json::json!({ "error": tr(&msg.into()) })),
+    )
+        .into_response()
 }
 
 fn registry_error(e: RegistryError) -> Response {
@@ -786,13 +828,19 @@ async fn api_browse(State(st): State<Arc<AppState>>, Query(q): Query<BrowseQuery
     let home = st.paths.home.clone();
     match tokio::task::spawn_blocking(move || crate::browse::list(&home, &q.path)).await {
         Ok(Ok(l)) => Json(l).into_response(),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e }))).into_response(),
+        Ok(Err(e)) => error(StatusCode::NOT_FOUND, e),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 async fn api_accounts(State(st): State<Arc<AppState>>) -> Response {
-    Json(st.accounts.view()).into_response()
+    // La vista se rehace de fondo, en español: se traduce al mandarla.
+    let mut view = st.accounts.view();
+    for a in &mut view.accounts {
+        a.problem = a.problem.as_deref().map(tr);
+    }
+    view.error = view.error.as_deref().map(tr);
+    Json(view).into_response()
 }
 
 #[derive(Deserialize)]
@@ -808,7 +856,9 @@ async fn api_login_start(
     State(st): State<Arc<AppState>>,
     body: Option<Json<LoginStartReq>>,
 ) -> Response {
-    let hint = body.and_then(|Json(b)| b.email).filter(|e| accounts::valid_target(e));
+    let hint = body
+        .and_then(|Json(b)| b.email)
+        .filter(|e| accounts::valid_target(e));
     let (url, state) = st.accounts.login_start(hint.as_deref());
     Json(serde_json::json!({ "url": url, "state": state })).into_response()
 }
@@ -824,7 +874,11 @@ async fn api_login_finish(
     State(st): State<Arc<AppState>>,
     Json(req): Json<LoginFinishReq>,
 ) -> Response {
-    match st.accounts.login_finish(req.state.as_deref(), &req.code).await {
+    match st
+        .accounts
+        .login_finish(req.state.as_deref(), &req.code)
+        .await
+    {
         Ok(r) => Json(r).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, e),
     }
@@ -837,9 +891,15 @@ async fn api_remove_account(State(st): State<Arc<AppState>>, Path(number): Path<
     }
 }
 
-/// Cómo va la conexión con el hub.
+/// Cómo va la conexión con el hub (su error, en el idioma de la petición).
+fn hub_status(st: &AppState) -> hub::HubStatus {
+    let mut s = st.hub.status.borrow().clone();
+    s.error = s.error.as_deref().map(tr);
+    s
+}
+
 async fn api_hub(State(st): State<Arc<AppState>>) -> Response {
-    Json(st.hub.status.borrow().clone()).into_response()
+    Json(hub_status(&st)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -852,14 +912,19 @@ struct HubReq {
 /// Pone (o quita, con `url: null`) el hub y reconecta.
 async fn api_set_hub(State(st): State<Arc<AppState>>, Json(req): Json<HubReq>) -> Response {
     match st.hub.set_url(req.url, req.address) {
-        Ok(()) => Json(st.hub.status.borrow().clone()).into_response(),
+        Ok(()) => Json(hub_status(&st)).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, e),
     }
 }
 
 async fn api_push_test(State(st): State<Arc<AppState>>) -> Response {
     let badge = attention(&st.views.borrow().sessions);
-    let failed = st.push_all("nido", "Aviso de prueba", "", badge).await;
+    let failed: Vec<String> = st
+        .push_all("nido", "Aviso de prueba", "", badge)
+        .await
+        .iter()
+        .map(|f| tr(f))
+        .collect();
     let phones = st
         .phones
         .lock()
@@ -885,9 +950,15 @@ async fn api_switch_account(
         return error(StatusCode::BAD_REQUEST, "cuenta no válida");
     }
     match st.accounts.switch(target).await {
-        Ok(r) => {
+        Ok(mut r) => {
             // Las sesiones paradas por el límite de la cuenta anterior siguen con la nueva.
-            let resumed = if r.switched { resume_limited(&st).await } else { Vec::new() };
+            let resumed = if r.switched {
+                resume_limited(&st).await
+            } else {
+                Vec::new()
+            };
+            r.message = r.message.as_deref().map(tr);
+            r.warnings = r.warnings.iter().map(|w| tr(w)).collect();
             let mut v = serde_json::to_value(&r).unwrap_or_default();
             v["resumed"] = resumed.into();
             Json(v).into_response()
@@ -907,15 +978,29 @@ async fn resume_limited(st: &AppState) -> Vec<String> {
         if !s.alive || !c.running || c.account.is_some() {
             continue;
         }
-        let link = st.registry.lock().await.get(&s.id).and_then(|x| x.claude.clone());
+        let link = st
+            .registry
+            .lock()
+            .await
+            .get(&s.id)
+            .and_then(|x| x.claude.clone());
         let stopped = link
             .and_then(|l| {
-                let config = l.config_dir.clone().unwrap_or_else(|| claude::default_config_dir(&st.paths.home));
+                let config = l
+                    .config_dir
+                    .clone()
+                    .unwrap_or_else(|| claude::default_config_dir(&st.paths.home));
                 crate::transcript::find(&config, &l.session_id)
             })
             .is_some_and(|p| crate::transcript::stopped_by_limit(&p));
-        let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
-        let Ok(stream) = holder_connect(st, &s.id, hello).await else { continue };
+        let hello = Hello {
+            role: Role::Viewer,
+            cols: 80,
+            rows: 24,
+        };
+        let Ok(stream) = holder_connect(st, &s.id, hello).await else {
+            continue;
+        };
         let (rd, wr) = crate::ipc::split(stream);
         let mut scr = prompt::Screen::new(rd, wr);
         let _one = st.answering.lock().await;
@@ -993,7 +1078,10 @@ struct ConversationsQuery {
 
 /// Las conversaciones de Claude guardadas en una carpeta, para retomar una en una sesión nueva.
 /// Cada una dice en qué sesión de nido está ya, si está en alguna.
-async fn api_conversations(State(st): State<Arc<AppState>>, Query(q): Query<ConversationsQuery>) -> Response {
+async fn api_conversations(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ConversationsQuery>,
+) -> Response {
     let cwd = expand_home(&st.paths.home, q.cwd);
     let dir = crate::transcript::project_dir(&claude::default_config_dir(&st.paths.home), &cwd);
     let list = tokio::task::spawn_blocking(move || crate::transcript::conversations(&dir, 30))
@@ -1217,7 +1305,11 @@ async fn api_answer(
         Err(r) => return r,
     };
     let _one = st.answering.lock().await;
-    let hello = Hello { role: Role::Viewer, cols: 80, rows: 24 };
+    let hello = Hello {
+        role: Role::Viewer,
+        cols: 80,
+        rows: 24,
+    };
     let Ok(stream) = holder_connect(&st, &s.id, hello).await else {
         return error(StatusCode::CONFLICT, "la sesión no está en marcha");
     };
@@ -1326,7 +1418,11 @@ struct HistoryQuery {
     screen: bool,
 }
 
-async fn holder_connect(st: &AppState, id: &str, hello: Hello) -> std::io::Result<crate::ipc::Stream> {
+async fn holder_connect(
+    st: &AppState,
+    id: &str,
+    hello: Hello,
+) -> std::io::Result<crate::ipc::Stream> {
     let mut stream = crate::ipc::connect(&st.paths.socket(id)).await?;
     proto::write_frame(&mut stream, &Frame::Hello(hello)).await?;
     Ok(stream)
@@ -1441,6 +1537,7 @@ async fn api_chat(
     {
         Ok(Ok(chunk)) => {
             let mut v = serde_json::to_value(&chunk).unwrap_or_default();
+            localize_chunk(&mut v);
             v["session_id"] = serde_json::Value::String(link.session_id);
             Json(v).into_response()
         }
@@ -1503,7 +1600,12 @@ async fn api_pair(State(st): State<Arc<AppState>>, body: Option<Json<PairReq>>) 
     let offer = match days {
         Some(d) => match st.pairing.offer_standing(&st.identity, &direct, hub_ref, d) {
             Ok(o) => o,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("no se pudo guardar el código: {e}")),
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("no se pudo guardar el código: {e}"),
+                );
+            }
         },
         None => st.pairing.offer(&st.identity, &direct, hub_ref),
     };
@@ -1644,7 +1746,9 @@ async fn ws_term(
         Ok(s) => s,
         Err(r) => return r,
     };
-    ws.on_upgrade(move |socket| term(socket, st, s.id, q))
+    // El WebSocket sigue en otra tarea: se lleva el idioma de la petición.
+    let lang = i18n::lang();
+    ws.on_upgrade(move |socket| i18n::scope(lang, term(socket, st, s.id, q)))
 }
 
 /// Puente entre el navegador y el guardián: bytes en binario; control en JSON.
@@ -1659,7 +1763,7 @@ async fn term(mut socket: WebSocket, st: Arc<AppState>, id: String, q: TermQuery
         Err(_) => {
             let frame = axum::extract::ws::CloseFrame {
                 code: 4004,
-                reason: "la sesión no está en marcha".into(),
+                reason: tr("la sesión no está en marcha").into(),
             };
             let _ = socket.send(Message::Close(Some(frame))).await;
             return;
@@ -1713,6 +1817,18 @@ struct LiveQuery {
     limit: Option<usize>,
 }
 
+/// Los avisos que nido pone en la conversación (p. ej. «Claude resumió la conversación…»), en el
+/// idioma de la petición. Lo demás es de Claude o tuyo: tal cual.
+fn localize_chunk(v: &mut serde_json::Value) {
+    for item in v["items"].as_array_mut().into_iter().flatten() {
+        if item["kind"] == "notice"
+            && let Some(t) = item["text"].as_str()
+        {
+            item["text"] = tr(t).into();
+        }
+    }
+}
+
 /// El plan que Claude pide aprobar: el fichero que nombra el menú (`~/.claude/plans/<nombre>.md`).
 /// Solo se lee si es un `.md` dentro de una carpeta `plans`.
 fn plan_text(home: &std::path::Path, m: &prompt::Menu) -> Option<String> {
@@ -1728,7 +1844,9 @@ fn plan_text(home: &std::path::Path, m: &prompt::Menu) -> Option<String> {
         None => PathBuf::from(token),
     };
     if !path.is_absolute()
-        || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
         || path.parent()?.file_name()? != "plans"
     {
         return None;
@@ -1747,7 +1865,8 @@ async fn ws_live(
         Ok(s) => s,
         Err(r) => return r,
     };
-    ws.on_upgrade(move |socket| live(socket, st, s.id, q))
+    let lang = i18n::lang();
+    ws.on_upgrade(move |socket| i18n::scope(lang, live(socket, st, s.id, q)))
 }
 
 /// Lo que la vista chat necesita, en cuanto cambia: los mensajes nuevos de la transcripción de
@@ -1812,6 +1931,7 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                                 offset = chunk.offset;
                                 if send {
                                     let mut v = serde_json::to_value(&chunk).unwrap_or_default();
+                                    localize_chunk(&mut v);
                                     v["type"] = "chat".into();
                                     v["session_id"] = link.session_id.clone().into();
                                     v["reset"] = (reset || chunk.reset).into();
