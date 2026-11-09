@@ -1,131 +1,138 @@
 # nido
 
-Gestor de sesiones de terminal, pensado para Claude Code. Cada sesión es una terminal con su
-programa (casi siempre Claude) que sigue en marcha aunque cierres la terminal, y que se vuelve a
-abrir al reiniciar el equipo: Claude retoma su conversación. Las manejas desde la consola, el
-navegador o el móvil, y si tienes varios equipos, desde un mismo sitio.
+**English** · [Español](README.es.md)
 
-**Funciona en Windows, macOS y Linux** (también en WSL 2).
+A terminal session manager built for Claude Code. Each session is a terminal running its program
+(usually Claude) that keeps running when you close the terminal, and comes back when the computer
+restarts: Claude picks up its conversation. You drive them from the command line, the browser or
+your phone, and if you have several computers, all from one place.
 
-Este repositorio es la herramienta que se instala en cada equipo: las sesiones, la API y la
-consola (`nido …`). Desde el navegador o el móvil se maneja con la web o la app de nido,
-emparejándolas con tu equipo; todo lo que pasa entre ellos va **cifrado de extremo a extremo**.
+**Works on Windows, macOS and Linux** (WSL 2 too).
 
-| Sistema | Cómo corre |
+This repository is the tool you install on each computer: the sessions, the API and the command
+line (`nido …`). From a browser or a phone you use the nido web app or mobile app, paired with
+your computer; everything between them is **end-to-end encrypted**.
+
+| System | How it runs |
 |---|---|
-| Linux con systemd | Servicio de usuario de systemd |
-| WSL 2 (con systemd) | Igual que en Linux |
-| macOS | Agente de launchd (sin límite de memoria por sesión) |
-| Windows 10/11 | Tarea al iniciar sesión (sin `nido attach`: las sesiones se ven en la web y la app) |
+| Linux with systemd | systemd user service |
+| WSL 2 (with systemd) | Same as Linux |
+| macOS | launchd agent (no per-session memory limit) |
+| Windows 10/11 | Task at sign-in (no `nido attach`: sessions are shown in the web and mobile apps) |
 
-## Úsalo gratis con nido.utebo.info
+## Use it for free with nido.utebo.info
 
-No hace falta montar nada: **[nido.utebo.info](https://nido.utebo.info)** es un hub público y
-gratuito con la web de nido. Tu equipo se conecta a él y tú entras desde cualquier navegador (o
-desde la app), sin abrir puertos ni tocar el router.
+Nothing to set up: **[nido.utebo.info](https://nido.utebo.info)** is a free public hub serving
+the nido web app. Your computer connects to it and you open it from any browser (or from the
+mobile app), without opening ports or touching your router.
 
-Y es **privado**: el hub solo reenvía bytes cifrados entre tu equipo y tus dispositivos, que son
-los únicos que tienen las claves. No puede leer tus sesiones, lo que escribes ni lo que te
-contesta Claude. Lo que sí ve: qué equipos están conectados (por un identificador sacado de su
-clave, no por su nombre), cuántos dispositivos y cuánto tráfico, y el identificador para mandar
-avisos al teléfono (su contenido también va cifrado). La web la sirve el propio hub: guarda la
-versión que usaste y te avisa si alguna vez recibes otra distinta.
+And it is **private**: the hub only relays encrypted bytes between your computer and your
+devices, which are the only ones holding the keys. It cannot read your sessions, what you type
+or what Claude answers. What it does see: which computers are connected (by an identifier derived
+from their key, not by name), how many devices and how much traffic, and the token used to send
+notifications to your phone (their content is encrypted too). The web app is served by the hub
+itself: your browser keeps the version you used and warns you if it ever gets a different one.
 
 ```sh
-# Con nido ya instalado (ver «Instalar», más abajo):
+# With nido installed (see "Install" below):
 nido hub set wss://nido.utebo.info
-nido pair          # da un código nido://pair?… (vale 10 minutos y una vez)
+nido pair          # prints a nido://pair?… code (valid for 10 minutes, once)
 ```
 
-Abre [nido.utebo.info](https://nido.utebo.info), pega el código y listo (en Windows, lo mismo
-con `nido.exe`). Para añadir otro equipo al mismo sitio, mira [Varios equipos](#varios-equipos).
+Open [nido.utebo.info](https://nido.utebo.info), paste the code and you're done (on Windows, the
+same with `nido.exe`). To add another computer to the same place, see
+[Several computers](#several-computers).
 
-## Uso
+nido's messages follow your language: the web and mobile apps are in English, or in Spanish when
+your browser or phone is set to Spanish. The command line is in Spanish for now.
+
+## Usage
 
 ```sh
-nido ls                          # sesiones y su estado
-nido new api                     # Claude nuevo en la carpeta actual
-nido new web -- npm run dev      # cualquier otra orden
-nido attach api                  # engancharse desde la terminal (Ctrl+\ para soltar)
-nido attach                      # elegir de una lista
-nido stop|start|restart|rm <nombre>
-nido new api --folder trabajo    # carpetas lógicas, para agrupar
-nido mv api personal             # mover de carpeta (sin carpeta: `nido mv api`)
-nido import-tmux [--dry-run]     # registrar los Claude que corren en tmux
-nido accounts                    # las cuentas de Claude y lo que gasta cada una
-nido accounts use 3              # pasar Claude (todas las sesiones) a la cuenta 3
-nido accounts login [3]          # entrar en una cuenta nueva, o volver a entrar en la 3
+nido ls                          # sessions and their state
+nido new api                     # a new Claude in the current folder
+nido new web -- npm run dev      # any other command
+nido attach api                  # attach from the terminal (Ctrl+\ to detach)
+nido attach                      # pick from a list
+nido stop|start|restart|rm <name>
+nido new api --folder work       # logical folders, for grouping
+nido mv api personal             # move to a folder (no folder: `nido mv api`)
+nido import-tmux [--dry-run]     # register the Claudes running in tmux
+nido accounts                    # your Claude accounts and how much each one has used
+nido accounts use 3              # switch Claude (every session) to account 3
+nido accounts login [3]          # sign in to a new account, or sign in to account 3 again
 ```
 
-Las cuentas de Claude las lleva nido: para entrar da un enlace a la página de Claude (se puede
-abrir en cualquier navegador, también el del móvil) y se pega el código que enseña al acabar. Si
-había cuentas de cswap (claude-swap), la primera vez se traen con sus números; después, mejor no
-usar cswap a la vez: cada uno renovaría las sesiones por su lado y las del otro dejarían de valer.
-Con `NIDO_ACCOUNTS=off`, un nido no toca las cuentas (para uno de pruebas o de demostración junto
-al de verdad).
+nido manages your Claude accounts: to sign in it gives you a link to Claude's page (it can be
+opened in any browser, including your phone's) and you paste the code it shows at the end. If you
+had cswap (claude-swap) accounts, they are imported with their numbers the first time; after that,
+better not to use cswap at the same time: each would renew the sessions on its own and invalidate
+the other's. With `NIDO_ACCOUNTS=off`, a nido leaves accounts alone (for a test or demo nido next
+to the real one).
 
-### Desde Windows Terminal
+### From Windows Terminal
 
-Un perfil por sesión, o uno que pregunte cuál. En *Configuración → Agregar perfil*, línea de
-comandos:
+One profile per session, or one that asks which. In *Settings → Add a new profile*, command line:
 
 ```
 wsl.exe -d Debian -- nido attach api
 wsl.exe -d Debian -- nido attach
 ```
 
-`Ctrl+\` suelta la sesión (sigue en marcha); cerrar la pestaña hace lo mismo.
+`Ctrl+\` detaches from the session (it keeps running); closing the tab does the same.
 
-### El móvil y el navegador
-
-```sh
-nido pair                        # QR para emparejar un dispositivo (vale 10 minutos y una vez)
-nido pair --days 30              # código reutilizable 30 días, solo para equipos de demo (`--stop` lo retira)
-nido phones                      # dispositivos emparejados; `nido phones rm <id>` quita uno
-nido hub                         # cómo va la conexión con el hub
-nido hub set wss://hub.ejemplo   # usar un hub; `nido hub off` lo quita
-nido hub test                    # aviso de prueba a los dispositivos
-```
-
-Cómo funciona:
-
-- **Sin puertos abiertos.** nido abre una conexión saliente con un *hub*, y el móvil o el
-  navegador se unen a ella. El hub solo reenvía bytes cifrados y manda los avisos (con su
-  contenido también cifrado).
-- **Cifrado de extremo a extremo** con [Noise](https://noiseprotocol.org/)
-  (`Noise_IK_25519_ChaChaPoly_SHA256`, y `IKpsk1` con el secreto del QR para emparejar). Ni el
-  hub ni nadie en el camino puede leer las sesiones, la conversación o lo que se teclea.
-- **Identidad.** La de tu equipo es la clave de `~/.config/nido/hub.key`: no la compartas, y si
-  se pierde hay que volver a emparejar los dispositivos. Cada dispositivo tiene su propia clave y
-  su propio token, y `nido phones rm` lo deja fuera en el momento.
-- **En casa**, si nido escucha en la LAN, el móvil puede ir directo, por el mismo canal cifrado.
-
-### Varios equipos
+### Phone and browser
 
 ```sh
-nido group invite                # en un equipo del grupo: un código (10 minutos, una vez)
-nido group join '<código>'       # en el equipo nuevo, conectado al mismo hub
-nido group                       # los equipos del grupo; `nido group rm <id>` saca uno
+nido pair                        # QR code to pair a device (valid for 10 minutes, once)
+nido pair --days 30              # reusable code for 30 days, only for demo machines (`--stop` revokes it)
+nido phones                      # paired devices; `nido phones rm <id>` removes one
+nido hub                         # status of the connection to the hub
+nido hub set wss://hub.example   # use a hub; `nido hub off` removes it
+nido hub test                    # test notification to your devices
 ```
 
-Los equipos de un grupo comparten qué dispositivos están autorizados: un móvil o navegador
-emparejado con cualquiera sirve para todos, y quitarlo en uno lo quita en todos. Todos los equipos
-son iguales. Se sincronizan entre ellos por el hub, cifrado de extremo a extremo; el hub no ve la
-lista. El nombre de cada equipo es el del sistema, o el de `NIDO_NAME`.
+How it works:
 
-## La API
+- **No open ports.** nido opens an outgoing connection to a *hub*, and the phone or browser joins
+  it. The hub only relays encrypted bytes and sends the notifications (whose content is encrypted
+  too).
+- **End-to-end encryption** with [Noise](https://noiseprotocol.org/)
+  (`Noise_IK_25519_ChaChaPoly_SHA256`, and `IKpsk1` with the QR code's secret for pairing).
+  Neither the hub nor anyone in between can read the sessions, the conversation or what you type.
+- **Identity.** Your computer's identity is the key in `~/.config/nido/hub.key`: don't share it,
+  and if it is lost you need to pair your devices again. Each device has its own key and its own
+  token, and `nido phones rm` locks it out immediately.
+- **At home**, if nido listens on the LAN, the phone can connect directly, over the same encrypted
+  channel.
 
-Solo se atiende en este equipo (`127.0.0.1`), con `Authorization: Bearer <token>`: el de
-`~/.config/nido/token` (la consola) o el de un dispositivo emparejado (que llega por el canal
-cifrado). Desde fuera de este equipo solo responde el canal cifrado (`/api/v1/e2e`).
+### Several computers
 
-## Instalar
+```sh
+nido group invite                # on a computer in the group: a code (10 minutes, once)
+nido group join '<code>'         # on the new computer, connected to the same hub
+nido group                       # the computers in the group; `nido group rm <id>` removes one
+```
 
-Hay ejecutables para Linux (x86_64 y ARM64), macOS (Apple Silicon e Intel) y Windows (x86_64) en
-[Releases](https://github.com/jleal52/nido/releases). Cada versión trae `SHA256SUMS` para
-comprobarlos.
+The computers in a group share which devices are authorized: a phone or browser paired with any
+of them works with all of them, and removing it on one removes it on all. All computers are equal.
+They sync with each other through the hub, end-to-end encrypted; the hub does not see the list.
+Each computer's name is the system's, or `NIDO_NAME`.
 
-**Linux** (y WSL 2), con systemd de usuario. Cambia `x86_64` por `aarch64` en ARM:
+## The API
+
+It only answers on this computer (`127.0.0.1`), with `Authorization: Bearer <token>`: the one in
+`~/.config/nido/token` (the command line) or a paired device's (which arrives over the encrypted
+channel). From outside this computer only the encrypted channel answers (`/api/v1/e2e`). Messages
+come in English, or in Spanish if the request asks for it with `Accept-Language: es`.
+
+## Install
+
+There are binaries for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel) and Windows
+(x86_64) in [Releases](https://github.com/jleal52/nido/releases). Each release includes
+`SHA256SUMS` to verify them.
+
+**Linux** (and WSL 2), with a systemd user service. Replace `x86_64` with `aarch64` on ARM:
 
 ```sh
 curl -fsSL https://github.com/jleal52/nido/releases/latest/download/nido-x86_64-unknown-linux-gnu.tar.gz | tar -xz
@@ -135,7 +142,7 @@ install -Dm644 contrib/nido.service ~/.config/systemd/user/nido.service
 systemctl --user daemon-reload && systemctl --user enable --now nido
 ```
 
-**macOS**, con un agente de launchd. Cambia `aarch64` por `x86_64` en un Mac con Intel:
+**macOS**, with a launchd agent. Replace `aarch64` with `x86_64` on an Intel Mac:
 
 ```sh
 curl -fsSL https://github.com/jleal52/nido/releases/latest/download/nido-aarch64-apple-darwin.tar.gz | tar -xz
@@ -146,12 +153,12 @@ sed "s/USUARIO/$(whoami)/g" contrib/nido.plist > ~/Library/LaunchAgents/io.githu
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.jleal52.nido.plist
 ```
 
-El ejecutable no está firmado por Apple. Bajado con `curl`, como arriba, macOS lo deja correr; si
-lo bajas con el navegador y no te deja abrirlo, quítale la marca de descarga con
+The binary is not signed by Apple. Downloaded with `curl`, as above, macOS lets it run; if you
+download it with a browser and macOS won't open it, remove the download flag with
 `xattr -d com.apple.quarantine ~/.local/bin/nido`.
 
-**Windows 10/11** (PowerShell), con una tarea programada que arranca nido al iniciar sesión, con
-tu usuario y sin ventana (`nidow.exe` lo lanza sin consola):
+**Windows 10/11** (PowerShell), with a scheduled task that starts nido when you sign in, as your
+user and with no window (`nidow.exe` launches it without a console):
 
 ```powershell
 $zip = "$env:TEMP\nido.zip"
@@ -159,34 +166,35 @@ Invoke-WebRequest https://github.com/jleal52/nido/releases/latest/download/nido-
 Expand-Archive $zip -DestinationPath "$env:TEMP\nido" -Force
 New-Item -ItemType Directory -Force ~\.local\bin | Out-Null
 Copy-Item "$env:TEMP\nido\nido*.exe" ~\.local\bin\
-~\.local\bin\nido.exe service install          # --name otro-nombre: como sale en la web y la app
+~\.local\bin\nido.exe service install          # --name other-name: as shown in the web and mobile apps
 ```
 
-Para que `nido` funcione en cualquier terminal, añade `~/.local/bin` (en Windows,
-`%USERPROFILE%\.local\bin`) al `PATH` si no lo está.
+For `nido` to work in any terminal, add `~/.local/bin` (on Windows, `%USERPROFILE%\.local\bin`)
+to your `PATH` if it isn't there.
 
-### Compilarlo tú
+### Build it yourself
 
-Con Rust 1.88 o más nuevo ([rustup](https://rustup.rs)):
+With Rust 1.88 or newer ([rustup](https://rustup.rs)):
 
 ```sh
 git clone https://github.com/jleal52/nido && cd nido
-cargo build --release      # deja target/release/nido (y en Windows, también nidow.exe)
+cargo build --release      # produces target/release/nido (and on Windows, nidow.exe too)
 ```
 
-y luego los mismos pasos de arriba con `target/release/nido` en lugar del ejecutable descargado.
+and then the same steps as above with `target/release/nido` instead of the downloaded binary.
 
-En Windows escucha en `127.0.0.1:7691` (el 7690 puede ser del WSL del mismo equipo), el registro
-está en `~\.local\state\nido\serve.log` y `nido service uninstall` quita la tarea. Cerrar la
-sesión de Windows cierra las sesiones de nido; al volver a entrar se abren las de autoarranque.
+On Windows it listens on `127.0.0.1:7691` (7690 may belong to WSL on the same computer), the log
+is in `~\.local\state\nido\serve.log` and `nido service uninstall` removes the task. Signing out
+of Windows closes nido's sessions; when you sign in again, the autostart ones open.
 
-Para actualizarlo: Windows no deja reemplazar un `.exe` en marcha, pero sí renombrarlo. Renombra
-`nido.exe` y `nidow.exe` (p. ej. a `nido.old.exe`), copia los nuevos y reinicia la tarea
-(`schtasks /End /TN nido` y `schtasks /Run /TN nido`): el gestor se reinicia y las sesiones siguen.
+To update it: Windows won't let you replace a running `.exe`, but it will let you rename it.
+Rename `nido.exe` and `nidow.exe` (e.g. to `nido.old.exe`), copy the new ones and restart the task
+(`schtasks /End /TN nido` and `schtasks /Run /TN nido`): the manager restarts and the sessions
+keep running.
 
-Por defecto escucha en `127.0.0.1:7690`. Para que el móvil llegue directo en casa, añade la
-dirección de la LAN con `NIDO_BIND` en un *drop-in* de la unidad
-(`~/.config/systemd/user/nido.service.d/bind.conf`): por ella solo se atiende el canal cifrado.
+By default it listens on `127.0.0.1:7690`. For the phone to connect directly at home, add the LAN
+address with `NIDO_BIND` in a unit *drop-in* (`~/.config/systemd/user/nido.service.d/bind.conf`):
+only the encrypted channel is served on it.
 
-Reiniciar el gestor no toca las sesiones: cada una es su propia unidad (`nido-s-<id>`, con
+Restarting the manager doesn't touch the sessions: each one is its own unit (`nido-s-<id>`, with
 `MemoryMax=4G`).
