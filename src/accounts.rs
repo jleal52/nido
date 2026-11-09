@@ -8,6 +8,8 @@
 //! - El uso se pregunta a Anthropic poco (la API admite muy pocas peticiones por hora): la activa
 //!   cada pocos minutos y las demás menos; tras un «demasiadas peticiones», se espera más.
 //! - La primera vez se traen las cuentas de cswap (claude-swap), si lo hay, con sus números.
+//! - Cambio automático (por equipo, apagado de entrada): cuando la cuenta activa llega al
+//!   [`AUTO_PCT`] de su ventana de 5 h o de la semanal, pasa a la siguiente que no esté agotada.
 //!
 //! A la web y a la app solo salen identidad y uso; nunca tokens.
 
@@ -37,6 +39,10 @@ const FRESH_S: u64 = 20 * 60;
 const EXPIRY_MARGIN_MS: u64 = 5 * 60 * 1000;
 /// Un inicio de sesión a medias vale esto.
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
+/// El cambio automático pasa de cuenta desde este uso (de la ventana de 5 h o de la semanal).
+pub const AUTO_PCT: f64 = 99.0;
+/// Una cuenta a la que no se pudo cambiar no se vuelve a probar hasta pasado esto.
+const AUTO_RETRY: Duration = Duration::from_secs(600);
 
 fn now_s() -> u64 {
     oauth::now_ms() / 1000
@@ -86,6 +92,9 @@ struct SavedFile {
     /// Ya se miró si había cuentas de cswap que traer.
     #[serde(default)]
     cswap_imported: bool,
+    /// Cambio automático de cuenta al llegar al [`AUTO_PCT`].
+    #[serde(default)]
+    auto_switch: bool,
 }
 
 /// Una cuenta, como la ven la web y la app.
@@ -118,6 +127,9 @@ pub struct View {
     pub error: Option<String>,
     /// Siempre: nido ya no necesita cswap (se queda para la web y la app de antes).
     pub installed: bool,
+    /// Cambio automático de cuenta, y desde qué uso.
+    pub auto_switch: bool,
+    pub auto_pct: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,6 +182,10 @@ struct Timing {
     backoff: HashMap<u32, Duration>,
     /// La última medida falló (y por qué), para enseñarlo.
     failing: HashMap<u32, String>,
+    /// Cuentas a las que el cambio automático no pudo pasar, hasta cuándo no probarlas.
+    auto_skip: HashMap<u32, Instant>,
+    /// Ya se dijo que no queda ninguna cuenta a la que pasar (para no repetirlo cada pasada).
+    auto_stuck: bool,
 }
 
 struct Inner {
@@ -189,6 +205,8 @@ pub struct Accounts {
     view: std::sync::Mutex<View>,
     logins: std::sync::Mutex<HashMap<String, Pending>>,
     kick: Notify,
+    /// Avisa cuando el cambio automático ha pasado de cuenta.
+    auto_switched: Notify,
 }
 
 impl Accounts {
@@ -209,10 +227,12 @@ impl Accounts {
             }),
             view: std::sync::Mutex::new(View {
                 installed: !disabled(),
+                auto_pct: AUTO_PCT,
                 ..Default::default()
             }),
             logins: Default::default(),
             kick: Notify::new(),
+            auto_switched: Notify::new(),
         })
     }
 
@@ -252,6 +272,31 @@ impl Accounts {
 
     pub fn view(&self) -> View {
         self.view.lock().expect("vista").clone()
+    }
+
+    /// Se dispara cada vez que el cambio automático pasa de cuenta.
+    pub fn auto_switched(&self) -> &Notify {
+        &self.auto_switched
+    }
+
+    /// Enciende o apaga el cambio automático de este equipo.
+    pub async fn set_auto(&self, on: bool) -> Result<View, String> {
+        if disabled() {
+            return Err(OFF.into());
+        }
+        {
+            let mut inner = self.inner.lock().await;
+            inner.file.auto_switch = on;
+            inner.timing.auto_skip.clear();
+            inner.timing.auto_stuck = false;
+            self.save(&inner);
+        }
+        let (identity, _) = self.live_now().await;
+        self.redraw(identity.as_ref().and_then(|v| v["accountUuid"].as_str()))
+            .await;
+        // Si ya va pasada del límite, que cambie ahora y no en la próxima medida.
+        self.kick.notify_one();
+        Ok(self.view())
     }
 
     fn save(&self, inner: &Inner) {
@@ -316,6 +361,73 @@ impl Accounts {
             self.measure(number, active, live_oauth.as_ref()).await;
         }
         self.redraw(active_uuid.as_deref()).await;
+        self.auto(active_uuid.as_deref()).await;
+    }
+
+    /// El cambio automático: si la cuenta activa (con un dato reciente) ha llegado al
+    /// [`AUTO_PCT`], pasa a la siguiente que pueda.
+    async fn auto(&self, active_uuid: Option<&str>) {
+        let (from, to, pct) = {
+            let mut inner = self.inner.lock().await;
+            if !inner.file.auto_switch {
+                return;
+            }
+            let now = now_s();
+            let Some(cur) = active_uuid
+                .and_then(|u| inner.file.accounts.iter().find(|a| a.uuid == u))
+                .cloned()
+            else {
+                return;
+            };
+            let fresh = cur
+                .usage_at
+                .is_some_and(|t| now.saturating_sub(t) <= FRESH_S);
+            let Some(pct) = cur
+                .usage
+                .as_ref()
+                .filter(|_| fresh)
+                .and_then(|u| spent(u, now as f64))
+                .filter(|p| *p >= AUTO_PCT)
+            else {
+                inner.timing.auto_stuck = false;
+                return;
+            };
+            let at = Instant::now();
+            inner.timing.auto_skip.retain(|_, until| *until > at);
+            let skip: Vec<u32> = inner.timing.auto_skip.keys().copied().collect();
+            match next_account(&inner.file.accounts, cur.number, &skip, now as f64) {
+                Some(to) => {
+                    inner.timing.auto_stuck = false;
+                    (cur.number, to, pct)
+                }
+                None => {
+                    if !inner.timing.auto_stuck {
+                        eprintln!(
+                            "nido: la cuenta {} va al {pct:.0} % y no queda ninguna otra a la que pasar",
+                            cur.number
+                        );
+                        inner.timing.auto_stuck = true;
+                    }
+                    return;
+                }
+            }
+        };
+        match self.switch(&to.to_string()).await {
+            Ok(r) if r.switched => {
+                eprintln!("nido: la cuenta {from} va al {pct:.0} %: cambio automático a la {to}");
+                self.auto_switched.notify_one();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("nido: el cambio automático no pudo pasar a la cuenta {to}: {e}");
+                self.inner
+                    .lock()
+                    .await
+                    .timing
+                    .auto_skip
+                    .insert(to, Instant::now() + AUTO_RETRY);
+            }
+        }
     }
 
     /// Mide el uso de una cuenta (renovando antes su token si es de las guardadas).
@@ -602,6 +714,8 @@ impl Accounts {
             age_s,
             error: None,
             installed: true,
+            auto_switch: inner.file.auto_switch,
+            auto_pct: AUTO_PCT,
         };
     }
 
@@ -704,6 +818,8 @@ impl Accounts {
         }
         self.save(&inner);
         drop(inner);
+        // La vista ya con la nueva activa (la web la pide en cuanto contesta esto).
+        self.redraw(Some(&to.uuid)).await;
         self.kick.notify_one();
         Ok(Switched {
             switched: true,
@@ -847,6 +963,13 @@ impl Accounts {
         drop(inner);
         result?;
         saved?;
+        // La cuenta ya en la lista (su uso llega en cuanto se mida, en la pasada que se despierta).
+        let now_active = if active {
+            Some(uuid.as_str())
+        } else {
+            live_uuid.as_deref()
+        };
+        self.redraw(now_active).await;
         self.kick.notify_one();
         Ok(LoggedIn {
             number,
@@ -970,6 +1093,43 @@ pub fn disabled() -> bool {
 
 const OFF: &str = "las cuentas de Claude están desactivadas en este nido (NIDO_ACCOUNTS=off)";
 
+/// Lo más gastado de una cuenta (su ventana de 5 h o la semanal), sin contar las ventanas que
+/// ya se han reiniciado desde que se midió.
+fn spent(u: &Usage, now: f64) -> Option<f64> {
+    [&u.five_hour, &u.seven_day]
+        .into_iter()
+        .flatten()
+        .filter(|w| {
+            w.resets_at
+                .as_deref()
+                .and_then(oauth::ts)
+                .is_none_or(|r| r > now)
+        })
+        .filter_map(|w| w.pct)
+        .reduce(f64::max)
+}
+
+/// A qué cuenta pasa el cambio automático desde `from`: la siguiente por número (dando la
+/// vuelta) que tenga sesión guardada válida, no esté en `skip` y no vaya ya al [`AUTO_PCT`].
+fn next_account(accounts: &[Saved], from: u32, skip: &[u32], now: f64) -> Option<u32> {
+    let mut ok: Vec<u32> = accounts
+        .iter()
+        .filter(|a| a.number != from && !a.relogin && !skip.contains(&a.number))
+        .filter(|a| {
+            a.usage
+                .as_ref()
+                .and_then(|u| spent(u, now))
+                .is_none_or(|p| p < AUTO_PCT)
+        })
+        .map(|a| a.number)
+        .collect();
+    ok.sort_unstable();
+    ok.iter()
+        .find(|n| **n > from)
+        .or_else(|| ok.first())
+        .copied()
+}
+
 fn set_relogin(inner: &mut Inner, number: u32, v: bool) {
     if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == number) {
         a.relogin = v;
@@ -1087,6 +1247,72 @@ mod tests {
         assert!(!valid_target("-3"));
         assert!(!valid_target("a b"));
         assert!(!valid_target(""));
+    }
+
+    fn acc(number: u32, five: f64, week: f64, resets: &str) -> Saved {
+        let w = |pct| crate::oauth::Window {
+            name: None,
+            pct: Some(pct),
+            resets_at: Some(resets.to_owned()),
+            expected_pct: None,
+            ahead_of_pace: None,
+            will_last_to_reset: None,
+            projected_exhaustion_at: None,
+        };
+        Saved {
+            number,
+            uuid: format!("u{number}"),
+            usage: Some(Usage {
+                five_hour: Some(w(five)),
+                seven_day: Some(w(week)),
+                models: vec![],
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn spent_ignores_windows_already_reset() {
+        let now = 1_800_000_000.0; // 2027-01-15
+        let later = "2027-01-16T00:00:00Z";
+        let gone = "2027-01-01T00:00:00Z";
+        assert_eq!(
+            spent(acc(1, 40.0, 99.5, later).usage.as_ref().unwrap(), now),
+            Some(99.5)
+        );
+        assert_eq!(
+            spent(acc(1, 40.0, 99.5, gone).usage.as_ref().unwrap(), now),
+            None
+        );
+    }
+
+    #[test]
+    fn next_account_goes_round_and_skips_spent_ones() {
+        let now = 1_800_000_000.0;
+        let r = "2027-01-16T00:00:00Z";
+        let mut list = vec![
+            acc(1, 99.0, 50.0, r),
+            acc(2, 10.0, 99.2, r),
+            acc(3, 20.0, 30.0, r),
+            acc(5, 0.0, 0.0, r),
+        ];
+        assert_eq!(next_account(&list, 1, &[], now), Some(3), "la 2 va agotada");
+        assert_eq!(next_account(&list, 3, &[], now), Some(5));
+        assert_eq!(next_account(&list, 5, &[], now), Some(3), "da la vuelta");
+        assert_eq!(
+            next_account(&list, 1, &[3], now),
+            Some(5),
+            "la 3 falló hace poco"
+        );
+        list[3].relogin = true;
+        assert_eq!(next_account(&list, 3, &[], now), None, "no queda ninguna");
+        // Sin dato de uso, también vale.
+        list.push(Saved {
+            number: 9,
+            uuid: "u9".into(),
+            ..Default::default()
+        });
+        assert_eq!(next_account(&list, 3, &[], now), Some(9));
     }
 
     #[test]

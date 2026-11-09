@@ -76,6 +76,12 @@ enum AccountsCmd {
     Login { account: Option<String> },
     /// Olvidar una cuenta guardada (no la activa).
     Rm { number: u32 },
+    /// Cambio automático: al llegar la cuenta activa al 99 % (5 h o semana), pasar a otra.
+    /// Sin más, cómo está.
+    Auto {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -650,6 +656,19 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             api.call("DELETE", &format!("/api/v1/accounts/{number}"), None)?;
             println!("Cuenta {number} olvidada.");
         }
+        Cmd::Accounts {
+            action: Some(AccountsCmd::Auto { state }),
+        } => {
+            let v = match state.as_deref() {
+                Some(s) => api.call(
+                    "POST",
+                    "/api/v1/accounts/auto",
+                    Some(&serde_json::json!({ "enabled": s == "on" })),
+                )?,
+                None => api.call("GET", "/api/v1/accounts", None)?,
+            };
+            println!("{}", auto_line(&v));
+        }
         Cmd::Accounts { action: None } => {
             let v = api.call("GET", "/api/v1/accounts", None)?;
             if let Some(e) = v["error"].as_str() {
@@ -708,6 +727,7 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                     }
                 );
             }
+            println!("{}", auto_line(&v));
         }
         Cmd::Ls => {
             let list = api.call("GET", "/api/v1/sessions", None)?;
@@ -1114,5 +1134,19 @@ fn windows_service(action: ServiceCmd) -> io::Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+/// «Cambio automático de cuenta: sí, al 99 %» (o «no»).
+fn auto_line(v: &serde_json::Value) -> String {
+    match v["auto_switch"].as_bool() {
+        Some(true) => format!(
+            "Cambio automático de cuenta: sí, al {} % (5 h o semana). `nido accounts auto off` lo apaga.",
+            v["auto_pct"].as_f64().unwrap_or(99.0)
+        ),
+        Some(false) => {
+            "Cambio automático de cuenta: no. `nido accounts auto on` lo enciende.".to_owned()
+        }
+        None => "Este nido no tiene cambio automático de cuenta.".to_owned(),
     }
 }

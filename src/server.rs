@@ -712,6 +712,22 @@ pub fn spawn_scanner(state: Arc<AppState>) {
     hub::spawn(state.hub.clone(), state.clone());
     // Las cuentas de Claude: lo que gasta cada una, mirado de vez en cuando.
     state.accounts.spawn(state.paths.home.clone());
+    // Tras un cambio automático de cuenta, las sesiones paradas por el límite siguen con la nueva.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                st.accounts.auto_switched().notified().await;
+                let resumed = resume_limited(&st).await;
+                if !resumed.is_empty() {
+                    eprintln!(
+                        "nido: retomadas tras el cambio de cuenta: {}",
+                        resumed.join(", ")
+                    );
+                }
+            }
+        });
+    }
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -733,6 +749,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/accounts/switch", post(api_switch_account))
         .route("/api/v1/accounts/login", post(api_login_start))
         .route("/api/v1/accounts/login/finish", post(api_login_finish))
+        .route("/api/v1/accounts/auto", post(api_accounts_auto))
         .route(
             "/api/v1/accounts/{number}",
             axum::routing::delete(api_remove_account),
@@ -833,14 +850,30 @@ async fn api_browse(State(st): State<Arc<AppState>>, Query(q): Query<BrowseQuery
     }
 }
 
-async fn api_accounts(State(st): State<Arc<AppState>>) -> Response {
-    // La vista se rehace de fondo, en español: se traduce al mandarla.
-    let mut view = st.accounts.view();
+/// La vista se rehace de fondo, en español: se traduce al mandarla.
+fn accounts_view(mut view: accounts::View) -> Response {
     for a in &mut view.accounts {
         a.problem = a.problem.as_deref().map(tr);
     }
     view.error = view.error.as_deref().map(tr);
     Json(view).into_response()
+}
+
+async fn api_accounts(State(st): State<Arc<AppState>>) -> Response {
+    accounts_view(st.accounts.view())
+}
+
+#[derive(Deserialize)]
+struct AutoReq {
+    enabled: bool,
+}
+
+/// Enciende o apaga el cambio automático de cuenta de este equipo; devuelve las cuentas.
+async fn api_accounts_auto(State(st): State<Arc<AppState>>, Json(req): Json<AutoReq>) -> Response {
+    match st.accounts.set_auto(req.enabled).await {
+        Ok(v) => accounts_view(v),
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
+    }
 }
 
 #[derive(Deserialize)]

@@ -394,7 +394,7 @@ const PACE_QUIET_S: f64 = 86400.0;
 /// "Por encima del ritmo": tantos puntos por encima de lo esperado.
 const AHEAD_PCT: f64 = 15.0;
 
-fn ts(s: &str) -> Option<f64> {
+pub(crate) fn ts(s: &str) -> Option<f64> {
     // `2026-11-09T12:00:00.123456+00:00` o con `Z`.
     let s = s.trim();
     let (date, rest) = s.split_once('T')?;
