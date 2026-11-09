@@ -1,0 +1,3 @@
+# Saltos de línea LF también al sacar el repo en Windows (las pruebas comparan ficheros byte a byte).
+* text=auto eol=lf
+*.png binary
