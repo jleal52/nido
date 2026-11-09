@@ -40,7 +40,9 @@ impl Paths {
         };
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(|d| PathBuf::from(d).join("nido"))
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("nido-{}", crate::sys::user_tag())));
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("nido-{}", crate::sys::user_tag()))
+            });
         Self {
             runtime,
             data: xdg("XDG_DATA_HOME", ".local/share"),
@@ -189,13 +191,15 @@ fn spawn_detached(cmd: &mut Command) -> io::Result<std::process::Child> {
 /// tareas para al gestor, que no se lleve las sesiones. Si el trabajo no deja salir, dentro.
 #[cfg(windows)]
 fn spawn_detached(cmd: &mut Command) -> io::Result<std::process::Child> {
-    use std::os::windows::process::CommandExt;
     use crate::sys::win::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+    use std::os::windows::process::CommandExt;
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
     match cmd.spawn() {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             // Si el gestor muere, esta sesión irá detrás: que conste.
-            eprintln!("nido: el trabajo del gestor no deja salir al guardián; la sesión depende de él");
+            eprintln!(
+                "nido: el trabajo del gestor no deja salir al guardián; la sesión depende de él"
+            );
             cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
             cmd.spawn()
         }

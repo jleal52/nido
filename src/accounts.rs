@@ -68,11 +68,15 @@ struct Saved {
 
 impl Saved {
     fn is(&self, uuid: &str, org: Option<&str>) -> bool {
-        self.uuid == uuid && (org.is_none() || self.org_uuid.is_none() || self.org_uuid.as_deref() == org)
+        self.uuid == uuid
+            && (org.is_none() || self.org_uuid.is_none() || self.org_uuid.as_deref() == org)
     }
 
     fn reference(&self) -> AccountRef {
-        AccountRef { number: self.number, email: Some(self.email.clone()) }
+        AccountRef {
+            number: self.number,
+            email: Some(self.email.clone()),
+        }
     }
 }
 
@@ -199,13 +203,18 @@ impl Accounts {
             file,
             creds_dir: data.join("accounts"),
             http: oauth::client(),
-            inner: Mutex::new(Inner { file: saved, timing: Timing::default() }),
-            view: std::sync::Mutex::new(View { installed: !disabled(), ..Default::default() }),
+            inner: Mutex::new(Inner {
+                file: saved,
+                timing: Timing::default(),
+            }),
+            view: std::sync::Mutex::new(View {
+                installed: !disabled(),
+                ..Default::default()
+            }),
             logins: Default::default(),
             kick: Notify::new(),
         })
     }
-
 
     /// Mira el uso de vez en cuando, para siempre.
     pub fn spawn(self: &Arc<Self>, home: PathBuf) {
@@ -263,7 +272,9 @@ impl Accounts {
 
     fn load_creds(&self, number: u32) -> Option<Value> {
         let raw = std::fs::read(self.creds_path(number)).ok()?;
-        serde_json::from_slice::<Value>(&raw).ok().filter(Value::is_object)
+        serde_json::from_slice::<Value>(&raw)
+            .ok()
+            .filter(Value::is_object)
     }
 
     fn save_creds(&self, number: u32, oauth: &Value) -> std::io::Result<()> {
@@ -310,7 +321,13 @@ impl Accounts {
     /// Mide el uso de una cuenta (renovando antes su token si es de las guardadas).
     async fn measure(&self, number: u32, active: bool, live_oauth: Option<&Value>) {
         let mut inner = self.inner.lock().await;
-        let Some(acc) = inner.file.accounts.iter().find(|a| a.number == number).cloned() else {
+        let Some(acc) = inner
+            .file
+            .accounts
+            .iter()
+            .find(|a| a.number == number)
+            .cloned()
+        else {
             return;
         };
         // Si se reinició nido, no volver a preguntar lo que ya se sabe.
@@ -332,21 +349,30 @@ impl Accounts {
                 None => match self.refresh_live_if_idle(&mut inner, number).await {
                     Some(t) => Some(t),
                     None => {
-                        inner.timing.next.insert(number, Instant::now() + Duration::from_secs(60));
+                        inner
+                            .timing
+                            .next
+                            .insert(number, Instant::now() + Duration::from_secs(60));
                         return;
                     }
                 },
             }
         } else {
             if acc.relogin {
-                inner.timing.next.insert(number, Instant::now() + OTHERS_EVERY);
+                inner
+                    .timing
+                    .next
+                    .insert(number, Instant::now() + OTHERS_EVERY);
                 return;
             }
             match self.fresh_token(&mut inner, number, false).await {
                 Ok(t) => Some(t),
                 Err(e) => {
                     inner.timing.failing.insert(number, e);
-                    inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
+                    inner
+                        .timing
+                        .next
+                        .insert(number, Instant::now() + AFTER_ERROR);
                     self.save(&inner);
                     return;
                 }
@@ -381,9 +407,15 @@ impl Accounts {
                     inner.timing.backoff.insert(number, wait);
                     inner.timing.next.insert(number, Instant::now() + wait);
                     if !inner.timing.failing.contains_key(&number) {
-                        eprintln!("nido: Anthropic pide esperar con la cuenta {number} ({} s)", wait.as_secs());
+                        eprintln!(
+                            "nido: Anthropic pide esperar con la cuenta {number} ({} s)",
+                            wait.as_secs()
+                        );
                     }
-                    inner.timing.failing.insert(number, "Anthropic pide esperar".into());
+                    inner
+                        .timing
+                        .failing
+                        .insert(number, "Anthropic pide esperar".into());
                     return;
                 }
                 Err(UsageError::Unauthorized) if !active && !retried => {
@@ -393,7 +425,10 @@ impl Accounts {
                         Ok(t) => token = t,
                         Err(e) => {
                             inner.timing.failing.insert(number, e);
-                            inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
+                            inner
+                                .timing
+                                .next
+                                .insert(number, Instant::now() + AFTER_ERROR);
                             self.save(&inner);
                             return;
                         }
@@ -402,12 +437,16 @@ impl Accounts {
                 Err(UsageError::Unauthorized) => {
                     // La activa: Claude la renovará. Las demás: ya se renovó y sigue sin valer.
                     if !active {
-                        if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == number) {
+                        if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == number)
+                        {
                             a.relogin = true;
                         }
                         self.save(&inner);
                     }
-                    inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
+                    inner
+                        .timing
+                        .next
+                        .insert(number, Instant::now() + AFTER_ERROR);
                     return;
                 }
                 Err(UsageError::Other(e)) => {
@@ -415,7 +454,10 @@ impl Accounts {
                         eprintln!("nido: no se pudo medir el uso de la cuenta {number}: {e}");
                     }
                     inner.timing.failing.insert(number, e);
-                    inner.timing.next.insert(number, Instant::now() + AFTER_ERROR);
+                    inner
+                        .timing
+                        .next
+                        .insert(number, Instant::now() + AFTER_ERROR);
                     return;
                 }
             }
@@ -443,7 +485,9 @@ impl Accounts {
         let tokens = match oauth::refresh(&self.http, &refresh).await {
             Ok(t) => t,
             Err(RefreshError::Dead) => {
-                eprintln!("nido: la sesión de Claude de este equipo ha caducado: hay que volver a entrar");
+                eprintln!(
+                    "nido: la sesión de Claude de este equipo ha caducado: hay que volver a entrar"
+                );
                 set_relogin(inner, number, true);
                 self.save(inner);
                 return None;
@@ -474,7 +518,12 @@ impl Accounts {
     /// El token de acceso de una cuenta guardada (no la activa), renovándolo si va a caducar (o
     /// si `force`). Lo renovado se guarda antes de usarlo: el token de renovación viejo deja de
     /// valer.
-    async fn fresh_token(&self, inner: &mut Inner, number: u32, force: bool) -> Result<String, String> {
+    async fn fresh_token(
+        &self,
+        inner: &mut Inner,
+        number: u32,
+        force: bool,
+    ) -> Result<String, String> {
         let Some(mut creds) = self.load_creds(number) else {
             set_relogin(inner, number, true);
             return Err("no hay sesión guardada de esta cuenta".into());
@@ -548,7 +597,12 @@ impl Accounts {
             .find(|a| Some(a.uuid.as_str()) == active_uuid)
             .and_then(|a| a.usage_at)
             .map(|t| now.saturating_sub(t));
-        *self.view.lock().expect("vista") = View { accounts, age_s, error: None, installed: true };
+        *self.view.lock().expect("vista") = View {
+            accounts,
+            age_s,
+            error: None,
+            installed: true,
+        };
     }
 
     fn find<'a>(file: &'a SavedFile, target: &str) -> Option<&'a Saved> {
@@ -570,9 +624,14 @@ impl Accounts {
             return Err("cuenta no válida".into());
         }
         let (identity, _) = self.live_now().await;
-        let cur_uuid = identity.as_ref().and_then(|v| v["accountUuid"].as_str()).map(str::to_owned);
+        let cur_uuid = identity
+            .as_ref()
+            .and_then(|v| v["accountUuid"].as_str())
+            .map(str::to_owned);
         let mut inner = self.inner.lock().await;
-        let to = Self::find(&inner.file, target).cloned().ok_or("no hay ninguna cuenta así")?;
+        let to = Self::find(&inner.file, target)
+            .cloned()
+            .ok_or("no hay ninguna cuenta así")?;
         let from = cur_uuid
             .as_deref()
             .and_then(|u| inner.file.accounts.iter().find(|a| a.uuid == u))
@@ -593,8 +652,12 @@ impl Accounts {
             ));
         }
         // Antes de tocar nada de Claude: que la sesión de destino valga (renovarla si toca).
-        self.fresh_token(&mut inner, to.number, false).await.inspect_err(|_| self.save(&inner))?;
-        let creds = self.load_creds(to.number).ok_or("no hay sesión guardada de esa cuenta")?;
+        self.fresh_token(&mut inner, to.number, false)
+            .await
+            .inspect_err(|_| self.save(&inner))?;
+        let creds = self
+            .load_creds(to.number)
+            .ok_or("no hay sesión guardada de esa cuenta")?;
         let live = self.live.clone();
         let identity_to = to.identity.clone();
         let old = blocking(move || -> std::io::Result<Option<Value>> {
@@ -611,7 +674,10 @@ impl Accounts {
                 // Sale de Claude: vale seguro.
                 set_relogin(&mut inner, f.number, false);
                 if let Err(e) = self.save_creds(f.number, &old) {
-                    warnings.push(format!("no se pudo guardar la sesión de la cuenta {}: {e}", f.number));
+                    warnings.push(format!(
+                        "no se pudo guardar la sesión de la cuenta {}: {e}",
+                        f.number
+                    ));
                 }
             }
             (None, Some(old)) if identity.is_some() => {
@@ -623,7 +689,12 @@ impl Accounts {
             }
             _ => {}
         }
-        if let Some(a) = inner.file.accounts.iter_mut().find(|a| a.number == to.number) {
+        if let Some(a) = inner
+            .file
+            .accounts
+            .iter_mut()
+            .find(|a| a.number == to.number)
+        {
             a.relogin = false;
         }
         // Las dos cuentas cambian de ritmo: medirlas ya.
@@ -649,28 +720,47 @@ impl Accounts {
         let mut logins = self.logins.lock().expect("entradas");
         logins.retain(|_, p| p.at.elapsed() < LOGIN_TTL);
         if logins.len() >= 8
-            && let Some(k) = logins.iter().min_by_key(|(_, p)| p.at).map(|(k, _)| k.clone())
+            && let Some(k) = logins
+                .iter()
+                .min_by_key(|(_, p)| p.at)
+                .map(|(k, _)| k.clone())
         {
             logins.remove(&k);
         }
-        logins.insert(s.state.clone(), Pending { verifier: s.verifier, at: Instant::now() });
+        logins.insert(
+            s.state.clone(),
+            Pending {
+                verifier: s.verifier,
+                at: Instant::now(),
+            },
+        );
         (s.url, s.state)
     }
 
     /// Acaba de entrar con el código que enseñó la página. Si la cuenta ya estaba, se le pone la
     /// sesión nueva (y, si es la activa, también a Claude).
-    pub async fn login_finish(&self, state: Option<&str>, pasted: &str) -> Result<LoggedIn, String> {
+    pub async fn login_finish(
+        &self,
+        state: Option<&str>,
+        pasted: &str,
+    ) -> Result<LoggedIn, String> {
         if disabled() {
             return Err(OFF.into());
         }
         let (code, pasted_state) = oauth::parse_pasted(pasted)?;
         let state = match (pasted_state, state) {
             (Some(p), Some(s)) if p != s => {
-                return Err("ese código es de otro inicio de sesión: abre el enlace de este".into());
+                return Err(
+                    "ese código es de otro inicio de sesión: abre el enlace de este".into(),
+                );
             }
             (Some(p), _) => p,
             (None, Some(s)) => s.to_owned(),
-            (None, None) => return Err("falta el final del código (lo que va tras «#»): cópialo entero".into()),
+            (None, None) => {
+                return Err(
+                    "falta el final del código (lo que va tras «#»): cópialo entero".into(),
+                );
+            }
         };
         let pending = self
             .logins
@@ -681,19 +771,42 @@ impl Accounts {
             .ok_or("ese inicio de sesión ya no vale (caducó o ya se usó): vuelve a empezar")?;
         let tokens = oauth::exchange(&self.http, &code, &state, &pending.verifier).await?;
         let profile = oauth::profile(&self.http, &tokens.access_token).await?;
-        let identity = oauth::identity(&profile, &tokens).ok_or("Claude no dice de quién es la cuenta")?;
+        let identity =
+            oauth::identity(&profile, &tokens).ok_or("Claude no dice de quién es la cuenta")?;
         let creds = oauth::credential(&tokens, &profile);
-        let uuid = identity["accountUuid"].as_str().unwrap_or_default().to_owned();
+        let uuid = identity["accountUuid"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         let org = identity["organizationUuid"].as_str().map(str::to_owned);
-        let email = identity["emailAddress"].as_str().unwrap_or_default().to_owned();
+        let email = identity["emailAddress"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
 
         let (live_identity, live_oauth) = self.live_now().await;
-        let live_uuid = live_identity.as_ref().and_then(|v| v["accountUuid"].as_str()).map(str::to_owned);
+        let live_uuid = live_identity
+            .as_ref()
+            .and_then(|v| v["accountUuid"].as_str())
+            .map(str::to_owned);
         let mut inner = self.inner.lock().await;
-        let existing = inner.file.accounts.iter().position(|a| a.is(&uuid, org.as_deref()));
+        let existing = inner
+            .file
+            .accounts
+            .iter()
+            .position(|a| a.is(&uuid, org.as_deref()));
         let number = match existing {
             Some(i) => inner.file.accounts[i].number,
-            None => inner.file.accounts.iter().map(|a| a.number).max().unwrap_or(0) + 1,
+            None => {
+                inner
+                    .file
+                    .accounts
+                    .iter()
+                    .map(|a| a.number)
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            }
         };
         let entry = Saved {
             number,
@@ -726,14 +839,21 @@ impl Accounts {
             Ok(())
         };
         // Guardada también: si luego se cambia de cuenta, la de Claude la sustituye.
-        let saved = self.save_creds(number, &creds).map_err(|e| format!("no se pudo guardar la sesión: {e}"));
+        let saved = self
+            .save_creds(number, &creds)
+            .map_err(|e| format!("no se pudo guardar la sesión: {e}"));
         inner.timing.next.remove(&number);
         self.save(&inner);
         drop(inner);
         result?;
         saved?;
         self.kick.notify_one();
-        Ok(LoggedIn { number, email, new: existing.is_none(), active })
+        Ok(LoggedIn {
+            number,
+            email,
+            new: existing.is_none(),
+            active,
+        })
     }
 
     /// Olvida una cuenta guardada (no la activa).
@@ -742,7 +862,10 @@ impl Accounts {
             return Err(OFF.into());
         }
         let (identity, _) = self.live_now().await;
-        let live_uuid = identity.as_ref().and_then(|v| v["accountUuid"].as_str()).map(str::to_owned);
+        let live_uuid = identity
+            .as_ref()
+            .and_then(|v| v["accountUuid"].as_str())
+            .map(str::to_owned);
         let mut inner = self.inner.lock().await;
         let i = inner
             .file
@@ -764,39 +887,57 @@ impl Accounts {
     /// Las cuentas de cswap (claude-swap): sus números, identidades y sesiones guardadas. La
     /// activa no: su sesión buena es la de Claude.
     fn import_cswap(&self, inner: &mut Inner, home: &Path, live_uuid: Option<&str>) -> usize {
-        let Some(root) = cswap_root(home) else { return 0 };
-        let Ok(raw) = std::fs::read(root.join("sequence.json")) else { return 0 };
-        let Ok(seq) = serde_json::from_slice::<Value>(&raw) else { return 0 };
+        let Some(root) = cswap_root(home) else {
+            return 0;
+        };
+        let Ok(raw) = std::fs::read(root.join("sequence.json")) else {
+            return 0;
+        };
+        let Ok(seq) = serde_json::from_slice::<Value>(&raw) else {
+            return 0;
+        };
         let mut n = 0;
         for (num, info) in seq["accounts"].as_object().into_iter().flatten() {
-            let (Ok(number), Some(email), Some(uuid)) =
-                (num.parse::<u32>(), info["email"].as_str(), info["uuid"].as_str())
-            else {
+            let (Ok(number), Some(email), Some(uuid)) = (
+                num.parse::<u32>(),
+                info["email"].as_str(),
+                info["uuid"].as_str(),
+            ) else {
                 continue;
             };
             let org = info["organizationUuid"].as_str();
-            if inner.file.accounts.iter().any(|a| a.number == number || a.is(uuid, org)) {
+            if inner
+                .file
+                .accounts
+                .iter()
+                .any(|a| a.number == number || a.is(uuid, org))
+            {
                 continue;
             }
-            let identity = std::fs::read(root.join("configs").join(format!(".claude-config-{number}-{email}.json")))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                .and_then(|mut v| v.get_mut("oauthAccount").map(Value::take))
-                .filter(|v| v["accountUuid"].as_str() == Some(uuid))
-                .unwrap_or_else(|| {
-                    serde_json::json!({
-                        "accountUuid": uuid,
-                        "emailAddress": email,
-                        "organizationUuid": org,
-                        "organizationName": info["organizationName"],
-                    })
-                });
+            let identity = std::fs::read(
+                root.join("configs")
+                    .join(format!(".claude-config-{number}-{email}.json")),
+            )
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|mut v| v.get_mut("oauthAccount").map(Value::take))
+            .filter(|v| v["accountUuid"].as_str() == Some(uuid))
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "accountUuid": uuid,
+                    "emailAddress": email,
+                    "organizationUuid": org,
+                    "organizationName": info["organizationName"],
+                })
+            });
             let mut relogin = false;
             if live_uuid != Some(uuid) {
                 match cswap_creds(&root, number, email) {
                     Some(c) => {
                         if let Err(e) = self.save_creds(number, &c) {
-                            eprintln!("nido: no se pudo guardar la sesión de la cuenta {number}: {e}");
+                            eprintln!(
+                                "nido: no se pudo guardar la sesión de la cuenta {number}: {e}"
+                            );
                             relogin = true;
                         }
                     }
@@ -820,7 +961,6 @@ impl Accounts {
         n
     }
 }
-
 
 /// `NIDO_ACCOUNTS=off`: nido no toca las cuentas de Claude (ni las mide, ni las trae de cswap,
 /// ni renueva sus sesiones). Para un nido de pruebas o de demostración junto al de verdad.
@@ -865,7 +1005,10 @@ fn adopt(file: &mut SavedFile, identity: &Value) -> Option<(u32, bool)> {
     let number = file.accounts.iter().map(|a| a.number).max().unwrap_or(0) + 1;
     file.accounts.push(Saved {
         number,
-        email: identity["emailAddress"].as_str().unwrap_or_default().to_owned(),
+        email: identity["emailAddress"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
         uuid: uuid.to_owned(),
         org_uuid: org.map(str::to_owned),
         organization: identity["organizationName"].as_str().map(str::to_owned),
@@ -893,17 +1036,30 @@ fn cswap_creds(root: &Path, number: u32, email: &str) -> Option<Value> {
     use base64::Engine;
     let from_json = |raw: &str| -> Option<Value> {
         let mut v: Value = serde_json::from_str(raw).ok()?;
-        v.get_mut("claudeAiOauth").map(Value::take).filter(Value::is_object)
+        v.get_mut("claudeAiOauth")
+            .map(Value::take)
+            .filter(Value::is_object)
     };
-    let enc = root.join("credentials").join(format!(".creds-{number}-{email}.enc"));
+    let enc = root
+        .join("credentials")
+        .join(format!(".creds-{number}-{email}.enc"));
     if let Ok(b) = std::fs::read_to_string(&enc) {
-        let decoded = base64::engine::general_purpose::STANDARD.decode(b.trim()).ok()?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b.trim())
+            .ok()?;
         return from_json(&String::from_utf8(decoded).ok()?);
     }
     #[cfg(target_os = "macos")]
     {
         let out = std::process::Command::new("/usr/bin/security")
-            .args(["find-generic-password", "-a", &format!("account-{number}-{email}"), "-s", "claude-swap", "-w"])
+            .args([
+                "find-generic-password",
+                "-a",
+                &format!("account-{number}-{email}"),
+                "-s",
+                "claude-swap",
+                "-w",
+            ])
             .stdin(std::process::Stdio::null())
             .output()
             .ok()?;
@@ -915,7 +1071,9 @@ fn cswap_creds(root: &Path, number: u32, email: &str) -> Option<Value> {
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    tokio::task::spawn_blocking(f).await.expect("tarea de fondo")
+    tokio::task::spawn_blocking(f)
+        .await
+        .expect("tarea de fondo")
 }
 
 #[cfg(test)]
@@ -934,7 +1092,12 @@ mod tests {
     #[test]
     fn adopt_adds_once_and_keeps_numbers() {
         let mut f = SavedFile::default();
-        f.accounts.push(Saved { number: 7, uuid: "u7".into(), email: "x@example.com".into(), ..Default::default() });
+        f.accounts.push(Saved {
+            number: 7,
+            uuid: "u7".into(),
+            email: "x@example.com".into(),
+            ..Default::default()
+        });
         let id = serde_json::json!({"accountUuid": "u1", "emailAddress": "ana@example.com", "organizationUuid": "o1"});
         assert_eq!(adopt(&mut f, &id), Some((8, true)));
         assert_eq!(adopt(&mut f, &id), Some((8, false)));
@@ -968,7 +1131,10 @@ mod tests {
         std::fs::write(root.join("credentials/.creds-2-ana@example.com.enc"), creds).unwrap();
         let data = home.join("data");
         let acc = Accounts::new(&home, &data);
-        let mut inner = Inner { file: SavedFile::default(), timing: Timing::default() };
+        let mut inner = Inner {
+            file: SavedFile::default(),
+            timing: Timing::default(),
+        };
         // La 5 es la activa: sin sesión guardada, pero apuntada.
         assert_eq!(acc.import_cswap(&mut inner, &home, Some("u5")), 2);
         let two = inner.file.accounts.iter().find(|a| a.number == 2).unwrap();

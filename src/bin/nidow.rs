@@ -26,7 +26,9 @@ fn main() {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("nido.exe")))
         .unwrap_or_else(|| "nido.exe".into());
-    let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
     let dir = home.join(".local").join("state").join("nido");
     let _ = std::fs::create_dir_all(&dir);
     let log = std::fs::OpenOptions::new()
@@ -34,7 +36,10 @@ fn main() {
         .append(true)
         .open(dir.join("serve.log"));
     let mut cmd = Command::new(&exe);
-    cmd.args(&args).envs(env).stdin(Stdio::null()).creation_flags(CREATE_NO_WINDOW);
+    cmd.args(&args)
+        .envs(env)
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
     if let Ok(log) = log {
         if let Ok(err) = log.try_clone() {
             cmd.stderr(err);

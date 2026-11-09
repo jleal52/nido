@@ -203,6 +203,7 @@ pub fn async_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Co
 pub mod win {
     use std::collections::HashMap;
 
+    use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, STILL_ACTIVE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -212,7 +213,6 @@ pub mod win {
         GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         PROCESS_TERMINATE, TerminateProcess,
     };
-    use windows_sys::Win32::Foundation::FILETIME;
 
     pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     pub const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -232,7 +232,11 @@ pub mod win {
             e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
             let mut ok = Process32FirstW(snap, &mut e) != 0;
             while ok {
-                let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                let len = e
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(e.szExeFile.len());
                 let name = String::from_utf16_lossy(&e.szExeFile[..len]);
                 out.push((e.th32ProcessID, e.th32ParentProcessID, name));
                 ok = Process32NextW(snap, &mut e) != 0;
@@ -258,7 +262,9 @@ pub mod win {
 
     /// El identificador de esta sesión de Windows (el LUID de su inicio de sesión).
     pub fn logon_id() -> Option<String> {
-        use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
+        };
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
         // SAFETY: se lee la información del token propio y se cierra.
         unsafe {
@@ -276,7 +282,12 @@ pub mod win {
                 &mut len,
             ) != 0;
             CloseHandle(token);
-            ok.then(|| format!("{}-{}", st.AuthenticationId.HighPart, st.AuthenticationId.LowPart))
+            ok.then(|| {
+                format!(
+                    "{}-{}",
+                    st.AuthenticationId.HighPart, st.AuthenticationId.LowPart
+                )
+            })
         }
     }
 
@@ -329,7 +340,10 @@ pub mod win {
             if h.is_null() {
                 return None;
             }
-            let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let z = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
             let (mut c, mut e, mut k, mut u) = (z, z, z, z);
             let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0;
             CloseHandle(h);

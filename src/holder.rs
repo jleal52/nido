@@ -157,7 +157,9 @@ fn pty_writer(master: &dyn MasterPty) -> io::Result<Box<dyn Write + Send>> {
     }
     #[cfg(windows)]
     {
-        master.take_writer().map_err(|e| io::Error::other(e.to_string()))
+        master
+            .take_writer()
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 }
 

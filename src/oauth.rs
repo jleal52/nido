@@ -67,7 +67,11 @@ pub fn start(login_hint: Option<&str>) -> Start {
     let url = reqwest::Url::parse_with_params(AUTHORIZE_URL, &params)
         .expect("URL fija")
         .to_string();
-    Start { url, state, verifier }
+    Start {
+        url,
+        state,
+        verifier,
+    }
 }
 
 /// Lo que se pega: `código#estado` (lo que enseña la página), solo el código, o la dirección
@@ -79,7 +83,11 @@ pub fn parse_pasted(input: &str) -> Result<(String, Option<String>), String> {
     }
     if s.starts_with("http://") || s.starts_with("https://") {
         let url = reqwest::Url::parse(s).map_err(|_| "esa dirección no se entiende".to_owned())?;
-        let get = |k: &str| url.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned());
+        let get = |k: &str| {
+            url.query_pairs()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.into_owned())
+        };
         let code = get("code").ok_or("en esa dirección no hay código")?;
         return Ok((code, get("state")));
     }
@@ -255,9 +263,10 @@ pub fn identity(profile: &Value, tokens: &Tokens) -> Option<Value> {
     let uuid = acc["uuid"]
         .as_str()
         .or(tokens.account.as_ref().map(|a| a.uuid.as_str()))?;
-    let email = acc["email"]
-        .as_str()
-        .or(tokens.account.as_ref().and_then(|a| a.email_address.as_deref()))?;
+    let email = acc["email"].as_str().or(tokens
+        .account
+        .as_ref()
+        .and_then(|a| a.email_address.as_deref()))?;
     let mut v = serde_json::json!({ "accountUuid": uuid, "emailAddress": email });
     let org_uuid = org["uuid"]
         .as_str()
@@ -272,10 +281,19 @@ pub fn identity(profile: &Value, tokens: &Tokens) -> Option<Value> {
         ("fullName", acc.get("full_name").cloned()),
         ("accountCreatedAt", acc.get("created_at").cloned()),
         ("billingType", org.get("billing_type").cloned()),
-        ("hasExtraUsageEnabled", org.get("has_extra_usage_enabled").cloned()),
-        ("subscriptionCreatedAt", org.get("subscription_created_at").cloned()),
+        (
+            "hasExtraUsageEnabled",
+            org.get("has_extra_usage_enabled").cloned(),
+        ),
+        (
+            "subscriptionCreatedAt",
+            org.get("subscription_created_at").cloned(),
+        ),
         ("organizationType", org.get("organization_type").cloned()),
-        ("organizationRateLimitTier", org.get("rate_limit_tier").cloned()),
+        (
+            "organizationRateLimitTier",
+            org.get("rate_limit_tier").cloned(),
+        ),
     ] {
         if let Some(val) = val.filter(|v| !v.is_null()) {
             v[k] = val;
@@ -388,13 +406,19 @@ fn ts(s: &str) -> Option<f64> {
         let (t, off) = rest.split_at(i);
         let sign = if off.starts_with('-') { -1 } else { 1 };
         let mut hm = off[1..].split(':').map(|x| x.parse::<i64>());
-        let (oh, om) = (hm.next()?.ok()?, hm.next().and_then(Result::ok).unwrap_or(0));
+        let (oh, om) = (
+            hm.next()?.ok()?,
+            hm.next().and_then(Result::ok).unwrap_or(0),
+        );
         (t, sign * (oh * 3600 + om * 60))
     } else {
         (rest, 0)
     };
     let mut t = time.split(':');
-    let (hh, mm) = (t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?);
+    let (hh, mm) = (
+        t.next()?.parse::<i64>().ok()?,
+        t.next()?.parse::<i64>().ok()?,
+    );
     let ss = t.next().map_or(Ok(0.0), str::parse::<f64>).ok()?;
     // Días desde 1970 (algoritmo de Howard Hinnant).
     let (yy, mo) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
@@ -434,7 +458,11 @@ fn pace(w: &mut Window, at: f64) {
         return;
     };
     let remaining = (next - at).rem_euclid(WEEK_S);
-    let elapsed = if remaining == 0.0 { 0.0 } else { WEEK_S - remaining };
+    let elapsed = if remaining == 0.0 {
+        0.0
+    } else {
+        WEEK_S - remaining
+    };
     if elapsed < PACE_QUIET_S {
         return;
     }
@@ -474,7 +502,9 @@ pub fn parse_usage(v: &Value, at: f64) -> Option<Usage> {
         let Some(name) = lim["scope"]["model"]["display_name"].as_str() else {
             continue;
         };
-        let Some(mut w) = window(lim, "percent") else { continue };
+        let Some(mut w) = window(lim, "percent") else {
+            continue;
+        };
         w.name = Some(name.to_owned());
         pace(&mut w, at);
         models.push(w);
@@ -482,7 +512,11 @@ pub fn parse_usage(v: &Value, at: f64) -> Option<Usage> {
     if five_hour.is_none() && seven_day.is_none() && models.is_empty() {
         return None;
     }
-    Some(Usage { five_hour, seven_day, models })
+    Some(Usage {
+        five_hour,
+        seven_day,
+        models,
+    })
 }
 
 #[cfg(test)]
@@ -510,10 +544,14 @@ mod tests {
 
     #[test]
     fn pasted_codes() {
-        assert_eq!(parse_pasted(" abc#xyz \n").unwrap(), ("abc".into(), Some("xyz".into())));
+        assert_eq!(
+            parse_pasted(" abc#xyz \n").unwrap(),
+            ("abc".into(), Some("xyz".into()))
+        );
         assert_eq!(parse_pasted("abc").unwrap(), ("abc".into(), None));
         assert_eq!(
-            parse_pasted("https://platform.claude.com/oauth/code/callback?code=c1&state=s1").unwrap(),
+            parse_pasted("https://platform.claude.com/oauth/code/callback?code=c1&state=s1")
+                .unwrap(),
             ("c1".into(), Some("s1".into()))
         );
         assert!(parse_pasted("").is_err());

@@ -18,7 +18,11 @@ pub fn split(s: Stream) -> (ReadHalf, WriteHalf) {
 /// pantalla, vería que el cliente se ha ido antes de leer la orden.
 pub fn send_stop(socket: &Path) -> io::Result<()> {
     use crate::proto::{Frame, Hello, Role, encode};
-    let mut buf = encode(&Frame::Hello(Hello { role: Role::Viewer, cols: 80, rows: 24 }))?;
+    let mut buf = encode(&Frame::Hello(Hello {
+        role: Role::Viewer,
+        cols: 80,
+        rows: 24,
+    }))?;
     buf.extend(encode(&Frame::Stop)?);
     imp::send_and_drain(socket, buf, std::time::Duration::from_secs(4))
 }
@@ -65,7 +69,11 @@ mod imp {
         std::os::unix::net::UnixStream::connect(socket).is_ok()
     }
 
-    pub fn send_and_drain(socket: &Path, buf: Vec<u8>, wait: std::time::Duration) -> io::Result<()> {
+    pub fn send_and_drain(
+        socket: &Path,
+        buf: Vec<u8>,
+        wait: std::time::Duration,
+    ) -> io::Result<()> {
         let mut s = std::os::unix::net::UnixStream::connect(socket)?;
         s.write_all(&buf)?;
         s.flush()?;
@@ -97,9 +105,19 @@ mod imp {
         let flat: String = socket
             .to_string_lossy()
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect();
-        let tail = if flat.len() > 200 { &flat[flat.len() - 200..] } else { &flat };
+        let tail = if flat.len() > 200 {
+            &flat[flat.len() - 200..]
+        } else {
+            &flat
+        };
         format!(r"\\.\pipe\nido-{tail}")
     }
 
@@ -109,7 +127,11 @@ mod imp {
     }
 
     impl AsyncRead for Stream {
-        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
             match self.get_mut() {
                 Stream::Server(s) => Pin::new(s).poll_read(cx, buf),
                 Stream::Client(c) => Pin::new(c).poll_read(cx, buf),
@@ -118,7 +140,11 @@ mod imp {
     }
 
     impl AsyncWrite for Stream {
-        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
             match self.get_mut() {
                 Stream::Server(s) => Pin::new(s).poll_write(cx, buf),
                 Stream::Client(c) => Pin::new(c).poll_write(cx, buf),
@@ -165,12 +191,16 @@ mod imp {
                     Ok(()) => break,
                     // ERROR_NO_DATA: el cliente llegó y se fue (una sonda): instancia nueva.
                     Err(e) if e.raw_os_error() == Some(232) => {
-                        self.next = ServerOptions::new().reject_remote_clients(true).create(&self.name)?;
+                        self.next = ServerOptions::new()
+                            .reject_remote_clients(true)
+                            .create(&self.name)?;
                     }
                     Err(e) => return Err(e),
                 }
             }
-            let fresh = ServerOptions::new().reject_remote_clients(true).create(&self.name)?;
+            let fresh = ServerOptions::new()
+                .reject_remote_clients(true)
+                .create(&self.name)?;
             Ok(Stream::Server(std::mem::replace(&mut self.next, fresh)))
         }
     }
@@ -186,24 +216,38 @@ mod imp {
                 Err(e) => return Err(e),
             }
         }
-        Err(io::Error::new(io::ErrorKind::TimedOut, "la tubería de la sesión está ocupada"))
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "la tubería de la sesión está ocupada",
+        ))
     }
 
     fn open_blocking(socket: &Path) -> io::Result<std::fs::File> {
         let name = pipe_name(socket);
         for _ in 0..40 {
-            match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&name)
+            {
                 Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 r => return r,
             }
         }
-        Err(io::Error::new(io::ErrorKind::TimedOut, "la tubería de la sesión está ocupada"))
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "la tubería de la sesión está ocupada",
+        ))
     }
 
     pub fn probe(socket: &Path) -> bool {
-        match std::fs::OpenOptions::new().read(true).write(true).open(pipe_name(socket)) {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_name(socket))
+        {
             Ok(_) => true,
             // Ocupada: hay guardián, atendiendo a otro.
             Err(e) => e.raw_os_error() == Some(PIPE_BUSY),
@@ -229,8 +273,13 @@ mod imp {
     mod tests {
         #[test]
         fn pipe_names_are_flat() {
-            let n = super::pipe_name(std::path::Path::new(r"C:\Users\ana\AppData\Local\Temp\nido-ana\ab12.sock"));
-            assert_eq!(n, r"\\.\pipe\nido-C--Users-ana-AppData-Local-Temp-nido-ana-ab12.sock");
+            let n = super::pipe_name(std::path::Path::new(
+                r"C:\Users\ana\AppData\Local\Temp\nido-ana\ab12.sock",
+            ));
+            assert_eq!(
+                n,
+                r"\\.\pipe\nido-C--Users-ana-AppData-Local-Temp-nido-ana-ab12.sock"
+            );
         }
     }
 }

@@ -142,8 +142,13 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    let mut f = crate::sys::private(std::fs::OpenOptions::new().write(true).create(true).truncate(true))
-        .open(&tmp)?;
+    let mut f = crate::sys::private(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+    )
+    .open(&tmp)?;
     std::io::Write::write_all(&mut f, data)?;
     std::fs::rename(&tmp, path)
 }
@@ -360,7 +365,13 @@ pub struct PairOffer {
     pub expires: u64,
 }
 
-fn pair_uri(id: &Identity, psk: &[u8; 32], expires: u64, direct: &[String], hub: Option<(&str, &str)>) -> String {
+fn pair_uri(
+    id: &Identity,
+    psk: &[u8; 32],
+    expires: u64,
+    direct: &[String],
+    hub: Option<(&str, &str)>,
+) -> String {
     let mut uri = format!(
         "nido://pair?k={}&s={}&x={expires}",
         B64URL.encode(id.public),
@@ -423,7 +434,10 @@ impl Pairing {
                 std::fs::create_dir_all(dir)?;
             }
             let tmp = f.with_extension("tmp");
-            std::fs::write(&tmp, serde_json::to_vec(&st).map_err(std::io::Error::other)?)?;
+            std::fs::write(
+                &tmp,
+                serde_json::to_vec(&st).map_err(std::io::Error::other)?,
+            )?;
             crate::sys::private_file(&tmp)?;
             std::fs::rename(&tmp, f)?;
         }
@@ -1118,7 +1132,10 @@ mod tests {
             addr: None,
         });
         let server_key = host.id.public.to_vec();
-        let offer = host.pairing.offer_standing(&host.id, &[], None, 30).unwrap();
+        let offer = host
+            .pairing
+            .offer_standing(&host.id, &[], None, 30)
+            .unwrap();
         let psk = psk_of(&offer.uri);
         assert!(offer.expires > unix_now() + 29 * 86_400);
         // Vale para varios, y no estorba al QR de una vez.
@@ -1131,7 +1148,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         let again = Pairing::load(file.clone());
         assert_eq!(again.standing_expires(), Some(offer.expires));

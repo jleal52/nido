@@ -292,7 +292,10 @@ mod tests {
     #[test]
     fn split_rows_cuts_at_the_width_ignoring_colours() {
         let joined = "\x1b[38;2;1;2;3m────\x1b[m❯ hola";
-        assert_eq!(split_rows(joined, 4), "\x1b[38;2;1;2;3m────\x1b[m\n❯ ho\nla");
+        assert_eq!(
+            split_rows(joined, 4),
+            "\x1b[38;2;1;2;3m────\x1b[m\n❯ ho\nla"
+        );
         assert_eq!(split_rows("ab\ncd", 4), "ab\ncd");
         assert_eq!(split_rows("中文字", 4), "中文\n字");
     }

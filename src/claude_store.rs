@@ -163,13 +163,19 @@ impl Live {
         let _l = lock(Path::new(&lock_path), Duration::from_secs(10))?;
         let mut v: Value = match std::fs::read(&path) {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: {e}", path.display()),
+                )
             })?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
             Err(e) => return Err(e),
         };
         if !v.is_object() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json no es un objeto"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "~/.claude.json no es un objeto",
+            ));
         }
         v["oauthAccount"] = account.clone();
         write_atomic(&path, serde_json::to_string_pretty(&v)?.as_bytes())
@@ -184,7 +190,9 @@ impl Live {
 
     /// Lo mismo, con los cerrojos ya tomados.
     pub fn swap_oauth_locked(&self, oauth: &Value) -> io::Result<Option<Value>> {
-        let mut all = self.read_credentials()?.unwrap_or_else(|| serde_json::json!({}));
+        let mut all = self
+            .read_credentials()?
+            .unwrap_or_else(|| serde_json::json!({}));
         if !all.is_object() {
             all = serde_json::json!({});
         }
@@ -260,7 +268,16 @@ mod keychain {
             child.wait_with_output()?
         } else {
             Command::new(SECURITY)
-                .args(["add-generic-password", "-U", "-a", &user(), "-s", SERVICE, "-X", &hex])
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-a",
+                    &user(),
+                    "-s",
+                    SERVICE,
+                    "-X",
+                    &hex,
+                ])
                 .stdin(Stdio::null())
                 .output()?
         };
@@ -305,8 +322,10 @@ mod tests {
         assert_eq!(all["claudeAiOauth"]["accessToken"], "nuevo");
         assert_eq!(all["mcpOAuth"]["x"], 1);
         assert_eq!(live.read_identity().unwrap()["accountUuid"], "u1");
-        live.write_identity(&serde_json::json!({"accountUuid": "u2"})).unwrap();
-        let cfg: Value = serde_json::from_slice(&std::fs::read(dir.join(".claude.json")).unwrap()).unwrap();
+        live.write_identity(&serde_json::json!({"accountUuid": "u2"}))
+            .unwrap();
+        let cfg: Value =
+            serde_json::from_slice(&std::fs::read(dir.join(".claude.json")).unwrap()).unwrap();
         assert_eq!(cfg["theme"], "dark");
         assert_eq!(cfg["oauthAccount"]["accountUuid"], "u2");
         // Sin cerrojos ni temporales olvidados.

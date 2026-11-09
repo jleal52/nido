@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
+use nido::attach;
 use nido::client::Api;
 use nido::launch::{self, Launcher, Paths};
 use nido::registry::{self, Registry};
 use nido::server::{self, AppState};
-#[cfg(unix)]
-use nido::attach;
 use nido::{auth, holder, import};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::watch;
@@ -440,7 +440,9 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                     "Código REUTILIZABLE: vale para cualquier número de dispositivos durante {days} días.\nQuien lo tenga puede manejar este equipo. Retíralo con `nido pair --stop`."
                 );
             } else {
-                println!("Escanéalo con la app de nido (Emparejar). Vale 10 minutos y una sola vez.");
+                println!(
+                    "Escanéalo con la app de nido (Emparejar). Vale 10 minutos y una sola vez."
+                );
             }
             let direct: Vec<&str> = r["direct"]
                 .as_array()
@@ -597,11 +599,16 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                 Some(a) => {
                     let v = api.call("GET", "/api/v1/accounts", None)?;
                     let found = v["accounts"].as_array().into_iter().flatten().find(|x| {
-                        a.parse::<u64>().ok() == x["number"].as_u64() || x["email"].as_str() == Some(a.as_str())
+                        a.parse::<u64>().ok() == x["number"].as_u64()
+                            || x["email"].as_str() == Some(a.as_str())
                     });
                     match found {
                         Some(x) => x["email"].as_str().map(str::to_owned),
-                        None => return Err(std::io::Error::other(format!("no hay ninguna cuenta «{a}»"))),
+                        None => {
+                            return Err(std::io::Error::other(format!(
+                                "no hay ninguna cuenta «{a}»"
+                            )));
+                        }
                     }
                 }
                 None => None,
@@ -623,10 +630,18 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             )?;
             println!(
                 "{} {} ({}){}.",
-                if done["new"] == true { "Añadida la cuenta" } else { "Sesión renovada en la cuenta" },
+                if done["new"] == true {
+                    "Añadida la cuenta"
+                } else {
+                    "Sesión renovada en la cuenta"
+                },
                 done["number"],
                 done["email"].as_str().unwrap_or_default(),
-                if done["active"] == true { ", que es la que usa Claude" } else { "" }
+                if done["active"] == true {
+                    ", que es la que usa Claude"
+                } else {
+                    ""
+                }
             );
         }
         Cmd::Accounts {
@@ -931,7 +946,12 @@ fn attach_cmd(api: &Api, paths: &Paths, name: Option<String>) -> io::Result<()> 
 /// En Windows, de momento, las sesiones se ven en la web y la app (la consola de Windows pide su
 /// propio modo crudo).
 #[cfg(windows)]
-fn attach_run(_api: &Api, _paths: &Paths, _session: &registry::Session, _seen: &str) -> io::Result<()> {
+fn attach_run(
+    _api: &Api,
+    _paths: &Paths,
+    _session: &registry::Session,
+    _seen: &str,
+) -> io::Result<()> {
     Err(io::Error::other(
         "en Windows, nido attach aún no está: abre la sesión en la web o en la app",
     ))
@@ -970,7 +990,9 @@ fn windows_service(action: ServiceCmd) -> io::Result<()> {
             let _ = schtasks(&["/End", "/TN", TASK]);
             let out = schtasks(&["/Delete", "/TN", TASK, "/F"])?;
             if !out.status.success() {
-                return Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned()));
+                return Err(io::Error::other(
+                    String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                ));
             }
             println!("Tarea quitada: nido ya no arrancará al iniciar sesión.");
             Ok(())
@@ -993,7 +1015,10 @@ fn windows_service(action: ServiceCmd) -> io::Result<()> {
                 _ => return Err(io::Error::other("no sé qué usuario eres (USERNAME)")),
             };
             let esc = |s: &str| {
-                s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+                s.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
             };
             let args = format!("--env NIDO_NAME={} serve --bind {}", name, bind);
             let xml = format!(
@@ -1050,7 +1075,9 @@ fn windows_service(action: ServiceCmd) -> io::Result<()> {
                 user = esc(&user),
                 cmd = esc(&nidow.to_string_lossy()),
                 args = esc(&args),
-                wd = esc(&nido::sys::home().unwrap_or_else(|| dir.clone()).to_string_lossy()),
+                wd = esc(&nido::sys::home()
+                    .unwrap_or_else(|| dir.clone())
+                    .to_string_lossy()),
             );
             // schtasks quiere el XML en UTF-16 con BOM.
             let mut bytes = vec![0xFF, 0xFE];
@@ -1059,7 +1086,14 @@ fn windows_service(action: ServiceCmd) -> io::Result<()> {
             }
             let file = std::env::temp_dir().join("nido-tarea.xml");
             std::fs::write(&file, bytes)?;
-            let out = schtasks(&["/Create", "/TN", TASK, "/XML", &file.to_string_lossy(), "/F"]);
+            let out = schtasks(&[
+                "/Create",
+                "/TN",
+                TASK,
+                "/XML",
+                &file.to_string_lossy(),
+                "/F",
+            ]);
             let _ = std::fs::remove_file(&file);
             let out = out?;
             if !out.status.success() {

@@ -85,7 +85,9 @@ fn hidden_attr(entry: &std::fs::DirEntry) -> bool {
     use std::os::windows::fs::MetadataExt;
     const HIDDEN: u32 = 0x2;
     const SYSTEM: u32 = 0x4;
-    entry.metadata().is_ok_and(|m| m.file_attributes() & (HIDDEN | SYSTEM) != 0)
+    entry
+        .metadata()
+        .is_ok_and(|m| m.file_attributes() & (HIDDEN | SYSTEM) != 0)
 }
 
 #[cfg(not(windows))]
@@ -122,7 +124,10 @@ pub fn commands() -> Vec<String> {
             .join("System32");
         for (name, path) in [
             ("cmd.exe", Some(sys.join("cmd.exe"))),
-            ("powershell.exe", Some(sys.join(r"WindowsPowerShell\v1.0\powershell.exe"))),
+            (
+                "powershell.exe",
+                Some(sys.join(r"WindowsPowerShell\v1.0\powershell.exe")),
+            ),
             ("pwsh.exe", in_path("pwsh.exe")),
             ("wsl.exe", Some(sys.join("wsl.exe"))),
         ] {
@@ -145,7 +150,15 @@ pub fn commands() -> Vec<String> {
 /// los que no son para trabajar (`nologin`, `git-shell`, `tmux`…).
 #[cfg_attr(windows, allow(dead_code))]
 fn shells(mine: Option<&str>, etc_shells: &str, exists: impl Fn(&str) -> bool) -> Vec<String> {
-    const SKIP: [&str; 7] = ["nologin", "false", "git-shell", "tmux", "screen", "rbash", "true"];
+    const SKIP: [&str; 7] = [
+        "nologin",
+        "false",
+        "git-shell",
+        "tmux",
+        "screen",
+        "rbash",
+        "true",
+    ];
     let mut out: Vec<String> = Vec::new();
     let lines = mine.into_iter().chain(
         etc_shells
@@ -155,7 +168,8 @@ fn shells(mine: Option<&str>, etc_shells: &str, exists: impl Fn(&str) -> bool) -
     );
     for path in lines {
         let name = path.rsplit('/').next().unwrap_or(path);
-        if name.is_empty() || SKIP.contains(&name) || out.iter().any(|o| o == name) || !exists(path) {
+        if name.is_empty() || SKIP.contains(&name) || out.iter().any(|o| o == name) || !exists(path)
+        {
             continue;
         }
         out.push(name.to_owned());
@@ -195,11 +209,23 @@ mod tests {
         let root = std::fs::canonicalize(&root).unwrap();
         let l = list(Path::new("/nada"), root.to_str().unwrap()).unwrap();
         let names: Vec<_> = l.dirs.iter().map(|d| (d.name.as_str(), d.hidden)).collect();
-        assert_eq!(names, [(".oculta", true), ("A", false), ("b", false), ("enlace", false)]);
+        assert_eq!(
+            names,
+            [
+                (".oculta", true),
+                ("A", false),
+                ("b", false),
+                ("enlace", false)
+            ]
+        );
         assert_eq!(l.parent.as_deref(), root.parent().and_then(|p| p.to_str()));
         assert!(list(&root, "~/b").unwrap().path.ends_with("/b"));
         assert!(list(&root, "relativa").is_err());
-        assert!(list(&root, "~/no-existe").unwrap_err().starts_with("no existe"));
+        assert!(
+            list(&root, "~/no-existe")
+                .unwrap_err()
+                .starts_with("no existe")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

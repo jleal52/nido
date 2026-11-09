@@ -324,7 +324,8 @@ fn parse_lines<'a>(
         let content = d.get("message").and_then(|m| m.get("content"));
         // El resumen que pone Claude Code al quedarse sin contexto: llega como un mensaje tuyo
         // enorme. Un aviso, con el resumen plegado.
-        if kind == Some("user") && d.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+        if kind == Some("user") && d.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+        {
             let text = match content {
                 Some(Value::String(s)) => s.clone(),
                 Some(c) => result_text(c),
@@ -333,7 +334,8 @@ fn parse_lines<'a>(
             items.push(ChatItem::Notice {
                 id,
                 ts,
-                text: "Claude resumió la conversación para seguir (se le acababa el contexto)".into(),
+                text: "Claude resumió la conversación para seguir (se le acababa el contexto)"
+                    .into(),
                 status: Some("compact".into()),
                 result: Some(clip(text.trim(), MAX_SUMMARY)),
             });
@@ -375,7 +377,10 @@ fn parse_lines<'a>(
                                 .unwrap_or_default();
                             let result = result_text(b.get("content").unwrap_or(&Value::Null));
                             let is_error = b.get("is_error").and_then(Value::as_bool) == Some(true);
-                            let answers = d.pointer("/toolUseResult/answers").filter(|a| a.is_object()).cloned();
+                            let answers = d
+                                .pointer("/toolUseResult/answers")
+                                .filter(|a| a.is_object())
+                                .cloned();
                             match tools.get(tool_id).and_then(|&i| items.get_mut(i)) {
                                 Some(ChatItem::Tool {
                                     result: r,
@@ -400,7 +405,11 @@ fn parse_lines<'a>(
                 }
                 let text = text.join("\n").trim().to_owned();
                 // «[Request interrupted by user…]» lo pone Claude Code, no tú.
-                let text = if text.starts_with("[Request interrupted") { String::new() } else { text };
+                let text = if text.starts_with("[Request interrupted") {
+                    String::new()
+                } else {
+                    text
+                };
                 if let Some(notice) = task_notice(&text, &id, &ts) {
                     items.push(notice);
                 } else if !text.is_empty() || images > 0 {
@@ -457,9 +466,16 @@ fn parse_lines<'a>(
                                 .unwrap_or_default()
                                 .to_owned();
                             tools.insert(tool_id.clone(), items.len());
-                            let ask = (name == "AskUserQuestion").then(|| ask_data(&input)).flatten();
+                            let ask = (name == "AskUserQuestion")
+                                .then(|| ask_data(&input))
+                                .flatten();
                             let plan = (name == "ExitPlanMode")
-                                .then(|| input.get("plan").and_then(Value::as_str).map(|p| clip(p, 30_000)))
+                                .then(|| {
+                                    input
+                                        .get("plan")
+                                        .and_then(Value::as_str)
+                                        .map(|p| clip(p, 30_000))
+                                })
                                 .flatten();
                             items.push(ChatItem::Tool {
                                 id: bid,
@@ -508,8 +524,10 @@ pub fn stopped_by_limit(path: &Path) -> bool {
         let Ok(d) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if !matches!(d.get("type").and_then(Value::as_str), Some("user" | "assistant"))
-            || d.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        if !matches!(
+            d.get("type").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) || d.get("isSidechain").and_then(Value::as_bool) == Some(true)
             || d.get("isMeta").and_then(Value::as_bool) == Some(true)
         {
             continue;
@@ -584,7 +602,13 @@ pub fn conversations(dir: &Path, limit: usize) -> Vec<Conversation> {
             if custom.is_some() {
                 title = custom;
             }
-            Some(Conversation { id, title, last_prompt, modified, size })
+            Some(Conversation {
+                id,
+                title,
+                last_prompt,
+                modified,
+                size,
+            })
         })
         .collect()
 }
@@ -638,7 +662,10 @@ fn summary(path: &Path) -> (Option<String>, Option<String>, bool) {
                     && let Some(t) = raw
                 {
                     let t = strip_reminders(&t);
-                    if !t.is_empty() && !t.starts_with('<') && !t.starts_with("[Request interrupted") {
+                    if !t.is_empty()
+                        && !t.starts_with('<')
+                        && !t.starts_with("[Request interrupted")
+                    {
                         user = Some(t);
                     }
                 }
@@ -646,8 +673,17 @@ fn summary(path: &Path) -> (Option<String>, Option<String>, bool) {
             _ => {}
         }
     }
-    let one_line = |s: String| clip(s.split_whitespace().collect::<Vec<_>>().join(" ").as_str(), 200);
-    (custom.or(ai), prompt.or(user).map(one_line), messages || start > 0)
+    let one_line = |s: String| {
+        clip(
+            s.split_whitespace().collect::<Vec<_>>().join(" ").as_str(),
+            200,
+        )
+    };
+    (
+        custom.or(ai),
+        prompt.or(user).map(one_line),
+        messages || start > 0,
+    )
 }
 
 /// Lee desde `offset` hasta la última línea completa (Claude puede estar escribiendo la
@@ -782,21 +818,38 @@ mod tests {
         let dir = project_dir(config.path(), Path::new("/home/ana/mi.proyecto"));
         assert!(dir.ends_with("projects/-home-ana-mi-proyecto"));
         std::fs::create_dir_all(dir.join("b")).unwrap();
-        let old = line(serde_json::json!({"type":"user","uuid":"u1","message":{"content":"arregla el login"}}))
-            + &line(serde_json::json!({"type":"ai-title","aiTitle":"Arreglar el login"}));
+        let old = line(
+            serde_json::json!({"type":"user","uuid":"u1","message":{"content":"arregla el login"}}),
+        ) + &line(serde_json::json!({"type":"ai-title","aiTitle":"Arreglar el login"}));
         std::fs::write(dir.join("a.jsonl"), old).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         let new = line(serde_json::json!({"type":"custom-title","customTitle":"viejo"}))
             + &line(serde_json::json!({"type":"user","uuid":"u1","message":{"content":"primero"}}))
-            + &line(serde_json::json!({"type":"last-prompt","lastPrompt":"lo último\nque escribí"}));
+            + &line(
+                serde_json::json!({"type":"last-prompt","lastPrompt":"lo último\nque escribí"}),
+            );
         std::fs::write(dir.join("b.jsonl"), new).unwrap();
-        std::fs::write(dir.join("b").join("custom-title.json"), r#"{"customTitle":"monitor"}"#).unwrap();
+        std::fs::write(
+            dir.join("b").join("custom-title.json"),
+            r#"{"customTitle":"monitor"}"#,
+        )
+        .unwrap();
         // Abierta y cerrada sin escribir: no sale.
-        std::fs::write(dir.join("c.jsonl"), line(serde_json::json!({"type":"permission-mode"}))).unwrap();
+        std::fs::write(
+            dir.join("c.jsonl"),
+            line(serde_json::json!({"type":"permission-mode"})),
+        )
+        .unwrap();
         let list = conversations(&dir, 10);
-        assert_eq!(list.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(
+            list.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
         assert_eq!(list[0].title.as_deref(), Some("monitor"));
-        assert_eq!(list[0].last_prompt.as_deref(), Some("lo último que escribí"));
+        assert_eq!(
+            list[0].last_prompt.as_deref(),
+            Some("lo último que escribí")
+        );
         assert_eq!(list[1].title.as_deref(), Some("Arreglar el login"));
         assert_eq!(list[1].last_prompt.as_deref(), Some("arregla el login"));
         assert!(conversations(&config.path().join("no-existe"), 10).is_empty());
@@ -806,13 +859,26 @@ mod tests {
     fn compaction_summary_is_a_folded_notice() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
-        let summary = format!("This session is being continued from a previous conversation…\n{}", "x".repeat(5000));
-        std::fs::write(&path, line(serde_json::json!({"type":"user","uuid":"u1","isCompactSummary":true,
-            "isVisibleInTranscriptOnly":true,"message":{"content":summary}}))).unwrap();
+        let summary = format!(
+            "This session is being continued from a previous conversation…\n{}",
+            "x".repeat(5000)
+        );
+        std::fs::write(
+            &path,
+            line(
+                serde_json::json!({"type":"user","uuid":"u1","isCompactSummary":true,
+            "isVisibleInTranscriptOnly":true,"message":{"content":summary}}),
+            ),
+        )
+        .unwrap();
         let c = read_chunk(&path, 0, None).unwrap();
         assert_eq!(c.items.len(), 1);
         match &c.items[0] {
-            ChatItem::Notice { status: Some(s), result: Some(r), .. } => {
+            ChatItem::Notice {
+                status: Some(s),
+                result: Some(r),
+                ..
+            } => {
                 assert_eq!(s, "compact");
                 assert!(r.starts_with("This session") && r.len() > 5000);
             }
@@ -826,13 +892,24 @@ mod tests {
         let path = dir.path().join("s.jsonl");
         let hit = serde_json::json!({"type":"assistant","uuid":"a1","error":"rate_limit","isApiErrorMessage":true,
             "message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your weekly limit · resets Oct 19, 7am (Europe/Madrid)"}]}});
-        std::fs::write(&path, line(hit) + &line(serde_json::json!({"type":"system","subtype":"x"}))).unwrap();
+        std::fs::write(
+            &path,
+            line(hit) + &line(serde_json::json!({"type":"system","subtype":"x"})),
+        )
+        .unwrap();
         let c = read_chunk(&path, 0, None).unwrap();
         assert!(matches!(&c.items[0], ChatItem::Notice { status: Some(s), .. } if s == "limit"));
         assert!(stopped_by_limit(&path));
         // Al seguir la conversación, ya no.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(line(serde_json::json!({"type":"user","uuid":"u1","message":{"content":"continúa"}})).as_bytes()).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(
+            line(serde_json::json!({"type":"user","uuid":"u1","message":{"content":"continúa"}}))
+                .as_bytes(),
+        )
+        .unwrap();
         drop(f);
         assert!(!stopped_by_limit(&path));
     }
@@ -850,7 +927,11 @@ mod tests {
         std::fs::write(&path, line(ask)).unwrap();
         let c = read_chunk(&path, 0, None).unwrap();
         match &c.items[0] {
-            ChatItem::Tool { ask: Some(a), result: None, .. } => {
+            ChatItem::Tool {
+                ask: Some(a),
+                result: None,
+                ..
+            } => {
                 let q = &a["questions"][0];
                 assert_eq!(q["question"], "¿Color?");
                 assert_eq!(q["multiSelect"], false);
@@ -860,19 +941,29 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(&c.items[1], ChatItem::Tool { plan: Some(p), .. } if p.starts_with("# Plan")));
+        assert!(
+            matches!(&c.items[1], ChatItem::Tool { plan: Some(p), .. } if p.starts_with("# Plan"))
+        );
 
         // La respuesta llega después: con lo contestado.
         let answer = serde_json::json!({"type":"user","uuid":"u1","message":{"content":[
             {"type":"tool_result","tool_use_id":"q-1","content":"Your questions have been answered"}]},
             "toolUseResult":{"questions":[],"answers":{"¿Color?":"Verde"}}});
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(line(answer).as_bytes()).unwrap();
         drop(f);
         let next = read_chunk(&path, c.offset, None).unwrap();
-        assert_eq!(next.results[0].answers, Some(serde_json::json!({"¿Color?":"Verde"})));
+        assert_eq!(
+            next.results[0].answers,
+            Some(serde_json::json!({"¿Color?":"Verde"}))
+        );
         let all = read_chunk(&path, 0, None).unwrap();
-        assert!(matches!(&all.items[0], ChatItem::Tool { answers: Some(a), .. } if a["¿Color?"] == "Verde"));
+        assert!(
+            matches!(&all.items[0], ChatItem::Tool { answers: Some(a), .. } if a["¿Color?"] == "Verde")
+        );
     }
 
     #[test]
