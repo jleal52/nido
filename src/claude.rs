@@ -280,6 +280,22 @@ mod mac {
     }
 }
 
+/// ¿Hay algún Claude en marcha en este equipo, sea o no de nido?
+pub fn any_running() -> bool {
+    #[cfg(windows)]
+    {
+        crate::sys::win::processes().iter().any(|(_, _, n)| {
+            let n = n.to_ascii_lowercase();
+            n == "claude.exe" || n == "claude"
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let p = Procfs::default();
+        p.parents().keys().any(|&pid| p.comm(pid).as_deref() == Some("claude"))
+    }
+}
+
 pub fn default_config_dir(home: &Path) -> PathBuf {
     home.join(".claude")
 }

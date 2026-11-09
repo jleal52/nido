@@ -179,6 +179,11 @@ impl Live {
     /// (para guardarla: es la más reciente de esa cuenta, Claude la habrá renovado).
     pub fn swap_oauth(&self, oauth: &Value) -> io::Result<Option<Value>> {
         let _locks = self.credentials_lock()?;
+        self.swap_oauth_locked(oauth)
+    }
+
+    /// Lo mismo, con los cerrojos ya tomados.
+    pub fn swap_oauth_locked(&self, oauth: &Value) -> io::Result<Option<Value>> {
         let mut all = self.read_credentials()?.unwrap_or_else(|| serde_json::json!({}));
         if !all.is_object() {
             all = serde_json::json!({});

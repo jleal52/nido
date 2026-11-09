@@ -319,13 +319,17 @@ impl Accounts {
             }
         }
         let token = if active {
-            // La de Claude: se lee, nunca se renueva aquí.
+            // La de Claude: se lee. Si ha caducado, la renueva Claude; solo si no hay ningún
+            // Claude en marcha (nadie la tiene en memoria) la renueva nido, en sus cerrojos.
             match live_oauth.filter(|o| !expiring(o, 60_000)) {
                 Some(o) => o["accessToken"].as_str().map(str::to_owned),
-                None => {
-                    inner.timing.next.insert(number, Instant::now() + Duration::from_secs(60));
-                    return;
-                }
+                None => match self.refresh_live_if_idle(&mut inner, number).await {
+                    Some(t) => Some(t),
+                    None => {
+                        inner.timing.next.insert(number, Instant::now() + Duration::from_secs(60));
+                        return;
+                    }
+                },
             }
         } else {
             if acc.relogin {
@@ -406,6 +410,55 @@ impl Accounts {
         }
     }
 
+    /// Renueva la sesión de Claude si ha caducado y no hay ningún Claude en marcha (en un equipo
+    /// sin Claude abierto nadie la renueva, y sin ella no se sabe el uso). Dentro de los cerrojos
+    /// de Claude: uno que arranque entretanto espera y lee la nueva.
+    async fn refresh_live_if_idle(&self, inner: &mut Inner, number: u32) -> Option<String> {
+        let live = self.live.clone();
+        let (locks, oauth) = blocking(move || -> Option<_> {
+            if crate::claude::any_running() {
+                return None;
+            }
+            let locks = live.credentials_lock().ok()?;
+            let oauth = live.read_oauth().ok()??;
+            Some((locks, oauth))
+        })
+        .await?;
+        if !expiring(&oauth, 60_000) {
+            return oauth["accessToken"].as_str().map(str::to_owned);
+        }
+        let refresh = oauth["refreshToken"].as_str()?.to_owned();
+        let tokens = match oauth::refresh(&self.http, &refresh).await {
+            Ok(t) => t,
+            Err(RefreshError::Dead) => {
+                eprintln!("nido: la sesión de Claude de este equipo ha caducado: hay que volver a entrar");
+                set_relogin(inner, number, true);
+                self.save(inner);
+                return None;
+            }
+            Err(RefreshError::Transient(e)) => {
+                eprintln!("nido: no se pudo renovar la sesión de Claude: {e}");
+                return None;
+            }
+        };
+        let mut fresh = oauth;
+        tokens.apply(&mut fresh);
+        let live = self.live.clone();
+        let written = blocking(move || {
+            let r = live.swap_oauth_locked(&fresh);
+            drop(locks);
+            r
+        })
+        .await;
+        match written {
+            Ok(_) => Some(tokens.access_token),
+            Err(e) => {
+                eprintln!("nido: no se pudo guardar la sesión renovada de Claude: {e}");
+                None
+            }
+        }
+    }
+
     /// El token de acceso de una cuenta guardada (no la activa), renovándolo si va a caducar (o
     /// si `force`). Lo renovado se guarda antes de usarlo: el token de renovación viejo deja de
     /// valer.
@@ -452,7 +505,7 @@ impl Accounts {
                 let active = Some(a.uuid.as_str()) == active_uuid;
                 let age = a.usage_at.map(|t| now.saturating_sub(t));
                 let fresh = age.is_some_and(|s| s <= FRESH_S);
-                let status = if a.relogin && !active {
+                let status = if a.relogin {
                     "relogin_required"
                 } else if a.usage.is_some() && !fresh {
                     "unavailable"
