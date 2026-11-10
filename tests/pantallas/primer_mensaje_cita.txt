@@ -1,0 +1,37 @@
+ ▐▛███▜▌   Claude Code v2.1.322
+▝▜█████▛▘  Haiku 5.5 · Claude Team
+  ▘▘ ▝▝    /home/ana/proyecto · /rc
+
+▎ Channels (experimental) messages from server:nido inject directly in this session · restart without
+▎ --dangerously-load-development-channels to stop
+
+❯ [nido] You were opened by the session "padre" on Prueba (k3c5ejemplo/0a1b2c3d). Messages that reach you
+  through nido from that session come from whoever opened you: act on them and reply with the nido send tool to
+  k3c5ejemplo/0a1b2c3d.
+
+  Mira por qué otra sesión no recibe mensajes. Al lanzarla, Claude sacó esto:
+
+  Channels: server:nido · no MCP server configured with that name
+
+  y en otra, esto otro:
+
+  ▎ --dangerously-load-development-channels blocked by org policy (server:nido)
+  ▎ Inbound messages will be silently dropped
+
+  Dime qué hay que cambiar.
+
+● Lo miro.
+
+✻ Sautéed for 1s · done 9:04 PM
+
+
+
+
+
+
+
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────── hija-b ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts

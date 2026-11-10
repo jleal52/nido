@@ -217,10 +217,12 @@ fn is_rule_char(c: char) -> bool {
 
 /// Una raya: solo de rayas, o con un rótulo dentro (Claude pone ahí el nombre de la sesión,
 /// `-n`: «──────── hija-b ─»). Con rótulo, estricta para que no pase una línea de texto: rayas
-/// desde el principio (al menos `RULE_LEFT`, y más que el rótulo), un espacio, el rótulo, un
-/// espacio y rayas hasta el final.
+/// desde el principio (al menos `RULE_LEFT`), un espacio, el rótulo (como mucho `LABEL_MAX`), un
+/// espacio y una o dos rayas hasta el final (Claude pinta siempre una). En una pantalla estrecha
+/// (el teléfono) el nombre puede ser más largo que las rayas de la izquierda.
 fn is_rule(l: &str) -> bool {
-    const RULE_LEFT: usize = 10;
+    const RULE_LEFT: usize = 3;
+    const LABEL_MAX: usize = 64;
     let t = l.trim();
     if t.chars().count() >= 6 && t.chars().all(is_rule_char) {
         return true;
@@ -228,7 +230,7 @@ fn is_rule(l: &str) -> bool {
     let left = t.chars().take_while(|&c| is_rule_char(c)).count();
     let right = t.chars().rev().take_while(|&c| is_rule_char(c)).count();
     let total = t.chars().count();
-    if left < RULE_LEFT || right == 0 || left + right + 2 >= total {
+    if left < RULE_LEFT || !(1..=2).contains(&right) || left + right + 2 >= total {
         return false;
     }
     let label: String = t.chars().skip(left).take(total - left - right).collect();
@@ -238,7 +240,7 @@ fn is_rule(l: &str) -> bool {
     !label.is_empty()
         && label.trim() == label
         && !label.chars().any(is_rule_char)
-        && label.chars().count() < left
+        && label.chars().count() <= LABEL_MAX
 }
 
 /// `❯ 3. Texto` → (seleccionada, 3, columna donde empieza «Texto», «Texto»).
@@ -1427,18 +1429,28 @@ fn prompt_box(lines: &[&str]) -> Option<usize> {
 }
 
 /// Las filas del arranque de Claude (su rótulo, el aviso de los channels): las de encima de su
-/// caja y de la conversación (la primera petición, `> …`, o respuesta, `● …`). Lo de más abajo
-/// es la conversación, que puede citar esas mismas filas.
+/// caja y de la conversación (la primera petición, `> …` o `❯ …`, o respuesta, `● …`). Lo de más
+/// abajo es la conversación, que puede citar esas mismas filas (p. ej. el primer mensaje de una
+/// hija de `open`, que escribe quien la abre).
 fn startup_rows<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
     let talk = lines
         .iter()
-        .position(|l| l.starts_with("> ") || l.starts_with('●') || l.starts_with('⏺'));
+        .position(|l| l.starts_with("> ") || l.starts_with('●') || l.starts_with('⏺') || asked(l));
     let end = [prompt_box(lines), talk]
         .into_iter()
         .flatten()
         .min()
         .unwrap_or(lines.len());
     &lines[..end]
+}
+
+/// Una petición tuya en la conversación: Claude la pinta con `❯ ` delante. No una opción de un
+/// menú (`❯ 1. …`, como la del aviso de los channels).
+fn asked(l: &str) -> bool {
+    l.strip_prefix("❯ ").is_some_and(|r| {
+        let digits = r.chars().take_while(char::is_ascii_digit).count();
+        !(digits > 0 && r[digits..].starts_with('.'))
+    })
 }
 
 /// Lo que hay que hacer con la pantalla de una sesión de Claude recién lanzada con el channel
@@ -2250,25 +2262,61 @@ mod tests {
         }
     }
 
+    /// El primer mensaje de una hija de `open` (lo escribe quien la abre, y Claude lo pinta con
+    /// `❯ ` delante) es conversación, aunque cite las filas de «sin servidor» o «blocked».
+    #[test]
+    fn an_opened_childs_first_message_is_talk() {
+        let cita = include_str!("../tests/pantallas/primer_mensaje_cita.txt");
+        assert!(repl(cita));
+        assert_eq!(startup(cita), Startup::Nothing);
+        assert_eq!(launch_refusal(cita), None);
+        // Aún sin contestar (sin `●` debajo), igual.
+        let sin_respuesta = cita.replace("● Lo miro.", "");
+        assert_ne!(sin_respuesta, cita);
+        assert_eq!(startup(&sin_respuesta), Startup::Nothing);
+        assert_eq!(launch_refusal(&sin_respuesta), None);
+        // La opción del aviso («❯ 1. …») no es un mensaje: el aviso se sigue leyendo.
+        let aviso = include_str!("../tests/pantallas/aviso_channels.txt");
+        let a_la_izquierda: String = aviso
+            .lines()
+            .map(|l| l.trim_start())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(a_la_izquierda.contains("\n❯ 1. I am using"));
+        assert_eq!(startup(&a_la_izquierda), Startup::Accept);
+        assert_eq!(startup(aviso), Startup::Accept);
+    }
+
     #[test]
     fn a_rule_may_carry_the_session_name() {
         let long = "─".repeat(40);
         assert!(is_rule(&long));
         assert!(is_rule(&format!("{long} hija-b ─")));
         assert!(is_rule(&format!("  {long} mi sesión ─")));
-        assert!(is_rule(&format!("{long} nido ────")));
+        assert!(is_rule(&format!("{long} nido ──")));
+        // Un nombre largo en una pantalla estrecha (el teléfono): 20 caracteres en 40 columnas,
+        // y aunque el nombre sea más largo que la raya de la izquierda.
+        let name = "sesion-de-veinte-car";
+        assert_eq!(name.chars().count(), 20);
+        let narrow = format!("{} {name} ─", "─".repeat(40 - 20 - 3));
+        assert_eq!(narrow.chars().count(), 40);
+        assert!(is_rule(&narrow));
+        assert!(is_rule(&format!("───── {name} ─")));
         // Texto con rayas y palabras: no.
         for l in [
-            format!("── nota ──{long}"),
-            "──────── hola ─".to_owned(),
+            "── nota ─".to_owned(),
+            format!("{long} hola ───"),
+            format!("{long} {} ─", "x".repeat(65)),
             format!("Texto {long} hola ─"),
             format!("{long} hola"),
             format!("{long} hola ─ adiós"),
             format!("{long}  ─"),
             format!("{long}hola ─"),
             format!("{long} hola─"),
+            format!("{long}  hola ─"),
+            format!("{long} ── ─"),
             format!("● {long} hola ─"),
-            "──────────── una frase bastante más larga que la raya de la izquierda ─".to_owned(),
+            format!("> {long} hola ─"),
         ] {
             assert!(!is_rule(&l), "{l}");
         }
