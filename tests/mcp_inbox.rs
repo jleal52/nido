@@ -310,7 +310,7 @@ async fn mcp_inbox_end_to_end() {
     assert_eq!(texts(&msgs), ["tres"]);
     assert!(took < Duration::from_secs(2), "{took:?}");
 
-    // Viva, sin channel y arrancada hace rato: no admite mensajes, y no se encola nada.
+    // Viva, sin channel y arrancada hace rato.
     let (code, vieja) = tool(
         addr,
         &padre,
@@ -326,13 +326,19 @@ async fn mcp_inbox_end_to_end() {
         .unwrap()
         .set_modified(SystemTime::now() - Duration::from_secs(300))
         .unwrap();
+    // `nido serve` acaba de arrancar: su `nido mcp` aún puede volver a recoger → a la cola.
+    let (code, r) = send(addr, &padre, &vieja, "tras reiniciar").await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["status"], "queued");
+    // Con `nido serve` en marcha desde hace rato: no admite mensajes, y no se encola nada.
+    state.inbox.backdate(Duration::from_secs(300));
     let (code, e) = send(addr, &padre, &vieja, "hola").await;
     assert_eq!(code, 409, "{e}");
     assert_eq!(
         e["error"],
         "this session does not accept messages (no channel)"
     );
-    assert!(state.inbox.pending(&vieja).is_empty());
+    assert_eq!(texts_of(&state, &vieja), ["tras reiniciar"]);
 
     // Como mucho 100 en cola por sesión.
     for i in 1..100 {
@@ -340,7 +346,7 @@ async fn mcp_inbox_end_to_end() {
         assert_eq!(code, 200, "{i}: {r}");
     }
     let (code, e) = send(addr, &padre, &parada, "uno más").await;
-    assert_eq!(code, 400, "{e}");
+    assert_eq!(code, 409, "{e}");
     assert_eq!(e["error"], "the inbox of that session is full");
 
     // Tras reiniciar nido, lo no confirmado sigue ahí.

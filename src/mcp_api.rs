@@ -380,6 +380,19 @@ pub struct Decision {
     pub note: Option<&'static str>,
 }
 
+/// Hace cuánto arrancó la sesión, para la ventana de arranque: lo que diga su guardián, pero
+/// nunca más que lo que lleva en marcha `nido serve`. Tras reiniciarlo, ningún `nido mcp` ha
+/// vuelto aún a recoger la bandeja: todas tienen el rato de arranque para volver.
+pub fn started(holder: Option<Duration>, uptime: Duration) -> Duration {
+    holder.map_or(uptime, |h| h.min(uptime))
+}
+
+/// ¿Ya recogió la sesión el mensaje (`taken`: ya no está en su bandeja) y se puso con él? Si no
+/// está parada, o si su conversación ha crecido desde que se mandó (contestó enseguida).
+pub fn picked_up(taken: bool, state: Status, grown: bool) -> bool {
+    taken && (state != Status::Idle || grown)
+}
+
 /// ¿Se manda el mensaje a sí misma la sesión `caller`?
 pub fn to_self(me: &Machine, address: &str, caller: &str) -> bool {
     locate(me, address) == Where::Here(caller)
@@ -922,6 +935,19 @@ async fn poll_status(st: &AppState, id: &str) -> (Status, Option<Menu>) {
     }
 }
 
+/// Lo que ocupa ahora la conversación de la sesión `id` (0 si aún no tiene).
+async fn transcript_len(st: &AppState, id: &str) -> u64 {
+    let link = st
+        .registry
+        .lock()
+        .await
+        .get(id)
+        .and_then(|s| s.claude.clone());
+    link.and_then(|l| server::transcript_of(st, &l))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len())
+}
+
 /// Lo que devuelve `read` de `s` para `reader`, con el estado y el menú que se acaban de ver: lo
 /// nuevo de su conversación (o los `last` últimos turnos) y la pregunta, recortado a `MAX_READ`.
 async fn read_out(
@@ -989,12 +1015,12 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Session, args: Value) -
     }
     let s = target(st, me, &a.session).await?;
     let alive = view(st, &s.id).await.is_some_and(|v| v.alive);
-    let started = launch::holder_started(&st.paths, &s.id)
+    let holder = launch::holder_started(&st.paths, &s.id)
         .map(|t| SystemTime::now().duration_since(t).unwrap_or_default());
     let d = decide(&Dest {
         alive,
         channel: st.inbox.channel(&s.id),
-        started,
+        started: Some(started(holder, st.inbox.uptime())),
         mine: opened_by(me, s.opened_by.as_deref(), &caller.id),
     })?;
     let msg = Msg {
@@ -1006,25 +1032,32 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Session, args: Value) -
         at: now_ms(),
     };
     let msg_id = msg.id.clone();
+    let wait = a.wait.filter(|&w| w > 0);
+    // Lo que ocupa su conversación antes de mandarlo: si crece, ya contestó.
+    let before = match wait {
+        Some(_) => transcript_len(st, &s.id).await,
+        None => 0,
+    };
     st.inbox
         .push(&s.id, msg)
-        .map_err(|_| bad_request("la bandeja de esa sesión está llena".into()))?;
+        .map_err(|_| fail(StatusCode::CONFLICT, "la bandeja de esa sesión está llena"))?;
     let mut out = json!({ "status": d.status });
     if let Some(note) = d.note {
         out["note"] = i18n::tr(note).into();
     }
-    let Some(secs) = a.wait.filter(|&w| w > 0) else {
+    let Some(secs) = wait else {
         return Ok(out);
     };
     let (id, msg_id) = (s.id.as_str(), msg_id.as_str());
     let poll = || async move {
         let (state, menu) = poll_status(st, id).await;
-        (state, menu, !st.inbox.has(id, msg_id))
+        let taken = !st.inbox.has(id, msg_id);
+        (state, menu, taken, transcript_len(st, id).await > before)
     };
-    let (state, menu, _) = wait_reply(
+    let (state, menu, _, _) = wait_reply(
         poll,
-        |(state, _, taken)| *taken && *state == Status::Working,
-        |(state, _, _)| *state,
+        |&(state, _, taken, grown)| picked_up(taken, state, grown),
+        |(state, _, _, _)| *state,
         WAIT_STEP,
         PICKUP,
         wait_timeout(Some(secs)),
@@ -1592,6 +1625,25 @@ mod tests {
         let (status, n) = decided(dest(true, false, Some(119), false)).unwrap();
         assert_eq!(status, Queued);
         assert!(n.unwrap().ends_with("decides whether to act on it"));
+        // Arrancada hace rato, pero `nido serve` se acaba de reiniciar: aún puede volver.
+        let up = Duration::from_secs(30);
+        let holder = Some(Duration::from_secs(5000));
+        assert_eq!(started(holder, up), up);
+        assert_eq!(started(None, up), up);
+        assert_eq!(
+            started(Some(Duration::from_secs(7)), up),
+            Duration::from_secs(7)
+        );
+        let after_restart = Dest {
+            started: Some(started(holder, up)),
+            ..dest(true, false, None, true)
+        };
+        assert_eq!(decided(after_restart).unwrap().0, Queued);
+        let long_up = Dest {
+            started: Some(started(holder, Duration::from_secs(600))),
+            ..after_restart
+        };
+        assert_eq!(decided(long_up), Err(StatusCode::CONFLICT));
         // Sin channel desde hace rato (o sin saber cuándo arrancó): no admite mensajes.
         for d in [
             dest(true, false, Some(120), true),
@@ -1617,18 +1669,32 @@ mod tests {
         assert!(!to_self(&m, "Sobremesa/padre1", "padre1"));
     }
 
-    /// Lo que va viendo `wait_reply`: cada vuelta, el siguiente estado (y si ya lo recogió); el
-    /// último se repite.
-    async fn replay(seen: &[(Status, bool)], pickup_ms: u64, total_ms: u64) -> (usize, Status) {
+    #[test]
+    fn picked_up_when_taken_and_on_it() {
+        use Status::*;
+        assert!(!picked_up(false, Working, true), "aún en la bandeja");
+        assert!(picked_up(true, Working, false));
+        assert!(picked_up(true, Question, false), "fue directa a preguntar");
+        assert!(!picked_up(true, Idle, false), "aún no se ha puesto");
+        assert!(picked_up(true, Idle, true), "contestó enseguida");
+    }
+
+    /// Lo que va viendo `wait_reply`: cada vuelta, el siguiente estado, si ya lo recogió y si su
+    /// conversación creció; el último se repite.
+    async fn replay(
+        seen: &[(Status, bool, bool)],
+        pickup_ms: u64,
+        total_ms: u64,
+    ) -> (usize, Status) {
         let polls = std::cell::Cell::new(0);
-        let (state, _) = wait_reply(
+        let (state, _, _) = wait_reply(
             || {
                 let i = polls.get();
                 polls.set(i + 1);
                 std::future::ready(seen[i.min(seen.len() - 1)])
             },
-            |&(s, taken)| taken && s == Status::Working,
-            |&(s, _)| s,
+            |&(s, taken, grown)| picked_up(taken, s, grown),
+            |&(s, _, _)| s,
             Duration::from_millis(1),
             Duration::from_millis(pickup_ms),
             Duration::from_millis(total_ms),
@@ -1642,29 +1708,44 @@ mod tests {
         use Status::*;
         // Ya trabajaba en otra cosa (sin recogerlo), lo recoge, sigue trabajando y termina.
         let seen = [
-            (Working, false),
-            (Idle, false),
-            (Working, true),
-            (Working, true),
-            (Idle, true),
+            (Working, false, false),
+            (Idle, false, false),
+            (Working, true, true),
+            (Working, true, true),
+            (Idle, true, true),
         ];
         assert_eq!(replay(&seen, 5000, 10_000).await, (5, Idle));
-        // Pregunta: también se acaba la espera.
-        let seen = [(Working, true), (Question, true)];
+        // Recogido pero aún sin ponerse: se sigue esperando a que se ponga.
+        let seen = [
+            (Idle, true, false),
+            (Working, true, false),
+            (Idle, true, true),
+        ];
+        assert_eq!(replay(&seen, 5000, 10_000).await, (3, Idle));
+        // Contesta tan rápido que entre dos vueltas ya terminó: no se esperan los 30 s.
+        let start = std::time::Instant::now();
+        let seen = [(Working, false, false), (Idle, true, true)];
+        assert_eq!(replay(&seen, 5000, 10_000).await, (3, Idle));
+        // Directa a preguntar: también.
+        let seen = [(Working, false, false), (Question, true, false)];
+        assert_eq!(replay(&seen, 5000, 10_000).await, (3, Question));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // Pregunta tras trabajar: también se acaba la espera.
+        let seen = [(Working, true, false), (Question, true, true)];
         assert_eq!(replay(&seen, 5000, 10_000).await, (2, Question));
         // Parada: no se espera a que lo recoja.
         assert_eq!(
-            replay(&[(Stopped, false)], 5000, 10_000).await,
+            replay(&[(Stopped, false, false)], 5000, 10_000).await,
             (1, Stopped)
         );
-        // No se pone a trabajar en el tiempo de recogida: lo que haya.
+        // No lo recoge en el tiempo de recogida: lo que haya.
         let start = std::time::Instant::now();
-        let (_, state) = replay(&[(Idle, false)], 50, 10_000).await;
+        let (_, state) = replay(&[(Idle, false, false)], 50, 10_000).await;
         assert_eq!(state, Idle);
         assert!(start.elapsed() < Duration::from_secs(2));
         // Se acaba la espera entera trabajando: «working».
         let start = std::time::Instant::now();
-        let (_, state) = replay(&[(Working, true)], 5000, 80).await;
+        let (_, state) = replay(&[(Working, true, false)], 5000, 80).await;
         assert_eq!(state, Working);
         let took = start.elapsed();
         assert!(

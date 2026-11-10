@@ -9,7 +9,7 @@
 //! JSON-RPC 2.0 por líneas. `handle` es pura (mensaje → lo que hay que escribir) y `run` la
 //! conecta con stdin y stdout.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -577,30 +577,70 @@ pub fn channel_event(msg: &Value) -> Value {
     }})
 }
 
+/// Cuántos ids de mensajes ya metidos en la sesión se recuerdan.
+const SEEN_MAX: usize = 256;
+
+/// Los últimos mensajes que ya entraron en la sesión (como mucho `SEEN_MAX`): si falló su
+/// confirmación y vuelven a salir, solo se confirman, sin meterlos otra vez.
+#[derive(Default)]
+pub struct Seen {
+    order: VecDeque<String>,
+    ids: HashSet<String>,
+}
+
+impl Seen {
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    /// Lo apunta; si ya hay `SEEN_MAX`, se olvida el más antiguo.
+    pub fn insert(&mut self, id: &str) {
+        if !self.ids.insert(id.to_owned()) {
+            return;
+        }
+        self.order.push_back(id.to_owned());
+        if self.order.len() > SEEN_MAX
+            && let Some(old) = self.order.pop_front()
+        {
+            self.ids.remove(&old);
+        }
+    }
+}
+
 /// Una vuelta de la bandeja: trae lo que espera, lo mete en la sesión con `emit` (que dice si
 /// pudo) y confirma lo que entró. Si `emit` falla o se pide parar, lo demás no se confirma y
-/// vuelve a salir (al menos una vez). Devuelve cuántos entraron.
+/// vuelve a salir (al menos una vez). Lo que ya entró en otra vuelta (en `seen`) solo se
+/// confirma. Devuelve cuántos entraron en esta.
 pub fn inbox_round(
     mb: &dyn Mailbox,
     emit: &dyn Fn(&Value) -> bool,
     stop: &AtomicBool,
+    seen: &mut Seen,
 ) -> Result<usize, String> {
     let msgs = mb.fetch()?;
     let mut done = Vec::new();
+    let mut emitted = 0;
     for m in &msgs {
         // Sin id no se puede confirmar: no se mete, o saldría cada vez.
         let Some(id) = m.get("id").and_then(Value::as_str) else {
             continue;
         };
-        if stop.load(Ordering::SeqCst) || !emit(&channel_event(m)) {
+        if stop.load(Ordering::SeqCst) {
             break;
+        }
+        if !seen.contains(id) {
+            if !emit(&channel_event(m)) {
+                break;
+            }
+            seen.insert(id);
+            emitted += 1;
         }
         done.push(id.to_owned());
     }
     if !done.is_empty() {
         mb.ack(&done)?;
     }
-    Ok(done.len())
+    Ok(emitted)
 }
 
 /// Recoge la bandeja hasta que se pida parar; tras un error, espera (`sleep`) cada vez más.
@@ -611,8 +651,9 @@ pub fn inbox_loop(
     sleep: &dyn Fn(Duration),
 ) {
     let mut backoff = BACKOFF_MIN;
+    let mut seen = Seen::default();
     while !stop.load(Ordering::SeqCst) {
-        match inbox_round(mb, emit, stop) {
+        match inbox_round(mb, emit, stop, &mut seen) {
             Ok(_) => backoff = BACKOFF_MIN,
             Err(_) => {
                 sleep(backoff);
@@ -1226,6 +1267,8 @@ mod tests {
     struct FakeBox {
         queue: Mutex<Vec<Value>>,
         fail: AtomicBool,
+        /// La confirmación falla (se apunta igual que se pidió).
+        ack_fails: AtomicBool,
         acked: Mutex<Vec<Vec<String>>>,
         fetches: std::sync::atomic::AtomicUsize,
     }
@@ -1241,6 +1284,9 @@ mod tests {
 
         fn ack(&self, ids: &[String]) -> Result<(), String> {
             self.acked.lock().unwrap().push(ids.to_vec());
+            if self.ack_fails.load(Ordering::SeqCst) {
+                return Err("nido serve is not answering".into());
+            }
             self.queue
                 .lock()
                 .unwrap()
@@ -1271,7 +1317,10 @@ mod tests {
             true
         };
         let stop = AtomicBool::new(false);
-        assert_eq!(inbox_round(&mb, &emit_ok, &stop), Ok(2));
+        assert_eq!(
+            inbox_round(&mb, &emit_ok, &stop, &mut Seen::default()),
+            Ok(2)
+        );
         assert_eq!(
             *sent.lock().unwrap(),
             [
@@ -1285,7 +1334,10 @@ mod tests {
         );
         assert_eq!(*mb.acked.lock().unwrap(), [vec!["m1", "m2"]]);
         // Vacía: nada que meter ni confirmar.
-        assert_eq!(inbox_round(&mb, &emit_ok, &stop), Ok(0));
+        assert_eq!(
+            inbox_round(&mb, &emit_ok, &stop, &mut Seen::default()),
+            Ok(0)
+        );
         assert_eq!(mb.acked.lock().unwrap().len(), 1);
     }
 
@@ -1304,7 +1356,10 @@ mod tests {
             n.get() < 2
         };
         let stop = AtomicBool::new(false);
-        assert_eq!(inbox_round(&mb, &emit_two, &stop), Ok(1));
+        assert_eq!(
+            inbox_round(&mb, &emit_two, &stop, &mut Seen::default()),
+            Ok(1)
+        );
         assert_eq!(*mb.acked.lock().unwrap(), [vec!["m1"]]);
         assert_eq!(mb.queue.lock().unwrap().len(), 2, "vuelven a salir");
         // Se pidió parar: no se mete ni se confirma nada.
@@ -1314,13 +1369,65 @@ mod tests {
             emit(v);
             true
         };
-        assert_eq!(inbox_round(&mb, &emit_ok, &AtomicBool::new(true)), Ok(0));
+        assert_eq!(
+            inbox_round(&mb, &emit_ok, &AtomicBool::new(true), &mut Seen::default()),
+            Ok(0)
+        );
         assert!(sent.lock().unwrap().is_empty());
         assert!(mb.acked.lock().unwrap().is_empty());
         // Sin id no entra (no se podría confirmar); lo demás, sí.
         let mb = boxed(&[json!({"text": "suelto"}), inbox_msg("m4", "cuatro")]);
-        assert_eq!(inbox_round(&mb, &emit_ok, &AtomicBool::new(false)), Ok(1));
+        assert_eq!(
+            inbox_round(&mb, &emit_ok, &AtomicBool::new(false), &mut Seen::default()),
+            Ok(1)
+        );
         assert_eq!(*mb.acked.lock().unwrap(), [vec!["m4"]]);
+    }
+
+    #[test]
+    fn what_got_in_is_not_emitted_again_if_the_ack_failed() {
+        let mb = boxed(&[inbox_msg("m1", "uno"), inbox_msg("m2", "dos")]);
+        mb.ack_fails.store(true, Ordering::SeqCst);
+        let (sent, emit) = sink();
+        let emit_ok = |v: &Value| {
+            emit(v);
+            true
+        };
+        let stop = AtomicBool::new(false);
+        let mut seen = Seen::default();
+        assert!(inbox_round(&mb, &emit_ok, &stop, &mut seen).is_err());
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        // Vuelven a salir, con uno nuevo: los dos de antes solo se confirman.
+        mb.ack_fails.store(false, Ordering::SeqCst);
+        mb.queue.lock().unwrap().push(inbox_msg("m3", "tres"));
+        assert_eq!(inbox_round(&mb, &emit_ok, &stop, &mut seen), Ok(1));
+        let texts: Vec<Value> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|v| v["params"]["content"].clone())
+            .collect();
+        assert_eq!(texts, [json!("uno"), json!("dos"), json!("tres")]);
+        assert_eq!(
+            *mb.acked.lock().unwrap(),
+            [vec!["m1", "m2"], vec!["m1", "m2", "m3"]]
+        );
+        assert!(mb.queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn seen_remembers_the_last_256() {
+        let mut seen = Seen::default();
+        for i in 0..SEEN_MAX {
+            seen.insert(&format!("m{i}"));
+        }
+        seen.insert("m5");
+        assert!(seen.contains("m0") && seen.contains("m255"));
+        seen.insert("otro");
+        assert!(!seen.contains("m0"), "fuera el más antiguo");
+        assert!(seen.contains("m1") && seen.contains("otro"));
+        assert_eq!(seen.order.len(), SEEN_MAX);
+        assert_eq!(seen.ids.len(), SEEN_MAX);
     }
 
     #[test]

@@ -69,6 +69,8 @@ pub struct Inbox {
     arrived: watch::Sender<()>,
     /// `POLL_WAIT` en ms (las pruebas la acortan).
     wait_ms: AtomicU64,
+    /// Cuándo se cargó (ver `uptime`).
+    loaded_at: Mutex<Instant>,
 }
 
 impl Inbox {
@@ -76,7 +78,16 @@ impl Inbox {
     pub fn load(path: PathBuf) -> Self {
         let queues: BTreeMap<String, Vec<Msg>> = match std::fs::read(&path) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                eprintln!("nido: no se pudo leer la bandeja {}: {e}", path.display());
+                // Rota: se aparta (para mirarla) y se empieza vacía; si no, se pisaría al guardar.
+                let bad = path.with_extension("json.bad");
+                eprintln!(
+                    "nido: la bandeja {} está rota ({e}); se aparta a {}",
+                    path.display(),
+                    bad.display()
+                );
+                if let Err(e) = std::fs::rename(&path, &bad) {
+                    eprintln!("nido: no se pudo apartar la bandeja rota: {e}");
+                }
                 BTreeMap::new()
             }),
             Err(_) => BTreeMap::new(),
@@ -87,6 +98,21 @@ impl Inbox {
             channels: Mutex::default(),
             arrived: watch::Sender::new(()),
             wait_ms: AtomicU64::new(POLL_WAIT.as_millis() as u64),
+            loaded_at: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Cuánto hace que se cargó (que arrancó `nido serve`): hasta que pasa un rato, los `nido
+    /// mcp` de las sesiones aún no han vuelto a recoger y no se sabe quién tiene channel.
+    pub fn uptime(&self) -> Duration {
+        self.loaded_at.lock().expect("bandeja").elapsed()
+    }
+
+    /// Para las pruebas: como si se hubiera cargado hace `d` más.
+    pub fn backdate(&self, d: Duration) {
+        let mut at = self.loaded_at.lock().expect("bandeja");
+        if let Some(t) = at.checked_sub(d) {
+            *at = t;
         }
     }
 
@@ -329,9 +355,31 @@ mod tests {
         let again = Inbox::load(path.clone());
         assert_eq!(again.pending("hija"), vec![msg("m2", "dos")]);
         assert!(again.pending("otra").is_empty());
-        // Un fichero roto: vacía, sin fallar.
+    }
+
+    #[test]
+    fn a_broken_file_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.json");
         std::fs::write(&path, "{roto").unwrap();
-        assert!(Inbox::load(path).pending("hija").is_empty());
+        let inbox = Inbox::load(path.clone());
+        assert!(inbox.pending("hija").is_empty(), "vacía, sin fallar");
+        assert!(!path.exists());
+        let bad = dir.path().join("inbox.json.bad");
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "{roto");
+        // Lo nuevo no la pisa.
+        inbox.push("hija", msg("m1", "uno")).unwrap();
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "{roto");
+        assert_eq!(Inbox::load(path).pending("hija"), vec![msg("m1", "uno")]);
+    }
+
+    #[test]
+    fn uptime_since_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Inbox::load(dir.path().join("inbox.json"));
+        assert!(inbox.uptime() < Duration::from_secs(5));
+        inbox.backdate(Duration::from_secs(300));
+        assert!(inbox.uptime() >= Duration::from_secs(300));
     }
 
     #[test]
