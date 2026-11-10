@@ -290,8 +290,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// Lo más que se espera a registrar el MCP en Claude antes de restaurar las sesiones.
-const REGISTER_CAP: std::time::Duration = std::time::Duration::from_secs(20);
+/// Cuánto se espera a registrar el MCP en Claude antes de restaurar las sesiones: a partir de
+/// `REGISTER_WARN` se avisa, y con `REGISTER_CAP` se restaura sin él.
+const REGISTER_WARN: std::time::Duration = std::time::Duration::from_secs(20);
+const REGISTER_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[tokio::main]
 async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: bool) -> ExitCode {
@@ -336,15 +338,22 @@ async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: b
     server::spawn_scanner(state.clone());
     // Primero que Claude tenga `nido mcp` y luego las sesiones: así las restauradas arrancan ya
     // con el channel, y `claude mcp add` no reescribe su configuración mientras ellas la usan. En
-    // segundo plano (la API atiende ya) y con tope: `claude mcp …` tarda unos segundos.
+    // segundo plano (la API atiende ya) y con tope: `claude mcp …` tarda unos segundos. El
+    // registro va en su tarea: aunque se deje de esperar, acaba y dice cómo fue.
     {
         let st = state.clone();
         tokio::spawn(async move {
-            if tokio::time::timeout(REGISTER_CAP, server::register_mcp(st.clone()))
-                .await
-                .is_err()
+            let register = tokio::spawn(server::register_mcp(st.clone()));
+            let done = async {
+                let _ = register.await;
+            };
+            if server::registration_done(done, REGISTER_WARN, REGISTER_CAP).await
+                == server::Registered::GaveUp
             {
-                eprintln!("nido: registrar el MCP en Claude tarda demasiado; se sigue sin esperar");
+                eprintln!(
+                    "nido: registrar el MCP en Claude no acaba en {} s; se restauran las sesiones sin esperar más",
+                    REGISTER_CAP.as_secs()
+                );
             }
             if !no_restore {
                 st.restore().await;

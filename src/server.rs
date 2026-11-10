@@ -597,6 +597,39 @@ fn registers_mcp(nido_home: Option<std::ffi::OsString>, flag: Option<String>) ->
     nido_home.is_none() || flag.as_deref() == Some("1")
 }
 
+/// Cómo acabó la espera al registro del MCP antes de restaurar las sesiones.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Registered {
+    /// Antes del aviso.
+    InTime,
+    /// Tardó más que el aviso, pero acabó antes del tope.
+    Late,
+    /// Ni con el tope: se sigue sin él (cuando acabe, aún dice cómo fue).
+    GaveUp,
+}
+
+/// Espera a que acabe de verdad el registro (`done`, cuando termina su tarea): si pasa de `warn`
+/// se dice y se sigue esperando, hasta `cap` en total.
+pub async fn registration_done(
+    done: impl std::future::Future<Output = ()>,
+    warn: Duration,
+    cap: Duration,
+) -> Registered {
+    tokio::pin!(done);
+    if tokio::time::timeout(warn, &mut done).await.is_ok() {
+        return Registered::InTime;
+    }
+    eprintln!(
+        "nido: registrar el MCP en Claude tarda más de {} s; se espera hasta {} s",
+        warn.as_secs(),
+        cap.as_secs()
+    );
+    match tokio::time::timeout(cap.saturating_sub(warn), done).await {
+        Ok(()) => Registered::Late,
+        Err(_) => Registered::GaveUp,
+    }
+}
+
 /// Cuánto se mira la pantalla de un Claude recién lanzado con el channel de nido.
 pub const STARTUP_WINDOW: Duration = Duration::from_secs(60);
 /// Lo más que se alarga mientras el usuario contesta si confía en la carpeta: este número de
@@ -2939,6 +2972,32 @@ mod tests {
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].text, "nueva");
         assert!(unread_alerts(&alerts, 30).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_waits_for_the_registration_to_really_end() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let ms = Duration::from_millis;
+        assert_eq!(
+            registration_done(async {}, ms(50), ms(500)).await,
+            Registered::InTime
+        );
+        // Pasa del aviso: se dice, y se sigue esperando a que acabe de verdad.
+        let start = std::time::Instant::now();
+        let slow = tokio::time::sleep(ms(200));
+        assert_eq!(
+            registration_done(slow, ms(50), ms(1000)).await,
+            Registered::Late
+        );
+        assert!(start.elapsed() >= ms(200));
+        // Hasta un tope.
+        let start = std::time::Instant::now();
+        let never = std::future::pending::<()>();
+        assert_eq!(
+            registration_done(never, ms(50), ms(300)).await,
+            Registered::GaveUp
+        );
+        assert!(start.elapsed() >= ms(300) && start.elapsed() < ms(2000));
     }
 
     #[test]

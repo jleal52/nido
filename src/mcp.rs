@@ -37,8 +37,8 @@ pub trait Mailbox: Send + Sync {
     fn fetch(&self) -> Result<Vec<Value>, String>;
     /// Ya está en la sesión: que no vuelva a salir.
     fn ack(&self, ids: &[String]) -> Result<(), String>;
-    /// La bandeja no es para este `nido mcp` (no lo lanzó el Claude de la sesión): no se vuelve
-    /// a pedir.
+    /// La última petición a la bandeja dijo que no es para este `nido mcp` (no lo lanzó el
+    /// Claude de la sesión): se vuelve a pedir, pero de tarde en tarde (`REFUSED_WAIT`).
     fn refused(&self) -> bool {
         false
     }
@@ -59,24 +59,22 @@ pub struct State {
 pub struct LocalApi {
     pub client: client::Api,
     pub session: String,
-    /// El Claude que lanzó este `nido mcp` (ver `claude_pid`): va con cada petición a la bandeja.
-    pub claude_pid: Option<u32>,
-    /// `nido serve` dijo que no es el Claude de la sesión (409): la bandeja no es para este.
+    /// Este `nido mcp` (ver `mcp_pid`): va con cada petición a la bandeja.
+    pub mcp_pid: Option<u32>,
+    /// La última petición a la bandeja dio 409: no es el Claude de la sesión.
     pub refused: AtomicBool,
 }
 
-/// El Claude que lanzó este `nido mcp`: su padre. Con él, `nido serve` sabe si la bandeja es
-/// suya o de otro `claude` de dentro de la sesión (ver `Inbox::claim`).
-pub fn claude_pid() -> Option<u32> {
-    #[cfg(unix)]
-    {
-        Some(std::os::unix::process::parent_id())
-    }
-    #[cfg(windows)]
-    {
-        crate::sys::win::parents().get(&std::process::id()).copied()
-    }
+/// El pid de este `nido mcp`. Con él, `nido serve` sube por sus padres hasta su Claude (aunque
+/// haya algo en medio, como `cmd /c` en Windows) y sabe si la bandeja es suya o de otro `claude`
+/// de dentro de la sesión (ver `inbox::claim`).
+pub fn mcp_pid() -> Option<u32> {
+    Some(std::process::id())
 }
+
+/// Tras un 409 se vuelve a probar, pero sin prisa: el Claude de la sesión puede cambiar (se
+/// reinicia) y este `nido mcp` pasar a ser el suyo.
+pub const REFUSED_WAIT: Duration = Duration::from_secs(60);
 
 /// Cuánto se espera la respuesta de la bandeja: más que lo que la retiene `nido serve` (25 s).
 const FETCH_TIMEOUT: Duration = Duration::from_secs(40);
@@ -110,7 +108,7 @@ impl Mailbox for LocalApi {
 }
 
 impl LocalApi {
-    /// A la bandeja, con el pid de su Claude. Un 409 es para siempre (ver `refused`).
+    /// A la bandeja, con el pid de este `nido mcp`. Apunta si dijo que no es suya (409).
     fn inbox_request(
         &self,
         method: &str,
@@ -118,18 +116,15 @@ impl LocalApi {
         body: Option<&Value>,
         timeout: Duration,
     ) -> Result<Value, String> {
-        let pid = self.claude_pid.map(|p| p.to_string());
+        let pid = self.mcp_pid.map(|p| p.to_string());
         let extra: Vec<(&str, &str)> = pid
             .as_deref()
-            .map(|p| vec![("X-Nido-Claude-Pid", p)])
+            .map(|p| vec![("X-Nido-Mcp-Pid", p)])
             .unwrap_or_default();
-        self.request_with(method, path, body, &extra, Some(timeout))
-            .map_err(|(code, msg)| {
-                if code == Some(409) {
-                    self.refused.store(true, Ordering::SeqCst);
-                }
-                msg
-            })
+        let r = self.request_with(method, path, body, &extra, Some(timeout));
+        let no = matches!(r, Err((Some(409), _)));
+        self.refused.store(no, Ordering::SeqCst);
+        r.map_err(|(_, msg)| msg)
     }
 
     fn request(
@@ -720,8 +715,11 @@ pub fn inbox_loop(
     while !stop.load(Ordering::SeqCst) {
         match inbox_round(mb, emit, stop, &mut seen) {
             Ok(_) => backoff = BACKOFF_MIN,
-            // No es para este `nido mcp`: se queda con las herramientas, sin bandeja.
-            Err(_) if mb.refused() => return,
+            // No es para este `nido mcp`, por ahora: se vuelve a mirar dentro de un rato.
+            Err(_) if mb.refused() => {
+                sleep(REFUSED_WAIT);
+                backoff = BACKOFF_MIN;
+            }
             Err(_) => {
                 sleep(backoff);
                 backoff = next_backoff(backoff);
@@ -753,7 +751,7 @@ pub fn run(api: client::Api) -> ! {
     let local = Arc::new(LocalApi {
         client: api,
         session: session.clone().unwrap_or_default(),
-        claude_pid: claude_pid(),
+        mcp_pid: mcp_pid(),
         refused: AtomicBool::new(false),
     });
     let mut st = State {
@@ -1202,7 +1200,7 @@ mod tests {
                 token: Some("t0k3n".into()),
             },
             session: "abc12345".into(),
-            claude_pid: Some(4321),
+            mcp_pid: Some(4321),
             refused: AtomicBool::new(false),
         }
     }
@@ -1618,13 +1616,13 @@ mod tests {
         assert!(head.starts_with("GET /api/v1/mcp/inbox HTTP/1.0"), "{head}");
         assert!(head.contains("X-Nido-Session: abc12345"), "{head}");
         assert!(head.contains("Authorization: Bearer t0k3n"), "{head}");
-        // Con el pid de su Claude: la bandeja es de ese proceso, no de otro Claude de dentro.
-        assert!(head.contains("X-Nido-Claude-Pid: 4321"), "{head}");
+        // Con su pid: `nido serve` busca el Claude que tiene encima, y la bandeja es de ese.
+        assert!(head.contains("X-Nido-Mcp-Pid: 4321"), "{head}");
         let (addr, h) = one_shot(http_ok(r#"{"ok":true,"removed":1}"#));
         assert_eq!(local(addr).ack(&["m1".into()]), Ok(()));
         let req = h.join().unwrap();
         let (head, body) = req.split_once("\r\n\r\n").unwrap();
-        assert!(head.contains("X-Nido-Claude-Pid: 4321"), "{head}");
+        assert!(head.contains("X-Nido-Mcp-Pid: 4321"), "{head}");
         assert!(
             head.starts_with("POST /api/v1/mcp/inbox/ack HTTP/1.0"),
             "{head}"
@@ -1637,7 +1635,7 @@ mod tests {
         let (addr, h) = one_shot(http_ok("{}"));
         assert!(local(addr).fetch().is_err());
         h.join().unwrap();
-        // Un 409 (no es el Claude de la sesión): para siempre. Otros errores, no.
+        // Un 409 (no es el Claude de la sesión): se apunta, para esperar más antes de volver.
         let body = r#"{"error":"not this session's claude"}"#;
         let conflict: &'static str = Box::leak(
             format!(
@@ -1656,35 +1654,51 @@ mod tests {
         assert_eq!(api.fetch(), Err("not this session's claude".into()));
         assert!(api.refused());
         h.join().unwrap();
+        // Y si luego sale bien, ya no.
+        let (addr, h) = one_shot(http_ok(r#"{"messages":[]}"#));
+        let api = LocalApi {
+            client: client::Api { addr, token: None },
+            ..api
+        };
+        assert_eq!(api.fetch(), Ok(vec![]));
+        assert!(!api.refused());
+        h.join().unwrap();
         // Sin pid, sin la cabecera.
         let (addr, h) = one_shot(http_ok(r#"{"messages":[]}"#));
         let api = LocalApi {
-            claude_pid: None,
+            mcp_pid: None,
             ..local(addr)
         };
         assert_eq!(api.fetch(), Ok(vec![]));
-        assert!(!h.join().unwrap().contains("X-Nido-Claude-Pid"));
+        assert!(!h.join().unwrap().contains("X-Nido-Mcp-Pid"));
     }
 
     #[test]
-    fn the_inbox_loop_stops_for_good_when_refused() {
-        let mb = FakeBox::default();
+    fn the_inbox_loop_waits_long_when_refused_and_tries_again() {
+        // No es el Claude de la sesión (por ahora: tras un reinicio puede serlo): espera un
+        // minuto y vuelve; cuando ya es suyo, recoge.
+        let mb = boxed(&[inbox_msg("m1", "hola")]);
         mb.fail.store(true, Ordering::SeqCst);
         mb.refused.store(true, Ordering::SeqCst);
-        let slept = Mutex::new(0);
-        let sleep = |_: Duration| *slept.lock().unwrap() += 1;
-        inbox_loop(&mb, &|_: &Value| true, &AtomicBool::new(false), &sleep);
-        assert_eq!(mb.fetches.load(Ordering::SeqCst), 1);
-        assert_eq!(*slept.lock().unwrap(), 0);
+        let stop = AtomicBool::new(false);
+        let slept = Mutex::new(Vec::new());
+        let sleep = |d: Duration| {
+            slept.lock().unwrap().push(d.as_secs());
+            mb.fail.store(false, Ordering::SeqCst);
+            mb.refused.store(false, Ordering::SeqCst);
+        };
+        let emit = |_: &Value| {
+            stop.store(true, Ordering::SeqCst);
+            true
+        };
+        inbox_loop(&mb, &emit, &stop, &sleep);
+        assert_eq!(*slept.lock().unwrap(), [60]);
+        assert_eq!(*mb.acked.lock().unwrap(), [vec!["m1"]]);
     }
 
     #[test]
-    fn nido_mcp_knows_its_claude() {
-        // En Unix, su padre: el Claude que lo lanzó.
-        #[cfg(unix)]
-        assert_eq!(claude_pid(), Some(std::os::unix::process::parent_id()));
-        #[cfg(windows)]
-        assert!(claude_pid().is_some());
+    fn nido_mcp_sends_its_own_pid() {
+        assert_eq!(mcp_pid(), Some(std::process::id()));
     }
 
     #[test]

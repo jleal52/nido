@@ -352,66 +352,99 @@ async fn claude_launches_with_the_nido_channel() {
     assert!(!paths.config.join("mcp-off").exists());
 
     // La bandeja es del Claude de la sesión: otro `claude` de dentro (con su `NIDO_SESSION` y
-    // `NIDO_CHANNEL` heredados) recibe 409 y no se lleva los mensajes.
+    // `NIDO_CHANNEL` heredados) recibe 409 y no se lleva los mensajes. Un «claude» de mentira
+    // (bash por un enlace `claude`: es su nombre) con dos hijos: el `nido mcp` suyo y otro
+    // `claude` con el suyo.
     state.inbox.set_poll_wait(Duration::from_millis(300));
-    let mine = std::process::id();
-    let mut other_child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let other = other_child.id();
+    let dir = tmp.path().join("bandeja");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Un enlace, no una copia: macOS mata la copia de un binario del sistema (su firma).
+    std::os::unix::fs::symlink("/bin/bash", dir.join("claude")).unwrap();
+    std::fs::write(
+        dir.join("program"),
+        "#!/bin/sh\nexec ./claude -c 'echo $$ > claude.pid; sleep 60 & echo $! > mine; \
+         ./claude -c \"sleep 60 & echo \\$! > nested; wait\" & wait'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        dir.join("program"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
     let s = state
         .registry
         .lock()
         .await
-        .add(session("bandeja", tmp.path(), &["true"]))
+        .add(session("bandeja", &dir, &["claude"]))
         .unwrap();
-    let (code, r) = inbox(addr, &s.id, Some(mine), None).await;
+    let msg = |id: &str| nido::inbox::Msg {
+        id: id.into(),
+        from: "padre".into(),
+        from_id: "Prueba/x".into(),
+        machine: "Prueba".into(),
+        text: "hola".into(),
+        at: 1,
+    };
+    state.inbox.push(&s.id, msg("m1")).unwrap();
+    // Parada (o arrancando, o el `nido mcp` de antes de reiniciarla): sin saber cuál es su
+    // Claude, ni mensajes ni channel, para nadie.
+    let me = std::process::id();
+    let (code, r) = inbox(addr, &s.id, Some(me), None).await;
     assert_eq!(code, 200, "{r}");
-    let (code, r) = inbox(addr, &s.id, Some(other), None).await;
+    assert_eq!(r["messages"], json!([]));
+    let (code, r) = inbox(addr, &s.id, Some(me), Some(json!({"ids": ["m1"]}))).await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["removed"], 0);
+    assert!(!state.inbox.channel(&s.id));
+    assert_eq!(state.inbox.pending(&s.id).len(), 1);
+
+    nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
+    for f in ["claude.pid", "mine", "nested"] {
+        assert!(wait_file(&dir.join(f), 100).await, "sin {f}");
+    }
+    let pid = |f: &str| -> u32 {
+        std::fs::read_to_string(dir.join(f))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let (claude, mine, nested) = (pid("claude.pid"), pid("mine"), pid("nested"));
+    // Lo que Claude apunta de sí mismo: así lo encuentra nido.
+    let sessions = tmp.path().join("home/.claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{claude}.json")),
+        r#"{"sessionId":"conv-b"}"#,
+    )
+    .unwrap();
+    let (code, r) = inbox(addr, &s.id, Some(nested), None).await;
     assert_eq!(code, 409, "{r}");
     assert_eq!(r["error"], "not this session's claude");
-    state
-        .inbox
-        .push(
-            &s.id,
-            nido::inbox::Msg {
-                id: "m1".into(),
-                from: "padre".into(),
-                from_id: "Prueba/x".into(),
-                machine: "Prueba".into(),
-                text: "hola".into(),
-                at: 1,
-            },
-        )
-        .unwrap();
-    let (code, _) = inbox(addr, &s.id, Some(other), None).await;
-    assert_eq!(code, 409);
-    let (code, _) = inbox(addr, &s.id, Some(other), Some(json!({"ids": ["m1"]}))).await;
+    let (code, _) = inbox(addr, &s.id, Some(nested), Some(json!({"ids": ["m1"]}))).await;
     assert_eq!(code, 409, "tampoco confirma");
+    assert!(
+        !state.inbox.channel(&s.id),
+        "rechazado, no marca el channel"
+    );
+    let (code, _) = inbox(addr, &s.id, Some(me), None).await;
+    assert_eq!(code, 409, "sin Claude encima");
     let (code, r) = inbox(addr, &s.id, Some(mine), None).await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(r["messages"][0]["id"], "m1");
+    assert!(state.inbox.channel(&s.id));
     let (code, r) = inbox(addr, &s.id, Some(mine), Some(json!({"ids": ["m1"]}))).await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(r["removed"], 1);
-    // Rechazado, no marca el channel: aquí el primero solo confirmó (eso no es recoger).
-    let s = state
-        .registry
-        .lock()
-        .await
-        .add(session("bandeja-2", tmp.path(), &["true"]))
-        .unwrap();
-    let (code, _) = inbox(addr, &s.id, Some(mine), Some(json!({"ids": []}))).await;
-    assert_eq!(code, 200);
-    let (code, _) = inbox(addr, &s.id, Some(other), None).await;
-    assert_eq!(code, 409);
-    assert!(!state.inbox.channel(&s.id));
     // Sin pid (un `nido mcp` que no lo manda), como siempre.
     let (code, _) = inbox(addr, &s.id, None, None).await;
     assert_eq!(code, 200);
-    let _ = other_child.kill();
-    let _ = other_child.wait();
+    nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
+    for p in [mine, nested] {
+        unsafe {
+            libc::kill(p as i32, libc::SIGKILL);
+        }
+    }
 }
 
 /// La bandeja como la pide `nido mcp`: `GET` para recoger, o `POST …/ack` con `ack`.
@@ -430,7 +463,7 @@ async fn inbox(
         let pid = pid.map(|p| p.to_string());
         let mut headers = vec![("X-Nido-Session", session.as_str())];
         if let Some(p) = &pid {
-            headers.push(("X-Nido-Claude-Pid", p.as_str()));
+            headers.push(("X-Nido-Mcp-Pid", p.as_str()));
         }
         let (method, path) = match &ack {
             Some(_) => ("POST", "/api/v1/mcp/inbox/ack"),

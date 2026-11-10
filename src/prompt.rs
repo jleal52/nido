@@ -1307,14 +1307,20 @@ pub fn waiting_for_limit(screen: &str) -> bool {
 /// lista y si el cursor está en «1. I am using this for local development» (la opción que nido
 /// acepta). Cada fila tiene que ser exactamente la del aviso y en su orden: el rótulo, la fila de
 /// `Channels:` (con las que la siguen si no cabe en una) y la opción. En la pregunta de confiar
-/// en una carpeta no se reconoce nunca: su ruta podría llevar esas filas.
+/// en una carpeta no se reconoce nunca: su ruta podría llevar esas filas. Tampoco si está la caja
+/// de Claude (el aviso no la deja ver) ni en lo que haya debajo del arranque (ver
+/// `startup_rows`): ahí puede estar citado.
 fn channels_warning(screen: &str) -> Option<(Vec<String>, bool)> {
     const OPTION: &str = "1. I am using this for local development";
     if trust_screen(screen) {
         return None;
     }
     let screen = strip_sgr(screen);
-    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    let all: Vec<&str> = screen.lines().collect();
+    if prompt_box(&all).is_some() {
+        return None;
+    }
+    let lines: Vec<&str> = startup_rows(&all).iter().map(|l| l.trim()).collect();
     let warning = lines
         .iter()
         .position(|l| *l == "WARNING: Loading development channels")?;
@@ -1353,6 +1359,28 @@ pub fn trust_screen(screen: &str) -> bool {
     .any(|t| screen.contains(t))
 }
 
+/// Dónde empieza la caja de Claude: una raya y, debajo, la fila de `❯`.
+fn prompt_box(lines: &[&str]) -> Option<usize> {
+    lines
+        .windows(2)
+        .position(|w| is_rule(w[0]) && w[1].trim_start().starts_with('❯'))
+}
+
+/// Las filas del arranque de Claude (su rótulo, el aviso de los channels): las de encima de su
+/// caja y de la conversación (la primera petición, `> …`, o respuesta, `● …`). Lo de más abajo
+/// es la conversación, que puede citar esas mismas filas.
+fn startup_rows<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let talk = lines
+        .iter()
+        .position(|l| l.starts_with("> ") || l.starts_with('●') || l.starts_with('⏺'));
+    let end = [prompt_box(lines), talk]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(lines.len());
+    &lines[..end]
+}
+
 /// Lo que hay que hacer con la pantalla de una sesión de Claude recién lanzada con el channel
 /// de nido.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1380,9 +1408,14 @@ pub fn startup(screen: &str) -> Startup {
         Some((list, _)) => return Startup::Foreign(list),
         None => {}
     }
-    let no_server = strip_sgr(screen).lines().map(str::trim).any(|l| {
-        l.starts_with("Channels:") && l.contains("server:nido · no MCP server configured")
-    });
+    // En el saludo de Claude (con su rótulo), no en algo citado en la conversación.
+    let screen = strip_sgr(screen);
+    let all: Vec<&str> = screen.lines().collect();
+    let rows = startup_rows(&all);
+    let no_server = rows.iter().any(|l| l.contains("Claude Code"))
+        && rows.iter().map(|l| l.trim()).any(|l| {
+            l.starts_with("Channels:") && l.contains("server:nido · no MCP server configured")
+        });
     if no_server {
         Startup::NoServer
     } else {
@@ -1866,6 +1899,24 @@ mod tests {
         assert_ne!(en_salir, aviso);
         assert_eq!(dev_channels(&en_salir), Some(vec!["server:nido".into()]));
         assert_eq!(startup(&en_salir), Startup::Nothing);
+        // Una conversación (retomada) que cita el aviso y la fila de «sin servidor», con la caja
+        // de Claude debajo: no cuenta, solo lo de arranque, sobre la caja y antes de la
+        // conversación.
+        let citado = include_str!("../tests/pantallas/conversacion_aviso.txt");
+        assert_eq!(dev_channels(citado), None);
+        assert_eq!(startup(citado), Startup::Nothing);
+        // Aunque el principio del mensaje ya no se vea: con la caja de Claude en pantalla no
+        // puede estar el aviso.
+        let cortado: String = citado
+            .lines()
+            .skip_while(|l| !l.contains("────────────────"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(cortado.starts_with("    ────"), "{cortado}");
+        assert_eq!(dev_channels(&cortado), None);
+        assert_eq!(startup(&cortado), Startup::Nothing);
+        // La de verdad, con la caja debajo, sí.
+        assert_eq!(startup(sin), Startup::NoServer);
         // «no MCP server configured» solo cuenta en la fila de Channels de nido: no en lo que
         // diga la conversación retomada.
         let normal = include_str!("../tests/pantallas/normal.txt");

@@ -1,0 +1,21 @@
+> ¿qué enseña Claude al lanzarlo con el channel de nido?
+
+● Esta pantalla, y nido la acepta sola:
+
+    ────────────────────────────────────────
+    WARNING: Loading development channels
+    Channels: server:nido
+    ❯ 1. I am using this for local development
+      2. Exit
+    Enter to confirm · Esc to cancel
+
+  Si Claude no tiene el servidor, sale esto otro:
+
+    Channels: server:nido · no MCP server configured with that name
+
+✻ Baked for 4s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ? for shortcuts

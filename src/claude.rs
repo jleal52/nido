@@ -280,6 +280,25 @@ mod mac {
     }
 }
 
+/// El primer Claude por encima del proceso `pid` (su padre, el padre de este…). Para el `nido
+/// mcp` de una sesión, el Claude que lo lanzó, aunque haya algo en medio (`cmd /c` en Windows).
+pub fn claude_ancestor(procfs: &Procfs, pid: u32) -> Option<u32> {
+    let parents = procfs.parents();
+    let mut at = pid;
+    // Con tope: un árbol raro (pids reusados) no deja dando vueltas.
+    for _ in 0..64 {
+        let up = *parents.get(&at)?;
+        if up == 0 || up == at {
+            return None;
+        }
+        if procfs.comm(up).is_some_and(|n| is_claude(&[n])) {
+            return Some(up);
+        }
+        at = up;
+    }
+    None
+}
+
 /// ¿Hay algún Claude en marcha en este equipo, sea o no de nido?
 pub fn any_running() -> bool {
     #[cfg(windows)]
@@ -869,6 +888,32 @@ mod tests {
         assert_eq!(found.info.status.as_deref(), Some("busy"));
         assert_eq!(found.config_dir, Some(profile));
         assert!(find_claude(&procfs, 150, &home).is_none());
+    }
+
+    #[test]
+    fn the_claude_above_a_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proc");
+        fake_proc(&root, 1, 0, "init", &[]);
+        fake_proc(&root, 100, 1, "claude", &[]);
+        // `nido mcp` directamente, o con algo en medio (`cmd /c` en Windows).
+        fake_proc(&root, 110, 100, "nido", &[]);
+        fake_proc(&root, 120, 100, "cmd.exe", &[]);
+        fake_proc(&root, 121, 120, "nido", &[]);
+        // Otro Claude dentro de la sesión (`claude -p` desde su Bash), con su `nido mcp`.
+        fake_proc(&root, 130, 100, "bash", &[]);
+        fake_proc(&root, 140, 130, "claude.exe", &[]);
+        fake_proc(&root, 150, 140, "nido", &[]);
+        // Sin Claude por encima.
+        fake_proc(&root, 200, 1, "nido", &[]);
+        let p = Procfs::at(&root);
+        assert_eq!(claude_ancestor(&p, 110), Some(100));
+        assert_eq!(claude_ancestor(&p, 121), Some(100));
+        assert_eq!(claude_ancestor(&p, 150), Some(140));
+        assert_eq!(claude_ancestor(&p, 200), None);
+        assert_eq!(claude_ancestor(&p, 999), None);
+        // Uno mismo no cuenta: se busca por encima.
+        assert_eq!(claude_ancestor(&p, 100), None);
     }
 
     #[test]

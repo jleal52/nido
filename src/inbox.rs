@@ -16,6 +16,32 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+/// ¿Es del `nido mcp` que pide la bandeja de una sesión? Claude pasa su entorno a lo que
+/// ejecuta: otro `claude` dentro de la sesión heredaría `NIDO_SESSION` y `NIDO_CHANNEL`, y su
+/// `nido mcp` se llevaría los mensajes de esta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// Suya: recoge, confirma y la sesión tiene channel.
+    Yes,
+    /// Aún no se sabe cuál es el Claude de la sesión (arrancando, o es el `nido mcp` de antes de
+    /// reiniciarla): ni mensajes ni channel, y que vuelva.
+    Wait,
+    /// De otro Claude: 409.
+    No,
+}
+
+/// `sent`: el `nido mcp` mandó su pid; `ancestor`: el Claude que tiene encima
+/// (`claude::claude_ancestor`); `known`: el Claude de la sesión (`claude::find_claude`).
+pub fn claim(sent: bool, ancestor: Option<u32>, known: Option<u32>) -> Claim {
+    match (sent, known) {
+        // Un `nido mcp` que no lo manda: como siempre.
+        (false, _) => Claim::Yes,
+        (true, None) => Claim::Wait,
+        (true, Some(k)) if ancestor == Some(k) => Claim::Yes,
+        (true, Some(_)) => Claim::No,
+    }
+}
+
 /// Lo más que se encola para una sesión.
 pub const MAX_QUEUED: usize = 100;
 /// Cuánto espera `GET /api/v1/mcp/inbox` a que llegue algo.
@@ -53,9 +79,6 @@ struct Channel {
     /// Su pantalla dice que no tiene channel («no MCP server configured» al arrancar). Dura lo
     /// que dure ese arranque: lo quita `relaunched` (o `forget`), no una recogida.
     refused: bool,
-    /// El Claude de la sesión (su pid) en este arranque: solo el `nido mcp` que él lanzó recoge
-    /// la bandeja (ver `claim`).
-    pid: Option<u32>,
 }
 
 /// ¿Tiene channel? Si no se sabe que no, y está recogiendo o recogió hace poco.
@@ -234,39 +257,6 @@ impl Inbox {
     pub fn relaunched(&self, id: &str) {
         if let Some(c) = self.channels.lock().expect("channels").get_mut(id) {
             c.refused = false;
-            c.pid = None;
-        }
-    }
-
-    /// ¿Puede recoger (o confirmar) la bandeja de `id` el `nido mcp` lanzado por el Claude `pid`?
-    /// Claude pasa su entorno a lo que ejecuta: otro `claude` dentro de la sesión heredaría
-    /// `NIDO_SESSION` y `NIDO_CHANNEL`, y su `nido mcp` se llevaría los mensajes de esta.
-    ///
-    /// Sin pid (un `nido mcp` que no lo sabe), sí. Si se sabe cuál es el Claude de la sesión
-    /// (`known`, el que encuentra `claude::find_claude`), solo ese. Si aún no, el primero que
-    /// llegue en este arranque, y otro solo si aquel ya no existe (`alive`).
-    pub fn claim(
-        &self,
-        id: &str,
-        pid: Option<u32>,
-        known: Option<u32>,
-        alive: impl Fn(u32) -> bool,
-    ) -> bool {
-        let Some(pid) = pid else {
-            return true;
-        };
-        let mut channels = self.channels.lock().expect("channels");
-        let c = channels.entry(id.to_owned()).or_default();
-        if let Some(k) = known {
-            c.pid = Some(k);
-            return pid == k;
-        }
-        match c.pid {
-            Some(p) if p != pid && alive(p) => false,
-            _ => {
-                c.pid = Some(pid);
-                true
-            }
         }
     }
 
@@ -496,31 +486,17 @@ mod tests {
 
     #[test]
     fn the_inbox_belongs_to_the_sessions_own_claude() {
-        let inbox = Inbox::load(std::env::temp_dir().join("nido-no-existe/inbox.json"));
-        let alive = |_: u32| true;
-        // Sin pid (Windows sin él, o un `nido mcp` de antes): como siempre.
-        assert!(inbox.claim("s", None, None, alive));
-        // Sin saber aún cuál es su Claude: el primero que recoge se queda con ella.
-        assert!(inbox.claim("s", Some(10), None, alive));
-        assert!(inbox.claim("s", Some(10), None, alive));
-        assert!(
-            !inbox.claim("s", Some(20), None, alive),
-            "otro Claude de dentro"
-        );
-        // Si ese ya no existe, el siguiente.
-        assert!(inbox.claim("s", Some(20), None, |p| p != 10));
-        assert!(!inbox.claim("s", Some(10), None, alive));
-        // Cuando se sabe cuál es (lo encuentra `find_claude`), manda eso.
-        assert!(inbox.claim("s", Some(30), Some(30), alive));
-        assert!(!inbox.claim("s", Some(20), Some(30), alive));
-        assert!(
-            !inbox.claim("s", Some(20), None, alive),
-            "se queda con el de verdad"
-        );
-        // Al volver a lanzarla, se empieza de cero.
-        inbox.relaunched("s");
-        assert!(inbox.claim("s", Some(40), None, alive));
-        // Rechazado, no cuenta como channel.
-        assert!(!inbox.channel("s"));
+        // Sin pid (un `nido mcp` que no lo manda): como siempre.
+        assert_eq!(claim(false, None, None), Claim::Yes);
+        assert_eq!(claim(false, None, Some(30)), Claim::Yes);
+        // Su Claude es el de la sesión (el que encuentra `find_claude`): suya.
+        assert_eq!(claim(true, Some(30), Some(30)), Claim::Yes);
+        // Otro Claude de dentro, o ninguno: no.
+        assert_eq!(claim(true, Some(40), Some(30)), Claim::No);
+        assert_eq!(claim(true, None, Some(30)), Claim::No);
+        // Aún no se sabe cuál es el de la sesión (arrancando, o el `nido mcp` del Claude de antes
+        // que aún no ha muerto): que espere, sin mensajes y sin marcar el channel.
+        assert_eq!(claim(true, Some(30), None), Claim::Wait);
+        assert_eq!(claim(true, None, None), Claim::Wait);
     }
 }

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::group::Member;
-use crate::inbox::Msg;
+use crate::inbox::{self, Claim, Msg};
 use crate::prompt::{self, Menu};
 use crate::proto::{Hello, Role};
 use crate::registry::{ClaudeLink, Registry, Session, new_id, now, now_ms};
@@ -1326,6 +1326,9 @@ fn with_session(mut args: Value, id: &str) -> Value {
     args
 }
 
+/// Cuánto retiene una recogida mientras no se sabe cuál es el Claude de la sesión.
+const WAIT_UNKNOWN: Duration = Duration::from_secs(2);
+
 /// `GET /api/v1/mcp/inbox`: lo que espera en la bandeja de la sesión que llama, del más antiguo
 /// al más nuevo (`{messages: [...]}`). Si no hay nada, espera a que llegue algo (25 s como mucho;
 /// luego, vacío). Lo no confirmado vuelve a salir en la siguiente.
@@ -1334,8 +1337,15 @@ pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
         Ok(s) => s,
         Err(f) => return f.into_response(),
     };
-    if let Err(f) = own_claude(&st, &caller.id, &headers).await {
-        return f.into_response();
+    match own_claude(&st, &caller.id, &headers).await {
+        Ok(Claim::Yes) => {}
+        // Aún no se sabe de quién es (arranca, o se está reiniciando y este es el `nido mcp` de
+        // antes): nada, y sin contar como channel, para que vuelva a preguntar enseguida.
+        Ok(_) => {
+            tokio::time::sleep(st.inbox.poll_wait().min(WAIT_UNKNOWN)).await;
+            return Json(json!({ "messages": [] })).into_response();
+        }
+        Err(f) => return f.into_response(),
     }
     let messages: Vec<Msg> = st.inbox.poll(&caller.id).await;
     Json(json!({ "messages": messages })).into_response()
@@ -1356,36 +1366,43 @@ pub async fn api_inbox_ack(
         Ok(a) => a,
         Err(f) => return f.into_response(),
     };
-    if let Err(f) = own_claude(&st, &caller.id, &headers).await {
-        return f.into_response();
+    match own_claude(&st, &caller.id, &headers).await {
+        Ok(Claim::Yes) => {}
+        Ok(_) => return Json(json!({ "ok": true, "removed": 0 })).into_response(),
+        Err(f) => return f.into_response(),
     }
     let removed = st.inbox.ack(&caller.id, &a.ids);
     Json(json!({ "ok": true, "removed": removed })).into_response()
 }
 
-/// La bandeja de la sesión `id` solo la recoge (y confirma) el `nido mcp` de su Claude: el que
-/// lo lanzó viene en `X-Nido-Claude-Pid` (ver `Inbox::claim`). Si no, 409.
-async fn own_claude(st: &AppState, id: &str, headers: &HeaderMap) -> Result<(), Fail> {
-    let pid = headers
-        .get("X-Nido-Claude-Pid")
+/// La bandeja de la sesión `id` solo la recoge (y confirma) el `nido mcp` de su Claude. Su pid
+/// viene en `X-Nido-Mcp-Pid`; de ahí se sube por los padres hasta el primer Claude y se compara
+/// con el de la sesión (ver `inbox::claim`).
+async fn own_claude(st: &AppState, id: &str, headers: &HeaderMap) -> Result<Claim, Fail> {
+    let Some(mcp) = headers
+        .get("X-Nido-Mcp-Pid")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u32>().ok());
-    if pid.is_none() {
-        return Ok(());
-    }
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    else {
+        return Ok(Claim::Yes);
+    };
     let paths = st.paths.clone();
     let session = id.to_owned();
-    let known = tokio::task::spawn_blocking(move || {
-        let holder = launch::holder_pid(&paths, &session).and_then(|p| u32::try_from(p).ok())?;
-        claude::find_claude(&claude::Procfs::default(), holder, &paths.home).map(|f| f.pid)
+    let (ancestor, known) = tokio::task::spawn_blocking(move || {
+        let procfs = claude::Procfs::default();
+        let known = launch::holder_pid(&paths, &session)
+            .and_then(|p| u32::try_from(p).ok())
+            .and_then(|holder| claude::find_claude(&procfs, holder, &paths.home))
+            .map(|f| f.pid);
+        // Sin el Claude de la sesión no hace falta subir.
+        let ancestor = known.and_then(|_| claude::claude_ancestor(&procfs, mcp));
+        (ancestor, known)
     })
     .await
-    .ok()
-    .flatten();
-    if st.inbox.claim(id, pid, known, crate::sys::pid_alive) {
-        Ok(())
-    } else {
-        Err(fail(StatusCode::CONFLICT, "no es el Claude de esta sesión"))
+    .unwrap_or((None, None));
+    match inbox::claim(true, ancestor, known) {
+        Claim::No => Err(fail(StatusCode::CONFLICT, "no es el Claude de esta sesión")),
+        c => Ok(c),
     }
 }
 
