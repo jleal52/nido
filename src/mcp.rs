@@ -175,10 +175,13 @@ const TOOLS: &[Tool] = &[
     Tool {
         any_of: &[],
         name: "sessions",
-        about: "List the Claude sessions on all the machines of the user's nido group: machine, \
-                id, name, folder, state (working, idle, question or stopped), channel (whether \
-                it can receive messages) and whether this session opened it (mine). Machines \
-                that don't answer show as offline.",
+        about: "List the Claude sessions on all the machines of the user's nido group. Returns \
+                {sessions, unreachable?, truncated?}. Each session has its address (session: \
+                machine/id, to pass to the other tools; the machine is written by its name, or \
+                by its id when two machines share a name), machine (name), machine_id, id, \
+                name, folder (cwd), state (working, idle, question or stopped), opened_by, \
+                channel (whether it can receive messages) and whether this session opened it \
+                (mine). Machines that don't answer are listed in unreachable, with the error.",
         args: &[],
     },
     Tool {
@@ -188,8 +191,8 @@ const TOOLS: &[Tool] = &[
                 this session. Returns status sent (it has a channel and gets it now) or queued \
                 (the session is stopped or still starting: it gets it when it is up). A running \
                 session without a channel does not accept messages. With wait, also returns \
-                what `read` returns once the session has picked the message up and is no longer \
-                working.",
+                (in read) what `read` returns once the session has picked the message up and \
+                answered, or asks a question, or the wait runs out.",
         args: &[
             SESSION,
             req("text", "string", "The message."),

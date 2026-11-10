@@ -443,7 +443,7 @@ async fn peer_calls_end_to_end() {
 
     // La de aquí con el mismo id no la abrió: ni la ve suya, ni la contesta, ni la cierra.
     let (_, list) = tool(addr, &local, "sessions", json!({})).await;
-    let entry = list
+    let entry = list["sessions"]
         .as_array()
         .unwrap()
         .iter()

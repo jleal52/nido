@@ -202,11 +202,8 @@ async fn mcp_inbox_end_to_end() {
     assert_eq!(code, 400, "{e}");
     assert_eq!(e["error"], "the text is longer than 24 KB");
     let (code, e) = send(addr, &padre, &format!("Otro/{parada}"), "hola").await;
-    assert_eq!(code, 400, "{e}");
-    assert_eq!(
-        e["error"],
-        "session is on another machine (not supported yet)"
-    );
+    assert_eq!(code, 404, "{e}");
+    assert_eq!(e["error"], "“Otro” is not a machine in the group");
     let (code, _) = send(addr, &padre, "Prueba/zzzz", "hola").await;
     assert_eq!(code, 404);
 
@@ -214,12 +211,14 @@ async fn mcp_inbox_end_to_end() {
     let (code, r) = send(addr, &padre, &format!("Prueba/{parada}"), "  ¿sigues?  ").await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(
-        r,
+        without_id(&r),
         json!({"status": "queued", "note": "queued; it will be delivered when the session \
             starts, and the session decides whether to act on it"})
     );
     let queued = state.inbox.pending(&parada);
     assert_eq!(queued.len(), 1);
+    // Con el id del mensaje (lo que miran las esperas).
+    assert_eq!(r["msg_id"], queued[0].id.as_str());
     assert_eq!(queued[0].text, "¿sigues?");
     assert_eq!(queued[0].from, "padre");
     assert_eq!(queued[0].from_id, format!("Prueba/{padre}"));
@@ -241,7 +240,7 @@ async fn mcp_inbox_end_to_end() {
     let (code, r) = send(addr, &padre, &hija, "uno").await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(
-        r,
+        without_id(&r),
         json!({"status": "queued",
             "note": "queued; it will be delivered when the session has finished starting"})
     );
@@ -265,7 +264,8 @@ async fn mcp_inbox_end_to_end() {
     // Ya tiene channel: entregado, sin nota (es suya).
     let (_, list) = tool(addr, &padre, "sessions", json!({})).await;
     let channel = |id: &str| {
-        list.as_array()
+        list["sessions"]
+            .as_array()
             .unwrap()
             .iter()
             .find(|s| s["id"] == id)
@@ -276,7 +276,7 @@ async fn mcp_inbox_end_to_end() {
     assert_eq!(channel(&parada), false);
     let (code, r) = send(addr, &padre, &hija, "dos").await;
     assert_eq!(code, 200, "{r}");
-    assert_eq!(r, json!({"status": "sent"}));
+    assert_eq!(without_id(&r), json!({"status": "sent"}));
 
     // Sin confirmar, vuelve a salir (del más antiguo al más nuevo).
     let (msgs, _) = poll(addr, &hija).await;
@@ -365,6 +365,17 @@ async fn mcp_inbox_end_to_end() {
     let file = std::fs::read_to_string(paths.state.join("inbox.json")).unwrap();
     assert!(!file.contains(&hija), "{file}");
     assert!(file.contains(&parada));
+}
+
+/// Lo que contesta `send` sin `msg_id` (que es distinto cada vez).
+fn without_id(r: &Value) -> Value {
+    let mut r = r.clone();
+    let id = r.as_object_mut().unwrap().remove("msg_id");
+    assert!(
+        id.is_some_and(|i| i.as_str().is_some_and(|i| !i.is_empty())),
+        "{r}"
+    );
+    r
 }
 
 fn texts_of(st: &AppState, id: &str) -> Vec<String> {

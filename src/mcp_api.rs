@@ -13,13 +13,15 @@
 //! Las sesiones de otro equipo del grupo piden lo mismo por el canal «peer» (`e2e::MODE_PEER`):
 //! `peer_call` atiende esas peticiones con las mismas herramientas, salvo `alert`. Quien llama es
 //! un [`Caller`]: una sesión de aquí o una de otro equipo, siempre con su dirección canónica.
-//! Las de aquí, de momento, solo llegan a las sesiones de este equipo: las de otro dan error.
+//! Lo que pide una de aquí para una sesión de otro equipo se le pasa a ese equipo por el mismo
+//! canal (`AppState::peer_member`), y `sessions` junta las de todos. Lo que pide una de otro
+//! equipo se queda en las de aquí: no se pasa a un tercero.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -30,6 +32,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::group::Member;
 use crate::inbox::Msg;
 use crate::prompt::{self, Menu};
 use crate::proto::{Hello, Role};
@@ -74,14 +77,21 @@ pub const STARTUP: Duration = Duration::from_secs(120);
 /// Con `last`, cuánto del final de la transcripción se lee primero (si no salen bastantes turnos,
 /// cada vez cuatro veces más).
 const TAIL: u64 = 256 * 1024;
+/// Lo que se espera a cada equipo cuando se pregunta a todos a la vez (`sessions`, las alertas).
+pub const FAN_OUT: Duration = Duration::from_secs(5);
+/// Cuánto se recuerda dónde estaba la conversación de una sesión al encolarle un mensaje.
+pub const MARK_TTL: Duration = Duration::from_secs(30 * 60);
+/// Cuánto se recuerda si vive la sesión madre (de otro equipo) de una abierta con `open`.
+pub const PARENT_TTL: Duration = Duration::from_secs(60);
 
 // ---------- Equipos y direcciones ----------
 
-/// Este equipo: su nombre y, si está conectado al hub, su id allí.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Este equipo: su nombre, su id en el hub si está conectado y los demás equipos del grupo.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Machine {
     pub name: String,
     pub key: Option<String>,
+    pub others: Vec<Member>,
 }
 
 impl Machine {
@@ -89,6 +99,71 @@ impl Machine {
         Self {
             name: <AppState as e2e::Host>::host_name(st),
             key: st.hub.pair_info().map(|(_, id)| id),
+            others: st.group.others(),
+        }
+    }
+
+    /// Cuántos equipos del grupo (este y los demás) se llaman `name`, sin mirar mayúsculas.
+    fn named(&self, name: &str) -> usize {
+        let same = |n: &str| n.eq_ignore_ascii_case(name);
+        usize::from(same(&self.name))
+            + self
+                .others
+                .iter()
+                .filter(|m| same(&clean_name(&m.name)))
+                .count()
+    }
+
+    /// Cómo se escribe este equipo en las direcciones que ve el modelo: su nombre, si ningún
+    /// otro del grupo se llama igual (WSL toma el del Windows en que corre); si no, su id en el
+    /// hub.
+    pub fn label(&self) -> String {
+        match &self.key {
+            Some(k) if self.named(&self.name) > 1 => k.clone(),
+            _ => self.name.clone(),
+        }
+    }
+
+    /// Lo mismo para otro equipo del grupo.
+    pub fn label_of(&self, m: &Member) -> String {
+        let name = clean_name(&m.name);
+        if !name.is_empty() && self.named(&name) == 1 {
+            name
+        } else {
+            m.id.clone()
+        }
+    }
+
+    /// El nombre de otro equipo, para enseñarlo (sin nombre, su id).
+    pub fn name_of(m: &Member) -> String {
+        let name = clean_name(&m.name);
+        if name.is_empty() { m.id.clone() } else { name }
+    }
+
+    /// Qué equipo es `machine` (su id en el hub, su nombre o lo que dé `label`): este (`None`) u
+    /// otro del grupo. Primero por el id; un nombre que llevan varios no vale (hay que dar el id).
+    pub fn find(&self, machine: &str) -> Result<Option<&Member>, Fail> {
+        let m = machine.trim();
+        if self.key.as_deref() == Some(m) {
+            return Ok(None);
+        }
+        if let Some(o) = self.others.iter().find(|o| o.id == m) {
+            return Ok(Some(o));
+        }
+        let mine = self.name.eq_ignore_ascii_case(m);
+        let named: Vec<&Member> = self
+            .others
+            .iter()
+            .filter(|o| clean_name(&o.name).eq_ignore_ascii_case(m))
+            .collect();
+        match (mine, &named[..]) {
+            (true, []) => Ok(None),
+            (false, [o]) => Ok(Some(o)),
+            (false, []) => Err(fail(
+                StatusCode::NOT_FOUND,
+                format!("«{m}» no es ningún equipo del grupo"),
+            )),
+            _ => Err(bad_request(server::ambiguous_member(m))),
         }
     }
 
@@ -107,27 +182,47 @@ impl Machine {
     pub fn address(&self, id: &str) -> String {
         format!("{}/{id}", self.key())
     }
+
+    /// La dirección que ve el modelo de una sesión de este equipo (`<label>/<id>`).
+    pub fn shown(&self, id: &str) -> String {
+        format!("{}/{id}", self.label())
+    }
 }
 
 /// Dónde está una sesión, según cómo la escribió quien llama.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Where<'a> {
     /// En este equipo, con este id.
     Here(&'a str),
-    /// En otro equipo.
-    Elsewhere { machine: &'a str, id: &'a str },
+    /// En otro equipo del grupo.
+    There { machine: Member, id: &'a str },
 }
 
-/// `equipo/id` (el equipo por su nombre o por su id en el hub) o solo `id`: este equipo.
-pub fn locate<'a>(me: &Machine, address: &'a str) -> Where<'a> {
+/// `equipo/id` (el equipo como lo acepta `Machine::find`) o solo `id`: este equipo.
+pub fn locate<'a>(me: &Machine, address: &'a str) -> Result<Where<'a>, Fail> {
     let address = address.trim();
-    match address.rsplit_once('/') {
-        Some((m, id)) if !m.trim().is_empty() && !me.is_me(m) => Where::Elsewhere {
-            machine: m.trim(),
-            id: id.trim(),
+    Ok(match address.rsplit_once('/') {
+        Some((m, id)) if !m.trim().is_empty() => match me.find(m)? {
+            None => Where::Here(id.trim()),
+            Some(o) => Where::There {
+                machine: o.clone(),
+                id: id.trim(),
+            },
         },
         Some((_, id)) => Where::Here(id.trim()),
         None => Where::Here(address),
+    })
+}
+
+/// El id de la sesión si `address` es de este equipo por su nombre o su id en el hub, sin mirar
+/// los demás equipos: así se leen las direcciones canónicas (`opened_by`) y lo que pide otro
+/// equipo.
+fn here<'a>(me: &Machine, address: &'a str) -> Option<&'a str> {
+    let address = address.trim();
+    match address.rsplit_once('/') {
+        Some((m, id)) if m.trim().is_empty() || me.is_me(m) => Some(id.trim()),
+        Some(_) => None,
+        None => Some(address),
     }
 }
 
@@ -248,12 +343,12 @@ impl Caller {
 /// hub de cuando se abrió: si el equipo se vuelve a emparejar y el hub le da otro, la madre deja
 /// de poder contestar y cerrar a sus hijas.
 pub fn opened_by(me: &Machine, opened_by: Option<&str>, caller: &str) -> bool {
-    opened_by.is_some_and(|o| locate(me, o) == Where::Here(caller))
+    opened_by.is_some_and(|o| here(me, o) == Some(caller))
 }
 
 // ---------- Estado, turnos y pregunta ----------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Working,
@@ -483,25 +578,83 @@ impl Cursors {
     }
 }
 
-/// Pregunta con `poll` cada `step` hasta que `done`, o hasta que pase `timeout`; devuelve lo
-/// último que vio. Es la espera de `read` con `wait` (y sirve igual para sesiones de otro equipo).
-/// `poll` da un futuro nuevo cada vez (con un cierre `async`, el futuro no se puede probar `Send`
-/// y axum lo exige).
-pub async fn wait_until<T, F: Future<Output = T>>(
-    mut poll: impl FnMut() -> F,
-    done: impl Fn(&T) -> bool,
+/// Lo que mira una espera de lo que dice `status` de la sesión de destino.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct Seen {
+    pub state: Status,
+    /// El mensaje ya no está en su bandeja.
+    #[serde(default)]
+    pub taken: bool,
+    /// Claude ha escrito algo desde que se encoló el mensaje.
+    #[serde(default)]
+    pub replied: bool,
+}
+
+/// ¿Merece la pena seguir esperando tras este fallo de `status`? Los del canal con otro equipo
+/// (no contesta, el hub tarda, una respuesta rota): la siguiente vuelta puede ir bien.
+fn passing(f: &Fail) -> bool {
+    f.0.is_server_error()
+}
+
+/// La espera de `send` y `read` con `wait`, igual para una sesión de aquí que para una de otro
+/// equipo: `status` dice cómo está (un futuro nuevo cada vez: con un cierre `async`, el futuro no
+/// se puede probar `Send` y axum lo exige). Con `pickup` (la de `send`), primero, hasta ese
+/// tiempo, a que la sesión recoja el mensaje y se ponga con él (`picked_up`); si no llega a
+/// ponerse (o está parada), no se sigue esperando. Luego (o desde el principio, con `read`),
+/// hasta `total`, a que deje de trabajar. Un fallo del canal no corta la espera; si no hubo ni
+/// una respuesta, sale ese fallo. Mirar el estado no mueve la posición de lectura.
+pub async fn wait_on<F: Future<Output = Result<Seen, Fail>>>(
+    mut status: impl FnMut() -> F,
+    pickup: Option<Duration>,
     step: Duration,
-    timeout: Duration,
-) -> T {
-    let deadline = tokio::time::Instant::now() + timeout;
+    total: Duration,
+) -> Result<(), Fail> {
+    let start = tokio::time::Instant::now();
+    let mut picked = pickup.is_none();
+    let (mut answered, mut failed) = (false, None);
     loop {
-        let v = poll().await;
-        let now = tokio::time::Instant::now();
-        if done(&v) || now >= deadline {
-            return v;
+        match status().await {
+            Ok(s) => {
+                answered = true;
+                picked = picked || picked_up(s.taken, s.state, s.replied);
+                if s.state.settled() && (picked || s.state == Status::Stopped) {
+                    break;
+                }
+            }
+            Err(f) if passing(&f) => failed = Some(f),
+            Err(f) => return Err(f),
         }
-        tokio::time::sleep(step.min(deadline - now)).await;
+        let limit = match pickup {
+            Some(p) if !picked => p.min(total),
+            _ => total,
+        };
+        let gone = start.elapsed();
+        if gone >= limit {
+            break;
+        }
+        tokio::time::sleep(step.min(limit - gone)).await;
     }
+    match failed {
+        Some(f) if !answered => Err(f),
+        _ => Ok(()),
+    }
+}
+
+/// `wait_on` y luego una sola lectura (`read`): lo que haya, también si se acabó el tiempo (con
+/// `state` aún `working`, el modelo sabe que puede volver a esperar con `read`).
+pub async fn wait_then_read<F, R>(
+    status: impl FnMut() -> F,
+    read: impl FnOnce() -> R,
+    pickup: Option<Duration>,
+    step: Duration,
+    total: Duration,
+) -> Reply
+where
+    F: Future<Output = Result<Seen, Fail>>,
+    R: Future<Output = Reply>,
+{
+    wait_on(status, pickup, step, total).await?;
+    read().await
 }
 
 /// Cuánto esperar con `wait`: lo pedido (o 10 min), como mucho media hora.
@@ -549,14 +702,15 @@ pub fn started(holder: Option<Duration>, uptime: Duration) -> Duration {
 }
 
 /// ¿Ya recogió la sesión el mensaje (`taken`: ya no está en su bandeja) y se puso con él? Si no
-/// está parada, o si su conversación ha crecido desde que se mandó (contestó enseguida).
-pub fn picked_up(taken: bool, state: Status, grown: bool) -> bool {
-    taken && (state != Status::Idle || grown)
+/// está parada, o si Claude ya ha escrito algo después (`replied`: contestó enseguida). Que su
+/// conversación crezca no basta: lo primero que entra es el propio mensaje.
+pub fn picked_up(taken: bool, state: Status, replied: bool) -> bool {
+    taken && (state != Status::Idle || replied)
 }
 
 /// ¿Se manda el mensaje a sí misma la sesión `caller`?
 pub fn to_self(me: &Machine, address: &str, caller: &str) -> bool {
-    locate(me, address) == Where::Here(caller)
+    matches!(locate(me, address), Ok(Where::Here(id)) if id == caller)
 }
 
 /// Qué hacer con un mensaje para `d`. Parada, a la cola (se entrega al arrancar); viva con
@@ -592,31 +746,76 @@ pub fn decide(d: &Dest) -> Result<Decision, Fail> {
     Ok(Decision { status, note })
 }
 
-/// La espera de `send` con `wait`: primero, hasta `pickup`, a que la sesión recoja el mensaje y
-/// se ponga a trabajar (`picked`); luego, hasta que pase `total` desde el principio, a que se
-/// asiente. Si no llega a ponerse a trabajar (o se para), no se sigue esperando. Devuelve lo
-/// último que vio `poll`. No sabe de dónde sale lo que mira: sirve también para otro equipo.
-pub async fn wait_reply<T, F: Future<Output = T>>(
-    mut poll: impl FnMut() -> F,
-    picked: impl Fn(&T) -> bool,
-    state: impl Fn(&T) -> Status,
-    step: Duration,
-    pickup: Duration,
-    total: Duration,
-) -> T {
-    let start = tokio::time::Instant::now();
-    let v = wait_until(
-        &mut poll,
-        |v| picked(v) || state(v) == Status::Stopped,
-        step,
-        pickup.min(total),
-    )
-    .await;
-    if !picked(&v) {
-        return v;
+/// Dónde estaba la conversación de la sesión de destino de cada mensaje de `send` al encolarlo
+/// (por el id del mensaje), para saber si ya contestó. Solo en memoria y un rato (`MARK_TTL`).
+#[derive(Default)]
+pub struct Marks(std::sync::Mutex<HashMap<String, Mark>>);
+
+#[derive(Debug, Clone)]
+struct Mark {
+    /// La sesión de destino.
+    session: String,
+    /// Su transcripción (`None`: aún no tenía) y hasta dónde se ha mirado sin ver respuesta.
+    path: Option<PathBuf>,
+    from: u64,
+    replied: bool,
+    at: Instant,
+}
+
+impl Marks {
+    /// Apunta dónde estaba la conversación de `session` (`path`, de `len` bytes) al encolarle el
+    /// mensaje `msg`. Fuera las de hace más de `MARK_TTL`.
+    pub fn put(&self, msg: &str, session: &str, path: Option<PathBuf>, len: u64, now: Instant) {
+        let mut m = self.0.lock().expect("marcas");
+        m.retain(|_, k| now.saturating_duration_since(k.at) < MARK_TTL);
+        m.insert(
+            msg.to_owned(),
+            Mark {
+                session: session.to_owned(),
+                path,
+                from: len,
+                replied: false,
+                at: now,
+            },
+        );
     }
-    let left = total.saturating_sub(start.elapsed());
-    wait_until(poll, |v| state(v).settled(), step, left).await
+
+    fn get(&self, msg: &str, session: &str) -> Option<Mark> {
+        self.0
+            .lock()
+            .expect("marcas")
+            .get(msg)
+            .filter(|k| k.session == session)
+            .cloned()
+    }
+
+    /// Ya se miró `path` hasta `from` (y si contestó).
+    fn seen(&self, msg: &str, path: PathBuf, from: u64, replied: bool) {
+        if let Some(k) = self.0.lock().expect("marcas").get_mut(msg) {
+            k.path = Some(path);
+            k.from = from;
+            k.replied |= replied;
+        }
+    }
+}
+
+/// ¿Hay un turno de Claude con texto en `now` (la transcripción de ahora) desde la marca (`mark`,
+/// hasta `from`)? Si la transcripción es otra (tras `/clear`) o no la había, desde el principio.
+/// Devuelve también hasta dónde se miró, para seguir desde ahí.
+pub fn replied_since(mark: Option<&Path>, from: u64, now: &Path) -> std::io::Result<(bool, u64)> {
+    let len = std::fs::metadata(now)?.len();
+    // La marca puede caer a media línea: lo que se estaba escribiendo es de antes.
+    let start = if mark == Some(now) && from <= len {
+        line_start(now, from)?
+    } else {
+        0
+    };
+    let chunk = transcript::read_chunk(now, start, None)?;
+    let replied = chunk
+        .items
+        .iter()
+        .any(|i| matches!(i, ChatItem::Assistant { text, .. } if !text.trim().is_empty()));
+    Ok((replied, chunk.offset))
 }
 
 // ---------- open ----------
@@ -747,12 +946,39 @@ struct AlertArgs {
     text: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusArgs {
+    session: String,
+    /// Un mensaje de `send` (su `msg_id`): si ya lo recogió y si ha contestado.
+    msg: Option<String>,
+}
+
+/// Lo que devuelve `status` (por el canal «peer», para las esperas del nido de quien llama, y
+/// para saber si vive una sesión madre).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatusOut {
+    pub state: Status,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<Question>,
+    /// Con `msg`: ya no está en su bandeja.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taken: Option<bool>,
+    /// Con `msg`: Claude ha escrito algo desde que se encoló.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replied: Option<bool>,
+}
+
 /// Una sesión de Claude en la lista de `sessions` (y lo que devuelve `open`).
 #[derive(Debug, Serialize)]
 pub struct Entry {
-    /// `<nombre del equipo>/<id>`: lo que se pasa a las demás herramientas.
+    /// `<equipo>/<id>` (el equipo como lo da `Machine::label`): lo que se pasa a las demás
+    /// herramientas.
     pub session: String,
+    /// El nombre del equipo.
     pub machine: String,
+    /// Su id en el hub (sin hub, su nombre).
+    pub machine_id: String,
     pub id: String,
     pub name: String,
     pub cwd: PathBuf,
@@ -767,8 +993,9 @@ pub struct Entry {
 
 fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: Status) -> Entry {
     Entry {
-        session: format!("{}/{}", me.name, v.id),
+        session: me.shown(&v.id),
         machine: me.name.clone(),
+        machine_id: me.key().to_owned(),
         id: v.id.clone(),
         name: v.name.clone(),
         cwd: v.cwd.clone(),
@@ -802,6 +1029,14 @@ impl IntoResponse for Fail {
     }
 }
 
+/// El error que contestó otro equipo, con su código.
+fn peer_fail((code, msg): (u16, String)) -> Fail {
+    Fail(
+        StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+        msg,
+    )
+}
+
 /// `POST /api/v1/mcp/{tool}`.
 pub async fn api_mcp(
     State(st): State<Arc<AppState>>,
@@ -831,9 +1066,12 @@ pub async fn api_mcp(
     }
 }
 
-/// Las herramientas que se pueden pedir desde otro equipo. `alert` no: una alerta va siempre al
-/// nido de quien la manda.
-pub const PEER_TOOLS: [&str; 6] = ["sessions", "send", "read", "open", "answer", "close"];
+/// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert` (una alerta va
+/// siempre al nido de quien la manda), y, para su nido, `status` (lo que miran sus esperas) y
+/// `alerts` (las de aquí sin leer, para `nido alerts`).
+pub const PEER_TOOLS: [&str; 8] = [
+    "sessions", "send", "read", "open", "answer", "close", "status", "alerts",
+];
 
 /// Una herramienta (menos `alert`), para quien llame: de aquí o de otro equipo.
 async fn run_tool(st: &AppState, me: &Machine, caller: &Caller, tool: &str, args: Value) -> Reply {
@@ -844,6 +1082,7 @@ async fn run_tool(st: &AppState, me: &Machine, caller: &Caller, tool: &str, args
         "open" => tool_open(st, me, caller, args).await,
         "answer" => tool_answer(st, me, caller, args).await,
         "close" => tool_close(st, me, caller, args).await,
+        "status" => tool_status(st, me, caller, args).await,
         _ => Err(fail(
             StatusCode::NOT_FOUND,
             format!("no hay ninguna herramienta {tool:?}"),
@@ -869,10 +1108,191 @@ pub async fn peer_call(
     }
     let me = Machine::of(st);
     let caller = params.as_object_mut().and_then(|p| p.remove("caller"));
+    // Las alertas son del equipo, no de una sesión: las pide `nido alerts`.
+    if method == "alerts" {
+        let NoArgs {} = args_of(params).map_err(code)?;
+        return Ok(fit_alerts(local_alerts(st, &me).await, MAX_READ));
+    }
     let caller = Caller::remote(&me, member, caller).map_err(code)?;
     run_tool(st, &me, &caller, method, params)
         .await
         .map_err(code)
+}
+
+/// Una alerta sin leer, para `nido alerts`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertOut {
+    /// El nombre del equipo.
+    pub machine: String,
+    pub machine_id: String,
+    /// La sesión que la mandó (`<equipo>/<id>`, como en `sessions`) y su nombre.
+    pub session: String,
+    pub name: String,
+    pub text: String,
+    pub at: u64,
+}
+
+/// Las alertas sin leer de las sesiones de aquí.
+async fn local_alerts(st: &AppState, me: &Machine) -> Vec<AlertOut> {
+    st.scan().await;
+    st.views
+        .borrow()
+        .sessions
+        .iter()
+        .flat_map(|v| {
+            v.alerts.iter().map(|a| AlertOut {
+                machine: me.name.clone(),
+                machine_id: me.key().to_owned(),
+                session: me.shown(&v.id),
+                name: v.name.clone(),
+                text: a.text.clone(),
+                at: a.at,
+            })
+        })
+        .collect()
+}
+
+/// Las alertas para otro equipo: `{alerts: [...]}` con las más nuevas que quepan en `max` bytes
+/// de JSON y, si no cupieron todas, `truncated: true`.
+pub fn fit_alerts(mut list: Vec<AlertOut>, max: usize) -> Value {
+    list.sort_by_key(|a| std::cmp::Reverse(a.at));
+    let truncated = fit_list(&mut list, max, r#"{"alerts":[],"truncated":true}"#.len());
+    let mut out = json!({ "alerts": list });
+    if truncated {
+        out["truncated"] = true.into();
+    }
+    out
+}
+
+/// Deja en `list` los primeros que caben en `max` bytes de JSON, con `used` ya ocupados por lo
+/// de alrededor. `true` si sobraba alguno.
+fn fit_list<T: Serialize>(list: &mut Vec<T>, max: usize, mut used: usize) -> bool {
+    let mut keep = 0;
+    for e in list.iter() {
+        let n = json_len(e) + 1;
+        if used + n > max {
+            break;
+        }
+        used += n;
+        keep += 1;
+    }
+    let truncated = keep < list.len();
+    list.truncate(keep);
+    truncated
+}
+
+/// `GET /api/v1/mcp/alerts`: las alertas sin leer de todos los equipos del grupo, para `nido
+/// alerts` (con el token principal, sin sesión): `{alerts: [...], unreachable?: [...]}`, de la
+/// más antigua a la más nueva. A cada equipo se le pregunta a la vez, `FAN_OUT` como mucho.
+pub async fn api_alerts(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(f) = main_token(&st, &headers) {
+        return f.into_response();
+    }
+    let me = Machine::of(&st);
+    let (local, remote) = tokio::join!(
+        local_alerts(&st, &me),
+        ask_others(&st, &me, "alerts", json!({}))
+    );
+    let mut alerts = local;
+    let mut unreachable = vec![];
+    for (m, r) in remote {
+        match r.and_then(|v| list_of::<AlertOut>(&v, "alerts")) {
+            Ok(list) => alerts.extend(list.into_iter().map(|mut a| {
+                let id = a.session.rsplit_once('/').map_or(&*a.session, |x| x.1);
+                a.session = format!("{}/{id}", me.label_of(m));
+                a.machine = Machine::name_of(m);
+                a.machine_id = m.id.clone();
+                a
+            })),
+            Err(f) => unreachable.push(unreachable_entry(m, &f)),
+        }
+    }
+    alerts.sort_by_key(|a| a.at);
+    let mut out = json!({ "alerts": alerts });
+    if !unreachable.is_empty() {
+        out["unreachable"] = unreachable.into();
+    }
+    Json(out).into_response()
+}
+
+/// Lo que contesta otro equipo en `key` (una lista), o el error de que no se entiende.
+fn list_of<T: DeserializeOwned>(v: &Value, key: &str) -> Result<Vec<T>, Fail> {
+    serde_json::from_value(v.get(key).cloned().unwrap_or(Value::Null)).map_err(|_| {
+        fail(
+            StatusCode::BAD_GATEWAY,
+            "respuesta no válida del otro equipo",
+        )
+    })
+}
+
+/// Un equipo que no contestó: `{machine, machine_id, error}`.
+fn unreachable_entry(m: &Member, f: &Fail) -> Value {
+    json!({ "machine": Machine::name_of(m), "machine_id": m.id, "error": i18n::tr(&f.1) })
+}
+
+/// Pide `method` a todos los demás equipos del grupo a la vez, `FAN_OUT` como mucho a cada uno.
+async fn ask_others<'m>(
+    st: &AppState,
+    me: &'m Machine,
+    method: &str,
+    params: Value,
+) -> Vec<(&'m Member, Result<Value, Fail>)> {
+    futures_util::future::join_all(me.others.iter().map(|m| {
+        let params = params.clone();
+        async move {
+            let r = tokio::time::timeout(FAN_OUT, st.peer_member(m, method, params)).await;
+            let r = match r {
+                Ok(r) => r.map_err(peer_fail),
+                Err(_) => Err(fail(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "el otro equipo no contesta",
+                )),
+            };
+            (m, r)
+        }
+    }))
+    .await
+}
+
+/// Pide `method` a otro equipo del grupo de parte de `caller` (una sesión de aquí) y devuelve lo
+/// que conteste, con la sesión que traiga escrita como se escribe aquí (`relabel`).
+async fn forward(
+    st: &AppState,
+    me: &Machine,
+    caller: &Caller,
+    machine: &Member,
+    method: &str,
+    mut params: Value,
+) -> Reply {
+    params["caller"] = json!({ "id": caller.id, "name": caller.name });
+    let v = st
+        .peer_member(machine, method, params)
+        .await
+        .map_err(peer_fail)?;
+    Ok(relabel(me, machine, v))
+}
+
+/// Una sesión de otro equipo (`v`, con `session`) como se ve desde aquí: su dirección con la
+/// etiqueta de ese equipo aquí (`Machine::label_of`), y el equipo por su nombre y su id en el
+/// grupo, no por lo que diga él.
+fn relabel(me: &Machine, m: &Member, mut v: Value) -> Value {
+    let Some(o) = v.as_object_mut() else {
+        return v;
+    };
+    let Some(session) = o.get("session").and_then(Value::as_str) else {
+        return v;
+    };
+    let id = session.rsplit_once('/').map_or(session, |x| x.1).to_owned();
+    o.insert("session".into(), format!("{}/{id}", me.label_of(m)).into());
+    o.insert("machine".into(), Machine::name_of(m).into());
+    o.insert("machine_id".into(), m.id.clone().into());
+    v
+}
+
+/// Los argumentos para otro equipo, con la sesión por su id (allí es de aquí).
+fn with_session(mut args: Value, id: &str) -> Value {
+    args["session"] = id.into();
+    args
 }
 
 /// `GET /api/v1/mcp/inbox`: lo que espera en la bandeja de la sesión que llama, del más antiguo
@@ -909,6 +1329,12 @@ pub async fn api_inbox_ack(
 /// Con el token principal (las sesiones van con el de la consola, no con el de un teléfono) y
 /// desde una sesión de aquí: cuál.
 async fn authorize(st: &AppState, headers: &HeaderMap) -> Result<Session, Fail> {
+    main_token(st, headers)?;
+    caller(st, headers).await
+}
+
+/// Con el token principal, el de la consola (no el de un teléfono).
+fn main_token(st: &AppState, headers: &HeaderMap) -> Result<(), Fail> {
     if let Some(token) = &st.token {
         let given = headers
             .get(header::AUTHORIZATION)
@@ -921,7 +1347,7 @@ async fn authorize(st: &AppState, headers: &HeaderMap) -> Result<Session, Fail> 
             ));
         }
     }
-    caller(st, headers).await
+    Ok(())
 }
 
 /// Los argumentos del cuerpo; vacío es `{}`.
@@ -967,32 +1393,27 @@ fn args_of<T: DeserializeOwned>(args: Value) -> Result<T, Fail> {
     })
 }
 
-/// La sesión de Claude a la que se refiere `address`, si es de este equipo. A otro equipo no se
-/// pasa nada de lo que pide otro equipo: solo se le atiende con las sesiones de aquí.
-async fn target(
-    st: &AppState,
-    me: &Machine,
-    caller: &Caller,
-    address: &str,
-) -> Result<Session, Fail> {
-    match locate(me, address) {
-        Where::Elsewhere { .. } if !caller.local => Err(fail(
-            StatusCode::BAD_REQUEST,
-            "esa sesión no es de este equipo",
-        )),
-        Where::Elsewhere { .. } => Err(fail(
-            StatusCode::BAD_REQUEST,
-            "la sesión está en otro equipo (aún no se puede)",
-        )),
-        Where::Here(id) => st
-            .registry
-            .lock()
-            .await
-            .get(id)
-            .filter(|s| s.claude.is_some())
-            .cloned()
-            .ok_or_else(|| fail(StatusCode::NOT_FOUND, "no existe esa sesión")),
+/// Dónde está la sesión `address` para quien llama. Para una de aquí, en este equipo o en otro
+/// del grupo; para una de otro equipo, solo en este: lo que pide otro equipo no se pasa a un
+/// tercero.
+fn place<'a>(me: &Machine, caller: &Caller, address: &'a str) -> Result<Where<'a>, Fail> {
+    if caller.local {
+        return locate(me, address);
     }
+    here(me, address)
+        .map(Where::Here)
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "esa sesión no es de este equipo"))
+}
+
+/// La sesión de Claude de aquí con ese id.
+async fn session_here(st: &AppState, id: &str) -> Result<Session, Fail> {
+    st.registry
+        .lock()
+        .await
+        .get(id)
+        .filter(|s| s.claude.is_some())
+        .cloned()
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "no existe esa sesión"))
 }
 
 fn to_json<T: Serialize>(v: &T) -> Reply {
@@ -1048,8 +1469,43 @@ async fn view(st: &AppState, id: &str) -> Option<SessionView> {
         .cloned()
 }
 
+/// `sessions`: para una de aquí, las de este equipo y, a la vez, las de los demás del grupo
+/// (`FAN_OUT` como mucho cada uno; los que no contestan, en `unreachable`), en
+/// `{sessions, unreachable?, truncated?}`. Para una de otro equipo, solo las de aquí.
 async fn tool_sessions(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let NoArgs {} = args_of(args)?;
+    if !caller.local {
+        // A otro equipo va en un solo mensaje Noise: con tope, y diciendo si se recortó.
+        return Ok(fit_sessions(local_sessions(st, me, caller).await, MAX_READ));
+    }
+    let who = json!({ "caller": { "id": caller.id, "name": caller.name } });
+    let (local, remote) = tokio::join!(
+        local_sessions(st, me, caller),
+        ask_others(st, me, "sessions", who)
+    );
+    let mut sessions: Vec<Value> = local.iter().map(to_json).collect::<Result<_, _>>()?;
+    let (mut unreachable, mut truncated) = (vec![], false);
+    for (m, r) in remote {
+        match r.and_then(|v| list_of::<Value>(&v, "sessions").map(|l| (l, v))) {
+            Ok((list, v)) => {
+                truncated |= v["truncated"] == true;
+                sessions.extend(list.into_iter().map(|e| relabel(me, m, e)));
+            }
+            Err(f) => unreachable.push(unreachable_entry(m, &f)),
+        }
+    }
+    let mut out = json!({ "sessions": sessions });
+    if !unreachable.is_empty() {
+        out["unreachable"] = unreachable.into();
+    }
+    if truncated {
+        out["truncated"] = true.into();
+    }
+    Ok(out)
+}
+
+/// Las sesiones de Claude de este equipo, como las ve `caller`.
+async fn local_sessions(st: &AppState, me: &Machine, caller: &Caller) -> Vec<Entry> {
     st.scan().await;
     let views: Vec<SessionView> = st
         .views
@@ -1060,33 +1516,17 @@ async fn tool_sessions(st: &AppState, me: &Machine, caller: &Caller, args: Value
         .cloned()
         .collect();
     let states = futures_util::future::join_all(views.iter().map(|v| status_of(st, v))).await;
-    let list: Vec<Entry> = views
+    views
         .iter()
         .zip(states)
         .map(|(v, (s, _))| entry(st, me, caller, v, s))
-        .collect();
-    if caller.local {
-        return to_json(&list);
-    }
-    // A otro equipo va en un solo mensaje Noise: con tope, y diciendo si se recortó.
-    Ok(fit_sessions(list, MAX_READ))
+        .collect()
 }
 
 /// La lista de `sessions` para otro equipo: `{sessions: [...]}` con las primeras que quepan en
 /// `max` bytes de JSON y, si no cupieron todas, `truncated: true`.
 pub fn fit_sessions(mut list: Vec<Entry>, max: usize) -> Value {
-    let mut used = r#"{"sessions":[],"truncated":true}"#.len();
-    let mut keep = 0;
-    for e in &list {
-        let n = json_len(e) + 1;
-        if used + n > max {
-            break;
-        }
-        used += n;
-        keep += 1;
-    }
-    let truncated = keep < list.len();
-    list.truncate(keep);
+    let truncated = fit_list(&mut list, max, r#"{"sessions":[],"truncated":true}"#.len());
     let mut out = json!({ "sessions": list });
     if truncated {
         out["truncated"] = true.into();
@@ -1161,8 +1601,8 @@ fn line_start(path: &Path, at: u64) -> std::io::Result<u64> {
     Ok(at - 1 + read as u64)
 }
 
-/// Cómo está la sesión `id` ahora. Hace un `scan()` entero (todas las sesiones): de sobra para
-/// una espera, pero hay que revisarlo en la tarea 9, con esperas de otros equipos.
+/// Cómo está la sesión `id` ahora. Hace un `scan()` entero (todas las sesiones) cada vez, también
+/// en cada `status` que pide la espera de otro equipo (cada 2 s): aún sin mirar solo la pedida.
 async fn poll_status(st: &AppState, id: &str) -> (Status, Option<Menu>) {
     match view(st, id).await {
         Some(v) => status_of(st, &v).await,
@@ -1170,17 +1610,15 @@ async fn poll_status(st: &AppState, id: &str) -> (Status, Option<Menu>) {
     }
 }
 
-/// Lo que ocupa ahora la conversación de la sesión `id` (0 si aún no tiene).
-async fn transcript_len(st: &AppState, id: &str) -> u64 {
+/// La transcripción de ahora de la sesión `id`, si ya la tiene.
+async fn transcript_now(st: &AppState, id: &str) -> Option<PathBuf> {
     let link = st
         .registry
         .lock()
         .await
         .get(id)
-        .and_then(|s| s.claude.clone());
-    link.and_then(|l| server::transcript_of(st, &l))
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map_or(0, |m| m.len())
+        .and_then(|s| s.claude.clone())?;
+    server::transcript_of(st, &link)
 }
 
 /// Lo que devuelve `read` de `s` para `reader`, con el estado y el menú que se acaban de ver: lo
@@ -1213,25 +1651,126 @@ async fn read_out(
     Ok(out)
 }
 
+/// `read` de la sesión `at` (aquí o, para una de aquí, en otro equipo), sin esperar.
+async fn read_at(
+    st: &AppState,
+    me: &Machine,
+    caller: &Caller,
+    at: &Where<'_>,
+    last: Option<usize>,
+) -> Reply {
+    match at {
+        Where::Here(id) => {
+            let s = session_here(st, id).await?;
+            let (state, menu) = poll_status(st, id).await;
+            to_json(&read_out(st, &caller.reader(), &s, state, menu, last).await?)
+        }
+        Where::There { machine, id } => {
+            let mut args = json!({ "session": id });
+            if let Some(n) = last {
+                args["last"] = n.into();
+            }
+            forward(st, me, caller, machine, "read", args).await
+        }
+    }
+}
+
+/// Cómo está la sesión `id` de aquí y, con `msg` (de `send`), si ya lo recogió y si ha contestado.
+async fn status_here(st: &AppState, id: &str, msg: Option<&str>) -> Result<StatusOut, Fail> {
+    session_here(st, id).await?;
+    let (state, menu) = poll_status(st, id).await;
+    let (taken, replied) = match msg {
+        Some(m) => (Some(!st.inbox.has(id, m)), Some(replied(st, id, m).await)),
+        None => (None, None),
+    };
+    Ok(StatusOut {
+        state,
+        question: menu.as_ref().map(Question::from),
+        taken,
+        replied,
+    })
+}
+
+/// ¿Ha escrito Claude algo en la conversación de `id` desde que se encoló `msg`? Sin marca (más
+/// de `MARK_TTL`, o `nido serve` se reinició), no se sabe: no.
+async fn replied(st: &AppState, id: &str, msg: &str) -> bool {
+    let Some(mark) = st.mcp_marks.get(msg, id) else {
+        return false;
+    };
+    if mark.replied {
+        return true;
+    }
+    let Some(now) = transcript_now(st, id).await else {
+        return false;
+    };
+    let seen = {
+        let now = now.clone();
+        tokio::task::spawn_blocking(move || replied_since(mark.path.as_deref(), mark.from, &now))
+            .await
+    };
+    match seen {
+        Ok(Ok((yes, upto))) => {
+            st.mcp_marks.seen(msg, now, upto, yes);
+            yes
+        }
+        _ => false,
+    }
+}
+
+/// Lo que miran las esperas de la sesión `at` (aquí o en otro equipo).
+async fn status_at(
+    st: &AppState,
+    me: &Machine,
+    caller: &Caller,
+    at: &Where<'_>,
+    msg: Option<&str>,
+) -> Result<Seen, Fail> {
+    let v = match at {
+        Where::Here(id) => to_json(&status_here(st, id, msg).await?)?,
+        Where::There { machine, id } => {
+            let mut args = json!({ "session": id });
+            if let Some(m) = msg {
+                args["msg"] = m.into();
+            }
+            forward(st, me, caller, machine, "status", args).await?
+        }
+    };
+    serde_json::from_value(v).map_err(|_| {
+        fail(
+            StatusCode::BAD_GATEWAY,
+            "respuesta no válida del otro equipo",
+        )
+    })
+}
+
+async fn tool_status(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
+    let raw = args.clone();
+    let a: StatusArgs = args_of(args)?;
+    match place(me, caller, &a.session)? {
+        Where::Here(id) => to_json(&status_here(st, id, a.msg.as_deref()).await?),
+        Where::There { machine, id } => {
+            forward(st, me, caller, &machine, "status", with_session(raw, id)).await
+        }
+    }
+}
+
 async fn tool_read(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let a: ReadArgs = args_of(args)?;
-    let s = target(st, me, caller, &a.session).await?;
-    let id = s.id.as_str();
-    let poll = || poll_status(st, id);
+    let at = place(me, caller, &a.session)?;
+    let read = || read_at(st, me, caller, &at, a.last);
     // Para otro equipo no se espera aquí: el ida y vuelta por el hub dura 15 s como mucho. Espera
     // el nido de quien llama, preguntando cada poco.
-    let (state, menu) = if a.wait && caller.local {
-        wait_until(
-            poll,
-            |(s, _)| s.settled(),
-            WAIT_STEP,
-            wait_timeout(a.timeout_s),
-        )
-        .await
-    } else {
-        poll().await
-    };
-    to_json(&read_out(st, &caller.reader(), &s, state, menu, a.last).await?)
+    if !(a.wait && caller.local) {
+        return read().await;
+    }
+    wait_then_read(
+        || status_at(st, me, caller, &at, None),
+        read,
+        None,
+        WAIT_STEP,
+        wait_timeout(a.timeout_s),
+    )
+    .await
 }
 
 async fn tool_send(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
@@ -1247,11 +1786,40 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         )));
     }
     // Antes de buscarla: la que llama puede no ser de Claude, y saldría «no existe». La de otro
-    // equipo no está aquí: su dirección ya da error en `target`.
+    // equipo no está aquí: su dirección ya da error en `place`.
     if caller.local && to_self(me, &a.session, &caller.id) {
         return Err(bad_request("no puedes mandarte mensajes a ti misma".into()));
     }
-    let s = target(st, me, caller, &a.session).await?;
+    let at = place(me, caller, &a.session)?;
+    let mut out = match &at {
+        Where::Here(id) => send_here(st, me, caller, id, text).await?,
+        // Sin `wait`: se espera aquí.
+        Where::There { machine, id } => {
+            let args = json!({ "session": id, "text": text });
+            forward(st, me, caller, machine, "send", args).await?
+        }
+    };
+    // Como en `read`: para otro equipo, sin esperar aquí.
+    let Some(secs) = a.wait.filter(|&w| w > 0 && caller.local) else {
+        return Ok(out);
+    };
+    // Un nido antiguo no da el id: sin él no se sabe si lo recogió, y se espera solo el rato de
+    // recogida.
+    let msg = out["msg_id"].as_str().map(str::to_owned);
+    out["read"] = wait_then_read(
+        || status_at(st, me, caller, &at, msg.as_deref()),
+        || read_at(st, me, caller, &at, None),
+        Some(PICKUP),
+        WAIT_STEP,
+        wait_timeout(Some(secs)),
+    )
+    .await?;
+    Ok(out)
+}
+
+/// Encola el mensaje para la sesión `id` de aquí: `{status, note?, msg_id}`.
+async fn send_here(st: &AppState, me: &Machine, caller: &Caller, id: &str, text: &str) -> Reply {
+    let s = session_here(st, id).await?;
     let alive = view(st, &s.id).await.is_some_and(|v| v.alive);
     let holder = launch::holder_started(&st.paths, &s.id)
         .map(|t| SystemTime::now().duration_since(t).unwrap_or_default());
@@ -1270,55 +1838,39 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         at: now_ms(),
     };
     let msg_id = msg.id.clone();
-    // Como en `read`: para otro equipo, sin esperar aquí.
-    let wait = a.wait.filter(|&w| w > 0 && caller.local);
-    // Lo que ocupa su conversación antes de mandarlo: si crece, ya contestó.
-    let before = match wait {
-        Some(_) => transcript_len(st, &s.id).await,
-        None => 0,
-    };
+    // Dónde está su conversación antes de mandarlo: lo que escriba Claude después es la respuesta.
+    let path = transcript_now(st, &s.id).await;
+    let len = path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len());
+    st.mcp_marks.put(&msg_id, &s.id, path, len, Instant::now());
     st.inbox
         .push(&s.id, msg)
         .map_err(|_| fail(StatusCode::CONFLICT, "la bandeja de esa sesión está llena"))?;
-    let mut out = json!({ "status": d.status });
+    let mut out = json!({ "status": d.status, "msg_id": msg_id });
     if let Some(note) = d.note {
         out["note"] = i18n::tr(note).into();
     }
-    let Some(secs) = wait else {
-        return Ok(out);
-    };
-    let (id, msg_id) = (s.id.as_str(), msg_id.as_str());
-    let poll = || async move {
-        let (state, menu) = poll_status(st, id).await;
-        let taken = !st.inbox.has(id, msg_id);
-        (state, menu, taken, transcript_len(st, id).await > before)
-    };
-    let (state, menu, _, _) = wait_reply(
-        poll,
-        |&(state, _, taken, grown)| picked_up(taken, state, grown),
-        |(state, _, _, _)| *state,
-        WAIT_STEP,
-        PICKUP,
-        wait_timeout(Some(secs)),
-    )
-    .await;
-    out["read"] = to_json(&read_out(st, &caller.reader(), &s, state, menu, None).await?)?;
     Ok(out)
 }
 
 async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
+    let raw = args.clone();
     let a: OpenArgs = args_of(args)?;
-    if !me.is_me(&a.machine) && !caller.local {
+    if !caller.local && !me.is_me(&a.machine) {
         return Err(bad_request(format!(
             "«{}» no es este equipo",
             a.machine.trim()
         )));
     }
-    if !me.is_me(&a.machine) {
-        return Err(bad_request(format!(
-            "«{}» es otro equipo (aún no se puede)",
-            a.machine.trim()
-        )));
+    if caller.local
+        && let Some(m) = me.find(&a.machine)?
+    {
+        // Allí, el equipo por su id: es el suyo.
+        let mut args = raw;
+        args["machine"] = m.id.clone().into();
+        return forward(st, me, caller, m, "open", args).await;
     }
     let cwd = server::expand_home(&st.paths.home, Some(PathBuf::from(a.folder.trim())));
     if !cwd.is_absolute() {
@@ -1430,8 +1982,15 @@ fn opened_session(
 }
 
 async fn tool_answer(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
+    let raw = args.clone();
     let a: AnswerArgs = args_of(args)?;
-    let s = target(st, me, caller, &a.session).await?;
+    let id = match place(me, caller, &a.session)? {
+        Where::Here(id) => id,
+        Where::There { machine, id } => {
+            return forward(st, me, caller, &machine, "answer", with_session(raw, id)).await;
+        }
+    };
+    let s = session_here(st, id).await?;
     if !caller.owns(me, s.opened_by.as_deref()) {
         return Err(fail(
             StatusCode::FORBIDDEN,
@@ -1482,8 +2041,15 @@ async fn tool_answer(st: &AppState, me: &Machine, caller: &Caller, args: Value) 
 }
 
 async fn tool_close(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
+    let raw = args.clone();
     let a: SessionArg = args_of(args)?;
-    let s = target(st, me, caller, &a.session).await?;
+    let id = match place(me, caller, &a.session)? {
+        Where::Here(id) => id,
+        Where::There { machine, id } => {
+            return forward(st, me, caller, &machine, "close", with_session(raw, id)).await;
+        }
+    };
+    let s = session_here(st, id).await?;
     if !caller.owns(me, s.opened_by.as_deref()) {
         return Err(fail(
             StatusCode::FORBIDDEN,
@@ -1508,6 +2074,64 @@ async fn tool_alert(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply 
     Ok(json!({ "ok": true }))
 }
 
+// ---------- La sesión madre ----------
+
+/// Si vive la sesión madre (de otro equipo) de una abierta con `open`, por su dirección, y
+/// cuándo se preguntó.
+#[derive(Default)]
+pub struct Parents(std::sync::Mutex<HashMap<String, (Instant, bool)>>);
+
+impl Parents {
+    fn get(&self, by: &str, now: Instant) -> Option<bool> {
+        self.0
+            .lock()
+            .expect("madres")
+            .get(by)
+            .filter(|(t, _)| now.saturating_duration_since(*t) < PARENT_TTL)
+            .map(|(_, alive)| *alive)
+    }
+
+    fn put(&self, by: &str, alive: bool, now: Instant) {
+        let mut m = self.0.lock().expect("madres");
+        m.retain(|_, (t, _)| now.saturating_duration_since(*t) < PARENT_TTL);
+        m.insert(by.to_owned(), (now, alive));
+    }
+}
+
+/// ¿Vive la sesión que abrió con `open` a la sesión `child` (`by`, su `opened_by`)? Lo que
+/// pregunta la hija es para ella mientras viva: no se avisa al usuario. Si es de aquí, si está en
+/// el registro y en marcha; si es de otro equipo, se le pregunta su `status` (`FAN_OUT` como
+/// mucho, y se recuerda `PARENT_TTL`): parada, sin respuesta o de un equipo que ya no está en el
+/// grupo, no vive.
+pub async fn parent_alive(st: &AppState, by: &str, child: &str, child_name: &str) -> bool {
+    let by = by.trim();
+    let me = Machine::of(st);
+    if let Some(id) = here(&me, by) {
+        let known = st.registry.lock().await.get(id).is_some();
+        return known && launch::is_alive(&st.paths, id);
+    }
+    let Some((machine, id)) = by.rsplit_once('/') else {
+        return false;
+    };
+    let Some(m) = me.others.iter().find(|m| m.id == machine.trim()) else {
+        return false;
+    };
+    if let Some(alive) = st.mcp_parents.get(by, Instant::now()) {
+        return alive;
+    }
+    let ask = st.peer_member(
+        m,
+        "status",
+        json!({ "session": id.trim(), "caller": { "id": child, "name": child_name } }),
+    );
+    let alive = matches!(
+        tokio::time::timeout(FAN_OUT, ask).await,
+        Ok(Ok(v)) if v["state"].as_str().is_some_and(|s| s != "stopped")
+    );
+    st.mcp_parents.put(by, alive, Instant::now());
+    alive
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1516,37 +2140,132 @@ mod tests {
         Machine {
             name: "Portatil".into(),
             key: key.map(str::to_owned),
+            others: vec![],
+        }
+    }
+
+    fn member(id: &str, name: &str) -> Member {
+        Member {
+            id: id.into(),
+            key: format!("clave-{id}"),
+            name: name.into(),
+            at: 0,
+            removed: false,
+        }
+    }
+
+    /// Este equipo con otros en el grupo (id, nombre).
+    fn grouped(key: Option<&str>, others: &[(&str, &str)]) -> Machine {
+        Machine {
+            others: others.iter().map(|(i, n)| member(i, n)).collect(),
+            ..me(key)
+        }
+    }
+
+    fn here_of<'a>(m: &Machine, a: &'a str) -> &'a str {
+        match locate(m, a).unwrap() {
+            Where::Here(id) => id,
+            w => panic!("{a}: {w:?}"),
+        }
+    }
+
+    fn there_of(m: &Machine, a: &str) -> (String, String) {
+        match locate(m, a).unwrap() {
+            Where::There { machine, id } => (machine.id, id.to_owned()),
+            w => panic!("{a}: {w:?}"),
         }
     }
 
     #[test]
     fn addresses() {
-        let m = me(Some("k123"));
-        assert_eq!(locate(&m, "ab12cd34"), Where::Here("ab12cd34"));
-        assert_eq!(locate(&m, "Portatil/ab12cd34"), Where::Here("ab12cd34"));
-        assert_eq!(locate(&m, "PORTATIL/ab12cd34"), Where::Here("ab12cd34"));
-        assert_eq!(locate(&m, "k123/ab12cd34"), Where::Here("ab12cd34"));
-        assert_eq!(locate(&m, " Portatil/ab12cd34 "), Where::Here("ab12cd34"));
+        let m = grouped(Some("k123"), &[("mac-id", "Mac")]);
+        assert_eq!(here_of(&m, "ab12cd34"), "ab12cd34");
+        assert_eq!(here_of(&m, "Portatil/ab12cd34"), "ab12cd34");
+        assert_eq!(here_of(&m, "PORTATIL/ab12cd34"), "ab12cd34");
+        assert_eq!(here_of(&m, "k123/ab12cd34"), "ab12cd34");
+        assert_eq!(here_of(&m, " Portatil/ab12cd34 "), "ab12cd34");
+        // Otro del grupo, por su nombre (sin mirar mayúsculas) o por su id.
+        for a in [
+            "Mac/ab12cd34",
+            "mac/ab12cd34",
+            "mac-id/ab12cd34",
+            " Mac/ab12cd34 ",
+        ] {
+            assert_eq!(there_of(&m, a), ("mac-id".into(), "ab12cd34".into()), "{a}");
+        }
+        // Uno que no es del grupo: 404. El id en el hub tal cual: otro id no es este.
+        for a in ["Sobremesa/ab12cd34", "K123/ab12cd34", "MAC-ID/ab"] {
+            let e = locate(&m, a).unwrap_err();
+            assert_eq!(e.0, StatusCode::NOT_FOUND, "{a}");
+        }
         assert_eq!(
-            locate(&m, "Sobremesa/ab12cd34"),
-            Where::Elsewhere {
-                machine: "Sobremesa",
-                id: "ab12cd34"
-            }
+            locate(&m, "Sobremesa/x").unwrap_err().1,
+            "«Sobremesa» no es ningún equipo del grupo"
         );
-        // El id en el hub tal cual: otro id es otro equipo.
+        // Sin conexión con el hub, este solo por el nombre.
+        assert!(locate(&me(None), "k123/ab12cd34").is_err());
+        assert_eq!(here_of(&me(None), "portatil/ab"), "ab");
+    }
+
+    #[test]
+    fn machine_labels_are_the_name_unless_it_is_repeated() {
+        // Nombres distintos: cada uno por su nombre.
+        let m = grouped(Some("k123"), &[("mac-id", "Mac"), ("win-id", "Sobremesa")]);
+        assert_eq!(m.label(), "Portatil");
+        assert_eq!(m.shown("ab"), "Portatil/ab");
+        assert_eq!(m.label_of(&m.others[0]), "Mac");
+        // WSL toma el nombre del Windows en que corre: los dos, por su id (sin mirar mayúsculas).
+        let m = grouped(Some("k123"), &[("mac-id", "Mac"), ("win-id", "portatil")]);
+        assert_eq!(m.label(), "k123");
+        assert_eq!(m.shown("ab"), "k123/ab");
+        assert_eq!(m.label_of(&m.others[1]), "win-id");
+        assert_eq!(m.label_of(&m.others[0]), "Mac");
+        // Dos de los otros con el mismo nombre; este sin hub sigue con el suyo.
+        let m = grouped(None, &[("a-id", "Gemelo"), ("b-id", "gemelo")]);
+        assert_eq!(m.label(), "Portatil");
+        assert_eq!(m.label_of(&m.others[0]), "a-id");
+        assert_eq!(m.label_of(&m.others[1]), "b-id");
+        // Sin nombre, su id; el nombre, limpio.
+        let m = grouped(Some("k"), &[("x-id", " \u{7} "), ("y-id", " Mac\u{7} ")]);
+        assert_eq!(m.label_of(&m.others[0]), "x-id");
+        assert_eq!(m.label_of(&m.others[1]), "Mac");
+        assert_eq!(Machine::name_of(&m.others[0]), "x-id");
+    }
+
+    #[test]
+    fn locate_by_label_name_or_id_and_ambiguous_names() {
+        let m = grouped(Some("k123"), &[("win-id", "Portatil"), ("mac-id", "Mac")]);
+        // Este y el Windows se llaman igual: por el nombre no, por el id (o la etiqueta) sí.
+        for a in ["Portatil/ab", "portatil/ab"] {
+            let e = locate(&m, a).unwrap_err();
+            assert_eq!(e.0, StatusCode::BAD_REQUEST, "{a}");
+        }
         assert_eq!(
-            locate(&m, "K123/ab12cd34"),
-            Where::Elsewhere {
-                machine: "K123",
-                id: "ab12cd34"
-            }
+            locate(&m, "Portatil/ab").unwrap_err().1,
+            "hay varios equipos «Portatil» en el grupo: usa su id"
         );
-        // Sin conexión con el hub, solo el nombre.
-        assert!(matches!(
-            locate(&me(None), "k123/ab12cd34"),
-            Where::Elsewhere { .. }
-        ));
+        assert_eq!(here_of(&m, &format!("{}/ab", m.label())), "ab");
+        assert_eq!(here_of(&m, "k123/ab"), "ab");
+        assert_eq!(there_of(&m, "win-id/ab"), ("win-id".into(), "ab".into()));
+        let win = m.label_of(&m.others[0]);
+        assert_eq!(there_of(&m, &format!("{win}/ab")).0, "win-id");
+        assert_eq!(there_of(&m, "MAC/ab").0, "mac-id");
+        // Solo el id, siempre de aquí.
+        assert_eq!(here_of(&m, "ab"), "ab");
+        // Un id que es justo lo pedido gana a los nombres.
+        let m = grouped(Some("k"), &[("Gemelo", "Otro"), ("g2", "gemelo")]);
+        assert_eq!(there_of(&m, "Gemelo/ab").0, "Gemelo");
+        assert_eq!(there_of(&m, "gemelo/ab").0, "g2");
+        // `find`, igual: el equipo de `open`.
+        let m = grouped(Some("k123"), &[("win-id", "Portatil"), ("mac-id", "Mac")]);
+        assert_eq!(m.find("k123").unwrap(), None);
+        assert_eq!(
+            m.find("mac").unwrap().map(|x| x.id.as_str()),
+            Some("mac-id")
+        );
+        assert_eq!(m.find("portatil").unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(m.find("Nadie").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(me(None).find("PORTATIL").unwrap(), None);
     }
 
     #[test]
@@ -1557,7 +2276,8 @@ mod tests {
 
     #[test]
     fn opened_by_compares_addresses() {
-        let m = me(Some("k123"));
+        // Aunque otro equipo se llame igual: la dirección canónica va por el id.
+        let m = grouped(Some("k123"), &[("win-id", "Portatil")]);
         assert!(opened_by(&m, Some("k123/padre"), "padre"));
         // Apuntada sin conexión con el hub (por el nombre): sigue siendo suya.
         assert!(opened_by(&m, Some("Portatil/padre"), "padre"));
@@ -1934,6 +2654,7 @@ mod tests {
         Entry {
             session: format!("Portatil/{i:08}"),
             machine: "Portatil".into(),
+            machine_id: "k123".into(),
             id: format!("{i:08}"),
             name: format!("sesion-{i}"),
             cwd: PathBuf::from(format!("/home/ana/proyectos/{}", "carpeta".repeat(20))),
@@ -2001,36 +2722,6 @@ mod tests {
         assert_eq!(line_start(&path, 1).unwrap(), 4);
         assert_eq!(line_start(&path, 4).unwrap(), 4, "ya es principio de línea");
         assert_eq!(line_start(&path, 5).unwrap(), 8);
-    }
-
-    #[tokio::test]
-    async fn wait_until_stops_when_done_or_on_timeout() {
-        let mut n = 0;
-        let got = wait_until(
-            || {
-                n += 1;
-                std::future::ready(n)
-            },
-            |&v| v == 3,
-            Duration::from_millis(1),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(got, 3);
-        let start = std::time::Instant::now();
-        let got = wait_until(
-            || std::future::ready(Status::Working),
-            |s| s.settled(),
-            Duration::from_millis(10),
-            Duration::from_millis(50),
-        )
-        .await;
-        assert_eq!(got, Status::Working);
-        let took = start.elapsed();
-        assert!(
-            took >= Duration::from_millis(50) && took < Duration::from_secs(2),
-            "{took:?}"
-        );
     }
 
     #[test]
@@ -2131,7 +2822,7 @@ mod tests {
 
     #[test]
     fn sending_to_yourself() {
-        let m = me(Some("k123"));
+        let m = grouped(Some("k123"), &[("mac-id", "Mac")]);
         for a in [
             "padre1",
             "Portatil/padre1",
@@ -2142,6 +2833,7 @@ mod tests {
         }
         assert!(!to_self(&m, "hija1", "padre1"));
         assert!(!to_self(&m, "Sobremesa/padre1", "padre1"));
+        assert!(!to_self(&m, "Mac/padre1", "padre1"));
     }
 
     #[test]
@@ -2154,79 +2846,381 @@ mod tests {
         assert!(picked_up(true, Idle, true), "contestó enseguida");
     }
 
-    /// Lo que va viendo `wait_reply`: cada vuelta, el siguiente estado, si ya lo recogió y si su
-    /// conversación creció; el último se repite.
+    fn seen(state: Status, taken: bool, replied: bool) -> Result<Seen, Fail> {
+        Ok(Seen {
+            state,
+            taken,
+            replied,
+        })
+    }
+
+    fn down() -> Result<Seen, Fail> {
+        Err(fail(
+            StatusCode::BAD_GATEWAY,
+            "sin conexión o versión antigua",
+        ))
+    }
+
+    /// Lo que devuelve la espera de `send` (`pickup`) o de `read` (sin él) con lo que va viendo
+    /// `status` (cada vuelta, el siguiente; el último se repite): cuántas veces se miró, cuántas
+    /// se leyó y lo leído (`{"after": vueltas}`) o el error.
     async fn replay(
-        seen: &[(Status, bool, bool)],
-        pickup_ms: u64,
+        seen: &[Result<Seen, Fail>],
+        pickup_ms: Option<u64>,
         total_ms: u64,
-    ) -> (usize, Status) {
+    ) -> (usize, usize, Result<Value, (StatusCode, String)>) {
         let polls = std::cell::Cell::new(0);
-        let (state, _, _) = wait_reply(
+        let reads = std::cell::Cell::new(0);
+        let again = |r: &Result<Seen, Fail>| match r {
+            Ok(s) => Ok(*s),
+            Err(f) => Err(Fail(f.0, f.1.clone())),
+        };
+        let r = wait_then_read(
             || {
                 let i = polls.get();
                 polls.set(i + 1);
-                std::future::ready(seen[i.min(seen.len() - 1)])
+                std::future::ready(again(&seen[i.min(seen.len() - 1)]))
             },
-            |&(s, taken, grown)| picked_up(taken, s, grown),
-            |&(s, _, _)| s,
+            || {
+                reads.set(reads.get() + 1);
+                std::future::ready(Ok(json!({ "after": polls.get() })))
+            },
+            pickup_ms.map(Duration::from_millis),
             Duration::from_millis(1),
-            Duration::from_millis(pickup_ms),
             Duration::from_millis(total_ms),
         )
         .await;
-        (polls.get(), state)
+        (polls.get(), reads.get(), r.map_err(|f| (f.0, f.1)))
     }
 
     #[tokio::test]
     async fn send_waits_for_pickup_then_for_the_answer() {
         use Status::*;
         // Ya trabajaba en otra cosa (sin recogerlo), lo recoge, sigue trabajando y termina.
-        let seen = [
-            (Working, false, false),
-            (Idle, false, false),
-            (Working, true, true),
-            (Working, true, true),
-            (Idle, true, true),
-        ];
-        assert_eq!(replay(&seen, 5000, 10_000).await, (5, Idle));
+        let r = replay(
+            &[
+                seen(Working, false, false),
+                seen(Idle, false, false),
+                seen(Working, true, false),
+                seen(Working, true, true),
+                seen(Idle, true, true),
+            ],
+            Some(5000),
+            10_000,
+        )
+        .await;
+        assert_eq!(r, (5, 1, Ok(json!({"after": 5}))));
         // Recogido pero aún sin ponerse: se sigue esperando a que se ponga.
-        let seen = [
-            (Idle, true, false),
-            (Working, true, false),
-            (Idle, true, true),
-        ];
-        assert_eq!(replay(&seen, 5000, 10_000).await, (3, Idle));
+        let r = replay(
+            &[
+                seen(Idle, true, false),
+                seen(Working, true, false),
+                seen(Idle, true, true),
+            ],
+            Some(5000),
+            10_000,
+        )
+        .await;
+        assert_eq!(r.0, 3);
         // Contesta tan rápido que entre dos vueltas ya terminó: no se esperan los 30 s.
         let start = std::time::Instant::now();
-        let seen = [(Working, false, false), (Idle, true, true)];
-        assert_eq!(replay(&seen, 5000, 10_000).await, (3, Idle));
+        let r = replay(
+            &[seen(Working, false, false), seen(Idle, true, true)],
+            Some(5000),
+            10_000,
+        )
+        .await;
+        assert_eq!(r.0, 2);
         // Directa a preguntar: también.
-        let seen = [(Working, false, false), (Question, true, false)];
-        assert_eq!(replay(&seen, 5000, 10_000).await, (3, Question));
+        let r = replay(
+            &[seen(Working, false, false), seen(Question, true, false)],
+            Some(5000),
+            10_000,
+        )
+        .await;
+        assert_eq!(r.0, 2);
         assert!(start.elapsed() < Duration::from_secs(2));
         // Pregunta tras trabajar: también se acaba la espera.
-        let seen = [(Working, true, false), (Question, true, true)];
-        assert_eq!(replay(&seen, 5000, 10_000).await, (2, Question));
+        let r = replay(
+            &[seen(Working, true, false), seen(Question, true, true)],
+            Some(5000),
+            10_000,
+        )
+        .await;
+        assert_eq!(r.0, 2);
         // Parada: no se espera a que lo recoja.
         assert_eq!(
-            replay(&[(Stopped, false, false)], 5000, 10_000).await,
-            (1, Stopped)
+            replay(&[seen(Stopped, false, false)], Some(5000), 10_000)
+                .await
+                .0,
+            1
         );
         // No lo recoge en el tiempo de recogida: lo que haya.
         let start = std::time::Instant::now();
-        let (_, state) = replay(&[(Idle, false, false)], 50, 10_000).await;
-        assert_eq!(state, Idle);
+        let (_, reads, _) = replay(&[seen(Idle, false, false)], Some(50), 10_000).await;
+        assert_eq!(reads, 1);
         assert!(start.elapsed() < Duration::from_secs(2));
-        // Se acaba la espera entera trabajando: «working».
+        // Se acaba la espera entera trabajando: se lee lo que haya (y dirá «working»).
         let start = std::time::Instant::now();
-        let (_, state) = replay(&[(Working, true, false)], 5000, 80).await;
-        assert_eq!(state, Working);
+        let (_, reads, r) = replay(&[seen(Working, true, false)], Some(5000), 80).await;
+        assert_eq!((reads, r.is_ok()), (1, true));
         let took = start.elapsed();
         assert!(
             took >= Duration::from_millis(80) && took < Duration::from_secs(2),
             "{took:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn send_wait_needs_a_reply_not_just_the_message() {
+        use Status::*;
+        // El fallo de antes: el mensaje entra en la conversación (crece) y la sesión aún está
+        // parada; eso no es la respuesta. Se espera a que Claude escriba.
+        let start = std::time::Instant::now();
+        let mut seq = vec![seen(Idle, false, false)];
+        seq.extend((0..20).map(|_| seen(Idle, true, false)));
+        seq.push(seen(Idle, true, true));
+        let (polls, reads, _) = replay(&seq, Some(5000), 10_000).await;
+        assert_eq!((polls, reads), (22, 1));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn read_waits_until_it_is_not_working() {
+        use Status::*;
+        // Termina: con lo que haya dicho al final (los turnos los da la lectura).
+        let r = replay(
+            &[
+                seen(Working, false, false),
+                seen(Working, false, false),
+                seen(Idle, false, false),
+            ],
+            None,
+            10_000,
+        )
+        .await;
+        assert_eq!(r, (3, 1, Ok(json!({"after": 3}))));
+        // Pregunta: también.
+        assert_eq!(
+            replay(
+                &[seen(Working, false, false), seen(Question, false, false)],
+                None,
+                10_000
+            )
+            .await
+            .0,
+            2
+        );
+        // Ya parada o sin trabajar: enseguida (aquí no hay mensaje que recoger).
+        assert_eq!(
+            replay(&[seen(Stopped, false, false)], None, 10_000).await.0,
+            1
+        );
+        assert_eq!(replay(&[seen(Idle, false, false)], None, 10_000).await.0, 1);
+        // Se acaba el tiempo trabajando: se lee igual.
+        let (_, reads, r) = replay(&[seen(Working, false, false)], None, 50).await;
+        assert_eq!((reads, r.is_ok()), (1, true));
+    }
+
+    #[tokio::test]
+    async fn waits_survive_the_channel_failing() {
+        use Status::*;
+        // Falla a ratos (el hub tarda, el otro no contesta): se sigue esperando.
+        let r = replay(
+            &[
+                seen(Working, true, false),
+                down(),
+                down(),
+                seen(Idle, true, true),
+            ],
+            Some(5000),
+            10_000,
+        )
+        .await;
+        assert_eq!(r, (4, 1, Ok(json!({"after": 4}))));
+        let r = replay(
+            &[
+                down(),
+                seen(Working, false, false),
+                down(),
+                seen(Idle, false, false),
+            ],
+            None,
+            10_000,
+        )
+        .await;
+        assert_eq!(r.0, 4);
+        // Si falla al final de la espera, se lee igual: alguna vez contestó.
+        let (_, reads, r) = replay(&[seen(Working, false, false), down()], None, 50).await;
+        assert_eq!((reads, r.is_ok()), (1, true));
+        // Si no contestó ni una vez, el error (sin leer).
+        let (polls, reads, r) = replay(&[down()], None, 50).await;
+        assert!(polls > 1, "{polls}");
+        assert_eq!(reads, 0);
+        assert_eq!(
+            r,
+            Err((
+                StatusCode::BAD_GATEWAY,
+                "sin conexión o versión antigua".into()
+            ))
+        );
+        // Un error que no es del canal (ya no existe, no se puede) corta la espera.
+        let gone = [
+            seen(Working, false, false),
+            Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión")),
+        ];
+        let (polls, reads, r) = replay(&gone, Some(5000), 10_000).await;
+        assert_eq!((polls, reads), (2, 0));
+        assert_eq!(r.unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    fn user_line(id: usize, text: &str) -> String {
+        json!({"type":"user","uuid":format!("u{id}"),"message":{"content":text}}).to_string()
+    }
+
+    fn push_lines(path: &Path, lines: &[String]) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+    }
+
+    #[test]
+    fn replied_only_with_claude_writing_after_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jsonl");
+        push_lines(
+            &a,
+            &[user_line(0, "antes"), assistant_line(0, "respuesta vieja")],
+        );
+        let mark = std::fs::metadata(&a).unwrap().len();
+        // Nada nuevo.
+        assert_eq!(replied_since(Some(&a), mark, &a).unwrap(), (false, mark));
+        // Solo el propio mensaje (la línea del usuario): no ha contestado.
+        push_lines(&a, &[user_line(1, "¿qué tal?")]);
+        let (yes, upto) = replied_since(Some(&a), mark, &a).unwrap();
+        assert!(!yes);
+        assert_eq!(upto, std::fs::metadata(&a).unwrap().len());
+        // Un turno de Claude sin texto (solo herramientas) tampoco.
+        push_lines(
+            &a,
+            &[json!({"type":"assistant","uuid":"t","message":{"content":[
+                {"type":"tool_use","id":"t-1","name":"Bash","input":{"command":"ls"}}]}})
+            .to_string()],
+        );
+        assert!(!replied_since(Some(&a), upto, &a).unwrap().0);
+        push_lines(&a, &[assistant_line(1, "Bien.")]);
+        assert!(replied_since(Some(&a), mark, &a).unwrap().0);
+        assert!(
+            replied_since(Some(&a), upto, &a).unwrap().0,
+            "desde lo ya mirado"
+        );
+        // La marca a media línea: esa línea es de antes.
+        let b = dir.path().join("b.jsonl");
+        let half = assistant_line(2, "a medias");
+        std::fs::write(&b, &half[..10]).unwrap();
+        let mark = 10;
+        std::fs::write(&b, format!("{half}\n{}\n", user_line(3, "hola"))).unwrap();
+        assert!(!replied_since(Some(&b), mark, &b).unwrap().0);
+        // Otra transcripción (tras `/clear`) o sin ella al encolarlo: cuenta lo que haya.
+        let c = dir.path().join("c.jsonl");
+        push_lines(&c, &[user_line(0, "hola"), assistant_line(0, "Hecho.")]);
+        assert!(replied_since(Some(&a), 3, &c).unwrap().0);
+        assert!(replied_since(None, 0, &c).unwrap().0);
+        // Más corta que la marca (se rehízo): desde el principio.
+        assert!(replied_since(Some(&c), 99_999, &c).unwrap().0);
+        let d = dir.path().join("d.jsonl");
+        push_lines(&d, &[user_line(0, "solo esto")]);
+        assert!(!replied_since(Some(&a), 0, &d).unwrap().0);
+    }
+
+    #[test]
+    fn marks_are_per_message_and_session_and_expire() {
+        let m = Marks::default();
+        let t0 = Instant::now();
+        let p = PathBuf::from("/t/a.jsonl");
+        m.put("m1", "hija", Some(p.clone()), 10, t0);
+        let k = m.get("m1", "hija").unwrap();
+        assert_eq!(
+            (k.path.as_deref(), k.from, k.replied),
+            (Some(&*p), 10, false)
+        );
+        assert!(m.get("m1", "otra").is_none(), "de otra sesión");
+        assert!(m.get("m2", "hija").is_none());
+        m.seen("m1", PathBuf::from("/t/b.jsonl"), 40, true);
+        let k = m.get("m1", "hija").unwrap();
+        assert_eq!((k.from, k.replied), (40, true));
+        m.seen("m1", PathBuf::from("/t/b.jsonl"), 50, false);
+        assert!(m.get("m1", "hija").unwrap().replied, "contestó: se queda");
+        // Pasada la media hora, fuera (al apuntar otra).
+        m.put(
+            "m2",
+            "hija",
+            None,
+            0,
+            t0 + MARK_TTL + Duration::from_secs(1),
+        );
+        assert!(m.get("m1", "hija").is_none());
+        assert!(m.get("m2", "hija").is_some());
+    }
+
+    #[test]
+    fn parents_are_remembered_for_a_while() {
+        let p = Parents::default();
+        let t0 = Instant::now();
+        assert_eq!(p.get("mac-id/padre", t0), None);
+        p.put("mac-id/padre", true, t0);
+        assert_eq!(
+            p.get("mac-id/padre", t0 + Duration::from_secs(59)),
+            Some(true)
+        );
+        assert_eq!(p.get("mac-id/padre", t0 + PARENT_TTL), None);
+    }
+
+    #[test]
+    fn relabel_writes_other_sessions_as_here() {
+        let m = grouped(Some("k123"), &[("win-id", "Portatil"), ("mac-id", "Mac")]);
+        let e = json!({"session": "Portatil/ab", "machine": "Portatil", "machine_id": "x",
+            "id": "ab", "name": "web"});
+        let r = relabel(&m, &m.others[0], e);
+        assert_eq!(r["session"], "win-id/ab");
+        assert_eq!(r["machine"], "Portatil");
+        assert_eq!(r["machine_id"], "win-id");
+        assert_eq!(r["name"], "web");
+        // De un nido antiguo, sin `machine_id`.
+        let r = relabel(&m, &m.others[1], json!({"session": "Mac/cd", "id": "cd"}));
+        assert_eq!(r["session"], "Mac/cd");
+        assert_eq!(r["machine_id"], "mac-id");
+        // Sin sesión, tal cual.
+        assert_eq!(
+            relabel(&m, &m.others[1], json!({"ok": true})),
+            json!({"ok": true})
+        );
+    }
+
+    #[test]
+    fn alerts_for_another_machine_fit_a_budget() {
+        let alert = |i: u64| AlertOut {
+            machine: "Portatil".into(),
+            machine_id: "k123".into(),
+            session: format!("Portatil/{i:08}"),
+            name: format!("sesion-{i}"),
+            text: "x".repeat(500),
+            at: i,
+        };
+        let few = fit_alerts((0..3).map(alert).collect(), MAX_READ);
+        assert_eq!(few["alerts"].as_array().unwrap().len(), 3);
+        assert!(few.get("truncated").is_none());
+        let many = fit_alerts((0..1000).map(alert).collect(), MAX_READ);
+        assert!(serde_json::to_vec(&many).unwrap().len() <= MAX_READ);
+        assert_eq!(many["truncated"], true);
+        // Las más nuevas.
+        assert_eq!(many["alerts"][0]["at"], 999);
     }
 
     #[test]
@@ -2290,10 +3284,6 @@ mod tests {
         );
         assert_eq!(en("no existe esa sesión"), "no such session");
         assert_eq!(
-            en("la sesión está en otro equipo (aún no se puede)"),
-            "session is on another machine (not supported yet)"
-        );
-        assert_eq!(
             en("solo puedes contestar las sesiones que abriste"),
             "you can only answer sessions you opened"
         );
@@ -2319,10 +3309,6 @@ mod tests {
             "the prompt is longer than 24 KB"
         );
         assert_eq!(en("modelo no válido: \"-x\""), "invalid model: \"-x\"");
-        assert_eq!(
-            en("«Sobremesa» es otro equipo (aún no se puede)"),
-            "“Sobremesa” is another machine (not supported yet)"
-        );
         assert_eq!(en("argumentos no válidos: x"), "invalid arguments: x");
         assert_eq!(
             en("no hay ninguna herramienta \"send\""),
@@ -2369,6 +3355,14 @@ mod tests {
         assert_eq!(
             en("«Mac» no es ningún equipo del grupo"),
             "“Mac” is not a machine in the group"
+        );
+        assert_eq!(
+            en("el otro equipo no contesta"),
+            "the other computer does not answer"
+        );
+        assert_eq!(
+            en("respuesta no válida del otro equipo"),
+            "invalid reply from the other machine"
         );
     }
 }

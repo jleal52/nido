@@ -253,15 +253,7 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("no hay ninguna herramienta {}", "there is no tool {0}"),
     ("argumentos no válidos: {}", "invalid arguments: {0}"),
-    (
-        "la sesión está en otro equipo (aún no se puede)",
-        "session is on another machine (not supported yet)",
-    ),
     ("no existe esa sesión", "no such session"),
-    (
-        "«{}» es otro equipo (aún no se puede)",
-        "“{0}” is another machine (not supported yet)",
-    ),
     ("modelo no válido: {}", "invalid model: {0}"),
     ("falta el mensaje", "the prompt is missing"),
     (

@@ -270,14 +270,21 @@ async fn mcp_api_end_to_end() {
     assert_eq!(code, 403, "{e}");
     assert_eq!(e["error"], "the MCP API only takes this machine's token");
 
-    // `sessions`: solo las de Claude, con su dirección; parada.
+    // `sessions`: solo las de Claude, con su dirección; parada. Sin más equipos en el grupo,
+    // nadie sin contestar.
     let (code, list) = tool(addr, me, "sessions", json!({})).await;
     assert_eq!(code, 200, "{list}");
-    let list = list.as_array().unwrap();
+    assert_eq!(
+        list.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["sessions"],
+        "{list}"
+    );
+    let list = list["sessions"].as_array().unwrap();
     assert_eq!(list.len(), 1, "{list:?}");
     let s = &list[0];
     assert_eq!(s["session"], format!("Prueba/{other}"));
     assert_eq!(s["machine"], "Prueba");
+    assert_eq!(s["machine_id"], "Prueba", "sin hub, el nombre");
     assert_eq!(s["id"], other.as_str());
     assert_eq!(s["name"], "otra");
     assert_eq!(s["state"], "stopped");
@@ -371,11 +378,8 @@ async fn mcp_api_end_to_end() {
         json!({"session": format!("Otro/{other}")}),
     )
     .await;
-    assert_eq!(code, 400);
-    assert_eq!(
-        e["error"],
-        "session is on another machine (not supported yet)"
-    );
+    assert_eq!(code, 404);
+    assert_eq!(e["error"], "“Otro” is not a machine in the group");
     let (code, e) = tool(addr, me, "read", json!({"session": "Prueba/zzzz"})).await;
     assert_eq!(code, 404);
     assert_eq!(e["error"], "no such session");
@@ -398,8 +402,8 @@ async fn mcp_api_end_to_end() {
         .update(&other, |s| s.opened_by = Some(by.clone()))
         .unwrap();
     let (_, list) = tool(addr, me, "sessions", json!({})).await;
-    assert_eq!(list[0]["mine"], true);
-    assert_eq!(list[0]["opened_by"], by.as_str());
+    assert_eq!(list["sessions"][0]["mine"], true);
+    assert_eq!(list["sessions"][0]["opened_by"], by.as_str());
     let (code, e) = tool(addr, me, "answer", json!({"session": other, "option": "1"})).await;
     assert_eq!(code, 409, "{e}");
     assert_eq!(e["error"], "the session is not running");
@@ -442,11 +446,8 @@ async fn mcp_api_end_to_end() {
         json!({"machine": "Otro", "folder": tmp.path(), "prompt": "di hola"}),
     )
     .await;
-    assert_eq!(code, 400);
-    assert!(
-        e["error"].as_str().unwrap().contains("another machine"),
-        "{e}"
-    );
+    assert_eq!(code, 404);
+    assert_eq!(e["error"], "“Otro” is not a machine in the group");
     std::fs::create_dir_all(&work).unwrap();
     let count = || async { state.registry.lock().await.sessions().len() };
     let before = count().await;

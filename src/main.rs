@@ -794,23 +794,19 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             }
         }
         Cmd::Alerts => {
-            // De momento, solo las de este equipo.
-            let list = api.call("GET", "/api/v1/sessions", None)?;
-            let mut alerts: Vec<(String, AlertRec)> = Vec::new();
-            for s in list.as_array().into_iter().flatten() {
-                let name = s["name"].as_str().unwrap_or("").to_owned();
-                let recs: Vec<AlertRec> =
-                    serde_json::from_value(s["alerts"].clone()).unwrap_or_default();
-                alerts.extend(recs.into_iter().map(|a| (name.clone(), a)));
-            }
-            if alerts.is_empty() {
+            // Las de todos los equipos del grupo.
+            let v = api.call("GET", "/api/v1/mcp/alerts", None)?;
+            let now = nido::sys::local_time(registry::now_ms()).unwrap_or_default();
+            let (lines, warnings) =
+                alert_lines(&v, now, |at| nido::sys::local_time(at).unwrap_or_default());
+            if lines.is_empty() {
                 println!("Sin alertas.");
             }
-            alerts.sort_by_key(|(_, a)| a.at);
-            let now = nido::sys::local_time(registry::now_ms()).unwrap_or_default();
-            for (name, a) in alerts {
-                let at = nido::sys::local_time(a.at).unwrap_or_default();
-                println!("{}", alert_line(None, &name, &a, at, now));
+            for l in lines {
+                println!("{l}");
+            }
+            for w in warnings {
+                eprintln!("{w}");
             }
         }
         Cmd::New {
@@ -1200,6 +1196,48 @@ fn alert_line(
     format!("{machine}{session} · {} · {}", clock(at, now), a.text)
 }
 
+/// Lo que enseña `nido alerts` de `GET /api/v1/mcp/alerts`: una línea por alerta, de la más
+/// antigua a la más nueva, con su equipo (como sale en las direcciones: el nombre o, si dos se
+/// llaman igual, el id), y los equipos que no contestaron.
+fn alert_lines(
+    v: &serde_json::Value,
+    now: LocalTime,
+    local_time: impl Fn(u64) -> LocalTime,
+) -> (Vec<String>, Vec<String>) {
+    let mut alerts: Vec<&serde_json::Value> =
+        v["alerts"].as_array().into_iter().flatten().collect();
+    alerts.sort_by_key(|a| a["at"].as_u64().unwrap_or(0));
+    let lines = alerts
+        .into_iter()
+        .map(|a| {
+            let session = a["session"].as_str().unwrap_or("");
+            let machine = session
+                .rsplit_once('/')
+                .map(|(m, _)| m)
+                .or_else(|| a["machine"].as_str());
+            let rec = AlertRec {
+                text: a["text"].as_str().unwrap_or("").to_owned(),
+                at: a["at"].as_u64().unwrap_or(0),
+            };
+            let name = a["name"].as_str().unwrap_or("");
+            alert_line(machine, name, &rec, local_time(rec.at), now)
+        })
+        .collect();
+    let warnings = v["unreachable"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|u| {
+            format!(
+                "{}: no contesta ({})",
+                u["machine"].as_str().unwrap_or("?"),
+                u["error"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    (lines, warnings)
+}
+
 /// «Cambio automático de cuenta: sí, al 99 %» (o «no»).
 fn auto_line(v: &serde_json::Value) -> String {
     match v["auto_switch"].as_bool() {
@@ -1253,6 +1291,35 @@ mod tests {
             alert_line(Some("portátil"), "web", &a, at, now),
             "portátil · web · 09:05 · acabé los tests"
         );
+    }
+
+    #[test]
+    fn alerts_of_every_machine_with_their_column() {
+        let v = serde_json::json!({
+            "alerts": [
+                {"machine": "Mac", "machine_id": "mac-id", "session": "Mac/ab", "name": "web",
+                 "text": "listo", "at": 2},
+                {"machine": "Portatil", "machine_id": "k1", "session": "k1/cd", "name": "api",
+                 "text": "acabé los tests", "at": 1},
+            ],
+            "unreachable": [{"machine": "Sobremesa", "machine_id": "s-id",
+                "error": "sin conexión o versión antigua"}],
+        });
+        let now = t(2026, 11, 10, 18, 30);
+        let (lines, warnings) = alert_lines(&v, now, |at| t(2026, 11, 10, 9, at as u32));
+        assert_eq!(
+            lines,
+            [
+                "k1 · api · 09:01 · acabé los tests",
+                "Mac · web · 09:02 · listo",
+            ]
+        );
+        assert_eq!(
+            warnings,
+            ["Sobremesa: no contesta (sin conexión o versión antigua)"]
+        );
+        let (lines, warnings) = alert_lines(&serde_json::json!({"alerts": []}), now, |_| now);
+        assert!(lines.is_empty() && warnings.is_empty());
     }
 
     #[test]

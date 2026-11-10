@@ -70,7 +70,27 @@ pub struct AppState {
     group_dirty: Notify,
     /// Las peticiones de otros equipos ya atendidas (`e2e::MODE_PEER`), para no repetirlas.
     peer_replays: e2e::PeerReplays,
+    /// Dónde estaba la conversación de cada sesión al encolarle un mensaje (`send`), para saber
+    /// si ya contestó (`status`).
+    pub(crate) mcp_marks: crate::mcp_api::Marks,
+    /// Si vive la sesión madre de otro equipo de una abierta con `open` (un rato).
+    pub(crate) mcp_parents: crate::mcp_api::Parents,
+    /// Cómo se llega a otro equipo del grupo: sin nada, por el hub (`peer_member`); en las
+    /// pruebas, lo que se ponga con `set_peer_link`.
+    peer_link: std::sync::OnceLock<PeerLink>,
 }
+
+/// Otra forma de llegar a los demás equipos del grupo (en vez del hub), para las pruebas: recibe
+/// el miembro, el método y los parámetros, y devuelve lo que contestaría ese equipo.
+pub type PeerLink = Box<
+    dyn Fn(
+            crate::group::Member,
+            String,
+            serde_json::Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = e2e::PeerResult> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl e2e::Host for AppState {
     fn identity(&self) -> &e2e::Identity {
@@ -340,6 +360,9 @@ impl AppState {
             group,
             group_dirty: Notify::new(),
             peer_replays: Default::default(),
+            mcp_marks: Default::default(),
+            mcp_parents: Default::default(),
+            peer_link: Default::default(),
         }))
     }
 
@@ -577,6 +600,14 @@ impl AppState {
         let Some(v) = view.filter(|v| still_alerting(v, a.kind)) else {
             return;
         };
+        // Lo que pregunta una sesión abierta con `open` es para su madre mientras viva: al
+        // usuario no se le avisa.
+        if a.kind == AlertKind::Waiting
+            && let Some(by) = v.opened_by.as_deref()
+            && crate::mcp_api::parent_alive(self, by, &v.id, &v.name).await
+        {
+            return;
+        }
         // «Terminó» solo si de verdad ha terminado: no ha vuelto a trabajar y no le quedan
         // subagentes en marcha (mirando su pantalla ahora). Sin leer sigue igual en la web y la app.
         if a.kind == AlertKind::Finished {
@@ -767,36 +798,52 @@ impl AppState {
         method: &str,
         params: serde_json::Value,
     ) -> e2e::PeerResult {
+        let m = self.member(member)?;
+        self.peer_member(&m, method, params).await
+    }
+
+    /// El equipo del grupo (sin este) con ese id en el hub o, si no, con ese nombre.
+    pub fn member(&self, member: &str) -> Result<crate::group::Member, (u16, String)> {
         let member = member.trim();
-        let unknown = || (404, format!("«{member}» no es ningún equipo del grupo"));
         let others = self.group.others();
-        let m = match others.iter().find(|m| m.id == member) {
-            Some(m) => m,
-            None => {
-                let named: Vec<_> = others
-                    .iter()
-                    .filter(|m| m.name.eq_ignore_ascii_case(member))
-                    .collect();
-                match named[..] {
-                    [m] => m,
-                    [] => return Err(unknown()),
-                    _ => {
-                        return Err((
-                            400,
-                            format!("hay varios equipos «{member}» en el grupo: usa su id"),
-                        ));
-                    }
-                }
-            }
-        };
+        if let Some(m) = others.iter().find(|m| m.id == member) {
+            return Ok(m.clone());
+        }
+        let named: Vec<_> = others
+            .iter()
+            .filter(|m| m.name.eq_ignore_ascii_case(member))
+            .collect();
+        match named[..] {
+            [m] => Ok(m.clone()),
+            [] => Err(unknown_member(member)),
+            _ => Err((400, ambiguous_member(member))),
+        }
+    }
+
+    /// Como `peer`, a un miembro ya elegido.
+    pub async fn peer_member(
+        &self,
+        m: &crate::group::Member,
+        method: &str,
+        params: serde_json::Value,
+    ) -> e2e::PeerResult {
+        if let Some(link) = self.peer_link.get() {
+            return link(m.clone(), method.to_owned(), params).await;
+        }
         let key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &m.key)
             .ok()
             .and_then(|k| <[u8; 32]>::try_from(k).ok())
-            .ok_or_else(unknown)?;
+            .ok_or_else(|| unknown_member(&m.id))?;
         e2e::peer_request(&self.identity, &key, method, params, |first| {
             self.hub.exchange(&m.id, first)
         })
         .await
+    }
+
+    /// Para las pruebas: a los demás equipos se llega con `link` y no por el hub. Solo una vez:
+    /// `false` si ya había otro.
+    pub fn set_peer_link(&self, link: PeerLink) -> bool {
+        self.peer_link.set(link).is_ok()
     }
 
     /// Unirse al grupo de otro equipo con su código de `nido group invite`.
@@ -1051,6 +1098,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/events", get(ws_events))
         .route("/api/v1/mcp/inbox", get(crate::mcp_api::api_inbox))
         .route("/api/v1/mcp/inbox/ack", post(crate::mcp_api::api_inbox_ack))
+        .route("/api/v1/mcp/alerts", get(crate::mcp_api::api_alerts))
         .route("/api/v1/mcp/{tool}", post(crate::mcp_api::api_mcp))
         .route(
             "/api/v1/upload",
@@ -1060,6 +1108,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Por fuera de todo (también de `guard`): el idioma de los mensajes, según la petición.
         .layer(middleware::from_fn(i18n::lang_layer))
         .with_state(state)
+}
+
+fn unknown_member(member: &str) -> (u16, String) {
+    (404, format!("«{member}» no es ningún equipo del grupo"))
+}
+
+/// Hay más de un equipo con ese nombre: hay que dar su id.
+pub(crate) fn ambiguous_member(member: &str) -> String {
+    format!("hay varios equipos «{member}» en el grupo: usa su id")
 }
 
 /// Un error para la app o la web, en el idioma de la petición.
