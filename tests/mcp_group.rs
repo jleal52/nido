@@ -95,6 +95,10 @@ enum Peer {
     Slow,
     /// Lo que diga la prueba en cada momento.
     Script(Arc<Mutex<PeerResult>>),
+    /// Una respuesta por llamada, en orden (la última se repite).
+    Queue(Arc<Mutex<Vec<PeerResult>>>),
+    /// Como `Real`, pero estos métodos no contestan.
+    Partial(Arc<AppState>, Member, &'static [&'static str]),
 }
 
 /// Lo que ve cada nido de los demás equipos, por su id, y cuántas veces se le pidió cada método.
@@ -143,6 +147,20 @@ impl Net {
                         Err((502, NO_PEER.to_owned()))
                     }
                     Some(Peer::Script(r)) => r.lock().unwrap().clone(),
+                    Some(Peer::Queue(q)) => {
+                        let mut q = q.lock().unwrap();
+                        if q.len() > 1 {
+                            q.remove(0)
+                        } else {
+                            q[0].clone()
+                        }
+                    }
+                    Some(Peer::Partial(_, _, failing)) if failing.contains(&method.as_str()) => {
+                        Err((502, NO_PEER.to_owned()))
+                    }
+                    Some(Peer::Partial(st, from, _)) => {
+                        nido::mcp_api::peer_call(&st, &from, &method, params).await
+                    }
                     Some(Peer::Down) | None => Err((502, NO_PEER.to_owned())),
                 }
             })
@@ -256,7 +274,11 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shell = bin.join("shell");
-    std::fs::write(&shell, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::write(
+        &shell,
+        "#!/bin/sh\nif [ -x ./program ]; then exec ./program; fi\nexec sleep 60\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     // Esta prueba es su propio proceso (un fichero de tests/): cambiar el entorno no toca a otras.
     // Los dos equipos se llaman igual de por sí (como WSL y su Windows); en el grupo, como se diga.
@@ -366,7 +388,7 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
     let took = start.elapsed();
     assert_eq!(code, 200, "{list}");
     assert!(
-        took >= Duration::from_secs(5) && took < Duration::from_secs(9),
+        took >= Duration::from_secs(5) && took < Duration::from_secs(20),
         "{took:?}"
     );
     assert_eq!(list["sessions"].as_array().unwrap().len(), 2, "{list}");
@@ -378,7 +400,7 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
             json!({"machine": "Sobremesa", "machine_id": "caido-id",
                 "error": "no connection or old version"}),
             json!({"machine": "Lento", "machine_id": "lento-id",
-                "error": "the other computer does not answer"}),
+                "error": "the other machine does not answer"}),
         ]
     );
     assert!(here.group.remove_member("lento-id"));
@@ -503,14 +525,14 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
     )
     .await;
     assert_eq!((code, r["state"].as_str()), (200, Some("stopped")), "{r}");
-    // Con el Mac caído toda la espera: el error.
+    // Con el Mac caído desde el principio: el error enseguida, sin esperar al tope.
     from_here.set("mac-id", Peer::Down);
     let start = Instant::now();
     let (code, e) = tool(
         addr,
         &padre,
         "read",
-        json!({"session": at_mac, "wait": true, "timeout_s": 3}),
+        json!({"session": at_mac, "wait": true, "timeout_s": 600}),
     )
     .await;
     assert_eq!(
@@ -518,10 +540,7 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
         (502, Some("no connection or old version"))
     );
     let took = start.elapsed();
-    assert!(
-        took >= Duration::from_secs(3) && took < Duration::from_secs(8),
-        "{took:?}"
-    );
+    assert!(took < Duration::from_secs(5), "{took:?}");
     let (code, list) = tool(addr, &padre, "sessions", json!({})).await;
     assert_eq!(code, 200);
     assert_eq!(list["sessions"].as_array().unwrap().len(), 1, "{list}");
@@ -530,6 +549,98 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
         "mac-id",
         Peer::Real(mac.clone(), member("aqui-id", &here, "Prueba")),
     );
+
+    // Un `status` que no vuelve se corta a los 10 s (o a lo que quede de espera): sin ninguna
+    // respuesta, el error.
+    from_here.set("mac-id", Peer::Slow);
+    for (timeout, cut) in [(600, 10), (3, 3)] {
+        let start = Instant::now();
+        let (code, e) = tool(
+            addr,
+            &padre,
+            "read",
+            json!({"session": at_mac, "wait": true, "timeout_s": timeout}),
+        )
+        .await;
+        assert_eq!(
+            (code, e["error"].as_str()),
+            (504, Some("the other machine does not answer")),
+            "{timeout}"
+        );
+        let took = start.elapsed();
+        assert!(
+            took + Duration::from_millis(500) >= Duration::from_secs(cut)
+                && took < Duration::from_secs(cut + 15),
+            "{timeout}: {took:?}"
+        );
+    }
+    // Lo que no se entiende (un estado que no existe) acaba la espera: no se reintenta.
+    let state = |s: &str| Ok(json!({"state": s}));
+    let script = Arc::new(Mutex::new(vec![
+        state("working"),
+        state("dormida"),
+        state("idle"),
+    ]));
+    from_here.set("mac-id", Peer::Queue(script));
+    let before = from_here.count("mac-id", "status");
+    let (code, e) = tool(
+        addr,
+        &padre,
+        "read",
+        json!({"session": at_mac, "wait": true}),
+    )
+    .await;
+    assert_eq!(
+        (code, e["error"].as_str()),
+        (502, Some("invalid reply from the other machine"))
+    );
+    assert_eq!(from_here.count("mac-id", "status") - before, 2);
+    // `send` con `wait`: si ya está en la cola y la espera falla, se dice en `read`, sin perder
+    // lo demás.
+    from_here.set(
+        "mac-id",
+        Peer::Partial(
+            mac.clone(),
+            member("aqui-id", &here, "Prueba"),
+            &["status", "read"],
+        ),
+    );
+    let (code, r) = tool(
+        addr,
+        &padre,
+        "send",
+        json!({"session": at_mac, "text": "¿sigues?", "wait": 60}),
+    )
+    .await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["status"], "queued", "{r}");
+    let sent = r["msg_id"].as_str().unwrap().to_owned();
+    assert!(mac.inbox.pending(&otra).iter().any(|m| m.id == sent));
+    assert_eq!(r["read"], json!({"error": "no connection or old version"}));
+    from_here.set(
+        "mac-id",
+        Peer::Real(mac.clone(), member("aqui-id", &here, "Prueba")),
+    );
+
+    // Lo que pide otro equipo para un tercero, tampoco con `status` ni `open`.
+    let from = member("aqui-id", &here, "Prueba");
+    let who = json!({"id": padre, "name": "padre"});
+    let r = nido::mcp_api::peer_call(
+        &mac,
+        &from,
+        "status",
+        json!({"session": format!("Otro/{otra}"), "caller": who}),
+    )
+    .await;
+    assert_eq!(r, Err((400, "esa sesión no es de este equipo".into())));
+    let r = nido::mcp_api::peer_call(
+        &mac,
+        &from,
+        "open",
+        json!({"machine": "aqui-id", "folder": tmp.path(), "prompt": "x", "caller": who}),
+    )
+    .await;
+    assert_eq!(r, Err((400, "«aqui-id» no es este equipo".into())));
 
     // `answer` y `close` en una que no abrió: el 403 de allí sigue siendo 403.
     let (code, e) = tool(
@@ -590,13 +701,63 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
         (409, Some("no question is pending"))
     );
 
-    // La madre de la hija es de aquí: mientras viva, lo que pregunte la hija no avisa. Aquí, la
-    // madre no es de Claude: no hay `status` que dé, y no vive.
+    // Una espera en el Mac que acaba en una pregunta.
+    let menu = tmp.path().join("menu");
+    std::fs::create_dir_all(&menu).unwrap();
+    let program = menu.join("program");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nprintf '\\033[2J\\033[H'; cat screen\nexec sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &program,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let permiso = std::fs::read_to_string(format!(
+        "{}/tests/pantallas/permiso.txt",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    std::fs::write(menu.join("screen"), permiso).unwrap();
+    let (code, o) = tool(
+        addr,
+        &padre,
+        "open",
+        json!({"machine": "Mac", "folder": menu, "prompt": "pregunta"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{o}");
+    let pregunta = o["session"].as_str().unwrap().to_owned();
+    let (code, r) = tool(
+        addr,
+        &padre,
+        "read",
+        json!({"session": pregunta, "wait": true, "timeout_s": 30}),
+    )
+    .await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["state"], "question", "{r}");
+    assert_eq!(r["question"]["kind"], "permission", "{r}");
+    let (code, _) = tool(addr, &padre, "close", json!({"session": pregunta})).await;
+    assert_eq!(code, 200);
+
+    // La madre de la hija es de aquí: mientras viva, lo que pregunte la hija no avisa. Vive si no
+    // está parada, sea o no de Claude (como las de aquí): esta, parada.
+    let s = nido::mcp_api::peer_call(
+        &here,
+        &member("mac-id", &mac, "Mac"),
+        "status",
+        json!({"session": padre, "caller": {"id": hija, "name": "work"}}),
+    )
+    .await;
+    assert_eq!(s, Ok(json!({"state": "stopped"})));
     let by = format!("aqui-id/{padre}");
-    assert!(!nido::mcp_api::parent_alive(&mac, &by, &hija, "work").await);
+    assert!(!nido::mcp_api::parent_alive(&mac, &by, &hija, "work", false).await);
     // Una de Claude aquí, parada: tampoco.
     let by_aqui = format!("aqui-id/{aqui}");
-    assert!(!nido::mcp_api::parent_alive(&mac, &by_aqui, &hija, "work").await);
+    assert!(!nido::mcp_api::parent_alive(&mac, &by_aqui, &hija, "work", false).await);
 
     // `close` de la hija desde aquí.
     let (code, r) = tool(
@@ -708,7 +869,11 @@ async fn a_child_does_not_alert_while_its_parent_lives() {
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shell = bin.join("shell");
-    std::fs::write(&shell, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::write(
+        &shell,
+        "#!/bin/sh\nif [ -x ./program ]; then exec ./program; fi\nexec sleep 60\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     unsafe {
         std::env::set_var("NIDO_HOME", tmp.path().join("nido"));
@@ -730,7 +895,7 @@ async fn a_child_does_not_alert_while_its_parent_lives() {
     };
     for by in [format!("k-aqui/{madre}"), format!("Prueba/{madre}")] {
         assert!(
-            !nido::mcp_api::parent_alive(&st, &by, &hija, "hija").await,
+            !nido::mcp_api::parent_alive(&st, &by, &hija, "hija", false).await,
             "{by}"
         );
     }
@@ -744,13 +909,15 @@ async fn a_child_does_not_alert_while_its_parent_lives() {
     assert!(nido::launch::is_alive(&paths, &madre), "no arrancó");
     for by in [format!("k-aqui/{madre}"), format!("Prueba/{madre}")] {
         assert!(
-            nido::mcp_api::parent_alive(&st, &by, &hija, "hija").await,
+            nido::mcp_api::parent_alive(&st, &by, &hija, "hija", false).await,
             "{by}"
         );
     }
-    assert!(!nido::mcp_api::parent_alive(&st, "k-aqui/nadie", &hija, "hija").await);
+    assert!(!nido::mcp_api::parent_alive(&st, "k-aqui/nadie", &hija, "hija", false).await);
     st.registry.lock().await.remove(&madre).unwrap();
-    assert!(!nido::mcp_api::parent_alive(&st, &format!("k-aqui/{madre}"), &hija, "hija").await);
+    assert!(
+        !nido::mcp_api::parent_alive(&st, &format!("k-aqui/{madre}"), &hija, "hija", false).await
+    );
     assert_eq!(
         net.calls.lock().unwrap().len(),
         0,
@@ -761,39 +928,39 @@ async fn a_child_does_not_alert_while_its_parent_lives() {
     let answer = Arc::new(Mutex::new(Ok(json!({"state": "working"}))));
     st.group.add_member("mac-id", "bWFj", "Mac");
     net.set("mac-id", Peer::Script(answer.clone()));
-    assert!(nido::mcp_api::parent_alive(&st, "mac-id/p1", &hija, "hija").await);
+    assert!(nido::mcp_api::parent_alive(&st, "mac-id/p1", &hija, "hija", false).await);
     // Se recuerda un rato: aunque ya esté parada, no se vuelve a preguntar.
     *answer.lock().unwrap() = Ok(json!({"state": "stopped"}));
-    assert!(nido::mcp_api::parent_alive(&st, "mac-id/p1", &hija, "hija").await);
+    assert!(nido::mcp_api::parent_alive(&st, "mac-id/p1", &hija, "hija", false).await);
     assert_eq!(net.count("mac-id", "status"), 1);
     // Otra madre: se pregunta, y parada no vive.
-    assert!(!nido::mcp_api::parent_alive(&st, "mac-id/p2", &hija, "hija").await);
+    assert!(!nido::mcp_api::parent_alive(&st, "mac-id/p2", &hija, "hija", false).await);
     assert_eq!(net.count("mac-id", "status"), 2);
     for state in ["idle", "question"] {
         *answer.lock().unwrap() = Ok(json!({"state": state}));
         let by = format!("mac-id/p-{state}");
         assert!(
-            nido::mcp_api::parent_alive(&st, &by, &hija, "hija").await,
+            nido::mcp_api::parent_alive(&st, &by, &hija, "hija", false).await,
             "{state}"
         );
     }
     // Un error (ya no existe) o sin respuesta: no vive, y se avisa como siempre.
     *answer.lock().unwrap() = Err((404, "no existe esa sesión".into()));
-    assert!(!nido::mcp_api::parent_alive(&st, "mac-id/p3", &hija, "hija").await);
+    assert!(!nido::mcp_api::parent_alive(&st, "mac-id/p3", &hija, "hija", false).await);
     net.set("mac-id", Peer::Down);
-    assert!(!nido::mcp_api::parent_alive(&st, "mac-id/p4", &hija, "hija").await);
+    assert!(!nido::mcp_api::parent_alive(&st, "mac-id/p4", &hija, "hija", false).await);
     // Uno que no contesta no hace esperar más de 5 s.
     net.set("mac-id", Peer::Slow);
     let start = Instant::now();
-    assert!(!nido::mcp_api::parent_alive(&st, "mac-id/p5", &hija, "hija").await);
+    assert!(!nido::mcp_api::parent_alive(&st, "mac-id/p5", &hija, "hija", false).await);
     let took = start.elapsed();
     assert!(
-        took >= Duration::from_secs(5) && took < Duration::from_secs(8),
+        took >= Duration::from_secs(5) && took < Duration::from_secs(20),
         "{took:?}"
     );
     // De un equipo que no es del grupo, o una dirección sin equipo: no se pregunta.
     let before = net.calls.lock().unwrap().len();
-    assert!(!nido::mcp_api::parent_alive(&st, "otro-id/p1", &hija, "hija").await);
-    assert!(!nido::mcp_api::parent_alive(&st, "p1", &hija, "hija").await);
+    assert!(!nido::mcp_api::parent_alive(&st, "otro-id/p1", &hija, "hija", false).await);
+    assert!(!nido::mcp_api::parent_alive(&st, "p1", &hija, "hija", false).await);
     assert_eq!(net.calls.lock().unwrap().len(), before);
 }

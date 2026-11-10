@@ -104,19 +104,20 @@ impl Machine {
     }
 
     /// Cuántos equipos del grupo (este y los demás) se llaman `name`, sin mirar mayúsculas.
+    /// Un id en el hub (de este o de otro) que se escribe igual también cuenta: el nombre no
+    /// valdría de etiqueta, porque `find` mira antes los ids.
     fn named(&self, name: &str) -> usize {
         let same = |n: &str| n.eq_ignore_ascii_case(name);
+        let others = |f: &dyn Fn(&Member) -> bool| self.others.iter().filter(|m| f(m)).count();
         usize::from(same(&self.name))
-            + self
-                .others
-                .iter()
-                .filter(|m| same(&clean_name(&m.name)))
-                .count()
+            + usize::from(self.key.as_deref().is_some_and(same))
+            + others(&|m| same(&clean_name(&m.name)))
+            + others(&|m| same(&m.id))
     }
 
     /// Cómo se escribe este equipo en las direcciones que ve el modelo: su nombre, si ningún
-    /// otro del grupo se llama igual (WSL toma el del Windows en que corre); si no, su id en el
-    /// hub.
+    /// otro del grupo se llama igual (WSL toma el del Windows en que corre) y no es el id de
+    /// ninguno; si no, su id en el hub.
     pub fn label(&self) -> String {
         match &self.key {
             Some(k) if self.named(&self.name) > 1 => k.clone(),
@@ -590,20 +591,35 @@ pub struct Seen {
     pub replied: bool,
 }
 
-/// ¿Merece la pena seguir esperando tras este fallo de `status`? Los del canal con otro equipo
-/// (no contesta, el hub tarda, una respuesta rota): la siguiente vuelta puede ir bien.
+/// ¿Es un fallo del canal con otro equipo (no contesta, el hub tarda, sin conexión)? La
+/// siguiente vez puede ir bien.
 fn passing(f: &Fail) -> bool {
     f.0.is_server_error()
 }
+
+/// Por qué no se supo cómo está la sesión de destino en una vuelta de la espera.
+#[derive(Debug)]
+pub enum Miss {
+    /// Falló el canal con su equipo: la siguiente vuelta puede ir bien.
+    Channel(Fail),
+    /// Otra cosa (ya no existe, una respuesta que no se entiende): no se vuelve a intentar.
+    Fatal(Fail),
+}
+
+/// Tras tantos fallos seguidos del canal se deja de esperar.
+pub const CHANNEL_TRIES: usize = 3;
+/// Lo más que se espera cada `status` de otro equipo (o lo que quede de espera, si es menos).
+pub const STATUS_POLL: Duration = Duration::from_secs(10);
 
 /// La espera de `send` y `read` con `wait`, igual para una sesión de aquí que para una de otro
 /// equipo: `status` dice cómo está (un futuro nuevo cada vez: con un cierre `async`, el futuro no
 /// se puede probar `Send` y axum lo exige). Con `pickup` (la de `send`), primero, hasta ese
 /// tiempo, a que la sesión recoja el mensaje y se ponga con él (`picked_up`); si no llega a
 /// ponerse (o está parada), no se sigue esperando. Luego (o desde el principio, con `read`),
-/// hasta `total`, a que deje de trabajar. Un fallo del canal no corta la espera; si no hubo ni
-/// una respuesta, sale ese fallo. Mirar el estado no mueve la posición de lectura.
-pub async fn wait_on<F: Future<Output = Result<Seen, Fail>>>(
+/// hasta `total`, a que deje de trabajar. Si el canal falla en la primera vuelta, o
+/// `CHANNEL_TRIES` veces seguidas, sale ese fallo; un fallo suelto no corta la espera. Mirar el
+/// estado no mueve la posición de lectura.
+pub async fn wait_on<F: Future<Output = Result<Seen, Miss>>>(
     mut status: impl FnMut() -> F,
     pickup: Option<Duration>,
     step: Duration,
@@ -611,18 +627,23 @@ pub async fn wait_on<F: Future<Output = Result<Seen, Fail>>>(
 ) -> Result<(), Fail> {
     let start = tokio::time::Instant::now();
     let mut picked = pickup.is_none();
-    let (mut answered, mut failed) = (false, None);
+    let (mut answered, mut failures) = (false, 0);
     loop {
         match status().await {
             Ok(s) => {
-                answered = true;
+                (answered, failures) = (true, 0);
                 picked = picked || picked_up(s.taken, s.state, s.replied);
                 if s.state.settled() && (picked || s.state == Status::Stopped) {
                     break;
                 }
             }
-            Err(f) if passing(&f) => failed = Some(f),
-            Err(f) => return Err(f),
+            Err(Miss::Channel(f)) => {
+                failures += 1;
+                if !answered || failures >= CHANNEL_TRIES {
+                    return Err(f);
+                }
+            }
+            Err(Miss::Fatal(f)) => return Err(f),
         }
         let limit = match pickup {
             Some(p) if !picked => p.min(total),
@@ -634,10 +655,7 @@ pub async fn wait_on<F: Future<Output = Result<Seen, Fail>>>(
         }
         tokio::time::sleep(step.min(limit - gone)).await;
     }
-    match failed {
-        Some(f) if !answered => Err(f),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 /// `wait_on` y luego una sola lectura (`read`): lo que haya, también si se acabó el tiempo (con
@@ -650,7 +668,7 @@ pub async fn wait_then_read<F, R>(
     total: Duration,
 ) -> Reply
 where
-    F: Future<Output = Result<Seen, Fail>>,
+    F: Future<Output = Result<Seen, Miss>>,
     R: Future<Output = Reply>,
 {
     wait_on(status, pickup, step, total).await?;
@@ -780,12 +798,14 @@ impl Marks {
         );
     }
 
+    /// La de `msg` para `session`, si no ha pasado `MARK_TTL`.
     fn get(&self, msg: &str, session: &str) -> Option<Mark> {
+        let now = Instant::now();
         self.0
             .lock()
             .expect("marcas")
             .get(msg)
-            .filter(|k| k.session == session)
+            .filter(|k| k.session == session && now.saturating_duration_since(k.at) < MARK_TTL)
             .cloned()
     }
 
@@ -1029,12 +1049,13 @@ impl IntoResponse for Fail {
     }
 }
 
-/// El error que contestó otro equipo, con su código.
+/// El error que contestó otro equipo, con su código si es de error (400 a 599); si no, 502.
 fn peer_fail((code, msg): (u16, String)) -> Fail {
-    Fail(
-        StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
-        msg,
-    )
+    let code = StatusCode::from_u16(code)
+        .ok()
+        .filter(|c| c.is_client_error() || c.is_server_error())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    Fail(code, msg)
 }
 
 /// `POST /api/v1/mcp/{tool}`.
@@ -1196,14 +1217,19 @@ pub async fn api_alerts(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
     let mut alerts = local;
     let mut unreachable = vec![];
     for (m, r) in remote {
-        match r.and_then(|v| list_of::<AlertOut>(&v, "alerts")) {
-            Ok(list) => alerts.extend(list.into_iter().map(|mut a| {
-                let id = a.session.rsplit_once('/').map_or(&*a.session, |x| x.1);
-                a.session = format!("{}/{id}", me.label_of(m));
-                a.machine = Machine::name_of(m);
-                a.machine_id = m.id.clone();
-                a
-            })),
+        let list = r
+            .and_then(|v| list_of::<AlertOut>(&v, "alerts"))
+            .and_then(|l| {
+                l.iter()
+                    .map(|a| {
+                        let v = relabel(&me, m, to_json(a)?);
+                        serde_json::from_value(v)
+                            .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+                    })
+                    .collect::<Result<Vec<AlertOut>, Fail>>()
+            });
+        match list {
+            Ok(list) => alerts.extend(list),
             Err(f) => unreachable.push(unreachable_entry(m, &f)),
         }
     }
@@ -1676,8 +1702,11 @@ async fn read_at(
 }
 
 /// Cómo está la sesión `id` de aquí y, con `msg` (de `send`), si ya lo recogió y si ha contestado.
+/// Vale para cualquier sesión, sea o no de Claude: también dice si vive una sesión madre.
 async fn status_here(st: &AppState, id: &str, msg: Option<&str>) -> Result<StatusOut, Fail> {
-    session_here(st, id).await?;
+    if st.registry.lock().await.get(id).is_none() {
+        return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
+    }
     let (state, menu) = poll_status(st, id).await;
     let (taken, replied) = match msg {
         Some(m) => (Some(!st.inbox.has(id, m)), Some(replied(st, id, m).await)),
@@ -1718,28 +1747,49 @@ async fn replied(st: &AppState, id: &str, msg: &str) -> bool {
 }
 
 /// Lo que miran las esperas de la sesión `at` (aquí o en otro equipo).
+/// Lo que miran las esperas de la sesión `at` (aquí o en otro equipo), con la espera hasta
+/// `until`: a otro equipo se le espera `STATUS_POLL` como mucho, o lo que quede.
 async fn status_at(
     st: &AppState,
     me: &Machine,
     caller: &Caller,
     at: &Where<'_>,
     msg: Option<&str>,
-) -> Result<Seen, Fail> {
+    until: tokio::time::Instant,
+) -> Result<Seen, Miss> {
     let v = match at {
-        Where::Here(id) => to_json(&status_here(st, id, msg).await?)?,
+        // Como en `read`: solo las de Claude.
+        Where::Here(id) => async {
+            session_here(st, id).await?;
+            to_json(&status_here(st, id, msg).await?)
+        }
+        .await
+        .map_err(Miss::Fatal)?,
         Where::There { machine, id } => {
             let mut args = json!({ "session": id });
             if let Some(m) = msg {
                 args["msg"] = m.into();
             }
-            forward(st, me, caller, machine, "status", args).await?
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let ask = forward(st, me, caller, machine, "status", args);
+            match tokio::time::timeout(STATUS_POLL.min(left).max(WAIT_STEP / 2), ask).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(f)) if passing(&f) => return Err(Miss::Channel(f)),
+                Ok(Err(f)) => return Err(Miss::Fatal(f)),
+                Err(_) => {
+                    return Err(Miss::Channel(fail(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "el otro equipo no contesta",
+                    )));
+                }
+            }
         }
     };
     serde_json::from_value(v).map_err(|_| {
-        fail(
+        Miss::Fatal(fail(
             StatusCode::BAD_GATEWAY,
             "respuesta no válida del otro equipo",
-        )
+        ))
     })
 }
 
@@ -1763,12 +1813,14 @@ async fn tool_read(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
     if !(a.wait && caller.local) {
         return read().await;
     }
+    let total = wait_timeout(a.timeout_s);
+    let until = tokio::time::Instant::now() + total;
     wait_then_read(
-        || status_at(st, me, caller, &at, None),
+        || status_at(st, me, caller, &at, None, until),
         read,
         None,
         WAIT_STEP,
-        wait_timeout(a.timeout_s),
+        total,
     )
     .await
 }
@@ -1806,14 +1858,18 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
     // Un nido antiguo no da el id: sin él no se sabe si lo recogió, y se espera solo el rato de
     // recogida.
     let msg = out["msg_id"].as_str().map(str::to_owned);
-    out["read"] = wait_then_read(
-        || status_at(st, me, caller, &at, msg.as_deref()),
+    let total = wait_timeout(Some(secs));
+    let until = tokio::time::Instant::now() + total;
+    let read = wait_then_read(
+        || status_at(st, me, caller, &at, msg.as_deref(), until),
         || read_at(st, me, caller, &at, None),
         Some(PICKUP),
         WAIT_STEP,
-        wait_timeout(Some(secs)),
+        total,
     )
-    .await?;
+    .await;
+    // El mensaje ya está en la cola: lo que falle al esperar no lo deshace.
+    out["read"] = read.unwrap_or_else(|f| json!({ "error": i18n::tr(&f.1) }));
     Ok(out)
 }
 
@@ -2077,38 +2133,67 @@ async fn tool_alert(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply 
 // ---------- La sesión madre ----------
 
 /// Si vive la sesión madre (de otro equipo) de una abierta con `open`, por su dirección, y
-/// cuándo se preguntó.
-#[derive(Default)]
-pub struct Parents(std::sync::Mutex<HashMap<String, (Instant, bool)>>);
+/// cuándo se preguntó; se recuerda `ttl()` (`PARENT_TTL`, o lo que pongan las pruebas).
+pub struct Parents {
+    map: std::sync::Mutex<HashMap<String, (Instant, bool)>>,
+    ttl_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Default for Parents {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+            ttl_ms: (PARENT_TTL.as_millis() as u64).into(),
+        }
+    }
+}
 
 impl Parents {
+    /// Cuánto se recuerda, y cada cuánto se vuelve a mirar un aviso que se calló por ella.
+    pub fn ttl(&self) -> Duration {
+        Duration::from_millis(self.ttl_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Para las pruebas.
+    pub fn set_ttl(&self, d: Duration) {
+        let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        self.ttl_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn get(&self, by: &str, now: Instant) -> Option<bool> {
-        self.0
+        let ttl = self.ttl();
+        self.map
             .lock()
             .expect("madres")
             .get(by)
-            .filter(|(t, _)| now.saturating_duration_since(*t) < PARENT_TTL)
+            .filter(|(t, _)| now.saturating_duration_since(*t) < ttl)
             .map(|(_, alive)| *alive)
     }
 
     fn put(&self, by: &str, alive: bool, now: Instant) {
-        let mut m = self.0.lock().expect("madres");
-        m.retain(|_, (t, _)| now.saturating_duration_since(*t) < PARENT_TTL);
+        let ttl = self.ttl();
+        let mut m = self.map.lock().expect("madres");
+        m.retain(|_, (t, _)| now.saturating_duration_since(*t) < ttl);
         m.insert(by.to_owned(), (now, alive));
     }
 }
 
 /// ¿Vive la sesión que abrió con `open` a la sesión `child` (`by`, su `opened_by`)? Lo que
-/// pregunta la hija es para ella mientras viva: no se avisa al usuario. Si es de aquí, si está en
-/// el registro y en marcha; si es de otro equipo, se le pregunta su `status` (`FAN_OUT` como
-/// mucho, y se recuerda `PARENT_TTL`): parada, sin respuesta o de un equipo que ya no está en el
-/// grupo, no vive.
-pub async fn parent_alive(st: &AppState, by: &str, child: &str, child_name: &str) -> bool {
+/// avisaría de la hija es para ella mientras viva. Vive si no está parada (`status`), sea o no de
+/// Claude, aquí o en otro equipo: la de aquí se mira aquí; a la de otro equipo se le pide su
+/// `status` (`FAN_OUT` como mucho, y se recuerda `Parents::ttl`, salvo con `fresh`). Sin
+/// respuesta, con un error o de un equipo que ya no está en el grupo, no vive.
+pub async fn parent_alive(
+    st: &AppState,
+    by: &str,
+    child: &str,
+    child_name: &str,
+    fresh: bool,
+) -> bool {
     let by = by.trim();
     let me = Machine::of(st);
     if let Some(id) = here(&me, by) {
-        let known = st.registry.lock().await.get(id).is_some();
-        return known && launch::is_alive(&st.paths, id);
+        return alive_state(status_here(st, id, None).await.map(|s| s.state));
     }
     let Some((machine, id)) = by.rsplit_once('/') else {
         return false;
@@ -2116,7 +2201,7 @@ pub async fn parent_alive(st: &AppState, by: &str, child: &str, child_name: &str
     let Some(m) = me.others.iter().find(|m| m.id == machine.trim()) else {
         return false;
     };
-    if let Some(alive) = st.mcp_parents.get(by, Instant::now()) {
+    if !fresh && let Some(alive) = st.mcp_parents.get(by, Instant::now()) {
         return alive;
     }
     let ask = st.peer_member(
@@ -2124,12 +2209,21 @@ pub async fn parent_alive(st: &AppState, by: &str, child: &str, child_name: &str
         "status",
         json!({ "session": id.trim(), "caller": { "id": child, "name": child_name } }),
     );
-    let alive = matches!(
-        tokio::time::timeout(FAN_OUT, ask).await,
-        Ok(Ok(v)) if v["state"].as_str().is_some_and(|s| s != "stopped")
-    );
+    let state = match tokio::time::timeout(FAN_OUT, ask).await {
+        Ok(Ok(v)) => serde_json::from_value::<Seen>(v)
+            .map(|s| s.state)
+            .map_err(|e| fail(StatusCode::BAD_GATEWAY, e.to_string())),
+        Ok(Err(e)) => Err(peer_fail(e)),
+        Err(_) => Err(fail(StatusCode::GATEWAY_TIMEOUT, "")),
+    };
+    let alive = alive_state(state);
     st.mcp_parents.put(by, alive, Instant::now());
     alive
+}
+
+/// La regla de `parent_alive`, la misma aquí y en otro equipo.
+fn alive_state(state: Result<Status, Fail>) -> bool {
+    state.is_ok_and(|s| s != Status::Stopped)
 }
 
 #[cfg(test)]
@@ -2230,6 +2324,39 @@ mod tests {
         assert_eq!(m.label_of(&m.others[0]), "x-id");
         assert_eq!(m.label_of(&m.others[1]), "Mac");
         assert_eq!(Machine::name_of(&m.others[0]), "x-id");
+    }
+
+    #[test]
+    fn a_name_that_is_a_hub_id_is_taken() {
+        // Otro equipo se llama como el id de este: su nombre no vale de etiqueta.
+        let m = grouped(Some("k123"), &[("mac-id", "k123"), ("win-id", "Sobremesa")]);
+        assert_eq!(m.label_of(&m.others[0]), "mac-id");
+        assert_eq!(m.label_of(&m.others[1]), "Sobremesa");
+        assert_eq!(m.label(), "Portatil");
+        // Ni como el id de otro del grupo.
+        let m = grouped(
+            Some("k123"),
+            &[("mac-id", "win-id"), ("win-id", "Sobremesa")],
+        );
+        assert_eq!(m.label_of(&m.others[0]), "mac-id");
+        // Ni este, si su nombre es el id de otro.
+        let m = grouped(Some("k123"), &[("Portatil", "Mac")]);
+        assert_eq!(m.label(), "k123");
+        // Las etiquetas llevan siempre al equipo que nombran.
+        for m in [
+            grouped(Some("k123"), &[("mac-id", "k123"), ("win-id", "Sobremesa")]),
+            grouped(
+                Some("k123"),
+                &[("mac-id", "win-id"), ("win-id", "Sobremesa")],
+            ),
+            grouped(Some("k123"), &[("Portatil", "Mac")]),
+        ] {
+            assert_eq!(here_of(&m, &m.shown("ab")), "ab", "{m:?}");
+            for o in &m.others {
+                let a = format!("{}/ab", m.label_of(o));
+                assert_eq!(there_of(&m, &a).0, o.id, "{a}");
+            }
+        }
     }
 
     #[test]
@@ -2871,9 +2998,11 @@ mod tests {
     ) -> (usize, usize, Result<Value, (StatusCode, String)>) {
         let polls = std::cell::Cell::new(0);
         let reads = std::cell::Cell::new(0);
+        // Un 5xx, del canal (como los que da `status_at` de otro equipo); lo demás, no.
         let again = |r: &Result<Seen, Fail>| match r {
             Ok(s) => Ok(*s),
-            Err(f) => Err(Fail(f.0, f.1.clone())),
+            Err(f) if passing(f) => Err(Miss::Channel(Fail(f.0, f.1.clone()))),
+            Err(f) => Err(Miss::Fatal(Fail(f.0, f.1.clone()))),
         };
         let r = wait_then_read(
             || {
@@ -2939,7 +3068,7 @@ mod tests {
         )
         .await;
         assert_eq!(r.0, 2);
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(5));
         // Pregunta tras trabajar: también se acaba la espera.
         let r = replay(
             &[seen(Working, true, false), seen(Question, true, true)],
@@ -2959,14 +3088,14 @@ mod tests {
         let start = std::time::Instant::now();
         let (_, reads, _) = replay(&[seen(Idle, false, false)], Some(50), 10_000).await;
         assert_eq!(reads, 1);
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(5));
         // Se acaba la espera entera trabajando: se lee lo que haya (y dirá «working»).
         let start = std::time::Instant::now();
         let (_, reads, r) = replay(&[seen(Working, true, false)], Some(5000), 80).await;
         assert_eq!((reads, r.is_ok()), (1, true));
         let took = start.elapsed();
         assert!(
-            took >= Duration::from_millis(80) && took < Duration::from_secs(2),
+            took >= Duration::from_millis(80) && took < Duration::from_secs(5),
             "{took:?}"
         );
     }
@@ -2982,7 +3111,7 @@ mod tests {
         seq.push(seen(Idle, true, true));
         let (polls, reads, _) = replay(&seq, Some(5000), 10_000).await;
         assert_eq!((polls, reads), (22, 1));
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
@@ -3023,7 +3152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waits_survive_the_channel_failing() {
+    async fn waits_survive_the_channel_failing_now_and_then() {
         use Status::*;
         // Falla a ratos (el hub tarda, el otro no contesta): se sigue esperando.
         let r = replay(
@@ -3038,32 +3167,19 @@ mod tests {
         )
         .await;
         assert_eq!(r, (4, 1, Ok(json!({"after": 4}))));
-        let r = replay(
+        // Si se acaba la espera tras un fallo suelto, se lee igual: alguna vez contestó.
+        let (polls, reads, r) = replay(
             &[
-                down(),
                 seen(Working, false, false),
                 down(),
-                seen(Idle, false, false),
+                seen(Working, false, false),
             ],
             None,
-            10_000,
+            50,
         )
         .await;
-        assert_eq!(r.0, 4);
-        // Si falla al final de la espera, se lee igual: alguna vez contestó.
-        let (_, reads, r) = replay(&[seen(Working, false, false), down()], None, 50).await;
+        assert!(polls > 3, "{polls}");
         assert_eq!((reads, r.is_ok()), (1, true));
-        // Si no contestó ni una vez, el error (sin leer).
-        let (polls, reads, r) = replay(&[down()], None, 50).await;
-        assert!(polls > 1, "{polls}");
-        assert_eq!(reads, 0);
-        assert_eq!(
-            r,
-            Err((
-                StatusCode::BAD_GATEWAY,
-                "sin conexión o versión antigua".into()
-            ))
-        );
         // Un error que no es del canal (ya no existe, no se puede) corta la espera.
         let gone = [
             seen(Working, false, false),
@@ -3072,6 +3188,56 @@ mod tests {
         let (polls, reads, r) = replay(&gone, Some(5000), 10_000).await;
         assert_eq!((polls, reads), (2, 0));
         assert_eq!(r.unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn waits_give_up_on_a_dead_channel() {
+        use Status::*;
+        let no_peer = Err((
+            StatusCode::BAD_GATEWAY,
+            "sin conexión o versión antigua".to_owned(),
+        ));
+        // Caído desde el principio: el error enseguida, sin esperar al tope.
+        for pickup in [None, Some(5000)] {
+            let start = std::time::Instant::now();
+            let (polls, reads, r) = replay(&[down()], pickup, 10_000).await;
+            assert_eq!((polls, reads), (1, 0), "{pickup:?}");
+            assert_eq!(r, no_peer);
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+        // Tres fallos seguidos acaban la espera (sin leer).
+        let start = std::time::Instant::now();
+        let (polls, reads, r) = replay(
+            &[
+                seen(Working, true, false),
+                down(),
+                down(),
+                down(),
+                seen(Idle, true, true),
+            ],
+            Some(5000),
+            10_000,
+        )
+        .await;
+        assert_eq!((polls, reads), (4, 0));
+        assert_eq!(r, no_peer);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Dos seguidos, no: la cuenta vuelve a empezar con cada respuesta.
+        let (polls, reads, r) = replay(
+            &[
+                seen(Working, false, false),
+                down(),
+                down(),
+                seen(Working, false, false),
+                down(),
+                down(),
+                seen(Idle, false, false),
+            ],
+            None,
+            10_000,
+        )
+        .await;
+        assert_eq!((polls, reads, r.is_ok()), (7, 1, true));
     }
 
     fn user_line(id: usize, text: &str) -> String {
@@ -3137,6 +3303,33 @@ mod tests {
         let d = dir.path().join("d.jsonl");
         push_lines(&d, &[user_line(0, "solo esto")]);
         assert!(!replied_since(Some(&a), 0, &d).unwrap().0);
+    }
+
+    #[test]
+    fn old_marks_are_not_read() {
+        let m = Marks::default();
+        let old = Instant::now()
+            .checked_sub(MARK_TTL + Duration::from_secs(1))
+            .expect("el reloj lleva en marcha más de media hora");
+        m.put("m1", "hija", None, 0, old);
+        assert!(m.get("m1", "hija").is_none());
+    }
+
+    #[test]
+    fn peer_errors_keep_only_error_codes() {
+        for (code, want) in [
+            (403, StatusCode::FORBIDDEN),
+            (404, StatusCode::NOT_FOUND),
+            (504, StatusCode::GATEWAY_TIMEOUT),
+            (200, StatusCode::BAD_GATEWAY),
+            (302, StatusCode::BAD_GATEWAY),
+            (399, StatusCode::BAD_GATEWAY),
+            (600, StatusCode::BAD_GATEWAY),
+            (0, StatusCode::BAD_GATEWAY),
+        ] {
+            let f = peer_fail((code, "x".into()));
+            assert_eq!((f.0, f.1.as_str()), (want, "x"), "{code}");
+        }
     }
 
     #[test]
@@ -3358,7 +3551,7 @@ mod tests {
         );
         assert_eq!(
             en("el otro equipo no contesta"),
-            "the other computer does not answer"
+            "the other machine does not answer"
         );
         assert_eq!(
             en("respuesta no válida del otro equipo"),

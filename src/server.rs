@@ -596,18 +596,32 @@ impl AppState {
             AlertKind::Requested => return,
         })
         .await;
-        let (view, badge) = self.view_and_badge(&a.session);
-        let Some(v) = view.filter(|v| still_alerting(v, a.kind)) else {
-            return;
-        };
-        // Lo que pregunta una sesión abierta con `open` es para su madre mientras viva: al
-        // usuario no se le avisa.
-        if a.kind == AlertKind::Waiting
-            && let Some(by) = v.opened_by.as_deref()
-            && crate::mcp_api::parent_alive(self, by, &v.id, &v.name).await
-        {
-            return;
+        if let Some((title, body, badge)) = self.alert_push(&a).await {
+            self.push_all(&title, &body, &a.session, badge).await;
         }
+    }
+
+    /// Lo que hay que mandar por `a`, ya pasado su retraso (el título, el texto y el número del
+    /// icono), o nada si ya no hace falta.
+    async fn alert_push(&self, a: &Alert) -> Option<(String, String, usize)> {
+        let (view, _) = self.view_and_badge(&a.session);
+        let v = view.filter(|v| still_alerting(v, a.kind))?;
+        // De una sesión abierta con `open`, es para su madre mientras viva: al usuario no se le
+        // avisa. Se vuelve a mirar cada rato (sin lo recordado) mientras siga haciendo falta: si
+        // la madre ya no está, sale el aviso.
+        if Self::quiet_while_parent(a.kind)
+            && let Some(by) = v.opened_by.as_deref()
+        {
+            let mut fresh = false;
+            while crate::mcp_api::parent_alive(self, by, &v.id, &v.name, fresh).await {
+                tokio::time::sleep(self.mcp_parents.ttl()).await;
+                fresh = true;
+                let (view, _) = self.view_and_badge(&a.session);
+                view.filter(|v| still_alerting(v, a.kind))?;
+            }
+        }
+        let (view, badge) = self.view_and_badge(&a.session);
+        let v = view.filter(|v| still_alerting(v, a.kind))?;
         // «Terminó» solo si de verdad ha terminado: no ha vuelto a trabajar y no le quedan
         // subagentes en marcha (mirando su pantalla ahora). Sin leer sigue igual en la web y la app.
         if a.kind == AlertKind::Finished {
@@ -615,17 +629,17 @@ impl AppState {
                 .as_ref()
                 .is_some_and(|c| c.status.as_deref() == Some("busy"))
             {
-                return;
+                return None;
             }
             if self.has_subagents(&v.id).await {
-                return;
+                return None;
             }
             let mut pushed = self.finished_pushed.lock().expect("avisos");
             if pushed
                 .get(&v.id)
                 .is_some_and(|t| t.elapsed() < FINISHED_DELAY)
             {
-                return;
+                return None;
             }
             pushed.insert(v.id.clone(), std::time::Instant::now());
         }
@@ -635,9 +649,16 @@ impl AppState {
                 Some(t) if t != v.name => format!("Terminó · {t}"),
                 _ => "Terminó".to_owned(),
             },
-            AlertKind::Requested => return,
+            AlertKind::Requested => return None,
         };
-        self.push_all(&v.name, &body, &v.id, badge).await;
+        Some((v.name.clone(), body, badge))
+    }
+
+    /// Quiere decir algo al usuario que, de una sesión abierta con `open`, es para su madre
+    /// mientras viva (que pregunta o que terminó; la madre lo sabe por su espera). Las alertas que
+    /// manda la propia sesión (`alert`), nunca.
+    fn quiet_while_parent(kind: AlertKind) -> bool {
+        matches!(kind, AlertKind::Waiting | AlertKind::Finished)
     }
 
     /// Si hay a quién mandar avisos: algún teléfono con handle y el hub conectado.
@@ -2417,6 +2438,8 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     fn view(id: &str) -> SessionView {
@@ -2434,6 +2457,158 @@ mod tests {
             opened_by: None,
             alerts: vec![],
         }
+    }
+
+    /// Un nido en `dir` con un equipo «Mac» en el grupo que contesta a `status` lo que diga la
+    /// prueba, y cuántas veces se le preguntó. Las madres se vuelven a mirar cada 50 ms.
+    type Answer = Arc<std::sync::Mutex<e2e::PeerResult>>;
+    fn with_mac(dir: &std::path::Path) -> (Arc<AppState>, Answer, Arc<AtomicUsize>) {
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+        };
+        let st = AppState::new(paths, Launcher::Detached, None, true).unwrap();
+        st.group.add_member("mac-id", "bWFj", "Mac");
+        st.mcp_parents.set_ttl(Duration::from_millis(50));
+        let answer: Answer = Arc::new(std::sync::Mutex::new(Ok(json!({"state": "working"}))));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (a, n) = (answer.clone(), asked.clone());
+        assert!(st.set_peer_link(Box::new(move |_, method, _| {
+            let r = if method == "status" {
+                n.fetch_add(1, Ordering::SeqCst);
+                a.lock().unwrap().clone()
+            } else {
+                Err((502, "sin conexión o versión antigua".into()))
+            };
+            Box::pin(async move { r })
+        })));
+        (st, answer, asked)
+    }
+
+    /// Una hija abierta desde el Mac que pregunta (`Waiting`) o que terminó y no se ha visto.
+    fn child(kind: AlertKind, opened_by: Option<&str>) -> SessionView {
+        let mut v = view("hija");
+        v.opened_by = opened_by.map(str::to_owned);
+        v.unread = kind == AlertKind::Finished;
+        let status = if kind == AlertKind::Waiting {
+            "waiting"
+        } else {
+            "idle"
+        };
+        v.claude = Some(ClaudeView {
+            background: None,
+            session_id: "s".into(),
+            running: true,
+            status: Some(status.into()),
+            title: None,
+            account: None,
+        });
+        v
+    }
+
+    fn show(st: &AppState, v: SessionView) {
+        st.views.send_replace(Listing {
+            sessions: vec![v],
+            folders: vec![],
+        });
+    }
+
+    fn spawn_push(
+        st: &Arc<AppState>,
+        kind: AlertKind,
+    ) -> tokio::task::JoinHandle<Option<(String, String, usize)>> {
+        let st = st.clone();
+        let a = Alert {
+            session: "hija".into(),
+            kind,
+        };
+        tokio::spawn(async move { st.alert_push(&a).await })
+    }
+
+    #[tokio::test]
+    async fn a_child_alerts_once_its_parent_is_gone() {
+        for (kind, body) in [
+            (AlertKind::Waiting, "Te necesita"),
+            (AlertKind::Finished, "Terminó"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (st, answer, asked) = with_mac(dir.path());
+            show(&st, child(kind, Some("mac-id/madre")));
+            let task = spawn_push(&st, kind);
+            // La madre vive: no se avisa, y se vuelve a mirar (sin lo recordado) cada poco.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert!(
+                !task.is_finished(),
+                "{kind:?}: se calla mientras viva la madre"
+            );
+            assert!(asked.load(Ordering::SeqCst) >= 3, "{kind:?}");
+            // Ya no vive: sale el aviso.
+            *answer.lock().unwrap() = Ok(json!({"state": "stopped"}));
+            let got = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("a tiempo")
+                .unwrap();
+            let (title, text, _) = got.unwrap_or_else(|| panic!("{kind:?}: sin aviso"));
+            assert_eq!((title.as_str(), text.as_str()), ("hija", body));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quiet_alert_is_dropped_once_it_is_no_longer_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, _, _) = with_mac(dir.path());
+        show(&st, child(AlertKind::Waiting, Some("mac-id/madre")));
+        let task = spawn_push(&st, AlertKind::Waiting);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished());
+        // Ya no pregunta (le contestó la madre): no hay nada que avisar.
+        let mut busy = child(AlertKind::Waiting, Some("mac-id/madre"));
+        busy.claude.as_mut().unwrap().status = Some("busy".into());
+        show(&st, busy);
+        let got = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert_eq!(got.expect("a tiempo").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn alerts_without_a_live_parent_go_out_at_once() {
+        for kind in [AlertKind::Waiting, AlertKind::Finished] {
+            // Del usuario: sin preguntar a nadie.
+            let dir = tempfile::tempdir().unwrap();
+            let (st, answer, asked) = with_mac(dir.path());
+            show(&st, child(kind, None));
+            let got = spawn_push(&st, kind).await.unwrap();
+            assert!(got.is_some(), "{kind:?}");
+            assert_eq!(asked.load(Ordering::SeqCst), 0);
+            // Madre parada, que no contesta o de un equipo que ya no es del grupo.
+            for (by, r) in [
+                ("mac-id/madre", Ok(json!({"state": "stopped"}))),
+                (
+                    "mac-id/otra",
+                    Err((502, "sin conexión o versión antigua".into())),
+                ),
+                ("mac-id/tercera", Err((404, "no existe esa sesión".into()))),
+                ("viejo-id/madre", Ok(json!({"state": "working"}))),
+            ] {
+                *answer.lock().unwrap() = r;
+                st.finished_pushed.lock().unwrap().clear();
+                show(&st, child(kind, Some(by)));
+                let got = tokio::time::timeout(Duration::from_secs(5), spawn_push(&st, kind))
+                    .await
+                    .expect("a tiempo")
+                    .unwrap();
+                assert!(got.is_some(), "{kind:?} {by}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sessions_own_alerts_are_never_quiet() {
+        assert!(AppState::quiet_while_parent(AlertKind::Waiting));
+        assert!(AppState::quiet_while_parent(AlertKind::Finished));
+        assert!(!AppState::quiet_while_parent(AlertKind::Requested));
     }
 
     #[test]

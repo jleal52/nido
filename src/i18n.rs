@@ -210,15 +210,15 @@ const TABLE: &[(&str, &str)] = &[
     ),
     (
         "para formar un grupo, este equipo tiene que estar conectado al hub (nido hub set …)",
-        "to form a group, this computer has to be connected to the hub (nido hub set …)",
+        "to form a group, this machine has to be connected to the hub (nido hub set …)",
     ),
     (
         "para sacar este equipo, hazlo desde otro del grupo",
-        "to remove this computer, do it from another one in the group",
+        "to remove this machine, do it from another one in the group",
     ),
     (
         "ese equipo no está en el grupo",
-        "that computer is not in the group",
+        "that machine is not in the group",
     ),
     (
         "ese teléfono no está emparejado",
@@ -227,11 +227,11 @@ const TABLE: &[(&str, &str)] = &[
     ("cuenta no válida", "invalid account"),
     (
         "este equipo no está conectado al hub (nido hub)",
-        "this computer is not connected to the hub (nido hub)",
+        "this machine is not connected to the hub (nido hub)",
     ),
     (
         "el otro equipo usa otro hub ({}); este usa {}",
-        "the other computer uses a different hub ({0}); this one uses {1}",
+        "the other machine uses a different hub ({0}); this one uses {1}",
     ),
     (
         "{}: ya no recibe avisos",
@@ -361,7 +361,7 @@ const TABLE: &[(&str, &str)] = &[
     ),
     (
         "La API de nido solo se atiende en este equipo",
-        "The nido API is only served on this computer",
+        "The nido API is only served on this machine",
     ),
     ("Host no permitido", "Host not allowed"),
     // registry.rs
@@ -537,7 +537,7 @@ const TABLE: &[(&str, &str)] = &[
     ("al código le falta el hub", "the code is missing the hub"),
     (
         "al código le falta el equipo",
-        "the code is missing the computer",
+        "the code is missing the machine",
     ),
     (
         "el código ha caducado: genera otro con «nido group invite»",
@@ -546,7 +546,7 @@ const TABLE: &[(&str, &str)] = &[
     // e2e.rs
     (
         "el otro equipo no aceptó (¿código usado o caducado?)",
-        "the other computer did not accept (code used or expired?)",
+        "the other machine did not accept (code used or expired?)",
     ),
     (
         "sin conexión o versión antigua",
@@ -583,11 +583,11 @@ const TABLE: &[(&str, &str)] = &[
     ("no hay hub configurado", "no hub is configured"),
     (
         "el otro equipo cerró sin contestar",
-        "the other computer closed without answering",
+        "the other machine closed without answering",
     ),
     (
         "el otro equipo no contesta",
-        "the other computer does not answer",
+        "the other machine does not answer",
     ),
     ("reto no válido", "invalid challenge"),
     (
@@ -762,7 +762,7 @@ mod tests {
         );
         assert_eq!(
             english("el otro equipo usa otro hub (https://a); este usa wss://b"),
-            "the other computer uses a different hub (https://a); this one uses wss://b"
+            "the other machine uses a different hub (https://a); this one uses wss://b"
         );
     }
 

@@ -190,9 +190,11 @@ const TOOLS: &[Tool] = &[
         about: "Send a message to another session. It arrives there as a channel event from \
                 this session. Returns status sent (it has a channel and gets it now) or queued \
                 (the session is stopped or still starting: it gets it when it is up). A running \
-                session without a channel does not accept messages. With wait, also returns \
-                (in read) what `read` returns once the session has picked the message up and \
-                answered, or asks a question, or the wait runs out.",
+                session without a channel does not accept messages. Also returns msg_id, the \
+                id of the message. With wait, also returns (in read) what `read` returns once \
+                the session has picked the message up and answered, or asks a question, or the \
+                wait runs out; if waiting fails, read has the error (the message is still \
+                sent).",
         args: &[
             SESSION,
             req("text", "string", "The message."),
@@ -835,6 +837,12 @@ mod tests {
             assert!(!t["description"].as_str().unwrap().is_empty());
             assert_eq!(t["inputSchema"]["type"], "object");
         }
+        // `send` dice que devuelve el id del mensaje.
+        assert!(
+            tools[1]["description"].as_str().unwrap().contains("msg_id"),
+            "{}",
+            tools[1]["description"]
+        );
         let send = &tools[1]["inputSchema"];
         assert_eq!(
             send["properties"]
