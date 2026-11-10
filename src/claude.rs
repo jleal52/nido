@@ -299,6 +299,21 @@ pub fn claude_ancestor(procfs: &Procfs, pid: u32) -> Option<u32> {
     None
 }
 
+/// El Claude de una sesión (su guardián, `holder`): el que apunta de sí mismo lo que hace
+/// (`find_claude`) y, si no lo hay (otra versión de Claude que lo guarde en otro sitio, o en
+/// Windows con su perfil propio), el primer Claude de su árbol. Instalado con npm su proceso es
+/// `node`, y no se encuentra.
+pub fn session_claude(procfs: &Procfs, holder: u32, home: &Path) -> Option<u32> {
+    if let Some(f) = find_claude(procfs, holder, home) {
+        return Some(f.pid);
+    }
+    procfs
+        .tree(holder)
+        .into_iter()
+        .skip(1)
+        .find(|&p| procfs.comm(p).is_some_and(|n| is_claude(&[n])))
+}
+
 /// ¿Hay algún Claude en marcha en este equipo, sea o no de nido?
 pub fn any_running() -> bool {
     #[cfg(windows)]
@@ -914,6 +929,39 @@ mod tests {
         assert_eq!(claude_ancestor(&p, 999), None);
         // Uno mismo no cuenta: se busca por encima.
         assert_eq!(claude_ancestor(&p, 100), None);
+    }
+
+    #[test]
+    fn the_claude_of_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proc");
+        let home = tmp.path().join("home");
+        // Con lo que apunta de sí mismo (`sessions/<pid>.json`), el de `find_claude`, aunque
+        // haya otro antes en el árbol.
+        fake_proc(&root, 10, 1, "nido", &[]);
+        fake_proc(&root, 11, 10, "bash", &[]);
+        fake_proc(&root, 12, 11, "claude", &[]);
+        fake_proc(&root, 13, 10, "claude", &[]);
+        std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
+        std::fs::write(
+            home.join(".claude/sessions/13.json"),
+            r#"{"sessionId":"c"}"#,
+        )
+        .unwrap();
+        // Sin él (otra versión de Claude, o en Windows con su perfil propio): el primer Claude
+        // del árbol.
+        fake_proc(&root, 20, 1, "nido", &[]);
+        fake_proc(&root, 21, 20, "bash", &[]);
+        fake_proc(&root, 22, 21, "claude", &[]);
+        fake_proc(&root, 23, 22, "claude", &[]);
+        // Instalado con npm: el proceso es `node`. No hay Claude que encontrar.
+        fake_proc(&root, 30, 1, "nido", &[]);
+        fake_proc(&root, 31, 30, "node", &[]);
+        let p = Procfs::at(&root);
+        assert_eq!(session_claude(&p, 10, &home), Some(13));
+        assert_eq!(session_claude(&p, 20, &home), Some(22));
+        assert_eq!(session_claude(&p, 30, &home), None);
+        assert_eq!(session_claude(&p, 99, &home), None);
     }
 
     #[test]

@@ -31,15 +31,30 @@ pub enum Claim {
 }
 
 /// `sent`: el `nido mcp` mandó su pid; `ancestor`: el Claude que tiene encima
-/// (`claude::claude_ancestor`); `known`: el Claude de la sesión (`claude::find_claude`).
-pub fn claim(sent: bool, ancestor: Option<u32>, known: Option<u32>) -> Claim {
+/// (`claude::claude_ancestor`); `known`: el Claude de la sesión (`claude::session_claude`);
+/// `starting`: la sesión arranca (ver `CLAIM_STARTUP`).
+pub fn claim(sent: bool, ancestor: Option<u32>, known: Option<u32>, starting: bool) -> Claim {
     match (sent, known) {
         // Un `nido mcp` que no lo manda: como siempre.
         (false, _) => Claim::Yes,
-        (true, None) => Claim::Wait,
         (true, Some(k)) if ancestor == Some(k) => Claim::Yes,
         (true, Some(_)) => Claim::No,
+        // Sin Claude en su árbol, aún: que vuelva.
+        (true, None) if starting => Claim::Wait,
+        // Ni pasado el arranque (con npm su proceso es `node`): como antes, sin proteger la
+        // bandeja (ver `Inbox::unguarded`).
+        (true, None) => Claim::Yes,
     }
+}
+
+/// Cuánto se espera, tras lanzar una sesión, a que aparezca su Claude antes de dar la bandeja a
+/// quien la pida.
+pub const CLAIM_STARTUP: Duration = Duration::from_secs(30);
+
+/// ¿Arranca aún la sesión? `age`: cuánto hace que se lanzó su guardián (`None` si no lo hay:
+/// parada, o entre parar y volver a lanzarla, y entonces su Claude no puede ser ninguno).
+pub fn starting(age: Option<Duration>) -> bool {
+    age.is_none_or(|a| a < CLAIM_STARTUP)
 }
 
 /// Lo más que se encola para una sesión.
@@ -79,6 +94,8 @@ struct Channel {
     /// Su pantalla dice que no tiene channel («no MCP server configured» al arrancar). Dura lo
     /// que dure ese arranque: lo quita `relaunched` (o `forget`), no una recogida.
     refused: bool,
+    /// Ya se dijo que su bandeja va sin proteger (`unguarded`). Lo quita `relaunched`.
+    unguarded: bool,
 }
 
 /// ¿Tiene channel? Si no se sabe que no, y está recogiendo o recogió hace poco.
@@ -254,9 +271,18 @@ impl Inbox {
 
     /// La sesión `id` se acaba de lanzar otra vez: lo que se sabía de su channel era del
     /// arranque anterior.
+    /// Su bandeja va sin proteger (no se encuentra su Claude, ver `claim`): `true` la primera
+    /// vez en este arranque, para decirlo una vez.
+    pub fn unguarded(&self, id: &str) -> bool {
+        let mut channels = self.channels.lock().expect("channels");
+        let c = channels.entry(id.to_owned()).or_default();
+        !std::mem::replace(&mut c.unguarded, true)
+    }
+
     pub fn relaunched(&self, id: &str) {
         if let Some(c) = self.channels.lock().expect("channels").get_mut(id) {
             c.refused = false;
+            c.unguarded = false;
         }
     }
 
@@ -486,17 +512,44 @@ mod tests {
 
     #[test]
     fn the_inbox_belongs_to_the_sessions_own_claude() {
-        // Sin pid (un `nido mcp` que no lo manda): como siempre.
-        assert_eq!(claim(false, None, None), Claim::Yes);
-        assert_eq!(claim(false, None, Some(30)), Claim::Yes);
-        // Su Claude es el de la sesión (el que encuentra `find_claude`): suya.
-        assert_eq!(claim(true, Some(30), Some(30)), Claim::Yes);
-        // Otro Claude de dentro, o ninguno: no.
-        assert_eq!(claim(true, Some(40), Some(30)), Claim::No);
-        assert_eq!(claim(true, None, Some(30)), Claim::No);
-        // Aún no se sabe cuál es el de la sesión (arrancando, o el `nido mcp` del Claude de antes
-        // que aún no ha muerto): que espere, sin mensajes y sin marcar el channel.
-        assert_eq!(claim(true, Some(30), None), Claim::Wait);
-        assert_eq!(claim(true, None, None), Claim::Wait);
+        for starting in [true, false] {
+            // Sin pid (un `nido mcp` que no lo manda): como siempre.
+            assert_eq!(claim(false, None, None, starting), Claim::Yes);
+            assert_eq!(claim(false, None, Some(30), starting), Claim::Yes);
+            // Su Claude es el de la sesión (el que encuentra `session_claude`): suya.
+            assert_eq!(claim(true, Some(30), Some(30), starting), Claim::Yes);
+            // Otro Claude de dentro, o ninguno: no.
+            assert_eq!(claim(true, Some(40), Some(30), starting), Claim::No);
+            assert_eq!(claim(true, None, Some(30), starting), Claim::No);
+        }
+        // Arrancando, sin Claude aún en su árbol (o el `nido mcp` del Claude de antes, que aún
+        // no ha muerto): que espere, sin mensajes y sin marcar el channel.
+        assert_eq!(claim(true, Some(30), None, true), Claim::Wait);
+        assert_eq!(claim(true, None, None, true), Claim::Wait);
+        // Pasado el arranque y sin Claude que encontrar (instalado con npm, es `node`): como
+        // antes, sin proteger la bandeja.
+        assert_eq!(claim(true, None, None, false), Claim::Yes);
+        assert_eq!(claim(true, Some(30), None, false), Claim::Yes);
+    }
+
+    #[test]
+    fn the_session_is_starting_for_a_while() {
+        // Sin guardián (parada, o entre parar y volver a lanzarla): aún no hay de quién.
+        assert!(starting(None));
+        assert!(starting(Some(Duration::ZERO)));
+        assert!(starting(Some(Duration::from_secs(29))));
+        assert!(!starting(Some(CLAIM_STARTUP)));
+        assert!(!starting(Some(Duration::from_secs(3600))));
+    }
+
+    #[test]
+    fn says_once_per_launch_that_the_inbox_is_unguarded() {
+        let inbox = Inbox::load(std::env::temp_dir().join("nido-no-existe/inbox.json"));
+        assert!(inbox.unguarded("s"));
+        assert!(!inbox.unguarded("s"));
+        assert!(inbox.unguarded("t"));
+        inbox.relaunched("s");
+        assert!(inbox.unguarded("s"));
+        assert!(!inbox.unguarded("s"));
     }
 }

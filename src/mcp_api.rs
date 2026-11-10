@@ -1377,7 +1377,8 @@ pub async fn api_inbox_ack(
 
 /// La bandeja de la sesión `id` solo la recoge (y confirma) el `nido mcp` de su Claude. Su pid
 /// viene en `X-Nido-Mcp-Pid`; de ahí se sube por los padres hasta el primer Claude y se compara
-/// con el de la sesión (ver `inbox::claim`).
+/// con el de la sesión (`claude::session_claude`; ver `inbox::claim`). Si pasado el arranque no
+/// se encuentra el de la sesión, se da a quien la pida, y se dice una vez por arranque.
 async fn own_claude(st: &AppState, id: &str, headers: &HeaderMap) -> Result<Claim, Fail> {
     let Some(mcp) = headers
         .get("X-Nido-Mcp-Pid")
@@ -1388,19 +1389,25 @@ async fn own_claude(st: &AppState, id: &str, headers: &HeaderMap) -> Result<Clai
     };
     let paths = st.paths.clone();
     let session = id.to_owned();
-    let (ancestor, known) = tokio::task::spawn_blocking(move || {
+    let (ancestor, known, age) = tokio::task::spawn_blocking(move || {
         let procfs = claude::Procfs::default();
         let known = launch::holder_pid(&paths, &session)
             .and_then(|p| u32::try_from(p).ok())
-            .and_then(|holder| claude::find_claude(&procfs, holder, &paths.home))
-            .map(|f| f.pid);
+            .and_then(|holder| claude::session_claude(&procfs, holder, &paths.home));
         // Sin el Claude de la sesión no hace falta subir.
         let ancestor = known.and_then(|_| claude::claude_ancestor(&procfs, mcp));
-        (ancestor, known)
+        let age = launch::holder_started(&paths, &session)
+            .map(|t| SystemTime::now().duration_since(t).unwrap_or_default());
+        (ancestor, known, age)
     })
     .await
-    .unwrap_or((None, None));
-    match inbox::claim(true, ancestor, known) {
+    .unwrap_or((None, None, None));
+    let starting = inbox::starting(age);
+    let c = inbox::claim(true, ancestor, known, starting);
+    if c == Claim::Yes && known.is_none() && st.inbox.unguarded(id) {
+        eprintln!("nido: no encuentro el Claude de la sesión {id}; la bandeja no se protege");
+    }
+    match c {
         Claim::No => Err(fail(StatusCode::CONFLICT, "no es el Claude de esta sesión")),
         c => Ok(c),
     }

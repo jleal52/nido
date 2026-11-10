@@ -436,6 +436,15 @@ async fn claude_launches_with_the_nido_channel() {
     let (code, r) = inbox(addr, &s.id, Some(mine), Some(json!({"ids": ["m1"]}))).await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(r["removed"], 1);
+    // Sin lo que Claude apunta de sí mismo (otra versión, o en Windows con su perfil): el primer
+    // Claude del árbol de la sesión, igual.
+    std::fs::remove_file(sessions.join(format!("{claude}.json"))).unwrap();
+    state.inbox.push(&s.id, msg("m2")).unwrap();
+    let (code, r) = inbox(addr, &s.id, Some(nested), None).await;
+    assert_eq!(code, 409, "{r}");
+    let (code, r) = inbox(addr, &s.id, Some(mine), None).await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["messages"][0]["id"], "m2");
     // Sin pid (un `nido mcp` que no lo manda), como siempre.
     let (code, _) = inbox(addr, &s.id, None, None).await;
     assert_eq!(code, 200);
