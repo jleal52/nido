@@ -299,6 +299,28 @@ const TABLE: &[(&str, &str)] = &[
         "you cannot send a message to yourself",
     ),
     (
+        "«{}» no se puede pedir desde otro equipo",
+        "“{0}” cannot be requested from another machine",
+    ),
+    (
+        "falta la sesión que llama",
+        "the calling session is missing",
+    ),
+    (
+        "sesión que llama no válida: {}",
+        "invalid calling session: {0}",
+    ),
+    (
+        "esa sesión no es de este equipo",
+        "that session is not on this machine",
+    ),
+    ("«{}» no es este equipo", "“{0}” is not this machine"),
+    // server.rs (canal «peer»)
+    (
+        "«{}» no es ningún equipo del grupo",
+        "“{0}” is not a machine in the group",
+    ),
+    (
         "esa sesión no admite mensajes (no tiene channel)",
         "this session does not accept messages (no channel)",
     ),
@@ -521,6 +543,20 @@ const TABLE: &[(&str, &str)] = &[
     (
         "el otro equipo no aceptó (¿código usado o caducado?)",
         "the other computer did not accept (code used or expired?)",
+    ),
+    (
+        "sin conexión o versión antigua",
+        "no connection or old version",
+    ),
+    ("la respuesta es demasiado grande", "the reply is too large"),
+    (
+        "respuesta no válida del otro equipo",
+        "invalid reply from the other machine",
+    ),
+    ("petición no válida: {}", "invalid request: {0}"),
+    (
+        "este equipo no atiende peticiones de otros",
+        "this machine does not take requests from others",
     ),
     // hub.rs
     (

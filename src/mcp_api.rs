@@ -10,7 +10,10 @@
 //! `nido mcp` la recoge con `GET /api/v1/mcp/inbox` y confirma lo recogido con `POST
 //! /api/v1/mcp/inbox/ack`.
 //!
-//! De momento, solo las sesiones de este equipo: las de otro dan error.
+//! Las sesiones de otro equipo del grupo piden lo mismo por el canal «peer» (`e2e::MODE_PEER`):
+//! `peer_call` atiende esas peticiones con las mismas herramientas, salvo `alert`. Quien llama es
+//! un [`Caller`]: una sesión de aquí o una de otro equipo, siempre con su dirección canónica.
+//! Las de aquí, de momento, solo llegan a las sesiones de este equipo: las de otro dan error.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -110,6 +113,92 @@ pub fn locate<'a>(me: &Machine, address: &'a str) -> Where<'a> {
         },
         Some((_, id)) => Where::Here(id.trim()),
         None => Where::Here(address),
+    }
+}
+
+// ---------- Quién llama ----------
+
+/// La sesión que llama a una herramienta: una de este equipo (por la API local) o una de otro
+/// equipo del grupo (por el canal «peer»). Lo que se apunta o se compara de ella va por su
+/// dirección canónica (`address`), así que una de otro equipo con el mismo id que una de aquí es
+/// otra. La de otro equipo no está en el registro: no se busca en él.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// Su equipo: el id en el hub (la de aquí, sin hub, el nombre del equipo).
+    pub machine_key: String,
+    pub machine_name: String,
+    pub id: String,
+    pub name: String,
+    /// Es de este equipo.
+    pub local: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallerArg {
+    id: String,
+    name: String,
+}
+
+impl Caller {
+    /// Una sesión de este equipo (la de `X-Nido-Session`).
+    pub fn local(me: &Machine, id: &str, name: &str) -> Self {
+        Self {
+            machine_key: me.key().to_owned(),
+            machine_name: me.name.clone(),
+            id: id.to_owned(),
+            name: name.to_owned(),
+            local: true,
+        }
+    }
+
+    /// Una sesión de otro equipo del grupo. El equipo sale de su clave Noise, ya comprobada
+    /// (`member`), nunca de lo que diga; la sesión, de `caller` (`{id, name}`), que vale porque
+    /// el equipo es del grupo. El id, como los de nido (lo mismo que `NIDO_SESSION`).
+    pub fn remote(member: &crate::group::Member, caller: Option<Value>) -> Result<Self, Fail> {
+        let invalid = |e: String| bad_request(format!("sesión que llama no válida: {e}"));
+        let c: CallerArg = serde_json::from_value(
+            caller.ok_or_else(|| bad_request("falta la sesión que llama".into()))?,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        let id = crate::mcp::session_from(Some(c.id.clone()))
+            .filter(|id| id.len() <= 64)
+            .ok_or_else(|| invalid(format!("{:?}", c.id)))?;
+        let name: String = c.name.chars().filter(|c| !c.is_control()).collect();
+        let name: String = name.trim().chars().take(64).collect();
+        Ok(Self {
+            machine_key: member.id.clone(),
+            machine_name: member.name.clone(),
+            name: if name.is_empty() { id.clone() } else { name },
+            id,
+            local: false,
+        })
+    }
+
+    /// Su dirección canónica: `<equipo>/<id>`.
+    pub fn address(&self) -> String {
+        format!("{}/{}", self.machine_key, self.id)
+    }
+
+    /// Con qué lleva sus posiciones de lectura (`Cursors`): la de aquí, con su id, que es como
+    /// se olvidan al borrarla; la de otro equipo, con su dirección (un id no lleva «/»: no se
+    /// confunden).
+    pub fn reader(&self) -> String {
+        if self.local {
+            self.id.clone()
+        } else {
+            self.address()
+        }
+    }
+
+    /// ¿Abrió ella la sesión de aquí con este `opened_by`? La de aquí, como dirección de este
+    /// equipo (ver `opened_by`); la de otro, por su dirección tal cual.
+    pub fn owns(&self, me: &Machine, opened_by: Option<&str>) -> bool {
+        if self.local {
+            self::opened_by(me, opened_by, &self.id)
+        } else {
+            opened_by.is_some_and(|o| o.trim() == self.address())
+        }
     }
 }
 
@@ -604,7 +693,7 @@ pub struct Entry {
     pub channel: bool,
 }
 
-fn entry(st: &AppState, me: &Machine, caller: &str, v: &SessionView, state: Status) -> Entry {
+fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: Status) -> Entry {
     Entry {
         session: format!("{}/{}", me.name, v.id),
         machine: me.name.clone(),
@@ -613,7 +702,7 @@ fn entry(st: &AppState, me: &Machine, caller: &str, v: &SessionView, state: Stat
         cwd: v.cwd.clone(),
         state,
         opened_by: v.opened_by.clone(),
-        mine: opened_by(me, v.opened_by.as_deref(), caller),
+        mine: caller.owns(me, v.opened_by.as_deref()),
         channel: st.inbox.channel(&v.id),
     }
 }
@@ -648,7 +737,7 @@ pub async fn api_mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let caller = match authorize(&st, &headers).await {
+    let session = match authorize(&st, &headers).await {
         Ok(s) => s,
         Err(f) => return f.into_response(),
     };
@@ -658,22 +747,57 @@ pub async fn api_mcp(
     };
     let me = Machine::of(&st);
     let reply = match tool.as_str() {
-        "sessions" => tool_sessions(&st, &me, &caller, args).await,
-        "send" => tool_send(&st, &me, &caller, args).await,
-        "read" => tool_read(&st, &me, &caller, args).await,
-        "open" => tool_open(&st, &me, &caller, args).await,
-        "answer" => tool_answer(&st, &me, &caller, args).await,
-        "close" => tool_close(&st, &me, &caller, args).await,
-        "alert" => tool_alert(&st, &caller, args).await,
-        _ => Err(fail(
-            StatusCode::NOT_FOUND,
-            format!("no hay ninguna herramienta {tool:?}"),
-        )),
+        "alert" => tool_alert(&st, &session, args).await,
+        _ => {
+            let caller = Caller::local(&me, &session.id, &session.name);
+            run_tool(&st, &me, &caller, &tool, args).await
+        }
     };
     match reply {
         Ok(v) => Json(v).into_response(),
         Err(f) => f.into_response(),
     }
+}
+
+/// Las herramientas que se pueden pedir desde otro equipo. `alert` no: una alerta va siempre al
+/// nido de quien la manda.
+pub const PEER_TOOLS: [&str; 6] = ["sessions", "send", "read", "open", "answer", "close"];
+
+/// Una herramienta (menos `alert`), para quien llame: de aquí o de otro equipo.
+async fn run_tool(st: &AppState, me: &Machine, caller: &Caller, tool: &str, args: Value) -> Reply {
+    match tool {
+        "sessions" => tool_sessions(st, me, caller, args).await,
+        "send" => tool_send(st, me, caller, args).await,
+        "read" => tool_read(st, me, caller, args).await,
+        "open" => tool_open(st, me, caller, args).await,
+        "answer" => tool_answer(st, me, caller, args).await,
+        "close" => tool_close(st, me, caller, args).await,
+        _ => Err(fail(
+            StatusCode::NOT_FOUND,
+            format!("no hay ninguna herramienta {tool:?}"),
+        )),
+    }
+}
+
+/// Lo que pide otro equipo del grupo por el canal «peer» (`e2e::MODE_PEER`): `member` es el
+/// equipo (por su clave, ya comprobada) y `params`, los argumentos de la herramienta con la
+/// sesión que llama en `caller` (`{id, name}`). Los errores van en español, como en la API
+/// local: los traduce el nido de quien llama.
+pub async fn peer_call(
+    st: &AppState,
+    member: &crate::group::Member,
+    method: &str,
+    mut params: Value,
+) -> Result<Value, String> {
+    if !PEER_TOOLS.contains(&method) {
+        return Err(format!("«{method}» no se puede pedir desde otro equipo"));
+    }
+    let caller = params.as_object_mut().and_then(|p| p.remove("caller"));
+    let caller = Caller::remote(member, caller).map_err(|f| f.1)?;
+    let me = Machine::of(st);
+    run_tool(st, &me, &caller, method, params)
+        .await
+        .map_err(|f| f.1)
 }
 
 /// `GET /api/v1/mcp/inbox`: lo que espera en la bandeja de la sesión que llama, del más antiguo
@@ -768,9 +892,19 @@ fn args_of<T: DeserializeOwned>(args: Value) -> Result<T, Fail> {
     })
 }
 
-/// La sesión de Claude a la que se refiere `address`, si es de este equipo.
-async fn target(st: &AppState, me: &Machine, address: &str) -> Result<Session, Fail> {
+/// La sesión de Claude a la que se refiere `address`, si es de este equipo. A otro equipo no se
+/// pasa nada de lo que pide otro equipo: solo se le atiende con las sesiones de aquí.
+async fn target(
+    st: &AppState,
+    me: &Machine,
+    caller: &Caller,
+    address: &str,
+) -> Result<Session, Fail> {
     match locate(me, address) {
+        Where::Elsewhere { .. } if !caller.local => Err(fail(
+            StatusCode::BAD_REQUEST,
+            "esa sesión no es de este equipo",
+        )),
         Where::Elsewhere { .. } => Err(fail(
             StatusCode::BAD_REQUEST,
             "la sesión está en otro equipo (aún no se puede)",
@@ -839,7 +973,7 @@ async fn view(st: &AppState, id: &str) -> Option<SessionView> {
         .cloned()
 }
 
-async fn tool_sessions(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
+async fn tool_sessions(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let NoArgs {} = args_of(args)?;
     st.scan().await;
     let views: Vec<SessionView> = st
@@ -854,7 +988,7 @@ async fn tool_sessions(st: &AppState, me: &Machine, caller: &Session, args: Valu
     let list: Vec<Entry> = views
         .iter()
         .zip(states)
-        .map(|(v, (s, _))| entry(st, me, &caller.id, v, s))
+        .map(|(v, (s, _))| entry(st, me, caller, v, s))
         .collect();
     to_json(&list)
 }
@@ -978,12 +1112,14 @@ async fn read_out(
     Ok(out)
 }
 
-async fn tool_read(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
+async fn tool_read(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let a: ReadArgs = args_of(args)?;
-    let s = target(st, me, &a.session).await?;
+    let s = target(st, me, caller, &a.session).await?;
     let id = s.id.as_str();
     let poll = || poll_status(st, id);
-    let (state, menu) = if a.wait {
+    // Para otro equipo no se espera aquí: el ida y vuelta por el hub dura 15 s como mucho. Espera
+    // el nido de quien llama, preguntando cada poco.
+    let (state, menu) = if a.wait && caller.local {
         wait_until(
             poll,
             |(s, _)| s.settled(),
@@ -994,10 +1130,10 @@ async fn tool_read(st: &AppState, me: &Machine, caller: &Session, args: Value) -
     } else {
         poll().await
     };
-    to_json(&read_out(st, &caller.id, &s, state, menu, a.last).await?)
+    to_json(&read_out(st, &caller.reader(), &s, state, menu, a.last).await?)
 }
 
-async fn tool_send(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
+async fn tool_send(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let a: SendArgs = args_of(args)?;
     let text = a.text.trim();
     if text.is_empty() {
@@ -1009,11 +1145,12 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Session, args: Value) -
             MAX_PROMPT / 1024
         )));
     }
-    // Antes de buscarla: la que llama puede no ser de Claude, y saldría «no existe».
-    if to_self(me, &a.session, &caller.id) {
+    // Antes de buscarla: la que llama puede no ser de Claude, y saldría «no existe». La de otro
+    // equipo no está aquí: su dirección ya da error en `target`.
+    if caller.local && to_self(me, &a.session, &caller.id) {
         return Err(bad_request("no puedes mandarte mensajes a ti misma".into()));
     }
-    let s = target(st, me, &a.session).await?;
+    let s = target(st, me, caller, &a.session).await?;
     let alive = view(st, &s.id).await.is_some_and(|v| v.alive);
     let holder = launch::holder_started(&st.paths, &s.id)
         .map(|t| SystemTime::now().duration_since(t).unwrap_or_default());
@@ -1021,18 +1158,19 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Session, args: Value) -
         alive,
         channel: st.inbox.channel(&s.id),
         started: Some(started(holder, st.inbox.uptime())),
-        mine: opened_by(me, s.opened_by.as_deref(), &caller.id),
+        mine: caller.owns(me, s.opened_by.as_deref()),
     })?;
     let msg = Msg {
         id: server::uuid_v4(),
         from: caller.name.clone(),
-        from_id: me.address(&caller.id),
-        machine: me.name.clone(),
+        from_id: caller.address(),
+        machine: caller.machine_name.clone(),
         text: text.to_owned(),
         at: now_ms(),
     };
     let msg_id = msg.id.clone();
-    let wait = a.wait.filter(|&w| w > 0);
+    // Como en `read`: para otro equipo, sin esperar aquí.
+    let wait = a.wait.filter(|&w| w > 0 && caller.local);
     // Lo que ocupa su conversación antes de mandarlo: si crece, ya contestó.
     let before = match wait {
         Some(_) => transcript_len(st, &s.id).await,
@@ -1063,12 +1201,18 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Session, args: Value) -
         wait_timeout(Some(secs)),
     )
     .await;
-    out["read"] = to_json(&read_out(st, &caller.id, &s, state, menu, None).await?)?;
+    out["read"] = to_json(&read_out(st, &caller.reader(), &s, state, menu, None).await?)?;
     Ok(out)
 }
 
-async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
+async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let a: OpenArgs = args_of(args)?;
+    if !me.is_me(&a.machine) && !caller.local {
+        return Err(bad_request(format!(
+            "«{}» no es este equipo",
+            a.machine.trim()
+        )));
+    }
     if !me.is_me(&a.machine) {
         return Err(bad_request(format!(
             "«{}» es otro equipo (aún no se puede)",
@@ -1111,14 +1255,9 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -
             MAX_PROMPT / 1024
         )));
     }
-    let message = first_message(
-        &caller.name,
-        &me.name,
-        &me.address(&caller.id),
-        a.prompt.trim(),
-    );
+    let opener = caller.address();
+    let message = first_message(&caller.name, &caller.machine_name, &opener, a.prompt.trim());
     let name = a.name.as_deref().map(str::trim).map(str::to_owned);
-    let opener = me.address(&caller.id);
     let created = {
         let mut reg = st.registry.lock().await;
         let session = opened_session(&reg, cwd, name, model.as_deref(), &message, opener);
@@ -1138,7 +1277,7 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -
         return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
     };
     let (state, _) = status_of(st, &v).await;
-    to_json(&entry(st, me, &caller.id, &v, state))
+    to_json(&entry(st, me, caller, &v, state))
 }
 
 /// La sesión que apunta `open` en el registro (sin arrancarla): con el nombre pedido o uno libre
@@ -1175,10 +1314,10 @@ fn opened_session(
     }
 }
 
-async fn tool_answer(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
+async fn tool_answer(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let a: AnswerArgs = args_of(args)?;
-    let s = target(st, me, &a.session).await?;
-    if !opened_by(me, s.opened_by.as_deref(), &caller.id) {
+    let s = target(st, me, caller, &a.session).await?;
+    if !caller.owns(me, s.opened_by.as_deref()) {
         return Err(fail(
             StatusCode::FORBIDDEN,
             "solo puedes contestar las sesiones que abriste",
@@ -1227,10 +1366,10 @@ async fn tool_answer(st: &AppState, me: &Machine, caller: &Session, args: Value)
     Ok(json!({ "ok": true }))
 }
 
-async fn tool_close(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
+async fn tool_close(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let a: SessionArg = args_of(args)?;
-    let s = target(st, me, &a.session).await?;
-    if !opened_by(me, s.opened_by.as_deref(), &caller.id) {
+    let s = target(st, me, caller, &a.session).await?;
+    if !caller.owns(me, s.opened_by.as_deref()) {
         return Err(fail(
             StatusCode::FORBIDDEN,
             "solo puedes cerrar las sesiones que abriste",
@@ -1242,6 +1381,7 @@ async fn tool_close(st: &AppState, me: &Machine, caller: &Session, args: Value) 
     Ok(json!({ "ok": true }))
 }
 
+/// Solo desde una sesión de aquí: no está entre las de `PEER_TOOLS`.
 async fn tool_alert(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply {
     let a: AlertArgs = args_of(args)?;
     let Some(text) = server::alert_text(&a.text) else {
@@ -1309,6 +1449,90 @@ mod tests {
         assert!(!opened_by(&m, Some("k123/otra"), "padre"));
         assert!(!opened_by(&m, Some("Sobremesa/padre"), "padre"));
         assert!(!opened_by(&m, None, "padre"));
+    }
+
+    fn mac() -> crate::group::Member {
+        crate::group::Member {
+            id: "mac-id".into(),
+            key: "clave".into(),
+            name: "Mac".into(),
+            at: 0,
+            removed: false,
+        }
+    }
+
+    fn remote(id: &str) -> Caller {
+        Caller::remote(&mac(), Some(json!({"id": id, "name": "padre"}))).unwrap()
+    }
+
+    #[test]
+    fn local_and_remote_callers() {
+        let m = me(Some("k123"));
+        let here = Caller::local(&m, "padre1", "padre");
+        assert_eq!(here.address(), "k123/padre1");
+        assert_eq!((here.machine_name.as_str(), here.local), ("Portatil", true));
+        let there = remote("padre1");
+        assert_eq!(there.address(), "mac-id/padre1");
+        assert_eq!(
+            (
+                there.machine_name.as_str(),
+                there.name.as_str(),
+                there.local
+            ),
+            ("Mac", "padre", false)
+        );
+        // Sin hub, la de aquí va por el nombre del equipo.
+        assert_eq!(
+            Caller::local(&me(None), "padre1", "padre").address(),
+            "Portatil/padre1"
+        );
+        // Cada una lleva sus cursores: la de aquí por su id (así se olvidan al borrarla), la de
+        // otro equipo por su dirección.
+        assert_eq!(here.reader(), "padre1");
+        assert_eq!(there.reader(), "mac-id/padre1");
+    }
+
+    #[test]
+    fn ownership_by_canonical_address() {
+        let m = me(Some("k123"));
+        let here = Caller::local(&m, "padre1", "padre");
+        let there = remote("padre1");
+        // Abierta por la de aquí (con el id en el hub o, sin él, con el nombre).
+        for by in ["k123/padre1", "Portatil/padre1"] {
+            assert!(here.owns(&m, Some(by)), "{by}");
+            assert!(!there.owns(&m, Some(by)), "{by}: mismo id, otro equipo");
+        }
+        // Abierta por la del Mac.
+        assert!(there.owns(&m, Some("mac-id/padre1")));
+        assert!(there.owns(&m, Some(" mac-id/padre1 ")));
+        assert!(!here.owns(&m, Some("mac-id/padre1")));
+        assert!(!remote("otra").owns(&m, Some("mac-id/padre1")));
+        assert!(!there.owns(&m, Some("padre1")));
+        assert!(!there.owns(&m, None) && !here.owns(&m, None));
+    }
+
+    #[test]
+    fn remote_caller_must_be_valid() {
+        let bad = |v: Option<Value>| Caller::remote(&mac(), v).unwrap_err().1;
+        assert_eq!(bad(None), "falta la sesión que llama");
+        for id in ["", "a/b", "../x", "x y", "ñ", &"a".repeat(65)] {
+            assert!(
+                bad(Some(json!({"id": id, "name": "n"}))).starts_with("sesión que llama no válida"),
+                "{id:?}"
+            );
+        }
+        assert!(bad(Some(json!({"id": "ab"}))).starts_with("sesión que llama no válida"));
+        assert!(bad(Some(json!("ab"))).starts_with("sesión que llama no válida"));
+        // El nombre, sin caracteres de control y no muy largo.
+        let c = Caller::remote(
+            &mac(),
+            Some(json!({"id": "a_B-9", "name": format!("  pa\u{7}dre{}", "x".repeat(100))})),
+        )
+        .unwrap();
+        assert!(c.name.starts_with("padre"), "{}", c.name);
+        assert_eq!(c.name.chars().count(), 64);
+        let c = Caller::remote(&mac(), Some(json!({"id": "ab", "name": "  "}))).unwrap();
+        assert_eq!(c.name, "ab", "sin nombre, el id");
     }
 
     #[test]
@@ -1877,6 +2101,23 @@ mod tests {
         assert_eq!(
             en("la bandeja de esa sesión está llena"),
             "the inbox of that session is full"
+        );
+        assert_eq!(
+            en("«alert» no se puede pedir desde otro equipo"),
+            "“alert” cannot be requested from another machine"
+        );
+        assert_eq!(
+            en("falta la sesión que llama"),
+            "the calling session is missing"
+        );
+        assert_eq!(
+            en("sesión que llama no válida: \"a/b\""),
+            "invalid calling session: \"a/b\""
+        );
+        assert_eq!(en("«Mac» no es este equipo"), "“Mac” is not this machine");
+        assert_eq!(
+            en("«Mac» no es ningún equipo del grupo"),
+            "“Mac” is not a machine in the group"
         );
     }
 }

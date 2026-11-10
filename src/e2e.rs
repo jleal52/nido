@@ -34,6 +34,9 @@ pub const MODE_CONNECT_WEB: u8 = 4;
 /// miembros (IK).
 pub const MODE_GROUP_JOIN: u8 = 5;
 pub const MODE_GROUP_SYNC: u8 = 6;
+/// De nido a nido, entre miembros del grupo (IK): una petición del MCP a las sesiones de otro
+/// equipo (`{"method": …, "params": …}`) y su respuesta (`{"ok": …}` o `{"error": "…"}`).
+pub const MODE_PEER: u8 = 7;
 
 /// Tramas del túnel: `[tipo][flujo u32 BE][datos]`.
 pub const FRAME_OPEN: u8 = 1;
@@ -43,6 +46,13 @@ pub const FRAME_CLOSE: u8 = 3;
 pub const MAX_MSG: usize = 65535;
 /// Lo que cabe en un mensaje Noise menos la etiqueta (16) y la cabecera de la trama (5).
 pub const MAX_CHUNK: usize = MAX_MSG - 16 - 5;
+/// Lo que cabe en la respuesta de `MODE_PEER`: el segundo mensaje del IK lleva la clave efímera
+/// (32) y la etiqueta (16).
+pub const PEER_ROOM: usize = MAX_MSG - 32 - 16;
+/// Lo que sale cuando el otro equipo no contesta a `MODE_PEER`: no hay hub, no está conectado o
+/// tiene una versión de nido que no conoce el modo (y no contesta).
+pub const NO_PEER: &str = "sin conexión o versión antigua";
+const TOO_LARGE: &str = "la respuesta es demasiado grande";
 
 /// Lo que vale un QR de emparejar.
 const PAIR_LIFE: Duration = Duration::from_secs(600);
@@ -539,6 +549,17 @@ pub trait Host: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
+    /// Una petición del MCP desde otro equipo del grupo (`member`, ya comprobado por su clave).
+    fn peer_call<'a>(
+        &'a self,
+        _member: &'a crate::group::Member,
+        _method: &'a str,
+        _params: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+    > {
+        Box::pin(async { Err("este equipo no atiende peticiones de otros".into()) })
+    }
 }
 
 #[derive(Deserialize)]
@@ -579,6 +600,7 @@ pub async fn serve<H: Host>(
         }
         MODE_GROUP_JOIN => group_join(&*host, msg1, &tx).await,
         MODE_GROUP_SYNC => group_sync(&*host, msg1, &tx).await,
+        MODE_PEER => peer(&*host, msg1, &tx).await,
         MODE_CONNECT | MODE_CONNECT_WEB => {
             let pattern = if mode == MODE_CONNECT {
                 CONNECT
@@ -741,6 +763,91 @@ async fn group_sync<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) 
     }
 }
 
+/// Una petición del MCP de otro equipo del grupo (`MODE_PEER`).
+#[derive(Deserialize)]
+struct PeerRequest {
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+/// Otro equipo del grupo pide algo a las sesiones de este. Solo un miembro vivo: a los demás (de
+/// fuera o ya sacados del grupo) ni se les contesta.
+async fn peer<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) {
+    let Some(g) = host.group() else { return };
+    let Ok(mut hs) = builder(CONNECT)
+        .local_private_key(&host.identity().private)
+        .and_then(|b| b.prologue(PROLOGUE))
+        .and_then(|b| b.build_responder())
+    else {
+        return;
+    };
+    let mut payload = vec![0u8; MAX_MSG];
+    let Ok(n) = hs.read_message(msg1, &mut payload) else {
+        return;
+    };
+    let Some(key) = hs.get_remote_static().map(|k| B64.encode(k)) else {
+        return;
+    };
+    let Some(member) = g.snapshot().member_by_key(&key).cloned() else {
+        return;
+    };
+    let result = match serde_json::from_slice::<PeerRequest>(&payload[..n]) {
+        Ok(r) => host.peer_call(&member, &r.method, r.params).await,
+        Err(e) => Err(format!("petición no válida: {e}")),
+    };
+    let mut msg2 = vec![0u8; MAX_MSG];
+    if let Ok(n) = hs.write_message(&peer_reply(result), &mut msg2) {
+        msg2.truncate(n);
+        let _ = tx.send(msg2).await;
+    }
+}
+
+/// La respuesta de `MODE_PEER`: `{"ok": …}` o `{"error": "…"}`. Si no cabe en el mensaje, el
+/// error de que no cabe (nunca un JSON cortado).
+fn peer_reply(result: Result<serde_json::Value, String>) -> Vec<u8> {
+    let v = match result {
+        Ok(v) => serde_json::json!({ "ok": v }),
+        Err(e) => serde_json::json!({ "error": e }),
+    };
+    match serde_json::to_vec(&v) {
+        Ok(b) if b.len() <= PEER_ROOM => b,
+        _ => serde_json::json!({ "error": TOO_LARGE })
+            .to_string()
+            .into_bytes(),
+    }
+}
+
+/// Lo que trae la respuesta de `MODE_PEER`.
+fn peer_answer(body: &[u8]) -> Result<serde_json::Value, String> {
+    let bad = || "respuesta no válida del otro equipo".to_owned();
+    let mut v: serde_json::Value = serde_json::from_slice(body).map_err(|_| bad())?;
+    if let Some(e) = v.get("error") {
+        return Err(e.as_str().map_or_else(bad, str::to_owned));
+    }
+    v.get_mut("ok").map(serde_json::Value::take).ok_or_else(bad)
+}
+
+/// Pide `method` al nido de otro equipo del grupo (su clave, `remote`) por `MODE_PEER`.
+/// `exchange` lleva el primer mensaje y trae la respuesta (el hub, `Hub::exchange`); si falla, el
+/// otro no está o no conoce el modo: `NO_PEER`.
+pub async fn peer_request<F, Fut>(
+    id: &Identity,
+    remote: &[u8; 32],
+    method: &str,
+    params: serde_json::Value,
+    exchange: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnOnce(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    let payload = serde_json::json!({ "method": method, "params": params }).to_string();
+    let (dial, first) = Dial::start_mode(id, remote, None, MODE_PEER, payload.as_bytes())?;
+    let reply = exchange(first).await.map_err(|_| NO_PEER.to_owned())?;
+    peer_answer(&dial.finish(&reply)?)
+}
+
 /// Lado del que inicia (de nido a otro nido): manda el primer mensaje y lee la respuesta. El
 /// transporte lo pone quien llama (el hub).
 pub struct Dial {
@@ -753,6 +860,22 @@ impl Dial {
         id: &Identity,
         remote: &[u8; 32],
         psk: Option<&[u8; 32]>,
+        payload: &[u8],
+    ) -> Result<(Self, Vec<u8>), String> {
+        let mode = if psk.is_some() {
+            MODE_GROUP_JOIN
+        } else {
+            MODE_GROUP_SYNC
+        };
+        Self::start_mode(id, remote, psk, mode, payload)
+    }
+
+    /// Con el modo que se diga: con `psk`, `Noise_IKpsk1`; sin él, `Noise_IK`.
+    pub fn start_mode(
+        id: &Identity,
+        remote: &[u8; 32],
+        psk: Option<&[u8; 32]>,
+        mode: u8,
         payload: &[u8],
     ) -> Result<(Self, Vec<u8>), String> {
         let mut b = builder(if psk.is_some() { PAIR } else { CONNECT })
@@ -768,11 +891,6 @@ impl Dial {
         let n = hs
             .write_message(payload, &mut msg)
             .map_err(|e| e.to_string())?;
-        let mode = if psk.is_some() {
-            MODE_GROUP_JOIN
-        } else {
-            MODE_GROUP_SYNC
-        };
         let mut first = vec![mode];
         first.extend_from_slice(&msg[..n]);
         Ok((Self { hs }, first))
@@ -984,6 +1102,7 @@ mod tests {
         pairing: Pairing,
         phones: Mutex<Phones>,
         addr: Option<SocketAddr>,
+        group: Option<crate::group::Group>,
     }
 
     impl Host for TestHost {
@@ -1002,6 +1121,28 @@ mod tests {
         fn host_name(&self) -> String {
             "equipo".into()
         }
+        fn group(&self) -> Option<&crate::group::Group> {
+            self.group.as_ref()
+        }
+        /// Devuelve quién y qué pidió; `grande`, una respuesta que no cabe; `falla`, un error.
+        fn peer_call<'a>(
+            &'a self,
+            member: &'a crate::group::Member,
+            method: &'a str,
+            params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                match method {
+                    "grande" => Ok(serde_json::json!("x".repeat(70_000))),
+                    "falla" => Err("no se pudo".into()),
+                    _ => Ok(serde_json::json!({
+                        "member": member.id, "method": method, "params": params
+                    })),
+                }
+            })
+        }
     }
 
     fn test_host(dir: &Path, addr: Option<SocketAddr>) -> Arc<TestHost> {
@@ -1010,7 +1151,52 @@ mod tests {
             pairing: Pairing::default(),
             phones: Mutex::new(Phones::load(dir.join("phones.json"))),
             addr,
+            group: None,
         })
+    }
+
+    /// Un nido con grupo: él, `mac` (miembro vivo) y `viejo` (ya fuera del grupo).
+    fn group_host(dir: &Path, mac: &Identity, viejo: &Identity) -> Arc<TestHost> {
+        let id = Identity::load_or_create(&dir.join("hub.key")).unwrap();
+        let g = crate::group::Group::load(dir.join("group.json"), id.public);
+        g.set_self("yo-id", "equipo");
+        g.add_member("mac-id", &B64.encode(mac.public), "Mac");
+        g.add_member("viejo-id", &B64.encode(viejo.public), "Viejo");
+        assert!(g.remove_member("viejo-id"));
+        Arc::new(TestHost {
+            id,
+            pairing: Pairing::default(),
+            phones: Mutex::new(Phones::load(dir.join("phones.json"))),
+            addr: None,
+            group: Some(g),
+        })
+    }
+
+    fn new_identity(dir: &Path, name: &str) -> Identity {
+        Identity::load_or_create(&dir.join(format!("{name}.key"))).unwrap()
+    }
+
+    /// Un ida y vuelta `MODE_PEER` con `host`, sin hub: lo que conteste (`None`: nada).
+    async fn exchange_with<H: Host>(host: &Arc<H>, first: Vec<u8>) -> Result<Vec<u8>, String> {
+        let (tx, mut rx) = Phone::start(host);
+        tx.send(first).await.map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .map_err(|_| "el otro equipo no contesta".to_owned())?
+            .ok_or_else(|| "el otro equipo cerró sin contestar".to_owned())
+    }
+
+    /// Lo que contesta `host` a `from` (el JSON entero de la respuesta), si contesta.
+    async fn ask_peer<H: Host>(
+        host: &Arc<H>,
+        from: &Identity,
+        payload: &[u8],
+    ) -> Option<serde_json::Value> {
+        let (dial, first) =
+            Dial::start_mode(from, &host.identity().public, None, MODE_PEER, payload).unwrap();
+        let reply = exchange_with(host, first).await.ok()?;
+        let body = dial.finish(&reply).expect("descifra");
+        Some(serde_json::from_slice(&body).expect("JSON válido"))
     }
 
     /// Un teléfono de pruebas: su clave y un canal con nido.
@@ -1130,6 +1316,7 @@ mod tests {
             pairing: Pairing::load(file.clone()),
             phones: Mutex::new(Phones::load(dir.path().join("phones.json"))),
             addr: None,
+            group: None,
         });
         let server_key = host.id.public.to_vec();
         let offer = host
@@ -1322,6 +1509,137 @@ mod tests {
             "vectores de {}",
             path.display()
         );
+    }
+
+    #[tokio::test]
+    async fn peer_answers_only_live_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let req = br#"{"method":"sessions","params":{"caller":{"id":"ab12","name":"padre"}}}"#;
+        // Un miembro vivo: quién es (por su clave) y lo que pidió.
+        let r = ask_peer(&host, &mac, req).await.expect("contesta");
+        assert_eq!(
+            r,
+            serde_json::json!({"ok": {
+                "member": "mac-id", "method": "sessions",
+                "params": {"caller": {"id": "ab12", "name": "padre"}}
+            }})
+        );
+        // Un error de quien atiende sale como `error`.
+        let r = ask_peer(&host, &mac, br#"{"method":"falla","params":{}}"#).await;
+        assert_eq!(r, Some(serde_json::json!({"error": "no se pudo"})));
+        // Una petición que no se entiende, también.
+        let r = ask_peer(&host, &mac, b"no es json")
+            .await
+            .expect("contesta");
+        assert!(r["error"].is_string(), "{r}");
+        // Ni a uno que salió del grupo ni a uno de fuera: nada.
+        assert_eq!(ask_peer(&host, &viejo, req).await, None);
+        let otro = new_identity(dir.path(), "otro");
+        assert_eq!(ask_peer(&host, &otro, req).await, None);
+        // Sin grupo, tampoco.
+        let solo = test_host(&dir.path().join("solo"), None);
+        assert_eq!(ask_peer(&solo, &mac, req).await, None);
+    }
+
+    #[tokio::test]
+    async fn peer_reply_too_large_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let r = ask_peer(&host, &mac, br#"{"method":"grande","params":{}}"#).await;
+        assert_eq!(
+            r,
+            Some(serde_json::json!({"error": "la respuesta es demasiado grande"}))
+        );
+    }
+
+    #[test]
+    fn peer_reply_fits_one_noise_message() {
+        // Lo que ocupa `{"ok":"…"}` con `n` letras.
+        let ok = |n: usize| Ok(serde_json::json!("x".repeat(n)));
+        let wrap = r#"{"ok":""}"#.len();
+        let exact = peer_reply(ok(PEER_ROOM - wrap));
+        assert_eq!(exact.len(), PEER_ROOM);
+        let over = peer_reply(ok(PEER_ROOM - wrap + 1));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&over).unwrap(),
+            serde_json::json!({"error": "la respuesta es demasiado grande"})
+        );
+        // Lo que cabe, cabe de verdad en el segundo mensaje del IK.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (new_identity(dir.path(), "a"), new_identity(dir.path(), "b"));
+        let (_, first) = Dial::start_mode(&a, &b.public, None, MODE_PEER, b"{}").unwrap();
+        let mut hs = builder(CONNECT)
+            .local_private_key(&b.private)
+            .unwrap()
+            .prologue(PROLOGUE)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        assert_eq!(first[0], MODE_PEER);
+        hs.read_message(&first[1..], &mut vec![0u8; MAX_MSG])
+            .unwrap();
+        let mut msg2 = vec![0u8; MAX_MSG];
+        assert_eq!(hs.write_message(&exact, &mut msg2).unwrap(), MAX_MSG);
+        // Un error enorme también se sustituye.
+        let big_err = peer_reply(Err("e".repeat(70_000)));
+        assert!(big_err.len() <= PEER_ROOM);
+    }
+
+    #[tokio::test]
+    async fn peer_request_round_trip_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let key = host.id.public;
+        let params = serde_json::json!({"session": "ab12"});
+        let r = peer_request(&mac, &key, "read", params.clone(), |f| {
+            exchange_with(&host, f)
+        })
+        .await;
+        assert_eq!(
+            r,
+            Ok(serde_json::json!({"member": "mac-id", "method": "read", "params": params}))
+        );
+        let r = peer_request(&mac, &key, "falla", serde_json::json!({}), |f| {
+            exchange_with(&host, f)
+        })
+        .await;
+        assert_eq!(r, Err("no se pudo".into()));
+        // Uno que ya no es del grupo no recibe respuesta: sin conexión o versión antigua.
+        let r = peer_request(&viejo, &key, "read", serde_json::json!({}), |f| {
+            exchange_with(&host, f)
+        })
+        .await;
+        assert_eq!(r, Err(NO_PEER.into()));
+        // Sin hub, o un equipo con una versión que no conoce el modo: lo mismo.
+        let r = peer_request(&mac, &key, "read", serde_json::json!({}), |_| async {
+            Err::<Vec<u8>, _>("no hay hub configurado".to_owned())
+        })
+        .await;
+        assert_eq!(r, Err(NO_PEER.into()));
+        assert_eq!(
+            crate::i18n::english(NO_PEER),
+            "no connection or old version"
+        );
+        assert_eq!(
+            crate::i18n::english("la respuesta es demasiado grande"),
+            "the reply is too large"
+        );
+        // Una respuesta sin `ok` ni `error`, no vale.
+        assert!(peer_answer(br#"{"x":1}"#).is_err());
+        assert_eq!(peer_answer(br#"{"ok":null}"#), Ok(serde_json::Value::Null));
     }
 
     #[test]

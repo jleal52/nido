@@ -97,6 +97,16 @@ impl e2e::Host for AppState {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(self.sync_group())
     }
+    fn peer_call<'a>(
+        &'a self,
+        member: &'a crate::group::Member,
+        method: &'a str,
+        params: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+    > {
+        Box::pin(crate::mcp_api::peer_call(self, member, method, params))
+    }
     fn host_name(&self) -> String {
         if let Some(n) = std::env::var("NIDO_NAME")
             .ok()
@@ -740,6 +750,32 @@ impl AppState {
                 break;
             }
         }
+    }
+
+    /// Pide `method` (una herramienta del MCP, con quien llama en `params.caller`) al nido de otro
+    /// equipo del grupo, por su id en el hub o su nombre, por el canal «peer» (`e2e::MODE_PEER`).
+    /// Devuelve lo que conteste: lo de la herramienta o su error (en español).
+    pub async fn peer(
+        &self,
+        member: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let member = member.trim();
+        let m = self
+            .group
+            .others()
+            .into_iter()
+            .find(|m| m.id == member || m.name.eq_ignore_ascii_case(member))
+            .ok_or_else(|| format!("«{member}» no es ningún equipo del grupo"))?;
+        let key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &m.key)
+            .ok()
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
+            .ok_or_else(|| format!("«{member}» no es ningún equipo del grupo"))?;
+        e2e::peer_request(&self.identity, &key, method, params, |first| {
+            self.hub.exchange(&m.id, first)
+        })
+        .await
     }
 
     /// Unirse al grupo de otro equipo con su código de `nido group invite`.
