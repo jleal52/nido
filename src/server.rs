@@ -779,9 +779,8 @@ async fn watch_held(
                 );
                 // Retenida hasta que el usuario lo conteste (ver `keep_held`).
                 if let Some(h) = hold.take() {
-                    let socket = st.paths.socket(id);
                     tokio::spawn(keep_held(
-                        socket,
+                        st.paths.clone(),
                         scr.take(),
                         h,
                         name.clone(),
@@ -820,7 +819,7 @@ async fn watch_held(
     // que le llegue: retenida, y se sigue mirando (ver `keep_held`).
     if let Some(h) = hold.take() {
         tokio::spawn(keep_held(
-            st.paths.socket(id),
+            st.paths.clone(),
             scr.take(),
             h,
             name,
@@ -836,7 +835,35 @@ async fn watch_held(
 
 type HolderScreen = prompt::Screen<crate::ipc::ReadHalf, crate::ipc::WriteHalf>;
 
-/// Tras tantas veces seguidas sin que su guardián conteste (con `keep_held`, un minuto), se dice.
+/// Cada cuánto mira `keep_held` (`elapsed`: desde que empezó): cada segundo el primer minuto, y
+/// luego cada cinco (al restaurar puede haber muchas retenidas).
+fn keep_pace(elapsed: Duration) -> Duration {
+    if elapsed < Duration::from_secs(60) {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
+/// ¿Hay un Claude en la sesión `id` (ver `claude::session_claude`)? `None` si no hay guardián
+/// (se cerró).
+async fn claude_running(paths: &Paths, id: &str) -> Option<bool> {
+    let paths = paths.clone();
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if !launch::is_alive(&paths, &id) {
+            return None;
+        }
+        let holder = launch::holder_pid(&paths, &id).and_then(|p| u32::try_from(p).ok())?;
+        let procfs = Procfs::default();
+        Some(claude::session_claude(&procfs, holder, &paths.home).is_some())
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Tras tantas veces seguidas sin que su guardián conteste (con `keep_held`, un minuto o más), se
+/// dice.
 const SLOW_SAY: u32 = 12;
 
 /// Las veces seguidas que el guardián de una sesión tardó en contestar.
@@ -918,26 +945,47 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
         crate::inbox::Refusal::NoServer => {
             eprintln!("nido: {name}: Claude no tiene el MCP de nido; queda sin channel")
         }
+        crate::inbox::Refusal::NoClaude => eprintln!(
+            "nido: {name} ({id}): su Claude ya no está en marcha; queda sin channel hasta que se \
+             vuelva a lanzar"
+        ),
     }
 }
 
 /// Pasado el plazo sin haber soltado la bandeja (el aviso de los channels o la pregunta de
 /// confiar aún en pantalla, otra pantalla, o su guardián sin contestar): se sigue mirando (sin
 /// pulsar nada) hasta que Claude espere peticiones, y entonces se suelta (o se apunta que no
-/// tiene channel). Solo se suelta sin mirar si se cierra la sesión (nadie atiende en `socket`).
-/// Si su guardián lleva mucho sin contestar, se dice una vez.
+/// tiene channel). Solo se suelta sin mirar si se cierra la sesión (nadie atiende en su socket).
+/// Si su Claude se va y la sesión sigue (p. ej. una shell de login que no le hace `exec`), sin
+/// channel hasta que se vuelva a lanzar, y se deja de mirar. Si su guardián lleva mucho sin
+/// contestar, se dice una vez. Mira cada vez menos (ver `keep_pace`).
 async fn keep_held(
-    socket: std::path::PathBuf,
+    paths: Paths,
     mut scr: Option<HolderScreen>,
     hold: crate::inbox::Hold,
     name: String,
     id: String,
 ) {
     use prompt::Startup;
+    let socket = paths.socket(&id);
+    let begun = tokio::time::Instant::now();
     let mut since = None;
     let mut slow = SlowCount::default();
+    // Si se ha visto su Claude: sin verlo nunca no se sabe si se fue (instalado con npm su
+    // proceso es `node`, y no se encuentra).
+    let mut seen = false;
     loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(keep_pace(begun.elapsed())).await;
+        // Antes que la pantalla: sin Claude, la de la shell no dice nada.
+        match claude_running(&paths, &id).await {
+            Some(true) => seen = true,
+            Some(false) if seen => {
+                hold.refuse(crate::inbox::Refusal::NoClaude);
+                log_refusal(crate::inbox::Refusal::NoClaude, &name, &id);
+                return;
+            }
+            _ => {}
+        }
         if scr.is_none() {
             let Ok(s) = viewer_at(&socket).await else {
                 return;
@@ -3228,6 +3276,14 @@ mod tests {
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].text, "nueva");
         assert!(unread_alerts(&alerts, 30).is_empty());
+    }
+
+    #[test]
+    fn keep_held_looks_less_often_after_a_minute() {
+        assert_eq!(keep_pace(Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(keep_pace(Duration::from_secs(59)), Duration::from_secs(1));
+        assert_eq!(keep_pace(Duration::from_secs(60)), Duration::from_secs(5));
+        assert_eq!(keep_pace(Duration::from_secs(3600)), Duration::from_secs(5));
     }
 
     #[tokio::test]

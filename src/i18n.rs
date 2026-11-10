@@ -341,6 +341,10 @@ const TABLE: &[(&str, &str)] = &[
         "this session does not accept messages (no channel): its Claude does not have nido's MCP server",
     ),
     (
+        "esa sesión no admite mensajes (no tiene channel): su Claude no está en marcha",
+        "this session does not accept messages (no channel): its Claude is not running",
+    ),
+    (
         "la bandeja de esa sesión está llena",
         "the inbox of that session is full",
     ),

@@ -753,6 +753,9 @@ pub fn decide(d: &Dest) -> Result<Decision, Fail> {
                 "esa sesión no admite mensajes (no tiene channel): su Claude no tiene el MCP de \
                  nido"
             }
+            inbox::Refusal::NoClaude => {
+                "esa sesión no admite mensajes (no tiene channel): su Claude no está en marcha"
+            }
         };
         return Err(fail(StatusCode::CONFLICT, msg));
     }
@@ -3011,6 +3014,14 @@ mod tests {
                 StatusCode::CONFLICT,
                 "this session does not accept messages (no channel): its Claude does not have \
                  nido's MCP server"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            refused(inbox::Refusal::NoClaude),
+            Err((
+                StatusCode::CONFLICT,
+                "this session does not accept messages (no channel): its Claude is not running"
                     .to_owned()
             ))
         );

@@ -576,6 +576,101 @@ async fn claude_launches_with_the_nido_channel() {
     std::fs::remove_file(&socket).unwrap();
     assert!(released(&state, &s.id).await, "no se soltó sin guardián");
 
+    // Su Claude se va sin haber enseñado su caja, y la sesión sigue (p. ej. una shell de login
+    // que no le hace `exec`): nadie recogerá la bandeja. Sin channel hasta que se vuelva a lanzar
+    // (sin soltarla), y se deja de mirar; lo que espera sigue en la cola.
+    let ida = tmp.path().join("sin-claude");
+    std::fs::create_dir_all(&ida).unwrap();
+    std::os::unix::fs::symlink("/bin/bash", ida.join("claude")).unwrap();
+    std::fs::write(
+        ida.join("screen"),
+        "Select login method:\n\n❯ 1. Claude account with subscription\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ida.join("program"),
+        "#!/bin/sh\nprintf '\\033[2J\\033[H'; cat screen\n./claude -c 'sleep 5 & wait'\n\
+         printf '\\033[2J\\033[H$ '\nexec sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        ida.join("program"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(Session {
+            claude: Some(nido::registry::ClaudeLink {
+                session_id: "conv-ida".into(),
+                config_dir: None,
+                account: None,
+                inside_shell: false,
+            }),
+            ..session("sin-claude", &ida, &["claude"])
+        })
+        .unwrap();
+    state
+        .inbox
+        .push(
+            &s.id,
+            nido::inbox::Msg {
+                id: "i1".into(),
+                from: "padre".into(),
+                from_id: "Prueba/x".into(),
+                machine: "Prueba".into(),
+                text: "hola".into(),
+                at: 1,
+            },
+        )
+        .unwrap();
+    nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
+    let end = server::watch_startup(&state, &s.id, Duration::from_secs(1)).await;
+    assert_eq!(end, Startup::Nothing);
+    assert!(state.inbox.held(&s.id), "soltada sin mirar");
+    let mut gone = false;
+    for _ in 0..150 {
+        if state.inbox.refusal(&s.id) == Some(nido::inbox::Refusal::NoClaude) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(gone, "no vio que su Claude se fue");
+    assert!(nido::launch::is_alive(&paths, &s.id), "la shell sigue");
+    assert!(state.inbox.held(&s.id));
+    assert!(!state.inbox.channel(&s.id));
+    assert_eq!(state.inbox.pending(&s.id).len(), 1, "sigue en la cola");
+    let (code, e) = tool(
+        addr,
+        &caller,
+        "send",
+        json!({"session": s.id, "text": "hola"}),
+    )
+    .await;
+    assert_eq!(code, 409, "{e}");
+    let why = e["error"].as_str().unwrap();
+    assert!(
+        why.contains("not running") || why.contains("no está en marcha"),
+        "{e}"
+    );
+    let (_, list) = tool(addr, &caller, "sessions", json!({})).await;
+    let me = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == s.id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(me["channel_error"], "claude not running", "{me}");
+    // Ya no se mira: solo lo de este arranque la retiene.
+    state.inbox.relaunched(&s.id);
+    assert!(released(&state, &s.id).await, "se sigue mirando");
+    assert_eq!(state.inbox.pending(&s.id).len(), 1);
+    nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
+
     // Apagado: la sesión siguiente va sin opciones, sin `NIDO_CHANNEL` y sin que nadie teclee.
     assert!(nido_mcp(tmp.path(), false).contains("apagado"));
     assert!(paths.config.join("mcp-off").exists());

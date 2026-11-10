@@ -65,6 +65,9 @@ pub enum Refusal {
     /// La organización de la cuenta de Claude no permite channels (`channelsEnabled`): Claude
     /// tira lo que le llegue por el channel.
     Blocked,
+    /// Su Claude se fue sin haber enseñado su caja y la sesión sigue (p. ej. una shell de login
+    /// que no le hace `exec`): nadie recogerá su bandeja.
+    NoClaude,
 }
 
 impl Refusal {
@@ -73,6 +76,7 @@ impl Refusal {
         match self {
             Refusal::NoServer => "no nido MCP server",
             Refusal::Blocked => "blocked by org policy",
+            Refusal::NoClaude => "claude not running",
         }
     }
 }
