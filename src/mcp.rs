@@ -1729,7 +1729,7 @@ mod tests {
         assert!(head.contains("Authorization: Bearer t0k3n"), "{head}");
         // Con su pid: `nido serve` busca el Claude que tiene encima, y la bandeja es de ese.
         assert!(head.contains("X-Nido-Mcp-Pid: 4321"), "{head}");
-        let (addr, h) = one_shot(http_ok(r#"{"ok":true,"removed":1}"#));
+        let (addr, h) = one_shot(http_ok(r#"{"ok":true,"acked":1}"#));
         assert_eq!(local(addr).ack(&["m1".into()]), Ok(()));
         let req = h.join().unwrap();
         let (head, body) = req.split_once("\r\n\r\n").unwrap();

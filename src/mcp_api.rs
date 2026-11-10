@@ -1479,22 +1479,25 @@ pub async fn check_delivery(st: &AppState, id: &str, tick: Option<Duration>) {
     let Some(elapsed) = tick else {
         return;
     };
-    let busy = st
-        .views
-        .borrow()
-        .sessions
-        .iter()
-        .find(|v| v.id == id)
-        .is_none_or(|v| {
-            !v.alive
-                || v.claude
-                    .as_ref()
-                    .is_some_and(|c| c.status.as_deref() == Some("busy"))
-        });
+    let idle = idle_for_delivery(st.views.borrow().sessions.iter().find(|v| v.id == id));
     let writing = SystemTime::now()
         .duration_since(written)
         .is_ok_and(|age| age < st.inbox.transcript_quiet());
-    st.inbox.tick(id, !busy && !writing, elapsed);
+    st.inbox.tick(id, idle && !writing, elapsed);
+}
+
+/// ¿Corre el reloj de un mensaje emitido y aún no visto? Solo con la sesión viva y su Claude
+/// ni trabajando (`busy`) ni esperándote (`waiting`: un permiso o una pregunta en pantalla);
+/// en esos casos Claude Code guarda el evento y lo pasa a la conversación después, y darlo
+/// otra vez lo duplicaría.
+fn idle_for_delivery(v: Option<&SessionView>) -> bool {
+    v.is_some_and(|v| {
+        v.alive
+            && !v
+                .claude
+                .as_ref()
+                .is_some_and(|c| matches!(c.status.as_deref(), Some("busy" | "waiting")))
+    })
 }
 
 /// La bandeja de la sesión `id` solo la recoge (y confirma) el `nido mcp` de su Claude. Su pid
@@ -2429,6 +2432,40 @@ fn alive_state(state: Result<Status, Fail>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_delivery_clock_runs_only_with_claude_idle() {
+        let view = |alive: bool, status: Option<&str>| SessionView {
+            id: "s".into(),
+            name: "s".into(),
+            cwd: "/tmp".into(),
+            argv: vec!["claude".into()],
+            autostart: false,
+            created: 0,
+            alive,
+            claude: Some(crate::server::ClaudeView {
+                background: None,
+                session_id: "c".into(),
+                running: true,
+                status: status.map(str::to_owned),
+                title: None,
+                account: None,
+            }),
+            folder: None,
+            unread: false,
+            opened_by: None,
+            alerts: vec![],
+        };
+        let idle = |v: SessionView| idle_for_delivery(Some(&v));
+        assert!(idle(view(true, Some("idle"))));
+        assert!(idle(view(true, None)));
+        // Trabajando, o con un permiso o una pregunta en pantalla: Claude lo guarda para luego.
+        assert!(!idle(view(true, Some("busy"))));
+        assert!(!idle(view(true, Some("waiting"))));
+        // Parada, o aún sin ver por el escáner: no.
+        assert!(!idle(view(false, Some("idle"))));
+        assert!(!idle_for_delivery(None));
+    }
 
     fn me(key: Option<&str>) -> Machine {
         Machine {
