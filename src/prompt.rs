@@ -211,9 +211,34 @@ fn indent(l: &str) -> usize {
     l.chars().take_while(|c| *c == ' ').count()
 }
 
+fn is_rule_char(c: char) -> bool {
+    matches!(c, '─' | '╌' | '▔' | '━' | '═')
+}
+
+/// Una raya: solo de rayas, o con un rótulo dentro (Claude pone ahí el nombre de la sesión,
+/// `-n`: «──────── hija-b ─»). Con rótulo, estricta para que no pase una línea de texto: rayas
+/// desde el principio (al menos `RULE_LEFT`, y más que el rótulo), un espacio, el rótulo, un
+/// espacio y rayas hasta el final.
 fn is_rule(l: &str) -> bool {
+    const RULE_LEFT: usize = 10;
     let t = l.trim();
-    t.chars().count() >= 6 && t.chars().all(|c| matches!(c, '─' | '╌' | '▔' | '━' | '═'))
+    if t.chars().count() >= 6 && t.chars().all(is_rule_char) {
+        return true;
+    }
+    let left = t.chars().take_while(|&c| is_rule_char(c)).count();
+    let right = t.chars().rev().take_while(|&c| is_rule_char(c)).count();
+    let total = t.chars().count();
+    if left < RULE_LEFT || right == 0 || left + right + 2 >= total {
+        return false;
+    }
+    let label: String = t.chars().skip(left).take(total - left - right).collect();
+    let Some(label) = label.strip_prefix(' ').and_then(|r| r.strip_suffix(' ')) else {
+        return false;
+    };
+    !label.is_empty()
+        && label.trim() == label
+        && !label.chars().any(is_rule_char)
+        && label.chars().count() < left
 }
 
 /// `❯ 3. Texto` → (seleccionada, 3, columna donde empieza «Texto», «Texto»).
@@ -2172,6 +2197,43 @@ mod tests {
         assert!(repl(sin));
         assert!(!repl(aviso));
         assert!(!repl(include_str!("../tests/pantallas/confianza.txt")));
+        // Con nombre (`-n`), Claude lo pone en la raya de arriba de su caja: es su caja igual.
+        let nombrada = include_str!("../tests/pantallas/caja_con_nombre.txt");
+        assert!(repl(nombrada));
+        assert_eq!(startup(nombrada), Startup::Nothing);
+        assert_eq!(dev_channels(nombrada), None);
+        // Y con ella lo de antes se lee igual.
+        let named = |screen: &str| {
+            let rows: Vec<&str> = screen.lines().collect();
+            let top = rows
+                .windows(2)
+                .rposition(|w| w[0].starts_with("──────") && w[1].starts_with('❯'))
+                .expect("caja");
+            let mut out: Vec<String> = rows.iter().map(|l| l.to_string()).collect();
+            let n = out[top].chars().count();
+            out[top] = format!("{} hija-b ─", "─".repeat(n - 9));
+            out.join("\n")
+        };
+        let b = named(bloqueado);
+        assert_ne!(b, bloqueado.trim_end());
+        assert!(repl(&b));
+        assert_eq!(startup(&b), Startup::Blocked);
+        assert_eq!(launch_refusal(&b), Some(Startup::Blocked));
+        let b = named(sin);
+        assert!(repl(&b));
+        assert_eq!(startup(&b), Startup::NoServer);
+        let c = named(&citado);
+        assert!(repl(&c));
+        assert_eq!(dev_channels(&c), None);
+        assert_eq!(startup(&c), Startup::Nothing);
+        let c = named(include_str!("../tests/pantallas/conversacion_aviso.txt"));
+        let cortado: String = c
+            .lines()
+            .skip_while(|l| !l.contains("────────────────"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(dev_channels(&cortado), None);
+        assert_eq!(startup(&cortado), Startup::Nothing);
         // «no MCP server configured» solo cuenta en la fila de Channels de nido: no en lo que
         // diga la conversación retomada.
         let normal = include_str!("../tests/pantallas/normal.txt");
@@ -2185,6 +2247,30 @@ mod tests {
                 Startup::Nothing,
                 "{other}"
             );
+        }
+    }
+
+    #[test]
+    fn a_rule_may_carry_the_session_name() {
+        let long = "─".repeat(40);
+        assert!(is_rule(&long));
+        assert!(is_rule(&format!("{long} hija-b ─")));
+        assert!(is_rule(&format!("  {long} mi sesión ─")));
+        assert!(is_rule(&format!("{long} nido ────")));
+        // Texto con rayas y palabras: no.
+        for l in [
+            format!("── nota ──{long}"),
+            "──────── hola ─".to_owned(),
+            format!("Texto {long} hola ─"),
+            format!("{long} hola"),
+            format!("{long} hola ─ adiós"),
+            format!("{long}  ─"),
+            format!("{long}hola ─"),
+            format!("{long} hola─"),
+            format!("● {long} hola ─"),
+            "──────────── una frase bastante más larga que la raya de la izquierda ─".to_owned(),
+        ] {
+            assert!(!is_rule(&l), "{l}");
         }
     }
 
