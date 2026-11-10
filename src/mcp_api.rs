@@ -50,9 +50,21 @@ pub const WAIT_MAX_S: u64 = 1800;
 pub const MAX_PROMPT: usize = 24 * 1024;
 /// Lo más largo que puede ser el modelo de `open` (en caracteres).
 pub const MAX_MODEL: usize = 128;
-/// Cuántas sesiones abiertas con `open` desde un mismo equipo puede haber aquí a la vez (las que
-/// siguen apuntadas, en marcha o no): un equipo del grupo no llena este de Claudes.
+/// Cuántas sesiones abiertas con `open` desde un mismo equipo puede haber aquí en marcha a la vez,
+/// y apuntadas (en marcha o no): un equipo del grupo no llena este de Claudes. Las paradas cuentan
+/// solo para el segundo tope, más holgado: las huérfanas no dejan fuera al equipo.
 pub const MAX_REMOTE_OPEN: usize = 10;
+pub const MAX_REMOTE_REGISTERED: usize = 50;
+
+/// ¿Se puede abrir otra desde ese equipo? `alive`: si está en marcha cada una de las que ya abrió.
+pub fn open_allowed(alive: impl Iterator<Item = bool>) -> bool {
+    let (mut running, mut registered) = (0, 0);
+    for a in alive {
+        registered += 1;
+        running += usize::from(a);
+    }
+    running < MAX_REMOTE_OPEN && registered < MAX_REMOTE_REGISTERED
+}
 /// `send` con `wait`: cuánto se espera, como mucho, a que la sesión recoja el mensaje y se ponga
 /// a trabajar.
 pub const PICKUP: Duration = Duration::from_secs(30);
@@ -167,14 +179,15 @@ impl Caller {
     /// Una sesión de otro equipo del grupo. El equipo sale de su clave Noise, ya comprobada
     /// (`member`), nunca de lo que diga; la sesión, de `caller` (`{id, name}`), que vale porque
     /// el equipo es del grupo. El id, como los de nido (lo mismo que `NIDO_SESSION`). Un miembro
-    /// que se llama como este equipo (por su id o su nombre) no: su dirección sería de aquí.
+    /// cuyo id es el de este equipo (o su nombre, si no hay hub) no: su dirección sería de aquí.
+    /// Con el mismo nombre sí: WSL toma el del Windows en que corre.
     pub fn remote(
         me: &Machine,
         member: &crate::group::Member,
         caller: Option<Value>,
     ) -> Result<Self, Fail> {
         let machine_name = clean_name(&member.name);
-        if me.is_me(&member.id) || me.is_me(&machine_name) {
+        if me.is_me(&member.id) {
             return Err(bad_request(
                 "la sesión que llama no puede ser de este equipo".into(),
             ));
@@ -1350,15 +1363,15 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         let mut reg = st.registry.lock().await;
         if !caller.local {
             let from = format!("{}/", caller.machine_key);
-            let opened = reg
+            let alive = reg
                 .sessions()
                 .iter()
                 .filter(|s| s.opened_by.as_deref().is_some_and(|o| o.starts_with(&from)))
-                .count();
-            if opened >= MAX_REMOTE_OPEN {
+                .map(|s| launch::is_alive(&st.paths, &s.id));
+            if !open_allowed(alive) {
                 return Err(fail(
                     StatusCode::CONFLICT,
-                    "demasiadas sesiones abiertas desde ese equipo",
+                    "demasiadas sesiones abiertas desde ese equipo; cierra alguna",
                 ));
             }
         }
@@ -1681,20 +1694,38 @@ mod tests {
         assert_eq!(c.machine_name.chars().count(), 64);
         let c = Caller::remote(&m, &member("mac-id", " \t "), who.clone()).unwrap();
         assert_eq!(c.machine_name, "mac-id", "sin nombre, su id");
-        // Un miembro que dice ser este equipo (por su id o su nombre): no.
-        for (id, name) in [
-            ("k123", "Mac"),
-            ("Portatil", "Mac"),
-            ("mac-id", "portatil"),
-            ("mac-id", "k123"),
-            ("mac-id", " Portatil\u{7} "),
-        ] {
+        // Un miembro cuyo id es el de este equipo (o su nombre, sin hub): no, su dirección
+        // sería de aquí.
+        for (id, name) in [("k123", "Mac"), ("Portatil", "Mac")] {
             let e = Caller::remote(&m, &member(id, name), who.clone()).unwrap_err();
             assert_eq!(
                 e.1, "la sesión que llama no puede ser de este equipo",
                 "{id} {name}"
             );
         }
+        // Con el mismo nombre, sí: WSL toma el nombre del Windows en que corre, y la dirección
+        // va por el id.
+        for name in ["portatil", "k123", " Portatil\u{7} "] {
+            let c = Caller::remote(&m, &member("mac-id", name), who.clone()).unwrap();
+            assert_eq!(c.address(), "mac-id/ab", "{name}");
+        }
+    }
+
+    #[test]
+    fn open_limits_per_machine() {
+        // (en marcha) de las abiertas desde ese equipo.
+        let ok = |alive: &[bool]| open_allowed(alive.iter().copied());
+        assert!(ok(&[]));
+        assert!(ok(&[true; 9]));
+        assert!(!ok(&[true; 10]));
+        // Las paradas no cuentan para las 10…
+        let mut many = vec![true; 9];
+        many.extend([false; 40]);
+        assert!(ok(&many));
+        // …pero sí para las 50.
+        many.push(false);
+        assert!(!ok(&many));
+        assert_eq!((MAX_REMOTE_OPEN, MAX_REMOTE_REGISTERED), (10, 50));
     }
 
     #[test]

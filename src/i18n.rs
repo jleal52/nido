@@ -320,8 +320,8 @@ const TABLE: &[(&str, &str)] = &[
         "the calling session cannot be on this machine",
     ),
     (
-        "demasiadas sesiones abiertas desde ese equipo",
-        "too many sessions opened from that machine",
+        "demasiadas sesiones abiertas desde ese equipo; cierra alguna",
+        "too many sessions opened from that machine; close some",
     ),
     // server.rs (canal «peer»)
     (

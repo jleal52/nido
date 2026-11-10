@@ -68,13 +68,32 @@ pub type PeerResult = Result<serde_json::Value, (u16, String)>;
 /// Las peticiones de `MODE_PEER` atendidas en los últimos `PEER_REPLAY`, por la clave efímera del
 /// que pide (los 32 primeros bytes del primer mensaje). El hub no es de fiar: podría repetir un
 /// primer mensaje que vio pasar, y cada repetición volvería a mandar, abrir, contestar o cerrar.
-#[derive(Default)]
-pub struct PeerReplays(Mutex<HashMap<Vec<u8>, Instant>>);
+/// Solo en memoria: tras reiniciar no se sabe qué se atendió, así que no vale nada pedido antes de
+/// arrancar (`started_ms`).
+pub struct PeerReplays {
+    seen: Mutex<HashMap<Vec<u8>, Instant>>,
+    /// Cuándo se creó (ms): al arrancar nido.
+    pub started_ms: u64,
+}
+
+impl Default for PeerReplays {
+    fn default() -> Self {
+        Self::since(crate::group::now_ms())
+    }
+}
 
 impl PeerReplays {
+    /// Como si se hubiera arrancado en `started_ms`.
+    pub fn since(started_ms: u64) -> Self {
+        Self {
+            seen: Mutex::default(),
+            started_ms,
+        }
+    }
+
     /// La apunta y dice si es la primera vez que llega. Al apuntar, fuera las ya caducadas.
     pub fn first_time(&self, ephemeral: &[u8], now: Instant) -> bool {
-        let mut seen = self.0.lock().expect("peticiones");
+        let mut seen = self.seen.lock().expect("peticiones");
         seen.retain(|_, at| now.saturating_duration_since(*at) < PEER_REPLAY);
         if seen.contains_key(ephemeral) {
             return false;
@@ -84,7 +103,7 @@ impl PeerReplays {
     }
 
     pub fn len(&self) -> usize {
-        self.0.lock().expect("peticiones").len()
+        self.seen.lock().expect("peticiones").len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -842,7 +861,11 @@ async fn peer<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) {
     };
     let result = match serde_json::from_slice::<PeerRequest>(&payload[..n]) {
         Err(e) => Err((400, format!("petición no válida: {e}"))),
-        Ok(r) if crate::group::now_ms().abs_diff(r.at) > PEER_SKEW_MS => {
+        // Vieja, del futuro o de antes de arrancar (lo que se atendió entonces ya no se sabe).
+        Ok(r)
+            if crate::group::now_ms().abs_diff(r.at) > PEER_SKEW_MS
+                || r.at < replays.started_ms =>
+        {
             Err((409, REPLAYED.to_owned()))
         }
         // La efímera es lo primero del mensaje (y ya descifró: es de este miembro).
@@ -1234,6 +1257,16 @@ mod tests {
 
     /// Un nido con grupo: él, `mac` (miembro vivo) y `viejo` (ya fuera del grupo).
     fn group_host(dir: &Path, mac: &Identity, viejo: &Identity) -> Arc<TestHost> {
+        group_host_since(dir, mac, viejo, now())
+    }
+
+    /// Lo mismo, arrancado en `started` (ms).
+    fn group_host_since(
+        dir: &Path,
+        mac: &Identity,
+        viejo: &Identity,
+        started: u64,
+    ) -> Arc<TestHost> {
         let id = Identity::load_or_create(&dir.join("hub.key")).unwrap();
         let g = crate::group::Group::load(dir.join("group.json"), id.public);
         g.set_self("yo-id", "equipo");
@@ -1246,7 +1279,7 @@ mod tests {
             phones: Mutex::new(Phones::load(dir.join("phones.json"))),
             addr: None,
             group: Some(g),
-            replays: PeerReplays::default(),
+            replays: PeerReplays::since(started),
         })
     }
 
@@ -1690,11 +1723,71 @@ mod tests {
             let r = ask_peer(&host, &mac, &req("sessions", serde_json::json!({}), at)).await;
             assert_eq!(r, stale, "{at}");
         }
-        // Dentro del margen, sí.
+        // Dentro del margen, sí (en un nido que arrancó antes).
+        let host = group_host_since(dir.path(), &mac, &viejo, now() - 60_000);
         for at in [now() - 30_000, now() + 30_000] {
             let r = ask_peer(&host, &mac, &req("sessions", serde_json::json!({}), at)).await;
             assert_eq!(r.unwrap()["ok"]["method"], "sessions", "{at}");
         }
+    }
+
+    #[tokio::test]
+    async fn peer_rejects_requests_from_before_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let at = now();
+        let payload = req("sessions", serde_json::json!({}), at);
+        // Dos iniciadores con la misma efímera: el mismo primer mensaje, y cada uno lee su
+        // respuesta.
+        let host = group_host_since(dir.path(), &mac, &viejo, at - 1_000);
+        let initiator = || {
+            builder(CONNECT)
+                .local_private_key(&mac.private)
+                .unwrap()
+                .remote_public_key(&host.id.public)
+                .unwrap()
+                .fixed_ephemeral_key_for_testing_only(&[6u8; 32])
+                .prologue(PROLOGUE)
+                .unwrap()
+                .build_initiator()
+                .unwrap()
+        };
+        let ask_with = |hs: &mut snow::HandshakeState| {
+            let mut m = vec![0u8; MAX_MSG];
+            let n = hs.write_message(&payload, &mut m).unwrap();
+            let mut first = vec![MODE_PEER];
+            first.extend_from_slice(&m[..n]);
+            first
+        };
+        let read = |hs: &mut snow::HandshakeState, reply: &[u8]| {
+            let mut p = vec![0u8; MAX_MSG];
+            let n = hs.read_message(reply, &mut p).unwrap();
+            serde_json::from_slice::<serde_json::Value>(&p[..n]).unwrap()
+        };
+        let (mut a, mut b) = (initiator(), initiator());
+        let first = ask_with(&mut a);
+        assert_eq!(ask_with(&mut b), first, "el mismo mensaje");
+        let reply = exchange_with(&host, first.clone()).await.unwrap();
+        assert_eq!(read(&mut a, &reply)["ok"]["method"], "sessions");
+        // Reiniciado (lo ya visto se olvida), el hub repite el mensaje dentro del minuto: es de
+        // antes de arrancar, no vale.
+        let again = group_host_since(dir.path(), &mac, &viejo, at + 1);
+        let reply = exchange_with(&again, first).await.unwrap();
+        assert_eq!(
+            read(&mut b, &reply),
+            serde_json::json!({"error": "petición caducada o repetida", "code": 409})
+        );
+        // Una nueva, de después de arrancar, sí.
+        let fresh = ask_peer(
+            &again,
+            &mac,
+            &req("sessions", serde_json::json!({}), at + 2),
+        )
+        .await;
+        assert_eq!(fresh.unwrap()["ok"]["method"], "sessions");
     }
 
     #[test]

@@ -344,48 +344,6 @@ async fn peer_calls_end_to_end() {
     let a = opened["id"].as_str().unwrap().to_owned();
     let reg_a = state.registry.lock().await.get(&a).cloned().unwrap();
     assert_eq!(reg_a.opened_by.as_deref(), Some(remote_addr.as_str()));
-    // Como mucho 10 abiertas desde un mismo equipo (cuentan las que siguen apuntadas).
-    let filler: Vec<String> = {
-        let mut reg = state.registry.lock().await;
-        let mut ids = vec![];
-        for i in 0..9 {
-            let mut s = session(&format!("relleno-{i}"), tmp.path(), None);
-            s.opened_by = Some(format!("mac-id/zz{i}"));
-            ids.push(reg.add(s).unwrap().id);
-        }
-        // Las de otro equipo con un id que empieza igual no cuentan.
-        let mut s = session("de-otro", tmp.path(), None);
-        s.opened_by = Some("mac-id-2/zz".into());
-        ids.push(reg.add(s).unwrap().id);
-        ids
-    };
-    let open_again = p(json!({"machine": "Prueba", "folder": work, "prompt": "otra"}));
-    let e = failed(ask(&state, &mac, "open", open_again.clone()).await);
-    assert_eq!(
-        e,
-        (409, "demasiadas sesiones abiertas desde ese equipo".into())
-    );
-    assert_eq!(
-        nido::i18n::english("demasiadas sesiones abiertas desde ese equipo"),
-        "too many sessions opened from that machine"
-    );
-    // Las de aquí no tienen ese tope.
-    let (code, local_one) = tool(
-        addr,
-        &local,
-        "open",
-        json!({"machine": "Prueba", "folder": work, "prompt": "x"}),
-    )
-    .await;
-    assert_eq!(code, 200, "{local_one}");
-    let (code, _) = tool(addr, &local, "close", json!({"session": local_one["id"]})).await;
-    assert_eq!(code, 200);
-    {
-        let mut reg = state.registry.lock().await;
-        for id in &filler {
-            reg.remove(id).unwrap();
-        }
-    }
     assert!(wait_file(&work.join("args")).await, "la sesión no arrancó");
     let args = String::from_utf8_lossy(&std::fs::read(work.join("args")).unwrap()).into_owned();
     assert!(
@@ -394,6 +352,83 @@ async fn peer_calls_end_to_end() {
         )),
         "{args}"
     );
+
+    // Topes de `open` desde un mismo equipo: 10 en marcha y 50 apuntadas. En otra carpeta, para
+    // no pisar los argumentos de la primera.
+    let limited = tmp.path().join("topes");
+    std::fs::create_dir_all(&limited).unwrap();
+    let open_one = p(json!({"machine": "Prueba", "folder": limited, "prompt": "otra"}));
+    let too_many = (
+        409,
+        "demasiadas sesiones abiertas desde ese equipo; cierra alguna".to_owned(),
+    );
+    assert_eq!(
+        nido::i18n::english("demasiadas sesiones abiertas desde ese equipo; cierra alguna"),
+        "too many sessions opened from that machine; close some"
+    );
+    // En marcha: con la primera, 10; la siguiente no.
+    let mut running = vec![];
+    for _ in 0..9 {
+        let o = ok(ask(&state, &mac, "open", open_one.clone()).await);
+        running.push(o["id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(
+        failed(ask(&state, &mac, "open", open_one.clone()).await),
+        too_many
+    );
+    // Las de aquí no tienen ese tope.
+    let (code, local_one) = tool(
+        addr,
+        &local,
+        "open",
+        json!({"machine": "Prueba", "folder": limited, "prompt": "x"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{local_one}");
+    let (code, _) = tool(addr, &local, "close", json!({"session": local_one["id"]})).await;
+    assert_eq!(code, 200);
+    // Cerrada una, vuelve a haber sitio.
+    let gone = running.pop().unwrap();
+    ok(ask(&state, &mac, "close", p(json!({"session": gone}))).await);
+    let o = ok(ask(&state, &mac, "open", open_one.clone()).await);
+    running.push(o["id"].as_str().unwrap().to_owned());
+    for id in running.drain(..) {
+        ok(ask(&state, &mac, "close", p(json!({"session": id}))).await);
+    }
+    // Paradas no cuentan para las 10 (las huérfanas no dejan fuera al equipo)…
+    let mut filler: Vec<String> = {
+        let mut reg = state.registry.lock().await;
+        let mut ids = vec![];
+        for i in 0..49 {
+            let mut s = session(&format!("relleno-{i}"), tmp.path(), None);
+            s.opened_by = Some(format!("mac-id/zz{i}"));
+            ids.push(reg.add(s).unwrap().id);
+        }
+        // Las de otro equipo con un id que empieza igual no cuentan para nada.
+        let mut s = session("de-otro", tmp.path(), None);
+        s.opened_by = Some("mac-id-2/zz".into());
+        ids.push(reg.add(s).unwrap().id);
+        ids
+    };
+    // …pero sí para las 50 apuntadas: con la primera, 50.
+    assert_eq!(
+        failed(ask(&state, &mac, "open", open_one.clone()).await),
+        too_many
+    );
+    state
+        .registry
+        .lock()
+        .await
+        .remove(&filler.remove(0))
+        .unwrap();
+    let o = ok(ask(&state, &mac, "open", open_one.clone()).await);
+    ok(ask(&state, &mac, "close", p(json!({"session": o["id"]}))).await);
+    {
+        let mut reg = state.registry.lock().await;
+        for id in &filler {
+            reg.remove(id).unwrap();
+        }
+    }
     // Con `wait`, tampoco espera (trabajando: sin Claude que se apunte).
     let start = Instant::now();
     let r = ok(ask(
