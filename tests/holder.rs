@@ -71,8 +71,12 @@ impl Client {
     }
 
     async fn history(&mut self, all: bool) -> String {
-        self.send(Frame::HistoryRequest(HistoryRequest { all, screen: false }))
-            .await;
+        self.send(Frame::HistoryRequest(HistoryRequest {
+            all,
+            screen: false,
+            launch: None,
+        }))
+        .await;
         loop {
             match proto::read_frame(&mut self.stream).await.unwrap() {
                 Some(Frame::History(b)) => return String::from_utf8_lossy(&b).into_owned(),

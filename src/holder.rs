@@ -59,6 +59,8 @@ enum Cmd {
     History {
         all: bool,
         screen: bool,
+        /// Solo lo de este arranque, hasta tantos bytes (ver `HistoryRequest::launch`).
+        launch: Option<usize>,
         reply: oneshot::Sender<String>,
     },
     /// Un cliente que se quedó atrás: pantalla entera otra vez y suscripción nueva.
@@ -324,8 +326,17 @@ pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
                         }
                     }
                 }
-                Cmd::History { all, screen, reply } => {
-                    let text = if screen { emu.screen_text() } else { emu.history_text(all) };
+                Cmd::History {
+                    all,
+                    screen,
+                    launch,
+                    reply,
+                } => {
+                    let text = match (screen, launch) {
+                        (true, _) => emu.screen_text(),
+                        (false, Some(cap)) => emu.launch_text(cap),
+                        (false, None) => emu.history_text(all),
+                    };
                     let _ = reply.send(text);
                 }
                 Cmd::Resync { reply } => {
@@ -415,6 +426,7 @@ async fn serve_client(client: u64, stream: ipc::Stream, cmds: mpsc::Sender<Cmd>)
                         .send(Cmd::History {
                             all: req.all,
                             screen: req.screen,
+                            launch: req.launch,
                             reply,
                         })
                         .await

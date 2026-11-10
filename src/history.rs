@@ -149,6 +149,27 @@ impl History {
         }
     }
 
+    /// Lo de este arranque: desde la última marca de rearranque (o desde el principio, si no
+    /// la hay), con las de repintado, y solo hasta `cap` bytes, por filas enteras: el saludo del
+    /// programa está al principio, y no se reúne un historial entero para verlo.
+    pub fn since_restart(&self, cap: usize) -> String {
+        let restart = format!("{MARK}{} ", Marker::Restart.tag());
+        let start = self
+            .lines
+            .iter()
+            .rposition(|l| l.starts_with(&restart))
+            .map_or(0, |i| i + 1);
+        let mut out = String::new();
+        for l in self.lines.iter().skip(start) {
+            if out.len() + l.len() + 1 > cap {
+                break;
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+        out
+    }
+
     /// El historial como texto con colores, una línea por fila. Con `all = false`, solo desde la
     /// última marca (lo que el programa considera su historial actual). Las marcas salen como
     /// una línea `\u{1}reset <epoch>` / `\u{1}restart <epoch>` que la web dibuja como separador.
@@ -251,5 +272,34 @@ mod tests {
         assert!(size <= 200 + 10, "el fichero no se compactó: {size} bytes");
         let reloaded = History::open(&path, 100).unwrap();
         assert!(reloaded.text(true).contains("linea 199"));
+    }
+
+    #[test]
+    fn what_this_launch_said_and_no_more() {
+        let mut h = History::in_memory(1 << 20);
+        h.push_line("de antes".into());
+        h.mark(Marker::Restart);
+        h.push_line("saludo".into());
+        h.mark(Marker::Reset);
+        h.push_line("repintado".into());
+        // Desde la última marca de rearranque, con las de repintado.
+        let t = h.since_restart(1 << 10);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines[0], "saludo");
+        assert!(lines[1].starts_with("\u{1}reset "));
+        assert_eq!(lines[2], "repintado");
+        assert_eq!(lines.len(), 3);
+        // Con tope: lo primero (ahí está el saludo), por filas enteras.
+        for i in 0..1000 {
+            h.push_line(format!("fila {i:04}"));
+        }
+        let t = h.since_restart(100);
+        assert!(t.len() <= 100, "{}", t.len());
+        assert!(t.starts_with("saludo\n"));
+        assert!(t.ends_with('\n'));
+        // Sin marca de rearranque (la primera vez), desde el principio.
+        let mut nuevo = History::in_memory(1 << 20);
+        nuevo.push_line("saludo".into());
+        assert_eq!(nuevo.since_restart(1 << 10), "saludo\n");
     }
 }

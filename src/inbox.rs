@@ -283,6 +283,10 @@ impl Inbox {
 
     /// Quita de la cola de `id` los mensajes `ids` (los de otras colas no se tocan). Devuelve
     /// cuántos quitó.
+    ///
+    /// Retenida (`held`), no quita nada y devuelve 0, a propósito: mejor «al menos una vez» que
+    /// «perdido». Una confirmación que llega tarde, tras parar o volver a lanzar la sesión, deja
+    /// el mensaje en la cola y se entregará otra vez.
     pub fn ack(&self, id: &str, ids: &[String]) -> usize {
         // Retenida, no se le ha dado nada: lo que diga confirmar no es de este arranque.
         if self.held(id) {

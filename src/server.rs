@@ -709,8 +709,10 @@ async fn watch_held(
     // aceptado), su bandeja no da nada (ver `Inbox::hold`).
     let mut hold = Some(hold);
     let mut repl_since: Option<tokio::time::Instant> = None;
-    // Con el aviso (o la pregunta de confiar) aún en pantalla al acabar el plazo, no se suelta.
+    // Con el aviso (o la pregunta de confiar) aún en pantalla al acabar el plazo, o sin haber
+    // podido mirar lo que sacó (su guardián tardó en contestar), no se suelta.
     let mut stuck = false;
+    let mut unchecked = false;
     while tokio::time::Instant::now() < deadline {
         if scr.is_none() {
             let hello = Hello {
@@ -731,8 +733,14 @@ async fn watch_held(
             }
         }
         let Some(s) = scr.as_mut() else { break };
-        let Ok(text) = s.screen().await else {
-            break;
+        let text = match s.look().await {
+            Ok(t) => t,
+            // Tarda: otra conexión, y se vuelve a mirar.
+            Err(prompt::Unread::Slow) => {
+                scr = None;
+                continue;
+            }
+            Err(prompt::Unread::Closed) => break,
         };
         // Mientras está, y al irse, el plazo empieza de nuevo.
         let trust = prompt::trust_screen(&text);
@@ -775,8 +783,15 @@ async fn watch_held(
                     list.join(" ")
                 );
                 // Retenida hasta que el usuario lo conteste (ver `keep_held`).
-                if let (Some(h), Some(s)) = (hold.take(), scr.take()) {
-                    tokio::spawn(keep_held(s, h, name.clone(), id.to_owned()));
+                if let Some(h) = hold.take() {
+                    let socket = st.paths.socket(id);
+                    tokio::spawn(keep_held(
+                        socket,
+                        scr.take(),
+                        h,
+                        name.clone(),
+                        id.to_owned(),
+                    ));
                 }
                 return Startup::Foreign(list);
             }
@@ -792,7 +807,15 @@ async fn watch_held(
             match ready(s, &text, &mut repl_since).await {
                 Ready::Wait => {}
                 // Se sigue mirando hasta el plazo.
-                Ready::Release => hold = None,
+                Ready::Release => {
+                    hold = None;
+                    unchecked = false;
+                }
+                // Retenida aún; con otra conexión, se vuelve a mirar.
+                Ready::Reconnect => {
+                    scr = None;
+                    unchecked = true;
+                }
                 Ready::Refuse(r) => {
                     let why = refusal_of(&r);
                     st.inbox.refuse(id, why);
@@ -805,8 +828,16 @@ async fn watch_held(
     }
     // Se acabó el plazo con el aviso o la pregunta en pantalla: Claude tiraría lo que le llegue.
     // Retenida hasta que se contesten (o se pare la sesión).
-    if stuck && let (Some(h), Some(s)) = (hold.take(), scr.take()) {
-        tokio::spawn(keep_held(s, h, name, id.to_owned()));
+    if (stuck || unchecked)
+        && let Some(h) = hold.take()
+    {
+        tokio::spawn(keep_held(
+            st.paths.socket(id),
+            scr.take(),
+            h,
+            name,
+            id.to_owned(),
+        ));
     }
     if accepted {
         Startup::Accept
@@ -818,9 +849,12 @@ async fn watch_held(
 type HolderScreen = prompt::Screen<crate::ipc::ReadHalf, crate::ipc::WriteHalf>;
 
 /// Si ya puede soltarse la bandeja de una sesión que arranca.
+#[derive(Debug, PartialEq, Eq)]
 enum Ready {
     Wait,
     Release,
+    /// Su guardián tardó en dar lo que ha sacado: retenida aún, y otra conexión.
+    Reconnect,
     /// Lo que ha sacado desde que arrancó dice que no tiene channel (`Blocked` o `NoServer`).
     Refuse(prompt::Startup),
 }
@@ -828,11 +862,15 @@ enum Ready {
 /// Con la caja de Claude un rato en pantalla (`REPL_SETTLE`; `since`: desde cuándo), se mira todo
 /// lo que ha sacado desde que arrancó (ver `prompt::launch_refusal`): retomada con mucha
 /// conversación, su saludo ya no está en pantalla.
-async fn ready(
-    s: &mut HolderScreen,
+async fn ready<R, W>(
+    s: &mut prompt::Screen<R, W>,
     text: &str,
     since: &mut Option<tokio::time::Instant>,
-) -> Ready {
+) -> Ready
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     if !prompt::repl(text) {
         *since = None;
         return Ready::Wait;
@@ -843,8 +881,10 @@ async fn ready(
     }
     match s.output().await {
         Ok(out) => prompt::launch_refusal(&out).map_or(Ready::Release, Ready::Refuse),
+        // Sin mirarlo no se suelta: Claude podría estar tirando el channel.
+        Err(prompt::Unread::Slow) => Ready::Reconnect,
         // Se cerró: nada que retener.
-        Err(_) => Ready::Release,
+        Err(prompt::Unread::Closed) => Ready::Release,
     }
 }
 
@@ -870,20 +910,44 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
 
 /// Pasado el plazo, con el aviso de los channels o la pregunta de confiar aún en pantalla: se
 /// sigue mirando (sin pulsar nada) hasta que se contesten y Claude espere peticiones, y entonces
-/// se suelta la bandeja (o se apunta que no tiene channel). Si se cierra la sesión, se suelta.
-async fn keep_held(mut s: HolderScreen, hold: crate::inbox::Hold, name: String, id: String) {
+/// se suelta la bandeja (o se apunta que no tiene channel). También si no se pudo mirar lo que
+/// sacó: se vuelve a probar. Solo se suelta sin más si se cierra la sesión (nadie atiende en
+/// `socket`).
+async fn keep_held(
+    socket: std::path::PathBuf,
+    mut scr: Option<HolderScreen>,
+    hold: crate::inbox::Hold,
+    name: String,
+    id: String,
+) {
     use prompt::Startup;
     let mut since = None;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let Ok(text) = s.screen().await else {
-            return;
+        if scr.is_none() {
+            let Ok(s) = viewer_at(&socket).await else {
+                return;
+            };
+            scr = Some(s);
+        }
+        let Some(s) = scr.as_mut() else { return };
+        let text = match s.look().await {
+            Ok(t) => t,
+            Err(prompt::Unread::Slow) => {
+                scr = None;
+                continue;
+            }
+            Err(prompt::Unread::Closed) => return,
         };
         let r = match prompt::startup(&text) {
             r @ (Startup::NoServer | Startup::Blocked) => r,
-            _ => match ready(&mut s, &text, &mut since).await {
+            _ => match ready(s, &text, &mut since).await {
                 Ready::Wait => continue,
                 Ready::Release => return,
+                Ready::Reconnect => {
+                    scr = None;
+                    continue;
+                }
                 Ready::Refuse(r) => r,
             },
         };
@@ -2256,6 +2320,19 @@ pub(crate) async fn holder_connect(
     Ok(stream)
 }
 
+/// Como visor (80×24), al guardián que atiende en `socket`.
+async fn viewer_at(socket: &std::path::Path) -> std::io::Result<HolderScreen> {
+    let mut stream = crate::ipc::connect(socket).await?;
+    let hello = Hello {
+        role: Role::Viewer,
+        cols: 80,
+        rows: 24,
+    };
+    proto::write_frame(&mut stream, &Frame::Hello(hello)).await?;
+    let (rd, wr) = crate::ipc::split(stream);
+    Ok(prompt::Screen::new(rd, wr))
+}
+
 async fn api_history(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2279,6 +2356,7 @@ async fn api_history(
                 &Frame::HistoryRequest(HistoryRequest {
                     all: q.all,
                     screen: q.screen,
+                    launch: None,
                 }),
             )
             .await?;
@@ -2796,7 +2874,11 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                     && !screen_pending
                     && tokio::time::Instant::now() >= due
                 {
-                    let req = Frame::HistoryRequest(HistoryRequest { all: false, screen: true });
+                    let req = Frame::HistoryRequest(HistoryRequest {
+                        all: false,
+                        screen: true,
+                        launch: None,
+                    });
                     if proto::write_frame(wr, &req).await.is_err() {
                         holder = None;
                     } else {
@@ -3116,6 +3198,30 @@ mod tests {
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].text, "nueva");
         assert!(unread_alerts(&alerts, 30).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_check_before_releasing_waits_for_a_slow_holder() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let repl = include_str!("../tests/pantallas/normal.txt");
+        let settled = || Some(tokio::time::Instant::now() - Duration::from_secs(5));
+        // Su guardián sigue ahí pero no contesta a tiempo: retenida, y otra conexión.
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (rd, wr) = tokio::io::split(a);
+        let mut s = prompt::Screen::new(rd, wr);
+        assert_eq!(ready(&mut s, repl, &mut settled()).await, Ready::Reconnect);
+        drop(b);
+        // Cerrado de verdad: se suelta.
+        let (a, b) = tokio::io::duplex(1 << 16);
+        drop(b);
+        let (rd, wr) = tokio::io::split(a);
+        let mut s = prompt::Screen::new(rd, wr);
+        assert_eq!(ready(&mut s, repl, &mut settled()).await, Ready::Release);
+        // Sin la caja un rato, ni se pregunta.
+        let (a, _b) = tokio::io::duplex(1 << 16);
+        let (rd, wr) = tokio::io::split(a);
+        let mut s = prompt::Screen::new(rd, wr);
+        assert_eq!(ready(&mut s, repl, &mut None).await, Ready::Wait);
     }
 
     #[tokio::test]

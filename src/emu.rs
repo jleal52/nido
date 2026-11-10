@@ -157,6 +157,32 @@ impl Emu {
         out
     }
 
+    /// Lo que ha sacado el programa desde que arrancó (ver `History::since_restart`) y, si cabe,
+    /// lo que aún no ha subido y la pantalla, seguidos: hasta `cap` bytes.
+    pub fn launch_text(&self, cap: usize) -> String {
+        let cb = self.parser.callbacks();
+        let mut out = cb.history.since_restart(cap);
+        if out.len() < cap {
+            if !cb.pending.is_empty() {
+                out.push_str(&cb.pending);
+                out.push('\n');
+            }
+            let _ = self
+                .parser
+                .screen()
+                .write_contents_formatted_basic(&mut out, BasicFormattedCaptureRange::Visible);
+        }
+        if out.len() > cap {
+            let mut end = cap;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+        }
+        out.truncate(out.trim_end().len());
+        out
+    }
+
     /// Al terminar la sesión: lo que queda en pantalla también pasa al historial, para verlo
     /// tras volver a arrancarla.
     pub fn finish(&mut self) {
@@ -238,6 +264,25 @@ mod tests {
         assert!(text.contains("\x1b[32m"), "sin color: {text:?}");
         let expected: Vec<String> = (0..100).map(|i| format!("linea {i}")).collect();
         assert_eq!(plain(&text).lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn this_launch_up_to_a_cap() {
+        let mut e = emu();
+        e.history_mut().push_line("de antes".into());
+        e.history_mut().mark(Marker::Restart);
+        for i in 0..100 {
+            e.process(format!("linea {i}\r\n").as_bytes());
+        }
+        // Sin tope que corte: lo de este arranque y la pantalla, seguidos.
+        let p = plain(&e.launch_text(1 << 20));
+        let expected: Vec<String> = (0..100).map(|i| format!("linea {i}")).collect();
+        assert_eq!(p.lines().collect::<Vec<_>>(), expected);
+        // Con tope: solo lo primero.
+        let t = e.launch_text(64);
+        assert!(t.len() <= 64, "{}", t.len());
+        assert!(plain(&t).starts_with("linea 0\n"), "{t:?}");
+        assert!(!t.contains("de antes"));
     }
 
     #[test]

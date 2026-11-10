@@ -46,6 +46,23 @@ pub struct HistoryRequest {
     /// Solo la pantalla actual (sin historial): menús, permisos, el modo de Claude…
     #[serde(default)]
     pub screen: bool,
+    /// Solo lo de este arranque (desde la marca de rearranque) y la pantalla, hasta tantos
+    /// bytes (ver `Emu::launch_text`). Un guardián de antes no lo conoce: lo ignora y contesta
+    /// según `all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<usize>,
+}
+
+impl HistoryRequest {
+    /// Lo de este arranque, hasta `cap` bytes. Con `all`: un guardián de antes da todo el
+    /// historial, que también lo lleva (cuesta más, pero no falta nada).
+    pub fn launch(cap: usize) -> Self {
+        Self {
+            all: true,
+            screen: false,
+            launch: Some(cap),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,7 +195,9 @@ mod tests {
             Frame::HistoryRequest(HistoryRequest {
                 all: true,
                 screen: false,
+                launch: None,
             }),
+            Frame::HistoryRequest(HistoryRequest::launch(1024)),
             Frame::History(Vec::new()),
             Frame::Stop,
         ];
@@ -191,6 +210,34 @@ mod tests {
             assert_eq!(read_frame(&mut b).await.unwrap().as_ref(), Some(f));
         }
         assert_eq!(read_frame(&mut b).await.unwrap(), None);
+    }
+
+    #[test]
+    fn history_requests_old_and_new() {
+        // Sin `launch`, como siempre (un guardián de antes la entiende igual).
+        let old = HistoryRequest {
+            all: false,
+            screen: true,
+            launch: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"all":false,"screen":true}"#
+        );
+        // Un guardián de antes no sabe de `launch`: lo ignora y da todo el historial (`all`).
+        #[derive(serde::Deserialize)]
+        struct Before {
+            all: bool,
+            #[serde(default)]
+            screen: bool,
+        }
+        let new = HistoryRequest::launch(256 * 1024);
+        let b: Before = serde_json::from_slice(&serde_json::to_vec(&new).unwrap()).unwrap();
+        assert!(b.all && !b.screen);
+        assert_eq!(new.launch, Some(256 * 1024));
+        // Y uno de ahora entiende las de antes.
+        let r: HistoryRequest = serde_json::from_str(r#"{"all":true}"#).unwrap();
+        assert_eq!(r.launch, None);
     }
 
     #[tokio::test]

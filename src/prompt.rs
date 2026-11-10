@@ -1024,6 +1024,21 @@ pub struct QuestionAnswer {
     pub text: Option<String>,
 }
 
+/// Por qué no llegó lo pedido al guardián de una sesión.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// No contestó a tiempo, pero sigue ahí. La conexión ya no vale: su respuesta podría
+    /// llegar tarde y pasar por la de la siguiente pregunta.
+    Slow,
+    /// Se cerró (la sesión terminó).
+    Closed,
+}
+
+/// Lo más que se pide de lo que ha sacado una sesión desde que arrancó (`Screen::output`): el
+/// saludo de Claude está al principio. Con muchas sesiones arrancando a la vez, no se reúnen
+/// historiales enteros.
+pub const LAUNCH_CAP: usize = 256 * 1024;
+
 /// La pantalla de una sesión, a través de su guardián: leerla y teclear.
 pub struct Screen<R, W> {
     rd: R,
@@ -1046,30 +1061,43 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Screen<R, W> {
         self.read().await
     }
 
-    /// Todo lo que ha sacado la sesión (su historial, con las marcas de rearranque y repintado,
-    /// y la pantalla al final): ver `launch_refusal`.
-    pub async fn output(&mut self) -> Result<String, String> {
-        self.request(true, false).await
+    /// La pantalla, diciendo si la sesión se cerró o solo tardó (ver `Unread`).
+    pub async fn look(&mut self) -> Result<String, Unread> {
+        self.request(HistoryRequest {
+            all: false,
+            screen: true,
+            launch: None,
+        })
+        .await
+    }
+
+    /// Lo que ha sacado la sesión desde que arrancó (su historial desde la marca de rearranque,
+    /// con las de repintado, y la pantalla), hasta `LAUNCH_CAP`: ver `launch_refusal`.
+    pub async fn output(&mut self) -> Result<String, Unread> {
+        self.request(HistoryRequest::launch(LAUNCH_CAP)).await
     }
 
     async fn read(&mut self) -> Result<String, String> {
-        self.request(false, true).await
+        self.look().await.map_err(|e| {
+            match e {
+                Unread::Slow => "la sesión no contesta",
+                Unread::Closed => "la sesión se ha cerrado",
+            }
+            .into()
+        })
     }
 
-    async fn request(&mut self, all: bool, screen: bool) -> Result<String, String> {
-        let req = Frame::HistoryRequest(HistoryRequest { all, screen });
-        proto::write_frame(&mut self.wr, &req)
+    async fn request(&mut self, req: HistoryRequest) -> Result<String, Unread> {
+        proto::write_frame(&mut self.wr, &Frame::HistoryRequest(req))
             .await
-            .map_err(|_| "la sesión se ha cerrado")?;
+            .map_err(|_| Unread::Closed)?;
         loop {
             let frame = tokio::time::timeout(WAIT, proto::read_frame(&mut self.rd))
                 .await
-                .map_err(|_| "la sesión no contesta")?;
+                .map_err(|_| Unread::Slow)?;
             match frame {
                 Ok(Some(Frame::History(b))) => return Ok(String::from_utf8_lossy(&b).into_owned()),
-                Ok(Some(Frame::Exit(_)) | None) | Err(_) => {
-                    return Err("la sesión se ha cerrado".into());
-                }
+                Ok(Some(Frame::Exit(_)) | None) | Err(_) => return Err(Unread::Closed),
                 Ok(Some(_)) => {}
             }
         }
@@ -1901,6 +1929,39 @@ mod tests {
             );
         assert_ne!(c, s);
         assert_eq!(dev_channels(&c), Some(vec!["server:nido".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn a_slow_holder_is_not_a_closed_one() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        // Sigue ahí pero no contesta: tarda, no se ha cerrado.
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (rd, wr) = tokio::io::split(a);
+        let mut s = Screen::new(rd, wr);
+        assert_eq!(s.output().await, Err(Unread::Slow));
+        drop(b);
+        // Cerrado.
+        let (a, b) = tokio::io::duplex(1 << 16);
+        drop(b);
+        let (rd, wr) = tokio::io::split(a);
+        let mut s = Screen::new(rd, wr);
+        assert_eq!(s.output().await, Err(Unread::Closed));
+        // Lo pide con tope (y `all`, por si es un guardián de antes, que no sabe de `launch`).
+        let (a, mut b) = tokio::io::duplex(1 << 16);
+        let (rd, wr) = tokio::io::split(a);
+        let mut s = Screen::new(rd, wr);
+        let holder = tokio::spawn(async move {
+            let f = proto::read_frame(&mut b).await.unwrap();
+            proto::write_frame(&mut b, &Frame::History(b"hola".to_vec()))
+                .await
+                .unwrap();
+            f
+        });
+        assert_eq!(s.output().await.as_deref(), Ok("hola"));
+        assert_eq!(
+            holder.await.unwrap(),
+            Some(Frame::HistoryRequest(HistoryRequest::launch(LAUNCH_CAP)))
+        );
     }
 
     #[test]
