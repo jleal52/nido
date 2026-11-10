@@ -44,7 +44,24 @@ pub struct Session {
     /// Cuándo la vio el usuario por última vez (ms). Terminó después: «sin leer».
     #[serde(default, skip_serializing_if = "is_zero")]
     pub seen: u64,
+    /// Quién la abrió con el MCP de nido (`equipo/id`); `None`: el usuario.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
+    /// Alertas que mandó (las 10 últimas). Sin leer: `at` > `seen`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<AlertRec>,
 }
+
+/// Una alerta que mandó la sesión al usuario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertRec {
+    pub text: String,
+    /// ms desde 1970.
+    pub at: u64,
+}
+
+/// Alertas que se guardan por sesión.
+const MAX_ALERTS: usize = 10;
 
 fn is_zero(v: &u64) -> bool {
     *v == 0
@@ -240,6 +257,19 @@ impl Registry {
         Ok(updated)
     }
 
+    /// Añade una alerta y deja solo las `MAX_ALERTS` últimas.
+    pub fn add_alert(&mut self, id: &str, text: &str, at: u64) -> Result<(), RegistryError> {
+        self.update(id, |s| {
+            s.alerts.push(AlertRec {
+                text: text.to_owned(),
+                at,
+            });
+            let extra = s.alerts.len().saturating_sub(MAX_ALERTS);
+            s.alerts.drain(..extra);
+        })?;
+        Ok(())
+    }
+
     /// Orden de las carpetas tal como lo dejó el usuario.
     pub fn folders(&self) -> &[String] {
         &self.folders
@@ -324,6 +354,8 @@ mod tests {
             folder: None,
             finished: 0,
             seen: 0,
+            opened_by: None,
+            alerts: vec![],
         }
     }
 
@@ -438,5 +470,40 @@ mod tests {
         assert!(r.add(session("dos")).is_err());
         let back = Registry::load(&path).unwrap();
         assert_eq!(back.sessions().len(), 1);
+    }
+
+    #[test]
+    fn alerts_and_opened_by_roundtrip() {
+        let mut s = session("a1");
+        s.opened_by = Some("m1/b2".into());
+        s.alerts.push(AlertRec {
+            text: "listo".into(),
+            at: 5,
+        });
+        let back: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.opened_by.as_deref(), Some("m1/b2"));
+        assert_eq!(back.alerts[0].text, "listo");
+        let plain = serde_json::to_string(&session("a2")).unwrap();
+        assert!(!plain.contains("alerts") && !plain.contains("opened_by"));
+    }
+
+    #[test]
+    fn add_alert_keeps_the_last_ten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        let mut r = Registry::load(&path).unwrap();
+        let id = r.add(session("uno")).unwrap().id;
+        for i in 1..=12 {
+            r.add_alert(&id, &format!("aviso {i}"), i).unwrap();
+        }
+        let back = Registry::load(&path).unwrap();
+        let alerts = &back.get(&id).unwrap().alerts;
+        let at: Vec<u64> = alerts.iter().map(|a| a.at).collect();
+        assert_eq!(at, (3..=12).collect::<Vec<_>>());
+        assert_eq!(alerts[9].text, "aviso 12");
+        assert!(matches!(
+            r.add_alert("no-existe", "x", 1),
+            Err(RegistryError::NotFound(_))
+        ));
     }
 }

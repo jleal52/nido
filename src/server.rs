@@ -1184,6 +1184,8 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
             .filter(|f| !f.is_empty()),
         finished: 0,
         seen: 0,
+        opened_by: None,
+        alerts: vec![],
     };
     let created = match st.registry.lock().await.add(session) {
         Ok(s) => s,

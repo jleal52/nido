@@ -357,6 +357,8 @@ mod tests {
             folder: None,
             finished: 0,
             seen: 0,
+            opened_by: None,
+            alerts: vec![],
             claude: Some(ClaudeLink {
                 session_id: "sid-1".into(),
                 config_dir: None,
