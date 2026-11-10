@@ -246,13 +246,12 @@ impl Accounts {
             {
                 let mut inner = me.inner.lock().await;
                 if !inner.file.cswap_imported {
-                    let live_uuid = blocking({
+                    let live_identity = blocking({
                         let live = me.live.clone();
                         move || live.read_identity()
                     })
-                    .await
-                    .and_then(|v| v["accountUuid"].as_str().map(str::to_owned));
-                    let n = me.import_cswap(&mut inner, &home, live_uuid.as_deref());
+                    .await;
+                    let n = me.import_cswap(&mut inner, &home, live_identity.as_ref());
                     inner.file.cswap_imported = true;
                     if n > 0 {
                         eprintln!("nido: {n} cuentas de Claude traídas de cswap");
@@ -291,9 +290,8 @@ impl Accounts {
             inner.timing.auto_stuck = false;
             self.save(&inner);
         }
-        let (identity, _) = self.live_now().await;
-        self.redraw(identity.as_ref().and_then(|v| v["accountUuid"].as_str()))
-            .await;
+        let active = self.active_number().await;
+        self.redraw(active).await;
         // Si ya va pasada del límite, que cambie ahora y no en la próxima medida.
         self.kick.notify_one();
         Ok(self.view())
@@ -334,47 +332,51 @@ impl Accounts {
         blocking(move || (live.read_identity(), live.read_oauth().ok().flatten())).await
     }
 
+    /// El número de la cuenta que usa Claude ahora (por usuario y organización).
+    async fn active_number(&self) -> Option<u32> {
+        let (identity, _) = self.live_now().await;
+        number_of(&self.inner.lock().await.file.accounts, identity.as_ref())
+    }
+
     /// Una pasada: apunta la cuenta activa si es nueva y mide las que tocan.
     async fn pass(&self) {
         let (identity, live_oauth) = self.live_now().await;
-        let active_uuid = identity
-            .as_ref()
-            .and_then(|v| v["accountUuid"].as_str())
-            .map(str::to_owned);
-        let numbers: Vec<(u32, bool)> = {
+        let (active, numbers): (Option<u32>, Vec<(u32, bool)>) = {
             let mut inner = self.inner.lock().await;
             if let (Some(id), Some(_)) = (&identity, &live_oauth)
                 && adopt(&mut inner.file, id).is_some_and(|(_, changed)| changed)
             {
                 self.save(&inner);
             }
+            let active = number_of(&inner.file.accounts, identity.as_ref());
             let now = Instant::now();
-            inner
+            let numbers = inner
                 .file
                 .accounts
                 .iter()
-                .map(|a| (a.number, Some(&a.uuid) == active_uuid.as_ref()))
+                .map(|a| (a.number, Some(a.number) == active))
                 .filter(|(n, _)| inner.timing.next.get(n).is_none_or(|t| *t <= now))
-                .collect()
+                .collect();
+            (active, numbers)
         };
-        for (number, active) in numbers {
-            self.measure(number, active, live_oauth.as_ref()).await;
+        for (number, is_active) in numbers {
+            self.measure(number, is_active, live_oauth.as_ref()).await;
         }
-        self.redraw(active_uuid.as_deref()).await;
-        self.auto(active_uuid.as_deref()).await;
+        self.redraw(active).await;
+        self.auto(active).await;
     }
 
     /// El cambio automático: si la cuenta activa (con un dato reciente) ha llegado al
     /// [`AUTO_PCT`], pasa a la siguiente que pueda.
-    async fn auto(&self, active_uuid: Option<&str>) {
+    async fn auto(&self, active: Option<u32>) {
         let (from, to, pct) = {
             let mut inner = self.inner.lock().await;
             if !inner.file.auto_switch {
                 return;
             }
             let now = now_s();
-            let Some(cur) = active_uuid
-                .and_then(|u| inner.file.accounts.iter().find(|a| a.uuid == u))
+            let Some(cur) = active
+                .and_then(|n| inner.file.accounts.iter().find(|a| a.number == n))
                 .cloned()
             else {
                 return;
@@ -667,7 +669,7 @@ impl Accounts {
     }
 
     /// Rehace la vista para la web.
-    async fn redraw(&self, active_uuid: Option<&str>) {
+    async fn redraw(&self, active: Option<u32>) {
         let inner = self.inner.lock().await;
         let now = now_s();
         let mut accounts: Vec<Account> = inner
@@ -675,7 +677,7 @@ impl Accounts {
             .accounts
             .iter()
             .map(|a| {
-                let active = Some(a.uuid.as_str()) == active_uuid;
+                let is_active = Some(a.number) == active;
                 let age = a.usage_at.map(|t| now.saturating_sub(t));
                 let fresh = age.is_some_and(|s| s <= FRESH_S);
                 let status = if a.relogin {
@@ -690,7 +692,7 @@ impl Accounts {
                     email: Some(a.email.clone()),
                     alias: a.alias.clone(),
                     organization: a.organization.clone(),
-                    active,
+                    active: is_active,
                     disabled: false,
                     status: Some(status.into()),
                     usage: if fresh { a.usage.clone() } else { None },
@@ -706,7 +708,7 @@ impl Accounts {
             .file
             .accounts
             .iter()
-            .find(|a| Some(a.uuid.as_str()) == active_uuid)
+            .find(|a| Some(a.number) == active)
             .and_then(|a| a.usage_at)
             .map(|t| now.saturating_sub(t));
         *self.view.lock().expect("vista") = View {
@@ -719,14 +721,37 @@ impl Accounts {
         };
     }
 
-    fn find<'a>(file: &'a SavedFile, target: &str) -> Option<&'a Saved> {
+    /// Por número, alias o correo. Un correo con varias cuentas (una por organización) no
+    /// vale: hay que decir el número.
+    fn find<'a>(file: &'a SavedFile, target: &str) -> Result<&'a Saved, String> {
         let t = target.trim();
         if let Ok(n) = t.parse::<u32>() {
-            return file.accounts.iter().find(|a| a.number == n);
+            return file
+                .accounts
+                .iter()
+                .find(|a| a.number == n)
+                .ok_or_else(|| "no hay ninguna cuenta así".into());
         }
-        file.accounts
+        if let Some(a) = file.accounts.iter().find(|a| a.alias.as_deref() == Some(t)) {
+            return Ok(a);
+        }
+        let same: Vec<&Saved> = file
+            .accounts
             .iter()
-            .find(|a| a.email.eq_ignore_ascii_case(t) || a.alias.as_deref() == Some(t))
+            .filter(|a| a.email.eq_ignore_ascii_case(t))
+            .collect();
+        match same.as_slice() {
+            [] => Err("no hay ninguna cuenta así".into()),
+            [a] => Ok(a),
+            many => Err(format!(
+                "hay {} cuentas con ese correo (una por organización): usa su número ({})",
+                many.len(),
+                many.iter()
+                    .map(|a| a.number.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
     }
 
     /// Pasa Claude (`~/.claude`, el de todas las sesiones) a otra cuenta.
@@ -738,17 +763,10 @@ impl Accounts {
             return Err("cuenta no válida".into());
         }
         let (identity, _) = self.live_now().await;
-        let cur_uuid = identity
-            .as_ref()
-            .and_then(|v| v["accountUuid"].as_str())
-            .map(str::to_owned);
         let mut inner = self.inner.lock().await;
-        let to = Self::find(&inner.file, target)
-            .cloned()
-            .ok_or("no hay ninguna cuenta así")?;
-        let from = cur_uuid
-            .as_deref()
-            .and_then(|u| inner.file.accounts.iter().find(|a| a.uuid == u))
+        let to = Self::find(&inner.file, target)?.clone();
+        let from = number_of(&inner.file.accounts, identity.as_ref())
+            .and_then(|n| inner.file.accounts.iter().find(|a| a.number == n))
             .cloned();
         if from.as_ref().is_some_and(|f| f.number == to.number) {
             return Ok(Switched {
@@ -819,7 +837,7 @@ impl Accounts {
         self.save(&inner);
         drop(inner);
         // La vista ya con la nueva activa (la web la pide en cuanto contesta esto).
-        self.redraw(Some(&to.uuid)).await;
+        self.redraw(Some(to.number)).await;
         self.kick.notify_one();
         Ok(Switched {
             switched: true,
@@ -901,16 +919,9 @@ impl Accounts {
             .to_owned();
 
         let (live_identity, live_oauth) = self.live_now().await;
-        let live_uuid = live_identity
-            .as_ref()
-            .and_then(|v| v["accountUuid"].as_str())
-            .map(str::to_owned);
         let mut inner = self.inner.lock().await;
-        let existing = inner
-            .file
-            .accounts
-            .iter()
-            .position(|a| a.is(&uuid, org.as_deref()));
+        let live_number = number_of(&inner.file.accounts, live_identity.as_ref());
+        let existing = position_of(&inner.file.accounts, &uuid, org.as_deref());
         let number = match existing {
             Some(i) => inner.file.accounts[i].number,
             None => {
@@ -940,8 +951,16 @@ impl Accounts {
             Some(i) => inner.file.accounts[i] = entry,
             None => inner.file.accounts.push(entry),
         }
-        // Activa si es la que usa Claude o si Claude no tiene ninguna.
-        let active = live_uuid.as_deref() == Some(uuid.as_str()) || live_oauth.is_none();
+        // Activa si es la que usa Claude o si Claude no tiene ninguna. Una cuenta nueva no puede
+        // ser la de Claude salvo que Claude no tenga ninguna apuntada (la misma persona en otra
+        // organización es otra cuenta).
+        let active = (live_number.is_some() && live_number == Some(number))
+            || live_oauth.is_none()
+            || (live_number.is_none()
+                && live_identity.as_ref().is_some_and(|v| {
+                    v["accountUuid"].as_str() == Some(uuid.as_str())
+                        && v["organizationUuid"].as_str() == org.as_deref()
+                }));
         let result = if active {
             let live = self.live.clone();
             let (c, id) = (creds.clone(), identity.clone());
@@ -964,11 +983,7 @@ impl Accounts {
         result?;
         saved?;
         // La cuenta ya en la lista (su uso llega en cuanto se mida, en la pasada que se despierta).
-        let now_active = if active {
-            Some(uuid.as_str())
-        } else {
-            live_uuid.as_deref()
-        };
+        let now_active = if active { Some(number) } else { live_number };
         self.redraw(now_active).await;
         self.kick.notify_one();
         Ok(LoggedIn {
@@ -985,31 +1000,28 @@ impl Accounts {
             return Err(OFF.into());
         }
         let (identity, _) = self.live_now().await;
-        let live_uuid = identity
-            .as_ref()
-            .and_then(|v| v["accountUuid"].as_str())
-            .map(str::to_owned);
         let mut inner = self.inner.lock().await;
+        let live_number = number_of(&inner.file.accounts, identity.as_ref());
         let i = inner
             .file
             .accounts
             .iter()
             .position(|a| a.number == number)
             .ok_or("no hay ninguna cuenta así")?;
-        if Some(&inner.file.accounts[i].uuid) == live_uuid.as_ref() {
+        if Some(number) == live_number {
             return Err("es la que usa Claude ahora: cambia antes a otra".into());
         }
         inner.file.accounts.remove(i);
         let _ = std::fs::remove_file(self.creds_path(number));
         self.save(&inner);
         drop(inner);
-        self.redraw(live_uuid.as_deref()).await;
+        self.redraw(live_number).await;
         Ok(())
     }
 
     /// Las cuentas de cswap (claude-swap): sus números, identidades y sesiones guardadas. La
     /// activa no: su sesión buena es la de Claude.
-    fn import_cswap(&self, inner: &mut Inner, home: &Path, live_uuid: Option<&str>) -> usize {
+    fn import_cswap(&self, inner: &mut Inner, home: &Path, live: Option<&Value>) -> usize {
         let Some(root) = cswap_root(home) else {
             return 0;
         };
@@ -1054,7 +1066,14 @@ impl Accounts {
                 })
             });
             let mut relogin = false;
-            if live_uuid != Some(uuid) {
+            // La de Claude (el mismo usuario en la misma organización) trae su sesión de Claude.
+            let is_live = live.is_some_and(|v| {
+                v["accountUuid"].as_str() == Some(uuid)
+                    && (v["organizationUuid"].as_str().is_none()
+                        || org.is_none()
+                        || v["organizationUuid"].as_str() == org)
+            });
+            if !is_live {
                 match cswap_creds(&root, number, email) {
                     Some(c) => {
                         if let Err(e) = self.save_creds(number, &c) {
@@ -1143,12 +1162,41 @@ fn expiring(oauth: &Value, margin_ms: u64) -> bool {
         .is_none_or(|t| t <= oauth::now_ms() + margin_ms)
 }
 
+/// La cuenta guardada de un usuario en una organización. Un mismo usuario (el mismo correo) puede
+/// estar en varias organizaciones, y cada una es una cuenta distinta: primero la de su misma
+/// organización; si no hay, una apuntada sin organización, pero solo si no hay dudas.
+fn position_of(accounts: &[Saved], uuid: &str, org: Option<&str>) -> Option<usize> {
+    if let Some(i) = accounts
+        .iter()
+        .position(|a| a.uuid == uuid && a.org_uuid.as_deref() == org)
+    {
+        return Some(i);
+    }
+    let mut loose = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is(uuid, org))
+        .map(|(i, _)| i);
+    match (loose.next(), loose.next()) {
+        (Some(i), None) => Some(i),
+        _ => None,
+    }
+}
+
+/// El número de la cuenta de una identidad de Claude (`oauthAccount`).
+fn number_of(accounts: &[Saved], identity: Option<&Value>) -> Option<u32> {
+    let id = identity?;
+    let uuid = id["accountUuid"].as_str()?;
+    position_of(accounts, uuid, id["organizationUuid"].as_str()).map(|i| accounts[i].number)
+}
+
 /// Apunta la cuenta de esta identidad si no estaba (o le pone la identidad al día). Devuelve su
 /// número y si algo ha cambiado.
 fn adopt(file: &mut SavedFile, identity: &Value) -> Option<(u32, bool)> {
     let uuid = identity["accountUuid"].as_str()?;
     let org = identity["organizationUuid"].as_str();
-    if let Some(a) = file.accounts.iter_mut().find(|a| a.is(uuid, org)) {
+    if let Some(i) = position_of(&file.accounts, uuid, org) {
+        let a = &mut file.accounts[i];
         // Claude completa la identidad con el tiempo: quedarse con la suya.
         let changed = a.identity != *identity;
         if changed {
@@ -1161,6 +1209,10 @@ fn adopt(file: &mut SavedFile, identity: &Value) -> Option<(u32, bool)> {
             }
         }
         return Some((a.number, changed));
+    }
+    if file.accounts.iter().any(|a| a.is(uuid, org)) {
+        // Sin organización y con varias del mismo usuario: no se sabe cuál es; mejor no apuntarla.
+        return None;
     }
     let number = file.accounts.iter().map(|a| a.number).max().unwrap_or(0) + 1;
     file.accounts.push(Saved {
@@ -1362,7 +1414,8 @@ mod tests {
             timing: Timing::default(),
         };
         // La 5 es la activa: sin sesión guardada, pero apuntada.
-        assert_eq!(acc.import_cswap(&mut inner, &home, Some("u5")), 2);
+        let live = serde_json::json!({"accountUuid": "u5", "organizationUuid": "o5"});
+        assert_eq!(acc.import_cswap(&mut inner, &home, Some(&live)), 2);
         let two = inner.file.accounts.iter().find(|a| a.number == 2).unwrap();
         assert_eq!(two.identity["displayName"], "Ana");
         assert!(!two.relogin);
@@ -1371,7 +1424,117 @@ mod tests {
         assert!(!five.relogin);
         assert!(acc.load_creds(5).is_none());
         // Una segunda vez no repite nada.
-        assert_eq!(acc.import_cswap(&mut inner, &home, Some("u5")), 0);
+        assert_eq!(acc.import_cswap(&mut inner, &home, Some(&live)), 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// El mismo usuario (el mismo correo) en dos organizaciones: dos cuentas.
+    fn two_orgs() -> SavedFile {
+        let mut f = SavedFile::default();
+        for (number, org, name) in [(2, "o-empresa", "Empresa"), (12, "o-personal", "Personal")] {
+            f.accounts.push(Saved {
+                number,
+                uuid: "u1".into(),
+                email: "ana@example.com".into(),
+                org_uuid: Some(org.into()),
+                organization: Some(name.into()),
+                identity: serde_json::json!({
+                    "accountUuid": "u1", "emailAddress": "ana@example.com",
+                    "organizationUuid": org, "organizationName": name,
+                }),
+                ..Default::default()
+            });
+        }
+        f
+    }
+
+    #[test]
+    fn the_same_user_in_two_organizations_is_two_accounts() {
+        let f = two_orgs();
+        let id = |org: &str| serde_json::json!({"accountUuid": "u1", "organizationUuid": org});
+        assert_eq!(number_of(&f.accounts, Some(&id("o-empresa"))), Some(2));
+        assert_eq!(number_of(&f.accounts, Some(&id("o-personal"))), Some(12));
+        assert_eq!(number_of(&f.accounts, Some(&id("o-otra"))), None);
+        // Sin organización no se sabe cuál de las dos es.
+        let bare = serde_json::json!({"accountUuid": "u1"});
+        assert_eq!(number_of(&f.accounts, Some(&bare)), None);
+        assert_eq!(number_of(&f.accounts, None), None);
+    }
+
+    #[test]
+    fn an_account_saved_without_organization_still_matches_if_it_is_the_only_one() {
+        let mut f = SavedFile::default();
+        f.accounts.push(Saved {
+            number: 4,
+            uuid: "u1".into(),
+            ..Default::default()
+        });
+        let id = serde_json::json!({"accountUuid": "u1", "organizationUuid": "o1"});
+        assert_eq!(number_of(&f.accounts, Some(&id)), Some(4));
+        // Con otra ya en esa organización, gana la suya.
+        f.accounts.push(Saved {
+            number: 5,
+            uuid: "u1".into(),
+            org_uuid: Some("o1".into()),
+            ..Default::default()
+        });
+        assert_eq!(number_of(&f.accounts, Some(&id)), Some(5));
+    }
+
+    #[test]
+    fn adopt_keeps_each_organization_apart() {
+        let mut f = two_orgs();
+        let personal = f.accounts[1].identity.clone();
+        // Claude completa la identidad de la personal: solo cambia la 12.
+        let mut fuller = personal.clone();
+        fuller["displayName"] = "Ana".into();
+        assert_eq!(adopt(&mut f, &fuller), Some((12, true)));
+        assert_eq!(f.accounts[0].identity["organizationUuid"], "o-empresa");
+        assert!(f.accounts[0].identity.get("displayName").is_none());
+        assert_eq!(f.accounts[1].identity["displayName"], "Ana");
+        // Una tercera organización es una cuenta nueva.
+        let other = serde_json::json!({"accountUuid": "u1", "emailAddress": "ana@example.com", "organizationUuid": "o-otra"});
+        assert_eq!(adopt(&mut f, &other), Some((13, true)));
+        // Sin organización y con varias: no se apunta nada.
+        let bare = serde_json::json!({"accountUuid": "u1", "emailAddress": "ana@example.com"});
+        assert_eq!(adopt(&mut f, &bare), None);
+        assert_eq!(f.accounts.len(), 3);
+    }
+
+    #[test]
+    fn an_email_with_several_accounts_needs_the_number() {
+        let mut f = two_orgs();
+        let e = Accounts::find(&f, "ana@example.com").unwrap_err();
+        assert!(e.contains("2, 12"), "{e}");
+        assert_eq!(Accounts::find(&f, "12").unwrap().number, 12);
+        assert!(Accounts::find(&f, "7").is_err());
+        f.accounts[0].alias = Some("trabajo".into());
+        assert_eq!(Accounts::find(&f, "trabajo").unwrap().number, 2);
+        f.accounts.remove(0);
+        assert_eq!(Accounts::find(&f, "ANA@example.com").unwrap().number, 12);
+    }
+
+    #[tokio::test]
+    async fn only_the_account_of_claudes_organization_is_active() {
+        let home = std::env::temp_dir().join(format!("nido-orgs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let data = home.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("accounts.json"),
+            serde_json::to_vec(&two_orgs()).unwrap(),
+        )
+        .unwrap();
+        let acc = Accounts::new(&home, &data);
+        acc.redraw(Some(2)).await;
+        let active: Vec<u32> = acc
+            .view()
+            .accounts
+            .iter()
+            .filter(|a| a.active)
+            .map(|a| a.number)
+            .collect();
+        assert_eq!(active, vec![2]);
         let _ = std::fs::remove_dir_all(&home);
     }
 }
