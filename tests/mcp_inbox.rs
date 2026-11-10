@@ -142,6 +142,7 @@ fn session(name: &str, cwd: &Path, claude: Option<ClaudeLink>) -> Session {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_inbox_end_to_end() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(120));
     let tmp = tempfile::tempdir().unwrap();
     let _cleanup = KillHolders(tmp.path().join("nido/run"));
     // La «shell» de las sesiones: duerme. Así `open` no arranca ningún Claude.

@@ -75,6 +75,9 @@ pub struct AppState {
     pub(crate) mcp_marks: crate::mcp_api::Marks,
     /// Si vive la sesión madre de otro equipo de una abierta con `open` (un rato).
     pub(crate) mcp_parents: crate::mcp_api::Parents,
+    /// Los avisos que esperan, callados, a que muera la madre de su sesión: uno por sesión y
+    /// tipo (los que lleguen mientras, se juntan con ese).
+    quiet: std::sync::Mutex<std::collections::HashSet<(String, AlertKind)>>,
     /// Cómo se llega a otro equipo del grupo: sin nada, por el hub (`peer_member`); en las
     /// pruebas, lo que se ponga con `set_peer_link`.
     peer_link: std::sync::OnceLock<PeerLink>,
@@ -145,7 +148,7 @@ impl e2e::Host for AppState {
 }
 
 /// Un cambio de una sesión que merece aviso.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AlertKind {
     /// Espera tu respuesta (un permiso, un menú).
     Waiting,
@@ -362,6 +365,7 @@ impl AppState {
             peer_replays: Default::default(),
             mcp_marks: Default::default(),
             mcp_parents: Default::default(),
+            quiet: Default::default(),
             peer_link: Default::default(),
         }))
     }
@@ -523,6 +527,31 @@ fn still_alerting(v: &SessionView, kind: AlertKind) -> bool {
     }
 }
 
+/// Un aviso callado que espera (ver `AppState::alert_push`): mientras viva, otro igual de la
+/// misma sesión no espera aparte. Al acabar la espera (o cancelarse), fuera.
+struct Quiet<'a> {
+    set: &'a std::sync::Mutex<std::collections::HashSet<(String, AlertKind)>>,
+    key: (String, AlertKind),
+}
+
+impl<'a> Quiet<'a> {
+    /// `None` si ya hay uno con esa clave. Se crea con el cerrojo ya suelto: uno que no entra,
+    /// al tirarlo, lo cogería otra vez (y se quedaría colgado) y quitaría la clave del que espera.
+    fn take(
+        set: &'a std::sync::Mutex<std::collections::HashSet<(String, AlertKind)>>,
+        key: (String, AlertKind),
+    ) -> Option<Self> {
+        let new = set.lock().expect("callados").insert(key.clone());
+        new.then(|| Self { set, key })
+    }
+}
+
+impl Drop for Quiet<'_> {
+    fn drop(&mut self) {
+        self.set.lock().expect("callados").remove(&self.key);
+    }
+}
+
 /// Las que piden atención (el número sobre el icono de la app).
 fn attention(sessions: &[SessionView]) -> usize {
     sessions
@@ -612,6 +641,8 @@ impl AppState {
         if Self::quiet_while_parent(a.kind)
             && let Some(by) = v.opened_by.as_deref()
         {
+            // Ya espera otro aviso igual de esta sesión: sale (o no) con ese.
+            let _quiet = Quiet::take(&self.quiet, (a.session.clone(), a.kind))?;
             let mut fresh = false;
             while crate::mcp_api::parent_alive(self, by, &v.id, &v.name, fresh).await {
                 tokio::time::sleep(self.mcp_parents.ttl()).await;
@@ -2530,6 +2561,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_child_alerts_once_its_parent_is_gone() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         for (kind, body) in [
             (AlertKind::Waiting, "Te necesita"),
             (AlertKind::Finished, "Terminó"),
@@ -2557,7 +2589,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_quiet_wait_per_session_and_kind() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (st, answer, asked) = with_mac(dir.path());
+        show(&st, child(AlertKind::Finished, Some("mac-id/madre")));
+        // La hija termina dos veces mientras vive la madre: se espera una sola vez.
+        let first = spawn_push(&st, AlertKind::Finished);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = spawn_push(&st, AlertKind::Finished);
+        let got = tokio::time::timeout(Duration::from_secs(5), second).await;
+        assert_eq!(got.expect("enseguida").unwrap(), None);
+        // Mientras, una pregunta cada rato (50 ms), no dos.
+        let start = std::time::Instant::now();
+        let before = asked.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let n = asked.load(Ordering::SeqCst) - before;
+        let most = (start.elapsed().as_millis() / 50) as usize + 1;
+        assert!(
+            n >= 1 && n <= most,
+            "{n} preguntas en {:?}",
+            start.elapsed()
+        );
+        // Muere la madre: un solo aviso.
+        *answer.lock().unwrap() = Ok(json!({"state": "stopped"}));
+        let got = tokio::time::timeout(Duration::from_secs(5), first).await;
+        assert!(got.expect("a tiempo").unwrap().is_some());
+        // Ya no espera nadie: el siguiente sale (y no se queda la marca de la espera).
+        st.finished_pushed.lock().unwrap().clear();
+        let got =
+            tokio::time::timeout(Duration::from_secs(5), spawn_push(&st, AlertKind::Finished))
+                .await
+                .expect("a tiempo")
+                .unwrap();
+        assert!(got.is_some());
+        // Tampoco si se cancela la espera a medias.
+        *answer.lock().unwrap() = Ok(json!({"state": "working"}));
+        let cut = spawn_push(&st, AlertKind::Finished);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cut.abort();
+        let _ = cut.await;
+        *answer.lock().unwrap() = Ok(json!({"state": "stopped"}));
+        st.finished_pushed.lock().unwrap().clear();
+        let got =
+            tokio::time::timeout(Duration::from_secs(5), spawn_push(&st, AlertKind::Finished))
+                .await
+                .expect("a tiempo")
+                .unwrap();
+        assert!(got.is_some());
+    }
+
+    #[tokio::test]
     async fn a_quiet_alert_is_dropped_once_it_is_no_longer_needed() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let (st, _, _) = with_mac(dir.path());
         show(&st, child(AlertKind::Waiting, Some("mac-id/madre")));
@@ -2574,6 +2658,7 @@ mod tests {
 
     #[tokio::test]
     async fn alerts_without_a_live_parent_go_out_at_once() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         for kind in [AlertKind::Waiting, AlertKind::Finished] {
             // Del usuario: sin preguntar a nadie.
             let dir = tempfile::tempdir().unwrap();

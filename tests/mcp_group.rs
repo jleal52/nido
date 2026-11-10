@@ -99,6 +99,8 @@ enum Peer {
     Queue(Arc<Mutex<Vec<PeerResult>>>),
     /// Como `Real`, pero estos métodos no contestan.
     Partial(Arc<AppState>, Member, &'static [&'static str]),
+    /// Como `Real`, pero estos métodos tardan 30 s (y luego no contestan).
+    SlowOn(Arc<AppState>, Member, &'static [&'static str]),
 }
 
 /// Lo que ve cada nido de los demás equipos, por su id, y cuántas veces se le pidió cada método.
@@ -159,6 +161,13 @@ impl Net {
                         Err((502, NO_PEER.to_owned()))
                     }
                     Some(Peer::Partial(st, from, _)) => {
+                        nido::mcp_api::peer_call(&st, &from, &method, params).await
+                    }
+                    Some(Peer::SlowOn(_, _, slow)) if slow.contains(&method.as_str()) => {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Err((502, NO_PEER.to_owned()))
+                    }
+                    Some(Peer::SlowOn(st, from, _)) => {
                         nido::mcp_api::peer_call(&st, &from, &method, params).await
                     }
                     Some(Peer::Down) | None => Err((502, NO_PEER.to_owned())),
@@ -264,6 +273,7 @@ impl Drop for KillHolders {
 // Las dos partes cambian el entorno del proceso (`NIDO_HOME`): una detrás de otra.
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_across_the_group() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(120));
     the_mcp_reaches_every_machine_of_the_group().await;
     a_child_does_not_alert_while_its_parent_lives().await;
 }
@@ -617,6 +627,29 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
     let sent = r["msg_id"].as_str().unwrap().to_owned();
     assert!(mac.inbox.pending(&otra).iter().any(|m| m.id == sent));
     assert_eq!(r["read"], json!({"error": "no connection or old version"}));
+    // La lectura del final de la espera tampoco se queda colgada: 10 s como mucho.
+    from_here.set(
+        "mac-id",
+        Peer::SlowOn(mac.clone(), member("aqui-id", &here, "Prueba"), &["read"]),
+    );
+    let start = Instant::now();
+    let (code, e) = tool(
+        addr,
+        &padre,
+        "read",
+        json!({"session": at_mac, "wait": true}),
+    )
+    .await;
+    assert_eq!(
+        (code, e["error"].as_str()),
+        (504, Some("the other machine does not answer"))
+    );
+    let took = start.elapsed();
+    assert!(
+        took + Duration::from_millis(500) >= Duration::from_secs(10)
+            && took < Duration::from_secs(25),
+        "{took:?}"
+    );
     from_here.set(
         "mac-id",
         Peer::Real(mac.clone(), member("aqui-id", &here, "Prueba")),
@@ -914,6 +947,56 @@ async fn a_child_does_not_alert_while_its_parent_lives() {
         );
     }
     assert!(!nido::mcp_api::parent_alive(&st, "k-aqui/nadie", &hija, "hija", false).await);
+    // Lo que ve otro equipo de una sesión que no es de Claude: solo si vive, nunca lo que tenga en
+    // pantalla (aquí, un menú), ni si recogió un mensaje.
+    let concha = tmp.path().join("concha");
+    std::fs::create_dir_all(&concha).unwrap();
+    let program = concha.join("program");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nprintf '\\033[2J\\033[H'; cat screen\nexec sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &program,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let permiso = std::fs::read_to_string(format!(
+        "{}/tests/pantallas/permiso.txt",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    std::fs::write(concha.join("screen"), permiso).unwrap();
+    let shell_id = {
+        let mut reg = st.registry.lock().await;
+        reg.add(session("concha", &concha, None)).unwrap().id
+    };
+    nido::launch::start(&paths, Launcher::Detached, &shell_id).unwrap();
+    for _ in 0..100 {
+        if nido::launch::is_alive(&paths, &shell_id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Que le dé tiempo a pintar el menú.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mac = Member {
+        id: "mac-id".into(),
+        key: "bWFj".into(),
+        name: "Mac".into(),
+        at: 0,
+        removed: false,
+    };
+    for args in [
+        json!({"session": shell_id}),
+        json!({"session": shell_id, "msg": "m1"}),
+    ] {
+        let mut args = args;
+        args["caller"] = json!({"id": hija, "name": "hija"});
+        let s = nido::mcp_api::peer_call(&st, &mac, "status", args).await;
+        assert_eq!(s, Ok(json!({"state": "working"})));
+    }
     st.registry.lock().await.remove(&madre).unwrap();
     assert!(
         !nido::mcp_api::parent_alive(&st, &format!("k-aqui/{madre}"), &hija, "hija", false).await

@@ -1131,6 +1131,7 @@ mod tests {
 
     #[test]
     fn local_api_posts_the_tool_with_token_and_session() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let body = r#"{"delivered":true}"#;
         let reply: &'static str = Box::leak(
             format!(
@@ -1156,6 +1157,7 @@ mod tests {
 
     #[test]
     fn local_api_errors_are_the_server_message_or_english() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let (addr, h) = one_shot(
             "HTTP/1.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"no such session\"}",
         );
@@ -1222,6 +1224,7 @@ mod tests {
 
     #[test]
     fn ping_is_answered_while_a_call_waits_and_the_call_answers_later() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let (mut st, tx) = blocked();
         let calls = Calls::default();
         let (sent, emit) = sink();
@@ -1252,6 +1255,7 @@ mod tests {
 
     #[test]
     fn a_cancelled_call_answers_nothing() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let (mut st, tx) = blocked();
         let calls = Calls::default();
         let (sent, emit) = sink();
@@ -1504,6 +1508,7 @@ mod tests {
 
     #[test]
     fn local_api_fetches_and_acks_the_inbox() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let (addr, h) = one_shot(http_ok(r#"{"messages":[{"id":"m1","text":"hola"}]}"#));
         let got = local(addr).fetch();
         assert_eq!(got, Ok(vec![json!({"id":"m1","text":"hola"})]));

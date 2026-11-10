@@ -591,6 +591,11 @@ pub struct Seen {
     pub replied: bool,
 }
 
+/// Otro equipo no contestó a tiempo.
+fn no_answer() -> Fail {
+    fail(StatusCode::GATEWAY_TIMEOUT, "el otro equipo no contesta")
+}
+
 /// ¿Es un fallo del canal con otro equipo (no contesta, el hub tarda, sin conexión)? La
 /// siguiente vez puede ir bien.
 fn passing(f: &Fail) -> bool {
@@ -1677,13 +1682,15 @@ async fn read_out(
     Ok(out)
 }
 
-/// `read` de la sesión `at` (aquí o, para una de aquí, en otro equipo), sin esperar.
+/// `read` de la sesión `at` (aquí o, para una de aquí, en otro equipo), sin esperar. Con
+/// `limit` (la lectura del final de una espera), a otro equipo se le espera eso como mucho.
 async fn read_at(
     st: &AppState,
     me: &Machine,
     caller: &Caller,
     at: &Where<'_>,
     last: Option<usize>,
+    limit: Option<Duration>,
 ) -> Reply {
     match at {
         Where::Here(id) => {
@@ -1696,16 +1703,33 @@ async fn read_at(
             if let Some(n) = last {
                 args["last"] = n.into();
             }
-            forward(st, me, caller, machine, "read", args).await
+            let ask = forward(st, me, caller, machine, "read", args);
+            match limit {
+                None => ask.await,
+                Some(l) => tokio::time::timeout(l, ask)
+                    .await
+                    .unwrap_or_else(|_| Err(no_answer())),
+            }
         }
     }
 }
 
 /// Cómo está la sesión `id` de aquí y, con `msg` (de `send`), si ya lo recogió y si ha contestado.
-/// Vale para cualquier sesión, sea o no de Claude: también dice si vive una sesión madre.
+/// Vale para cualquier sesión, sea o no de Claude: también dice si vive una sesión madre. De una
+/// que no es de Claude, solo si vive (`{state}`): nada de su pantalla ni de su bandeja.
 async fn status_here(st: &AppState, id: &str, msg: Option<&str>) -> Result<StatusOut, Fail> {
-    if st.registry.lock().await.get(id).is_none() {
+    let found = st.registry.lock().await.get(id).map(|s| s.claude.is_some());
+    let Some(claude) = found else {
         return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
+    };
+    if !claude {
+        let alive = view(st, id).await.is_some_and(|v| v.alive);
+        return Ok(StatusOut {
+            state: status(alive, false, false, false),
+            question: None,
+            taken: None,
+            replied: None,
+        });
     }
     let (state, menu) = poll_status(st, id).await;
     let (taken, replied) = match msg {
@@ -1746,7 +1770,6 @@ async fn replied(st: &AppState, id: &str, msg: &str) -> bool {
     }
 }
 
-/// Lo que miran las esperas de la sesión `at` (aquí o en otro equipo).
 /// Lo que miran las esperas de la sesión `at` (aquí o en otro equipo), con la espera hasta
 /// `until`: a otro equipo se le espera `STATUS_POLL` como mucho, o lo que quede.
 async fn status_at(
@@ -1776,12 +1799,7 @@ async fn status_at(
                 Ok(Ok(v)) => v,
                 Ok(Err(f)) if passing(&f) => return Err(Miss::Channel(f)),
                 Ok(Err(f)) => return Err(Miss::Fatal(f)),
-                Err(_) => {
-                    return Err(Miss::Channel(fail(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "el otro equipo no contesta",
-                    )));
-                }
+                Err(_) => return Err(Miss::Channel(no_answer())),
             }
         }
     };
@@ -1807,12 +1825,12 @@ async fn tool_status(st: &AppState, me: &Machine, caller: &Caller, args: Value) 
 async fn tool_read(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
     let a: ReadArgs = args_of(args)?;
     let at = place(me, caller, &a.session)?;
-    let read = || read_at(st, me, caller, &at, a.last);
     // Para otro equipo no se espera aquí: el ida y vuelta por el hub dura 15 s como mucho. Espera
     // el nido de quien llama, preguntando cada poco.
     if !(a.wait && caller.local) {
-        return read().await;
+        return read_at(st, me, caller, &at, a.last, None).await;
     }
+    let read = || read_at(st, me, caller, &at, a.last, Some(STATUS_POLL));
     let total = wait_timeout(a.timeout_s);
     let until = tokio::time::Instant::now() + total;
     wait_then_read(
@@ -1862,7 +1880,7 @@ async fn tool_send(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
     let until = tokio::time::Instant::now() + total;
     let read = wait_then_read(
         || status_at(st, me, caller, &at, msg.as_deref(), until),
-        || read_at(st, me, caller, &at, None),
+        || read_at(st, me, caller, &at, None, Some(STATUS_POLL)),
         Some(PICKUP),
         WAIT_STEP,
         total,
@@ -3024,6 +3042,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_waits_for_pickup_then_for_the_answer() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         use Status::*;
         // Ya trabajaba en otra cosa (sin recogerlo), lo recoge, sigue trabajando y termina.
         let r = replay(
@@ -3102,6 +3121,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_wait_needs_a_reply_not_just_the_message() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         use Status::*;
         // El fallo de antes: el mensaje entra en la conversación (crece) y la sesión aún está
         // parada; eso no es la respuesta. Se espera a que Claude escriba.
@@ -3116,6 +3136,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_waits_until_it_is_not_working() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         use Status::*;
         // Termina: con lo que haya dicho al final (los turnos los da la lectura).
         let r = replay(
@@ -3153,6 +3174,7 @@ mod tests {
 
     #[tokio::test]
     async fn waits_survive_the_channel_failing_now_and_then() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         use Status::*;
         // Falla a ratos (el hub tarda, el otro no contesta): se sigue esperando.
         let r = replay(
@@ -3192,6 +3214,7 @@ mod tests {
 
     #[tokio::test]
     async fn waits_give_up_on_a_dead_channel() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         use Status::*;
         let no_peer = Err((
             StatusCode::BAD_GATEWAY,

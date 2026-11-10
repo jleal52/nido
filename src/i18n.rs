@@ -838,6 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn follows_the_request() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         assert_eq!(tr("cuenta no válida"), "invalid account");
         assert_eq!(
             scope(Lang::Es, async { tr("cuenta no válida") }).await,

@@ -167,6 +167,7 @@ async fn wait_file(path: &Path) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_calls_end_to_end() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(120));
     let tmp = tempfile::tempdir().unwrap();
     let _cleanup = KillHolders(tmp.path().join("nido/run"));
     let bin = tmp.path().join("bin");

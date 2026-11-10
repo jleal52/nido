@@ -167,6 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn types_sees_output_and_detaches() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("run/s.sock");
         let cfg = HolderConfig {

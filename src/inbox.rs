@@ -411,6 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_wakes_on_a_message_and_marks_the_channel() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let inbox = std::sync::Arc::new(Inbox::load(dir.path().join("inbox.json")));
         inbox.set_poll_wait(Duration::from_secs(10));

@@ -107,6 +107,7 @@ impl Drop for KillHolders {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_end_to_end() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(120));
     let tmp = tempfile::tempdir().unwrap();
     let _cleanup = KillHolders(tmp.path().join("run"));
     // El guardián (otro proceso) lee las mismas rutas por NIDO_HOME.

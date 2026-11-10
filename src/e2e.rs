@@ -1420,6 +1420,7 @@ mod tests {
 
     #[tokio::test]
     async fn standing_code_pairs_many_survives_restart_and_stops() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("pair-demo.json");
         let host = Arc::new(TestHost {
@@ -1464,6 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn pair_once_then_connect_and_tunnel() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         // Un «servidor HTTP» de eco para los flujos.
         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1640,6 +1642,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_answers_only_live_members() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let (mac, viejo) = (
             new_identity(dir.path(), "mac"),
@@ -1676,6 +1679,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_rejects_replays_and_stale_requests() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let (mac, viejo) = (
             new_identity(dir.path(), "mac"),
@@ -1733,6 +1737,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_rejects_requests_from_before_a_restart() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let (mac, viejo) = (
             new_identity(dir.path(), "mac"),
@@ -1804,6 +1809,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_reply_too_large_is_an_error() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let (mac, viejo) = (
             new_identity(dir.path(), "mac"),
@@ -1849,6 +1855,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_request_round_trip_and_errors() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let (mac, viejo) = (
             new_identity(dir.path(), "mac"),

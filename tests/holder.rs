@@ -114,6 +114,7 @@ fn config(dir: &Path) -> HolderConfig {
 
 #[tokio::test]
 async fn a_late_client_sees_what_the_first_one_did() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(60));
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(dir.path());
     let socket = cfg.socket.clone();
@@ -137,6 +138,7 @@ async fn a_late_client_sees_what_the_first_one_did() {
 
 #[tokio::test]
 async fn only_drivers_change_the_size() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(60));
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(dir.path());
     let socket = cfg.socket.clone();
@@ -167,6 +169,7 @@ async fn only_drivers_change_the_size() {
 
 #[tokio::test]
 async fn history_survives_clear_and_restart() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(60));
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(dir.path());
     let socket = cfg.socket.clone();
@@ -207,6 +210,7 @@ async fn history_survives_clear_and_restart() {
 
 #[tokio::test]
 async fn claude_code_session_marks_do_not_reach_the_session() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(60));
     // Como si `nido serve` se hubiera arrancado desde una sesión de Claude Code.
     // SAFETY: solo se añaden variables que ningún otro test lee.
     unsafe {

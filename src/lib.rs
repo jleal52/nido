@@ -29,3 +29,5 @@ pub mod server;
 pub mod sys;
 pub mod transcript;
 pub mod upload;
+#[doc(hidden)]
+pub mod watchdog;

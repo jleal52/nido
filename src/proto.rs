@@ -159,6 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_every_kind() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let frames = vec![
             Frame::Hello(Hello {
                 role: Role::Viewer,
@@ -194,6 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_oversized_and_unknown_frames() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
         let (mut a, mut b) = tokio::io::duplex(64);
         a.write_all(&(u32::MAX).to_be_bytes()).await.unwrap();
         assert!(read_frame(&mut b).await.is_err());
