@@ -46,6 +46,38 @@ pub fn hostname() -> Option<String> {
     }
 }
 
+/// Una hora local, hasta el minuto.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalTime {
+    pub year: i32,
+    /// 1–12.
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub min: u32,
+}
+
+/// La hora local de un instante (ms desde 1970), con la zona del sistema.
+pub fn local_time(ms: u64) -> Option<LocalTime> {
+    let secs = libc::time_t::try_from(ms / 1000).ok()?;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return None;
+    }
+    #[cfg(windows)]
+    if unsafe { libc::localtime_s(&mut tm, &secs) } != 0 {
+        return None;
+    }
+    Some(LocalTime {
+        year: tm.tm_year + 1900,
+        month: u32::try_from(tm.tm_mon + 1).ok()?,
+        day: u32::try_from(tm.tm_mday).ok()?,
+        hour: u32::try_from(tm.tm_hour).ok()?,
+        min: u32::try_from(tm.tm_min).ok()?,
+    })
+}
+
 /// El usuario, para separar lo de cada uno en los directorios compartidos (el temporal).
 pub fn user_tag() -> String {
     #[cfg(unix)]
@@ -399,5 +431,19 @@ mod tests {
         assert!(same_boot("1793948104.463287", "1793948104.463287"));
         assert!(same_boot("1793948104:0-1234", "1793948120:0-1234"));
         assert!(!same_boot("1793948104:0-1234", "1793948104:0-9999"));
+    }
+
+    #[test]
+    fn local_time_moves_by_the_minute() {
+        // 2023-11-14 22:00:00 UTC: las zonas van de cuarto en cuarto de hora.
+        let a = local_time(1_699_999_200_000).unwrap();
+        let b = local_time(1_699_999_260_000).unwrap();
+        assert!([0, 15, 30, 45].contains(&a.min), "{a:?}");
+        assert_eq!(b.min, a.min + 1);
+        assert_eq!(
+            (b.year, b.month, b.day, b.hour),
+            (a.year, a.month, a.day, a.hour)
+        );
+        assert!((1..=12).contains(&a.month) && (1..=31).contains(&a.day) && a.hour < 24);
     }
 }

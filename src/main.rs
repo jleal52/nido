@@ -8,11 +8,13 @@ use clap::{Parser, Subcommand};
 use nido::attach;
 use nido::client::Api;
 use nido::launch::{self, Launcher, Paths};
-use nido::registry::{self, Registry};
+use nido::registry::{self, AlertRec, Registry};
 use nido::server::{self, AppState};
+use nido::sys::LocalTime;
 use nido::{auth, holder, import};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::watch;
+use unicode_width::UnicodeWidthStr;
 
 /// El puerto de siempre. En Windows, otro: el WSL de ese mismo equipo ya puede tener el 7690 (y
 /// lo reenvía a Windows).
@@ -108,6 +110,8 @@ enum Cmd {
     Holder { id: String },
     /// Lista las sesiones.
     Ls,
+    /// Las alertas de las sesiones que aún no has visto.
+    Alerts,
     /// Emparejar un teléfono con la app de nido: enseña un QR para escanear (vale 10 minutos).
     Pair {
         /// Un código reutilizable durante estos días (máx. 90), para una demostración: quien lo
@@ -779,13 +783,31 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                 };
                 let cwd = s["cwd"].as_str().unwrap_or("");
                 let cwd = cwd.replacen(&paths.home.to_string_lossy().into_owned(), "~", 1);
+                let alerts = s["alerts"].as_array().map_or(0, Vec::len);
                 println!(
-                    "{:<24} {:<10} {:<10} {}",
-                    s["name"].as_str().unwrap_or(""),
-                    state,
-                    what,
-                    cwd
+                    "{}",
+                    ls_line(s["name"].as_str().unwrap_or(""), state, alerts, &what, &cwd)
                 );
+            }
+        }
+        Cmd::Alerts => {
+            // De momento, solo las de este equipo.
+            let list = api.call("GET", "/api/v1/sessions", None)?;
+            let mut alerts: Vec<(String, AlertRec)> = Vec::new();
+            for s in list.as_array().into_iter().flatten() {
+                let name = s["name"].as_str().unwrap_or("").to_owned();
+                let recs: Vec<AlertRec> =
+                    serde_json::from_value(s["alerts"].clone()).unwrap_or_default();
+                alerts.extend(recs.into_iter().map(|a| (name.clone(), a)));
+            }
+            if alerts.is_empty() {
+                println!("Sin alertas.");
+            }
+            alerts.sort_by_key(|(_, a)| a.at);
+            let now = nido::sys::local_time(registry::now_ms()).unwrap_or_default();
+            for (name, a) in alerts {
+                let at = nido::sys::local_time(a.at).unwrap_or_default();
+                println!("{}", alert_line(None, &name, &a, at, now));
             }
         }
         Cmd::New {
@@ -1137,6 +1159,43 @@ fn windows_service(action: ServiceCmd) -> io::Result<()> {
     }
 }
 
+/// Ancho en pantalla de la columna del estado en `nido ls`: cabe «te necesita 🔔10» (como mucho
+/// se guardan 10 alertas y el 🔔 ocupa dos columnas).
+const STATE_WIDTH: usize = 16;
+
+/// Una línea de `nido ls`: nombre, estado (con 🔔 si hay alertas sin ver), orden y carpeta.
+fn ls_line(name: &str, state: &str, alerts: usize, what: &str, cwd: &str) -> String {
+    let state = match alerts {
+        0 => state.to_owned(),
+        1 => format!("{state} 🔔"),
+        n => format!("{state} 🔔{n}"),
+    };
+    // A mano: `{:<N}` cuenta caracteres, no columnas.
+    let pad = " ".repeat(STATE_WIDTH.saturating_sub(state.width()));
+    format!("{name:<24} {state}{pad} {what:<10} {cwd}")
+}
+
+/// La hora de una alerta: «HH:MM» si es de hoy; si no, «dd/mm HH:MM».
+fn clock(at: LocalTime, now: LocalTime) -> String {
+    if (at.year, at.month, at.day) == (now.year, now.month, now.day) {
+        format!("{:02}:{:02}", at.hour, at.min)
+    } else {
+        format!("{:02}/{:02} {:02}:{:02}", at.day, at.month, at.hour, at.min)
+    }
+}
+
+/// Una línea de `nido alerts`: «equipo · sesión · hora · texto» (sin equipo, si no se sabe).
+fn alert_line(
+    machine: Option<&str>,
+    session: &str,
+    a: &AlertRec,
+    at: LocalTime,
+    now: LocalTime,
+) -> String {
+    let machine = machine.map_or(String::new(), |m| format!("{m} · "));
+    format!("{machine}{session} · {} · {}", clock(at, now), a.text)
+}
+
 /// «Cambio automático de cuenta: sí, al 99 %» (o «no»).
 fn auto_line(v: &serde_json::Value) -> String {
     match v["auto_switch"].as_bool() {
@@ -1148,5 +1207,66 @@ fn auto_line(v: &serde_json::Value) -> String {
             "Cambio automático de cuenta: no. `nido accounts auto on` lo enciende.".to_owned()
         }
         None => "Este nido no tiene cambio automático de cuenta.".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(year: i32, month: u32, day: u32, hour: u32, min: u32) -> LocalTime {
+        LocalTime {
+            year,
+            month,
+            day,
+            hour,
+            min,
+        }
+    }
+
+    #[test]
+    fn clock_is_short_today_and_with_date_otherwise() {
+        let now = t(2026, 11, 10, 18, 30);
+        assert_eq!(clock(t(2026, 11, 10, 9, 5), now), "09:05");
+        assert_eq!(clock(t(2026, 11, 9, 23, 59), now), "09/11 23:59");
+        // Mismo día y mes, otro año: con fecha.
+        assert_eq!(clock(t(2025, 11, 10, 9, 5), now), "10/11 09:05");
+    }
+
+    #[test]
+    fn alert_line_with_and_without_machine() {
+        let a = AlertRec {
+            text: "acabé los tests".into(),
+            at: 0,
+        };
+        let at = t(2026, 11, 10, 9, 5);
+        let now = t(2026, 11, 10, 18, 30);
+        assert_eq!(
+            alert_line(None, "web", &a, at, now),
+            "web · 09:05 · acabé los tests"
+        );
+        assert_eq!(
+            alert_line(Some("portátil"), "web", &a, at, now),
+            "portátil · web · 09:05 · acabé los tests"
+        );
+    }
+
+    #[test]
+    fn ls_line_bell_keeps_columns_aligned() {
+        let plain = ls_line("web", "esperando", 0, "claude", "~/src/web");
+        let one = ls_line("web", "esperando", 1, "claude", "~/src/web");
+        let three = ls_line("web", "te necesita", 3, "claude", "~/src/web");
+        let ten = ls_line("web", "te necesita", 10, "claude", "~/src/web");
+        assert!(!plain.contains('🔔'), "{plain}");
+        assert!(one.contains("esperando 🔔 "), "{one}");
+        assert!(!one.contains("🔔1"), "{one}");
+        assert!(three.contains("te necesita 🔔3 "), "{three}");
+        assert!(ten.contains("te necesita 🔔10 "), "{ten}");
+        // La orden y la carpeta empiezan en la misma columna de pantalla (el 🔔 ocupa dos).
+        let col = |l: &str, s: &str| l[..l.find(s).unwrap()].width();
+        for l in [&one, &three, &ten] {
+            assert_eq!(col(l, "claude"), col(&plain, "claude"), "{l}");
+            assert_eq!(col(l, "~/src"), col(&plain, "~/src"), "{l}");
+        }
     }
 }
