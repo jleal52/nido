@@ -523,6 +523,59 @@ async fn claude_launches_with_the_nido_channel() {
     nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
     assert!(released(&state, &s.id).await, "no se soltó al pararla");
 
+    // Claude en otra pantalla todo el plazo (iniciar sesión, aprobar un MCP, una novedad…): no
+    // se sabe si tira el channel. Retenida, hasta que se vea su caja o se cierre.
+    let otra = tmp.path().join("otra-pantalla");
+    folder(
+        &otra,
+        "Select login method:\n\n❯ 1. Claude account with subscription\n  2. Anthropic Console account\n",
+    );
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(session("otra-pantalla", &otra, &["claude"]))
+        .unwrap();
+    nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
+    let end = server::watch_startup(&state, &s.id, Duration::from_secs(1)).await;
+    assert_eq!(end, Startup::Nothing);
+    assert!(state.inbox.held(&s.id), "soltada sin mirar");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(state.inbox.held(&s.id), "soltada sin mirar, después");
+    nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
+    assert!(released(&state, &s.id).await, "no se soltó al pararla");
+
+    // Su guardián atiende pero no contesta en todo el plazo: tampoco se suelta. Cuando de
+    // verdad no hay nadie, sí.
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(session("mudo", tmp.path(), &["claude"]))
+        .unwrap();
+    let socket = paths.socket(&s.id);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (quiet_tx, mut quiet_rx) = tokio::sync::oneshot::channel::<()>();
+    let mute = tokio::spawn(async move {
+        let mut open = Vec::new();
+        loop {
+            tokio::select! {
+                Ok((c, _)) = listener.accept() => open.push(c),
+                _ = &mut quiet_rx => return,
+            }
+        }
+    });
+    let end = server::watch_startup(&state, &s.id, Duration::from_secs(1)).await;
+    assert_eq!(end, Startup::Nothing);
+    assert!(state.inbox.held(&s.id), "soltada sin mirar");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(state.inbox.held(&s.id), "soltada sin mirar, después");
+    let _ = quiet_tx.send(());
+    mute.await.unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    assert!(released(&state, &s.id).await, "no se soltó sin guardián");
+
     // Apagado: la sesión siguiente va sin opciones, sin `NIDO_CHANNEL` y sin que nadie teclee.
     assert!(nido_mcp(tmp.path(), false).contains("apagado"));
     assert!(paths.config.join("mcp-off").exists());

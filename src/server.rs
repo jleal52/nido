@@ -709,10 +709,6 @@ async fn watch_held(
     // aceptado), su bandeja no da nada (ver `Inbox::hold`).
     let mut hold = Some(hold);
     let mut repl_since: Option<tokio::time::Instant> = None;
-    // Con el aviso (o la pregunta de confiar) aún en pantalla al acabar el plazo, o sin haber
-    // podido mirar lo que sacó (su guardián tardó en contestar), no se suelta.
-    let mut stuck = false;
-    let mut unchecked = false;
     while tokio::time::Instant::now() < deadline {
         if scr.is_none() {
             let hello = Hello {
@@ -750,7 +746,6 @@ async fn watch_held(
                 .max(deadline);
         }
         trusting = trust;
-        stuck = trust || prompt::dev_channels(&text).is_some();
         match prompt::startup(&text) {
             Startup::Accept if !accepted => {
                 // De uno en uno, y mirando otra vez ya con el turno: otro que mire la misma
@@ -807,15 +802,9 @@ async fn watch_held(
             match ready(s, &text, &mut repl_since).await {
                 Ready::Wait => {}
                 // Se sigue mirando hasta el plazo.
-                Ready::Release => {
-                    hold = None;
-                    unchecked = false;
-                }
+                Ready::Release => hold = None,
                 // Retenida aún; con otra conexión, se vuelve a mirar.
-                Ready::Reconnect => {
-                    scr = None;
-                    unchecked = true;
-                }
+                Ready::Reconnect => scr = None,
                 Ready::Refuse(r) => {
                     let why = refusal_of(&r);
                     st.inbox.refuse(id, why);
@@ -826,11 +815,10 @@ async fn watch_held(
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    // Se acabó el plazo con el aviso o la pregunta en pantalla: Claude tiraría lo que le llegue.
-    // Retenida hasta que se contesten (o se pare la sesión).
-    if (stuck || unchecked)
-        && let Some(h) = hold.take()
-    {
+    // Se acabó el plazo sin haberla soltado: con el aviso o la pregunta en pantalla, en otra
+    // (iniciar sesión, aprobar un MCP…), o sin que su guardián contestara. Claude podría tirar lo
+    // que le llegue: retenida, y se sigue mirando (ver `keep_held`).
+    if let Some(h) = hold.take() {
         tokio::spawn(keep_held(
             st.paths.socket(id),
             scr.take(),
@@ -847,6 +835,31 @@ async fn watch_held(
 }
 
 type HolderScreen = prompt::Screen<crate::ipc::ReadHalf, crate::ipc::WriteHalf>;
+
+/// Tras tantas veces seguidas sin que su guardián conteste (con `keep_held`, un minuto), se dice.
+const SLOW_SAY: u32 = 12;
+
+/// Las veces seguidas que el guardián de una sesión tardó en contestar.
+#[derive(Default)]
+struct SlowCount {
+    n: u32,
+    said: bool,
+}
+
+impl SlowCount {
+    /// Otra vez sin contestar: `true` si toca decirlo (la primera vez que llega a `SLOW_SAY`).
+    fn slow(&mut self) -> bool {
+        self.n += 1;
+        let say = self.n >= SLOW_SAY && !self.said;
+        self.said |= say;
+        say
+    }
+
+    /// Contestó.
+    fn ok(&mut self) {
+        self.n = 0;
+    }
+}
 
 /// Si ya puede soltarse la bandeja de una sesión que arranca.
 #[derive(Debug, PartialEq, Eq)]
@@ -908,11 +921,11 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
     }
 }
 
-/// Pasado el plazo, con el aviso de los channels o la pregunta de confiar aún en pantalla: se
-/// sigue mirando (sin pulsar nada) hasta que se contesten y Claude espere peticiones, y entonces
-/// se suelta la bandeja (o se apunta que no tiene channel). También si no se pudo mirar lo que
-/// sacó: se vuelve a probar. Solo se suelta sin más si se cierra la sesión (nadie atiende en
-/// `socket`).
+/// Pasado el plazo sin haber soltado la bandeja (el aviso de los channels o la pregunta de
+/// confiar aún en pantalla, otra pantalla, o su guardián sin contestar): se sigue mirando (sin
+/// pulsar nada) hasta que Claude espere peticiones, y entonces se suelta (o se apunta que no
+/// tiene channel). Solo se suelta sin mirar si se cierra la sesión (nadie atiende en `socket`).
+/// Si su guardián lleva mucho sin contestar, se dice una vez.
 async fn keep_held(
     socket: std::path::PathBuf,
     mut scr: Option<HolderScreen>,
@@ -922,6 +935,7 @@ async fn keep_held(
 ) {
     use prompt::Startup;
     let mut since = None;
+    let mut slow = SlowCount::default();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if scr.is_none() {
@@ -935,6 +949,7 @@ async fn keep_held(
             Ok(t) => t,
             Err(prompt::Unread::Slow) => {
                 scr = None;
+                said_slow(&mut slow, &name, &id);
                 continue;
             }
             Err(prompt::Unread::Closed) => return,
@@ -942,10 +957,14 @@ async fn keep_held(
         let r = match prompt::startup(&text) {
             r @ (Startup::NoServer | Startup::Blocked) => r,
             _ => match ready(s, &text, &mut since).await {
-                Ready::Wait => continue,
+                Ready::Wait => {
+                    slow.ok();
+                    continue;
+                }
                 Ready::Release => return,
                 Ready::Reconnect => {
                     scr = None;
+                    said_slow(&mut slow, &name, &id);
                     continue;
                 }
                 Ready::Refuse(r) => r,
@@ -955,6 +974,17 @@ async fn keep_held(
         hold.refuse(why);
         log_refusal(why, &name, &id);
         return;
+    }
+}
+
+/// Otra vez sin que conteste el guardián de `keep_held`: tras `SLOW_SAY` seguidas, se dice (una
+/// vez).
+fn said_slow(slow: &mut SlowCount, name: &str, id: &str) {
+    if slow.slow() {
+        eprintln!(
+            "nido: {name} ({id}): su guardián no contesta; la bandeja sigue retenida hasta que \
+             conteste o se cierre"
+        );
     }
 }
 
@@ -3198,6 +3228,29 @@ mod tests {
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].text, "nueva");
         assert!(unread_alerts(&alerts, 30).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_long_silence_is_said_once() {
+        let mut c = SlowCount::default();
+        for _ in 1..SLOW_SAY {
+            assert!(!c.slow());
+        }
+        assert!(c.slow(), "a la vez {SLOW_SAY}");
+        // Una vez, aunque siga.
+        for _ in 0..3 * SLOW_SAY {
+            assert!(!c.slow());
+        }
+        // Seguidas: si contesta, se empieza a contar de nuevo (pero ya no se vuelve a decir).
+        let mut c = SlowCount::default();
+        for _ in 1..SLOW_SAY {
+            assert!(!c.slow());
+        }
+        c.ok();
+        for _ in 1..SLOW_SAY {
+            assert!(!c.slow());
+        }
+        assert!(c.slow());
     }
 
     #[tokio::test]
