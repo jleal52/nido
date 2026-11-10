@@ -194,6 +194,7 @@ const TABLE: &[(&str, &str)] = &[
     ("no se pudo arrancar: {}", "could not start: {0}"),
     ("no hay ninguna sesión {}", "there is no session {0}"),
     ("la sesión no está en marcha", "the session is not running"),
+    ("la alerta no tiene texto", "the alert has no text"),
     ("el guardián cerró", "the session holder closed"),
     (
         "el guardián no respondió",

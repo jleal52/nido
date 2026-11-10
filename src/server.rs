@@ -17,7 +17,9 @@ use crate::claude::{self, Procfs};
 use crate::i18n::{self, tr};
 use crate::launch::{self, Launcher, Paths};
 use crate::proto::{self, Frame, Hello, HistoryRequest, Role, Size};
-use crate::registry::{ClaudeLink, Registry, RegistryError, Session, new_id, now, now_ms};
+use crate::registry::{
+    AlertRec, ClaudeLink, Registry, RegistryError, Session, new_id, now, now_ms,
+};
 use crate::{accounts, auth, e2e, hub, prompt, upload};
 
 pub struct AppState {
@@ -43,6 +45,8 @@ pub struct AppState {
     /// Cuándo se avisó por última vez de que terminó cada sesión (para no avisar dos veces si
     /// termina, sigue y vuelve a terminar en poco tiempo).
     finished_pushed: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// El freno de las alertas que mandan las sesiones: un push por sesión cada 30 s.
+    alert_throttle: std::sync::Mutex<AlertThrottle>,
     /// La conexión con el hub: móviles sin VPN y avisos.
     pub hub: Arc<hub::Hub>,
     /// Lo que `scan` ve pasar (terminó, te necesita), para avisar al móvil.
@@ -109,6 +113,8 @@ enum AlertKind {
     Waiting,
     /// Terminó de trabajar.
     Finished,
+    /// La sesión mandó una alerta (`alert`): sale al momento.
+    Requested,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +128,78 @@ struct Alert {
 const ALERT_DELAY: Duration = Duration::from_secs(6);
 /// «Terminó» espera más: a menudo enseguida le llega algo (un subagente, otra sesión) y sigue.
 const FINISHED_DELAY: Duration = Duration::from_secs(20);
+/// Como mucho un push de alertas por sesión en este tiempo.
+const ALERT_EVERY: Duration = Duration::from_secs(30);
+/// El texto de una alerta, como mucho (en caracteres).
+const ALERT_MAX_CHARS: usize = 500;
+
+/// El freno de las alertas: cuándo salió el último push de cada sesión y las que se juntaron
+/// mientras tanto.
+#[derive(Debug, Default)]
+struct AlertThrottle {
+    last: std::collections::HashMap<String, std::time::Instant>,
+    held: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl AlertThrottle {
+    /// Si puede salir un push ahora; si puede, cuenta desde ahora.
+    fn allow(&mut self, session: &str, now: std::time::Instant) -> bool {
+        if self
+            .last
+            .get(session)
+            .is_some_and(|t| now.saturating_duration_since(*t) < ALERT_EVERY)
+        {
+            return false;
+        }
+        self.last.insert(session.to_owned(), now);
+        true
+    }
+
+    /// Cuánto falta para que pueda salir el siguiente.
+    fn wait(&self, session: &str, now: std::time::Instant) -> Duration {
+        self.last.get(session).map_or(Duration::ZERO, |t| {
+            ALERT_EVERY.saturating_sub(now.saturating_duration_since(*t))
+        })
+    }
+
+    /// Apunta una para el siguiente push.
+    fn hold(&mut self, session: &str, text: &str) {
+        self.held
+            .entry(session.to_owned())
+            .or_default()
+            .push(text.to_owned());
+    }
+
+    /// Cuántas hay juntas esperando.
+    fn pending(&self, session: &str) -> usize {
+        self.held.get(session).map_or(0, Vec::len)
+    }
+
+    /// Las que se juntaron, y queda vacío.
+    fn take(&mut self, session: &str) -> Vec<String> {
+        self.held.remove(session).unwrap_or_default()
+    }
+}
+
+/// El cuerpo del push: el texto, o «N alertas: <la última>» si se juntaron varias.
+fn alert_body(texts: &[String]) -> String {
+    match texts {
+        [one] => one.clone(),
+        [.., last] => format!("{} alertas: {last}", texts.len()),
+        [] => String::new(),
+    }
+}
+
+/// El texto de una alerta, sin espacios alrededor y recortado. `None` si queda vacío.
+fn alert_text(text: &str) -> Option<String> {
+    let t = text.trim();
+    (!t.is_empty()).then(|| t.chars().take(ALERT_MAX_CHARS).collect())
+}
+
+/// Las alertas que el usuario aún no ha visto.
+fn unread_alerts(alerts: &[AlertRec], seen: u64) -> Vec<AlertRec> {
+    alerts.iter().filter(|a| a.at > seen).cloned().collect()
+}
 
 /// Lo que la web recibe por el WebSocket de eventos: las sesiones (en su orden) y el orden de
 /// las carpetas.
@@ -145,6 +223,10 @@ pub struct SessionView {
     pub folder: Option<String>,
     /// Terminó de trabajar y el usuario aún no la ha abierto.
     pub unread: bool,
+    /// Quién la abrió con el MCP de nido (`equipo/id`); `None`: el usuario.
+    pub opened_by: Option<String>,
+    /// Las alertas que mandó y el usuario aún no ha visto.
+    pub alerts: Vec<AlertRec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -200,6 +282,7 @@ impl AppState {
             answering: Mutex::new(()),
             background: Default::default(),
             finished_pushed: Default::default(),
+            alert_throttle: Default::default(),
             hub,
             alerts,
             alerts_rx: std::sync::Mutex::new(Some(alerts_rx)),
@@ -284,6 +367,8 @@ impl AppState {
                 created: s.created,
                 folder: s.folder.clone(),
                 unread: finished > s.seen,
+                opened_by: s.opened_by.clone(),
+                alerts: unread_alerts(&s.alerts, s.seen),
                 alive,
                 claude: link.map(|l| ClaudeView {
                     background: found.as_ref().and_then(|_| {
@@ -364,6 +449,7 @@ fn still_alerting(v: &SessionView, kind: AlertKind) -> bool {
     match kind {
         AlertKind::Waiting => waiting,
         AlertKind::Finished => v.unread && !waiting,
+        AlertKind::Requested => !v.alerts.is_empty(),
     }
 }
 
@@ -371,7 +457,11 @@ fn still_alerting(v: &SessionView, kind: AlertKind) -> bool {
 fn attention(sessions: &[SessionView]) -> usize {
     sessions
         .iter()
-        .filter(|v| still_alerting(v, AlertKind::Waiting) || still_alerting(v, AlertKind::Finished))
+        .filter(|v| {
+            still_alerting(v, AlertKind::Waiting)
+                || still_alerting(v, AlertKind::Finished)
+                || still_alerting(v, AlertKind::Requested)
+        })
         .count()
 }
 
@@ -423,6 +513,7 @@ impl AppState {
         tokio::time::sleep(match a.kind {
             AlertKind::Waiting => ALERT_DELAY,
             AlertKind::Finished => FINISHED_DELAY,
+            AlertKind::Requested => Duration::ZERO,
         })
         .await;
         let (view, badge) = {
@@ -462,8 +553,100 @@ impl AppState {
                 Some(t) if t != v.name => format!("Terminó · {t}"),
                 _ => "Terminó".to_owned(),
             },
+            AlertKind::Requested => v.alerts.last().map(|a| a.text.clone()).unwrap_or_default(),
         };
         self.push_all(&v.name, &body, &v.id, badge).await;
+    }
+
+    /// Si hay a quién mandar avisos: algún teléfono con handle y el hub conectado.
+    fn can_push(&self) -> bool {
+        self.hub.status.borrow().connected
+            && self
+                .phones
+                .lock()
+                .expect("teléfonos")
+                .list()
+                .iter()
+                .any(|p| p.handle.is_some())
+    }
+
+    /// Una sesión manda una alerta al usuario: se apunta, se redibuja la lista y sale un push a
+    /// los teléfonos (como mucho uno cada 30 s por sesión; las demás se juntan en el siguiente).
+    pub async fn session_alert(self: &Arc<Self>, id: &str, text: &str) -> Result<(), String> {
+        let text = alert_text(text).ok_or("la alerta no tiene texto")?;
+        let id = {
+            let mut reg = self.registry.lock().await;
+            let id = reg
+                .find(id)
+                .map(|s| s.id.clone())
+                .ok_or_else(|| format!("no hay ninguna sesión {id:?}"))?;
+            reg.add_alert(&id, &text, now_ms())
+                .map_err(|e| e.to_string())?;
+            id
+        };
+        self.scan().await;
+        if !self.can_push() {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        let wait = {
+            let mut t = self.alert_throttle.lock().expect("freno");
+            t.hold(&id, &text);
+            if t.allow(&id, now) {
+                None
+            } else {
+                // Solo la primera que se aparta pone el reloj; las demás salen con ella.
+                Some((t.pending(&id) == 1).then(|| t.wait(&id, now)))
+            }
+        };
+        match wait {
+            None => self.flush_alerts(&id).await,
+            Some(Some(d)) => {
+                let st = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(d).await;
+                    if st
+                        .alert_throttle
+                        .lock()
+                        .expect("freno")
+                        .allow(&id, std::time::Instant::now())
+                    {
+                        st.flush_alerts(&id).await;
+                    }
+                });
+            }
+            Some(None) => {}
+        }
+        Ok(())
+    }
+
+    /// Manda en un push las alertas apartadas de una sesión.
+    async fn flush_alerts(&self, id: &str) {
+        let texts = self.alert_throttle.lock().expect("freno").take(id);
+        if texts.is_empty() {
+            return;
+        }
+        let (name, badge) = {
+            let l = self.views.borrow();
+            (
+                l.sessions
+                    .iter()
+                    .find(|v| v.id == id)
+                    .map(|v| v.name.clone()),
+                attention(&l.sessions),
+            )
+        };
+        let Some(name) = name else {
+            return;
+        };
+        let host = <Self as e2e::Host>::host_name(self);
+        self.push_all(
+            &format!("🔔 {name} ({host})"),
+            &alert_body(&texts),
+            id,
+            badge,
+        )
+        .await;
     }
 }
 
@@ -693,14 +876,7 @@ pub fn spawn_scanner(state: Arc<AppState>) {
         let st = state.clone();
         tokio::spawn(async move {
             while let Some(a) = rx.recv().await {
-                let any = st
-                    .phones
-                    .lock()
-                    .expect("teléfonos")
-                    .list()
-                    .iter()
-                    .any(|p| p.handle.is_some());
-                if !any || !st.hub.status.borrow().connected {
+                if !st.can_push() {
                     continue;
                 }
                 let st = st.clone();
@@ -781,6 +957,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sessions/order", post(api_order_sessions))
         .route("/api/v1/sessions/{id}/start", post(api_start))
         .route("/api/v1/sessions/{id}/seen", post(api_seen))
+        .route("/api/v1/sessions/{id}/alert", post(api_alert))
         .route("/api/v1/sessions/{id}/answer", post(api_answer))
         .route("/api/v1/sessions/{id}/stop", post(api_stop))
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
@@ -1371,6 +1548,27 @@ async fn api_seen(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Re
     match res {
         Ok(_) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => registry_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AlertRequest {
+    text: String,
+}
+
+/// La sesión avisa al usuario (la herramienta `alert` del MCP de nido).
+async fn api_alert(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AlertRequest>,
+) -> Response {
+    let s = match find_session(&st, &id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.session_alert(&s.id, &req.text).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
     }
 }
 
@@ -2055,5 +2253,107 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                 Some(Ok(_)) => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn view(id: &str) -> SessionView {
+        SessionView {
+            id: id.into(),
+            name: id.into(),
+            cwd: PathBuf::from("/tmp"),
+            argv: vec!["claude".into()],
+            autostart: false,
+            created: 0,
+            alive: true,
+            claude: None,
+            folder: None,
+            unread: false,
+            opened_by: None,
+            alerts: vec![],
+        }
+    }
+
+    #[test]
+    fn attention_counts_unread_alerts() {
+        let mut a = view("a");
+        a.alerts.push(AlertRec {
+            text: "listo".into(),
+            at: 5,
+        });
+        let b = view("b");
+        assert!(still_alerting(&a, AlertKind::Requested));
+        assert!(!still_alerting(&b, AlertKind::Requested));
+        assert_eq!(attention(&[a, b]), 1);
+    }
+
+    #[test]
+    fn only_alerts_after_seen_are_unread() {
+        let alerts = vec![
+            AlertRec {
+                text: "vieja".into(),
+                at: 10,
+            },
+            AlertRec {
+                text: "nueva".into(),
+                at: 30,
+            },
+        ];
+        let unread = unread_alerts(&alerts, 20);
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].text, "nueva");
+        assert!(unread_alerts(&alerts, 30).is_empty());
+    }
+
+    #[test]
+    fn throttle_one_push_every_30_s() {
+        let mut t = AlertThrottle::default();
+        let t0 = Instant::now();
+        assert!(t.allow("s", t0));
+        assert!(!t.allow("s", t0 + Duration::from_secs(10)));
+        assert_eq!(
+            t.wait("s", t0 + Duration::from_secs(10)),
+            Duration::from_secs(20)
+        );
+        // Otra sesión no espera.
+        assert!(t.allow("otra", t0 + Duration::from_secs(10)));
+        assert!(!t.allow("s", t0 + Duration::from_secs(29)));
+        assert!(t.allow("s", t0 + Duration::from_secs(30)));
+        assert!(!t.allow("s", t0 + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn throttle_holds_and_takes() {
+        let mut t = AlertThrottle::default();
+        assert_eq!(t.pending("s"), 0);
+        t.hold("s", "una");
+        assert_eq!(t.pending("s"), 1);
+        t.hold("s", "dos");
+        assert_eq!(t.pending("s"), 2);
+        assert_eq!(t.pending("otra"), 0);
+        assert_eq!(t.take("s"), vec!["una".to_owned(), "dos".to_owned()]);
+        assert_eq!(t.pending("s"), 0);
+        assert!(t.take("s").is_empty());
+    }
+
+    #[test]
+    fn alert_body_joins_held_ones() {
+        assert_eq!(alert_body(&["listo".into()]), "listo");
+        assert_eq!(
+            alert_body(&["una".into(), "dos".into(), "tres".into()]),
+            "3 alertas: tres"
+        );
+    }
+
+    #[test]
+    fn alert_text_is_trimmed_and_cut() {
+        assert_eq!(alert_text("  hola \n"), Some("hola".to_owned()));
+        assert_eq!(alert_text("   "), None);
+        let long = "á".repeat(600);
+        assert_eq!(alert_text(&long).unwrap().chars().count(), 500);
     }
 }
