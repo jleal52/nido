@@ -82,15 +82,14 @@ impl Paths {
     }
 }
 
-/// Con qué dirección hablan las sesiones de un `nido serve` que escucha en `bind`: la de
-/// loopback (la de la consola; la API del MCP solo atiende ahí), y si escucha en todas, por
-/// loopback.
+/// Con qué dirección hablan las sesiones de un `nido serve` que escucha en `bind`: siempre de
+/// loopback (la API del MCP solo atiende ahí): la suya, o la de loopback si escucha en todas.
+/// `None` si no escucha en loopback: su `nido mcp` no tendría con quién hablar.
 pub fn sessions_server(bind: &[std::net::SocketAddr]) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     let mut a = *bind
         .iter()
-        .find(|a| a.ip().is_loopback() || a.ip().is_unspecified())
-        .or_else(|| bind.first())?;
+        .find(|a| a.ip().is_loopback() || a.ip().is_unspecified())?;
     if a.ip().is_unspecified() {
         a.set_ip(match a.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -441,10 +440,8 @@ mod tests {
             Some(a("127.0.0.1:7690"))
         );
         assert_eq!(sessions_server(&[a("[::]:7690")]), Some(a("[::1]:7690")));
-        assert_eq!(
-            sessions_server(&[a("192.0.2.5:7690")]),
-            Some(a("192.0.2.5:7690"))
-        );
+        // Solo en otra dirección: la API del MCP solo contesta por loopback, no hay a dónde.
+        assert_eq!(sessions_server(&[a("192.0.2.5:7690")]), None);
         assert_eq!(sessions_server(&[]), None);
     }
 

@@ -504,23 +504,28 @@ impl AppState {
         let sessions: Vec<Session> = self.registry.lock().await.sessions().to_vec();
         for s in sessions.iter().filter(|s| s.autostart) {
             if !launch::is_alive(&self.paths, &s.id) {
+                let hold = self.launching(&s.id);
                 match launch::start(&self.paths, self.launcher, &s.id) {
-                    Ok(()) => self.launched(&s.id),
+                    Ok(()) => self.launched(&s.id, hold),
                     Err(e) => eprintln!("nido: no se pudo restaurar {}: {e}", s.name),
                 }
             }
         }
     }
 
-    /// Se acaba de arrancar la sesión `id`: si es un Claude con el channel de nido, que se mire
-    /// su pantalla de arranque.
-    pub(crate) fn launched(&self, id: &str) {
-        // Lo que se sabía de su channel (rechazo, su Claude) era del arranque anterior.
-        self.inbox.relaunched(id);
-        // Retenida ya, antes de que su `nido mcp` pueda recoger (ver `Inbox::hold`), si alguien
-        // va a mirar su arranque (`spawn_startup_watch`) y a soltarla.
+    /// Se va a arrancar la sesión `id`: su bandeja, retenida ya, antes de que su `nido mcp`
+    /// pueda recoger (ver `Inbox::hold`), si alguien va a mirar su arranque
+    /// (`spawn_startup_watch`) y a soltarla. Se le pasa a `launched`; si no arranca, se tira.
+    pub(crate) fn launching(&self, id: &str) -> Option<crate::inbox::Hold> {
         let watched = self.launched_rx.lock().expect("arranques").is_none();
-        let hold = watched.then(|| self.inbox.hold(id));
+        watched.then(|| self.inbox.hold(id))
+    }
+
+    /// Se acaba de arrancar la sesión `id` (con lo que dio `launching`): si es un Claude con el
+    /// channel de nido, que se mire su pantalla de arranque.
+    pub(crate) fn launched(&self, id: &str, hold: Option<crate::inbox::Hold>) {
+        // Lo que se sabía de su channel (rechazo, su Claude, parada) era del arranque anterior.
+        self.inbox.relaunched(id);
         let _ = self.launched.send((id.to_owned(), hold));
     }
 }
@@ -679,7 +684,7 @@ pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt:
     watch_held(st, id, window, st.inbox.hold(id)).await
 }
 
-/// `watch_startup`, con la bandeja ya retenida (`hold`, ver `AppState::launched`).
+/// `watch_startup`, con la bandeja ya retenida (`hold`, ver `AppState::launching`).
 async fn watch_held(
     st: &AppState,
     id: &str,
@@ -698,12 +703,14 @@ async fn watch_held(
         .await
         .get(id)
         .map_or_else(|| id.to_owned(), |s| s.name.clone());
-    let mut scr = None;
+    let mut scr: Option<HolderScreen> = None;
     let mut accepted = false;
-    // Hasta ver a Claude ya esperando peticiones sin decir que tira el channel (con el aviso
-    // aceptado), su bandeja no da nada (ver `Inbox::hold`); al acabar de mirar, se suelta igual.
+    // Hasta ver a Claude ya esperando peticiones sin que diga que no tiene channel (con el aviso
+    // aceptado), su bandeja no da nada (ver `Inbox::hold`).
     let mut hold = Some(hold);
     let mut repl_since: Option<tokio::time::Instant> = None;
+    // Con el aviso (o la pregunta de confiar) aún en pantalla al acabar el plazo, no se suelta.
+    let mut stuck = false;
     while tokio::time::Instant::now() < deadline {
         if scr.is_none() {
             let hello = Hello {
@@ -735,6 +742,7 @@ async fn watch_held(
                 .max(deadline);
         }
         trusting = trust;
+        stuck = trust || prompt::dev_channels(&text).is_some();
         match prompt::startup(&text) {
             Startup::Accept if !accepted => {
                 // De uno en uno, y mirando otra vez ya con el turno: otro que mire la misma
@@ -766,39 +774,123 @@ async fn watch_held(
                     "nido: {name}: el aviso de channels lista otros ({}); no se toca",
                     list.join(" ")
                 );
+                // Retenida hasta que el usuario lo conteste (ver `keep_held`).
+                if let (Some(h), Some(s)) = (hold.take(), scr.take()) {
+                    tokio::spawn(keep_held(s, h, name.clone(), id.to_owned()));
+                }
                 return Startup::Foreign(list);
             }
-            Startup::NoServer => {
-                st.inbox.refuse(id, crate::inbox::Refusal::NoServer);
-                eprintln!("nido: {name}: Claude no tiene el MCP de nido; queda sin channel");
-                return Startup::NoServer;
-            }
-            Startup::Blocked => {
-                st.inbox.refuse(id, crate::inbox::Refusal::Blocked);
-                eprintln!(
-                    "nido: la organización de la cuenta de Claude no permite channels \
-                     (channelsEnabled): la sesión {name} ({id}) no recibe mensajes"
-                );
-                return Startup::Blocked;
+            r @ (Startup::NoServer | Startup::Blocked) => {
+                let why = refusal_of(&r);
+                st.inbox.refuse(id, why);
+                log_refusal(why, &name, id);
+                return r;
             }
             _ => {}
         }
-        // Con su caja un rato (lo de arranque ya se ha pintado) y nada de lo anterior: la
-        // bandeja ya puede dar. Se sigue mirando hasta el plazo.
-        if hold.is_some() && prompt::repl(&text) {
-            let since = *repl_since.get_or_insert_with(tokio::time::Instant::now);
-            if since.elapsed() >= REPL_SETTLE {
-                hold = None;
+        if hold.is_some() {
+            match ready(s, &text, &mut repl_since).await {
+                Ready::Wait => {}
+                // Se sigue mirando hasta el plazo.
+                Ready::Release => hold = None,
+                Ready::Refuse(r) => {
+                    let why = refusal_of(&r);
+                    st.inbox.refuse(id, why);
+                    log_refusal(why, &name, id);
+                    return r;
+                }
             }
-        } else {
-            repl_since = None;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // Se acabó el plazo con el aviso o la pregunta en pantalla: Claude tiraría lo que le llegue.
+    // Retenida hasta que se contesten (o se pare la sesión).
+    if stuck && let (Some(h), Some(s)) = (hold.take(), scr.take()) {
+        tokio::spawn(keep_held(s, h, name, id.to_owned()));
     }
     if accepted {
         Startup::Accept
     } else {
         Startup::Nothing
+    }
+}
+
+type HolderScreen = prompt::Screen<crate::ipc::ReadHalf, crate::ipc::WriteHalf>;
+
+/// Si ya puede soltarse la bandeja de una sesión que arranca.
+enum Ready {
+    Wait,
+    Release,
+    /// Lo que ha sacado desde que arrancó dice que no tiene channel (`Blocked` o `NoServer`).
+    Refuse(prompt::Startup),
+}
+
+/// Con la caja de Claude un rato en pantalla (`REPL_SETTLE`; `since`: desde cuándo), se mira todo
+/// lo que ha sacado desde que arrancó (ver `prompt::launch_refusal`): retomada con mucha
+/// conversación, su saludo ya no está en pantalla.
+async fn ready(
+    s: &mut HolderScreen,
+    text: &str,
+    since: &mut Option<tokio::time::Instant>,
+) -> Ready {
+    if !prompt::repl(text) {
+        *since = None;
+        return Ready::Wait;
+    }
+    let t = *since.get_or_insert_with(tokio::time::Instant::now);
+    if t.elapsed() < REPL_SETTLE {
+        return Ready::Wait;
+    }
+    match s.output().await {
+        Ok(out) => prompt::launch_refusal(&out).map_or(Ready::Release, Ready::Refuse),
+        // Se cerró: nada que retener.
+        Err(_) => Ready::Release,
+    }
+}
+
+/// Por qué no tiene channel, según lo que se vio (`Blocked` o `NoServer`).
+fn refusal_of(r: &prompt::Startup) -> crate::inbox::Refusal {
+    match r {
+        prompt::Startup::Blocked => crate::inbox::Refusal::Blocked,
+        _ => crate::inbox::Refusal::NoServer,
+    }
+}
+
+fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
+    match why {
+        crate::inbox::Refusal::Blocked => eprintln!(
+            "nido: la organización de la cuenta de Claude no permite channels \
+             (channelsEnabled): la sesión {name} ({id}) no recibe mensajes"
+        ),
+        crate::inbox::Refusal::NoServer => {
+            eprintln!("nido: {name}: Claude no tiene el MCP de nido; queda sin channel")
+        }
+    }
+}
+
+/// Pasado el plazo, con el aviso de los channels o la pregunta de confiar aún en pantalla: se
+/// sigue mirando (sin pulsar nada) hasta que se contesten y Claude espere peticiones, y entonces
+/// se suelta la bandeja (o se apunta que no tiene channel). Si se cierra la sesión, se suelta.
+async fn keep_held(mut s: HolderScreen, hold: crate::inbox::Hold, name: String, id: String) {
+    use prompt::Startup;
+    let mut since = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let Ok(text) = s.screen().await else {
+            return;
+        };
+        let r = match prompt::startup(&text) {
+            r @ (Startup::NoServer | Startup::Blocked) => r,
+            _ => match ready(&mut s, &text, &mut since).await {
+                Ready::Wait => continue,
+                Ready::Release => return,
+                Ready::Refuse(r) => r,
+            },
+        };
+        let why = refusal_of(&r);
+        hold.refuse(why);
+        log_refusal(why, &name, &id);
+        return;
     }
 }
 
@@ -1857,6 +1949,7 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
         Err(e) => return registry_error(e),
     };
     if req.start {
+        let hold = st.launching(&created.id);
         if let Err(e) = launch::start(&st.paths, st.launcher, &created.id) {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1864,7 +1957,7 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
             );
         }
         wait_alive(&st, &created.id).await;
-        st.launched(&created.id);
+        st.launched(&created.id, hold);
     }
     st.refresh.notify_one();
     (StatusCode::CREATED, Json(created)).into_response()
@@ -1981,6 +2074,8 @@ async fn api_order_folders(
 }
 
 pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
+    // Lo que le llegue a su `nido mcp` mientras se muere se perdería.
+    st.inbox.stopped(id);
     // Bloquea un momento (en Windows espera a que el guardián recoja la orden): fuera del hilo
     // de tokio.
     let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
@@ -2077,11 +2172,12 @@ async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
         Err(r) => return r,
     };
     if !launch::is_alive(&st.paths, &s.id) {
+        let hold = st.launching(&s.id);
         if let Err(e) = launch::start(&st.paths, st.launcher, &s.id) {
             return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
         wait_alive(&st, &s.id).await;
-        st.launched(&s.id);
+        st.launched(&s.id, hold);
     }
     remember_running(&st, &s.id, true).await;
     st.refresh.notify_one();
@@ -2106,12 +2202,14 @@ async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) ->
     };
     // Antes de pararla, que el registro tenga la conversación actual para retomarla.
     st.scan().await;
+    // Retenida ya antes de pararla: el `nido mcp` de antes aún recoge.
+    let hold = st.launching(&s.id);
     stop_and_wait(&st, &s.id).await;
     if let Err(e) = launch::start(&st.paths, st.launcher, &s.id) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     wait_alive(&st, &s.id).await;
-    st.launched(&s.id);
+    st.launched(&s.id, hold);
     remember_running(&st, &s.id, true).await;
     st.refresh.notify_one();
     Json(serde_json::json!({ "ok": true })).into_response()

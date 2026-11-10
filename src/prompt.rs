@@ -1046,11 +1046,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Screen<R, W> {
         self.read().await
     }
 
+    /// Todo lo que ha sacado la sesión (su historial, con las marcas de rearranque y repintado,
+    /// y la pantalla al final): ver `launch_refusal`.
+    pub async fn output(&mut self) -> Result<String, String> {
+        self.request(true, false).await
+    }
+
     async fn read(&mut self) -> Result<String, String> {
-        let req = Frame::HistoryRequest(HistoryRequest {
-            all: false,
-            screen: true,
-        });
+        self.request(false, true).await
+    }
+
+    async fn request(&mut self, all: bool, screen: bool) -> Result<String, String> {
+        let req = Frame::HistoryRequest(HistoryRequest { all, screen });
         proto::write_frame(&mut self.wr, &req)
             .await
             .map_err(|_| "la sesión se ha cerrado")?;
@@ -1412,24 +1419,72 @@ pub fn repl(screen: &str) -> bool {
 }
 
 /// El aviso de Claude de que la organización de la cuenta no deja usar channels, para el de
-/// nido: en el saludo (con su rótulo, ver `startup_rows`), la fila «…blocked by org policy
-/// (…server:nido…)» y, justo debajo, «Inbound messages will be silently dropped». Con la caja ya
-/// en pantalla: no hay aviso que aceptar.
+/// nido: «--dangerously-load-development-channels blocked by org policy (…server:nido…)» y,
+/// justo detrás, «Inbound messages will be silently dropped». Va en filas con `▎` delante, que
+/// se juntan: en una terminal estrecha, o con varios channels, se parte en varias.
 fn channels_blocked(rows: &[&str]) -> bool {
     const BLOCKED: &str = "--dangerously-load-development-channels blocked by org policy (";
     const DROPPED: &str = "Inbound messages will be silently dropped";
-    let row = |l: &str| l.trim().trim_start_matches('▎').trim().to_owned();
-    rows.iter().any(|l| l.contains("Claude Code"))
-        && rows.windows(2).any(|w| {
-            let (first, next) = (row(w[0]), row(w[1]));
-            let Some(list) = first
-                .strip_prefix(BLOCKED)
-                .and_then(|r| r.strip_suffix(')'))
-            else {
-                return false;
-            };
-            next == DROPPED && list.split([',', ' ']).any(|c| c == "server:nido")
-        })
+    let mut blocks: Vec<String> = Vec::new();
+    let mut open = false;
+    for l in rows {
+        match l.trim().strip_prefix('▎') {
+            Some(r) if open => {
+                if let Some(b) = blocks.last_mut() {
+                    b.push(' ');
+                    b.push_str(r);
+                }
+            }
+            Some(r) => {
+                blocks.push(r.to_owned());
+                open = true;
+            }
+            None => open = false,
+        }
+    }
+    blocks.iter().any(|b| {
+        let b = b.split_whitespace().collect::<Vec<_>>().join(" ");
+        let Some(rest) = b.find(BLOCKED).map(|i| &b[i + BLOCKED.len()..]) else {
+            return false;
+        };
+        let Some((list, after)) = rest.split_once(')') else {
+            return false;
+        };
+        after.trim_start().starts_with(DROPPED)
+            && list.split([',', ' ']).any(|c| c == "server:nido")
+    })
+}
+
+/// Lo que dice del channel de nido el saludo de Claude (las filas de arranque, ver
+/// `startup_rows`, con su rótulo): que la organización no lo permite, o que no tiene el
+/// servidor `nido`.
+fn greeting_refusal(rows: &[&str]) -> Option<Startup> {
+    if !rows.iter().any(|l| l.contains("Claude Code")) {
+        return None;
+    }
+    if channels_blocked(rows) {
+        return Some(Startup::Blocked);
+    }
+    let no_server = rows.iter().map(|l| l.trim()).any(|l| {
+        l.starts_with("Channels:") && l.contains("server:nido · no MCP server configured")
+    });
+    no_server.then_some(Startup::NoServer)
+}
+
+/// Lo mismo (`Blocked` o `NoServer`), en todo lo que ha sacado la sesión desde que arrancó (su
+/// historial con la pantalla, ver `Screen::output`): retomada con mucha conversación, el saludo
+/// ya no está en pantalla. Desde la última marca de rearranque, y cada trozo entre repintados
+/// (`ESC[3J` deja otra marca) por separado.
+pub fn launch_refusal(history: &str) -> Option<Startup> {
+    let history = strip_sgr(history);
+    let lines: Vec<&str> = history.lines().collect();
+    let from = lines
+        .iter()
+        .rposition(|l| l.starts_with("\u{1}restart"))
+        .map_or(0, |i| i + 1);
+    lines[from..]
+        .split(|l| l.starts_with('\u{1}'))
+        .find_map(|part| greeting_refusal(startup_rows(part)))
 }
 
 pub fn startup(screen: &str) -> Startup {
@@ -1446,19 +1501,7 @@ pub fn startup(screen: &str) -> Startup {
     // En el saludo de Claude (con su rótulo), no en algo citado en la conversación.
     let screen = strip_sgr(screen);
     let all: Vec<&str> = screen.lines().collect();
-    let rows = startup_rows(&all);
-    if channels_blocked(rows) {
-        return Startup::Blocked;
-    }
-    let no_server = rows.iter().any(|l| l.contains("Claude Code"))
-        && rows.iter().map(|l| l.trim()).any(|l| {
-            l.starts_with("Channels:") && l.contains("server:nido · no MCP server configured")
-        });
-    if no_server {
-        Startup::NoServer
-    } else {
-        Startup::Nothing
-    }
+    greeting_refusal(startup_rows(&all)).unwrap_or(Startup::Nothing)
 }
 
 /// Tras cambiar de cuenta: si la sesión se quedó parada por el límite (`stopped`, según su
@@ -1861,6 +1904,53 @@ mod tests {
     }
 
     #[test]
+    fn what_this_launch_said_about_the_channel() {
+        // Una sesión retomada con mucha conversación: el saludo y las filas de «blocked» ya no
+        // están en pantalla, sino en lo que ha sacado desde que arrancó (su historial).
+        let bloqueado = include_str!("../tests/pantallas/channels_bloqueados.txt");
+        let sin = include_str!("../tests/pantallas/channels_sin_servidor.txt");
+        let (head, tail) = bloqueado.split_at(bloqueado.find('─').unwrap());
+        let mut talk = String::from("> sigue con lo de ayer\n\n");
+        for i in 0..60 {
+            talk.push_str(&format!("● Paso {i}: hecho.\n\n"));
+        }
+        let shown: Vec<&str> = talk.lines().collect();
+        let visible = format!("{}\n{tail}", shown[shown.len() - 20..].join("\n"));
+        assert_eq!(
+            startup(&visible),
+            Startup::Nothing,
+            "en pantalla ya no está"
+        );
+        let antes = "\u{1}restart 100\n● De otro arranque.\n";
+        let since = format!("{antes}\u{1}restart 200\n{head}{talk}{tail}");
+        assert_eq!(launch_refusal(&since), Some(Startup::Blocked));
+        // Lo de antes de este arranque no cuenta (la política pudo cambiar).
+        let viejo = format!("\u{1}restart 100\n{head}{talk}\u{1}restart 200\n{talk}{tail}");
+        assert_eq!(launch_refusal(&viejo), None);
+        // Sin marca de rearranque (la primera vez), todo es de este.
+        assert_eq!(
+            launch_refusal(&format!("{head}{talk}{tail}")),
+            Some(Startup::Blocked)
+        );
+        // Claude repinta (ESC[3J deja una marca `reset`): se mira cada trozo por separado, aunque
+        // en uno anterior saliera ya su caja.
+        let repintado = format!("\u{1}restart 200\n{tail}\n\u{1}reset 201\n{head}{tail}");
+        assert_eq!(launch_refusal(&repintado), Some(Startup::Blocked));
+        let sin_head = &sin[..sin.find('─').unwrap()];
+        assert_eq!(
+            launch_refusal(&format!("\u{1}restart 1\n{sin_head}{talk}{tail}")),
+            Some(Startup::NoServer)
+        );
+        // Citado en la conversación, no.
+        let citado = format!(
+            "\u{1}restart 1\n{talk}  {}\n{tail}",
+            &head[head.find('▎').unwrap()..]
+        );
+        assert_eq!(launch_refusal(&citado), None);
+        assert_eq!(launch_refusal(""), None);
+    }
+
+    #[test]
     fn what_to_do_with_the_startup_screen() {
         let aviso = include_str!("../tests/pantallas/aviso_channels.txt");
         assert_eq!(startup(aviso), Startup::Accept);
@@ -1989,6 +2079,33 @@ mod tests {
         // Sin el rótulo de Claude Code encima (ya se fue de la pantalla), tampoco.
         let sin_rotulo = rows[3..].join("\n");
         assert_eq!(startup(&sin_rotulo), Startup::Nothing);
+        // Partida en varias filas (terminal estrecha, o varios channels), igual.
+        let partido = |rows_: &[&str]| {
+            let mut v: Vec<String> = rows[..3].iter().map(|l| l.to_string()).collect();
+            v.extend(rows_.iter().map(|l| l.to_string()));
+            v.extend(rows[6..].iter().map(|l| l.to_string()));
+            v.join("\n")
+        };
+        let p = partido(&[
+            "▎ --dangerously-load-development-channels blocked by org policy",
+            "▎ (server:otro, server:nido)",
+            "▎ Inbound messages will be silently dropped",
+        ]);
+        assert_eq!(startup(&p), Startup::Blocked, "{p}");
+        let p = partido(&[
+            "▎ --dangerously-load-development-channels blocked by",
+            "▎ org policy (server:nido)",
+            "▎ Inbound messages will be silently",
+            "▎ dropped",
+            "▎ Have an administrator set channelsEnabled: true",
+        ]);
+        assert_eq!(startup(&p), Startup::Blocked, "{p}");
+        let p = partido(&[
+            "▎ --dangerously-load-development-channels blocked by org policy",
+            "▎ (server:otro)",
+            "▎ Inbound messages will be silently dropped",
+        ]);
+        assert_eq!(startup(&p), Startup::Nothing, "{p}");
         // Claude ya espera peticiones (su caja), y no en el aviso ni en la pregunta de confiar.
         assert!(repl(bloqueado));
         assert!(repl(sin));

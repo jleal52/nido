@@ -80,7 +80,18 @@ impl Refusal {
 /// Mientras vive, la bandeja de la sesión no da nada (ver `Inbox::hold`).
 pub struct Hold {
     channels: Arc<Mutex<HashMap<String, Channel>>>,
+    arrived: Arc<watch::Sender<()>>,
     id: String,
+}
+
+impl Hold {
+    /// Lo que vio quien la retiene: no tiene channel (como `Inbox::refuse`).
+    pub fn refuse(&self, why: Refusal) {
+        if let Some(c) = self.channels.lock().expect("channels").get_mut(&self.id) {
+            c.refused = Some(why);
+        }
+        self.arrived.send_replace(());
+    }
 }
 
 impl Drop for Hold {
@@ -89,6 +100,7 @@ impl Drop for Hold {
         if let Some(c) = self.channels.lock().expect("channels").get_mut(&self.id) {
             c.holding = c.holding.saturating_sub(1);
         }
+        self.arrived.send_replace(());
     }
 }
 
@@ -131,8 +143,17 @@ struct Channel {
     refused: Option<Refusal>,
     /// Arranques que se están mirando (ver `Inbox::hold`).
     holding: usize,
+    /// Se paró a mano (ver `Inbox::stopped`). Lo quita `relaunched`.
+    stopped: bool,
     /// Ya se dijo que su bandeja va sin proteger (`unguarded`). Lo quita `relaunched`.
     unguarded: bool,
+}
+
+impl Channel {
+    /// No se le da nada a su `nido mcp` (ver `Inbox::held`).
+    fn is_held(&self) -> bool {
+        self.refused.is_some() || self.holding > 0 || self.stopped
+    }
 }
 
 /// ¿Tiene channel? Si no se sabe que no, y está recogiendo o recogió hace poco.
@@ -147,7 +168,8 @@ pub struct Inbox {
     /// Compartido con los `Hold`, que lo sueltan al acabar.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
     /// Cambia con cada mensaje nuevo: despierta a las recogidas que esperan.
-    arrived: watch::Sender<()>,
+    /// Compartido con los `Hold`: al soltar, las recogidas que esperan vuelven a mirar.
+    arrived: Arc<watch::Sender<()>>,
     /// `POLL_WAIT` en ms (las pruebas la acortan).
     wait_ms: AtomicU64,
     /// Cuándo se cargó (ver `uptime`).
@@ -177,7 +199,7 @@ impl Inbox {
             path,
             queues: Mutex::new(queues.into_iter().collect()),
             channels: Arc::default(),
-            arrived: watch::Sender::new(()),
+            arrived: Arc::new(watch::Sender::new(())),
             wait_ms: AtomicU64::new(POLL_WAIT.as_millis() as u64),
             loaded_at: Mutex::new(Instant::now()),
         }
@@ -262,6 +284,10 @@ impl Inbox {
     /// Quita de la cola de `id` los mensajes `ids` (los de otras colas no se tocan). Devuelve
     /// cuántos quitó.
     pub fn ack(&self, id: &str, ids: &[String]) -> usize {
+        // Retenida, no se le ha dado nada: lo que diga confirmar no es de este arranque.
+        if self.held(id) {
+            return 0;
+        }
         let mut queues = self.queues.lock().expect("bandeja");
         let Some(q) = queues.get_mut(id) else {
             return 0;
@@ -294,7 +320,7 @@ impl Inbox {
             .lock()
             .expect("channels")
             .get(id)
-            .is_some_and(|c| live(c.polling, c.last, c.refused.is_some(), Instant::now()))
+            .is_some_and(|c| live(c.polling, c.last, c.is_held(), Instant::now()))
     }
 
     /// La sesión `id` no tiene channel, según su pantalla (hasta que se vuelva a lanzar).
@@ -305,6 +331,19 @@ impl Inbox {
             .entry(id.to_owned())
             .or_default()
             .refused = Some(why);
+        self.arrived.send_replace(());
+    }
+
+    /// Se para la sesión `id` (a mano): hasta que se vuelva a lanzar no se le da nada, que su
+    /// `nido mcp` se está muriendo con su Claude.
+    pub fn stopped(&self, id: &str) {
+        self.channels
+            .lock()
+            .expect("channels")
+            .entry(id.to_owned())
+            .or_default()
+            .stopped = true;
+        self.arrived.send_replace(());
     }
 
     /// Por qué no tiene channel la sesión `id`, si su pantalla lo dijo en este arranque.
@@ -316,14 +355,15 @@ impl Inbox {
             .and_then(|c| c.refused)
     }
 
-    /// ¿Se le retiene la bandeja a su `nido mcp`? Sin channel (Claude tiraría los mensajes), o
-    /// mientras se mira su arranque (`hold`).
+    /// ¿Se le retiene la bandeja a su `nido mcp`? Sin channel (Claude tiraría los mensajes),
+    /// mientras se mira su arranque (`hold`) o parada a mano (`stopped`). Mientras, tampoco
+    /// cuenta como con channel ni confirma nada.
     pub fn held(&self, id: &str) -> bool {
         self.channels
             .lock()
             .expect("channels")
             .get(id)
-            .is_some_and(|c| c.refused.is_some() || c.holding > 0)
+            .is_some_and(Channel::is_held)
     }
 
     /// Mientras se mira el arranque de `id` y aún no se sabe si Claude acepta el channel: su
@@ -336,8 +376,10 @@ impl Inbox {
             .entry(id.to_owned())
             .or_default()
             .holding += 1;
+        self.arrived.send_replace(());
         Hold {
             channels: self.channels.clone(),
+            arrived: self.arrived.clone(),
             id: id.to_owned(),
         }
     }
@@ -355,6 +397,7 @@ impl Inbox {
     pub fn relaunched(&self, id: &str) {
         if let Some(c) = self.channels.lock().expect("channels").get_mut(id) {
             c.refused = None;
+            c.stopped = false;
             c.unguarded = false;
         }
     }
@@ -377,7 +420,12 @@ impl Inbox {
         let mut rx = self.arrived.subscribe();
         let deadline = tokio::time::Instant::now() + self.poll_wait();
         loop {
-            let msgs = self.pending(id);
+            // Retenida (ver `held`), se sigue esperando: quien la suelte avisa.
+            let msgs = if self.held(id) {
+                Vec::new()
+            } else {
+                self.pending(id)
+            };
             if !msgs.is_empty() {
                 return msgs;
             }
@@ -589,6 +637,55 @@ mod tests {
         assert!(inbox.channel("hija"));
     }
 
+    #[tokio::test]
+    async fn a_poll_in_flight_respects_the_hold() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = std::sync::Arc::new(Inbox::load(dir.path().join("inbox.json")));
+        inbox.set_poll_wait(Duration::from_millis(1500));
+        let poll = |inbox: &std::sync::Arc<Inbox>| {
+            let inbox = inbox.clone();
+            tokio::spawn(async move { inbox.poll("s").await })
+        };
+        // Una recogida que empezó antes de retener la bandeja: lo que llegue no se lo lleva, y
+        // la sesión no cuenta como con channel.
+        let a = poll(&inbox);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(inbox.channel("s"));
+        let hold = inbox.hold("s");
+        assert!(!inbox.channel("s"), "retenida, no tiene channel");
+        inbox.push("s", msg("m1", "uno")).unwrap();
+        assert!(a.await.unwrap().is_empty(), "se lo llevó retenida");
+        // Ni confirmar.
+        assert_eq!(inbox.ack("s", &["m1".into()]), 0);
+        assert_eq!(ids(&inbox.pending("s")), ["m1"]);
+        // Al soltarla, la que espera lo recoge ya.
+        let b = poll(&inbox);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let start = Instant::now();
+        drop(hold);
+        assert_eq!(ids(&b.await.unwrap()), ["m1"]);
+        assert!(start.elapsed() < Duration::from_millis(1000));
+        assert_eq!(inbox.ack("s", &["m1".into()]), 1);
+        // Igual con un rechazo, que llega con una recogida en marcha.
+        let c = poll(&inbox);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        inbox.refuse("s", Refusal::Blocked);
+        inbox.push("s", msg("m2", "dos")).unwrap();
+        assert!(c.await.unwrap().is_empty());
+        inbox.relaunched("s");
+        assert_eq!(inbox.ack("s", &["m2".into()]), 1);
+        // Parada a mano: hasta volver a lanzarla, nada (su `nido mcp` se está muriendo).
+        let d = poll(&inbox);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        inbox.stopped("s");
+        inbox.push("s", msg("m3", "tres")).unwrap();
+        assert!(d.await.unwrap().is_empty());
+        assert!(!inbox.channel("s"));
+        inbox.relaunched("s");
+        assert_eq!(ids(&inbox.poll("s").await), ["m3"]);
+    }
+
     #[test]
     fn the_inbox_waits_while_the_startup_is_watched() {
         // Mientras se mira el arranque (y no se sabe aún si Claude va a tirar los mensajes), no
@@ -609,6 +706,12 @@ mod tests {
         drop(c);
         assert!(!inbox.held("s"));
         assert!(inbox.channels.lock().unwrap().get("s").is_none());
+        // Quien la retiene puede decir que no tiene channel (lo vio en su pantalla).
+        let d = inbox.hold("s");
+        d.refuse(Refusal::NoServer);
+        drop(d);
+        assert_eq!(inbox.refusal("s"), Some(Refusal::NoServer));
+        assert!(inbox.held("s"));
     }
 
     #[test]

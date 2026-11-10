@@ -296,6 +296,11 @@ async fn claude_launches_with_the_nido_channel() {
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!otro.join("picked").exists(), "tecleó en un aviso ajeno");
+    // Con el aviso aún en pantalla, Claude tiraría lo que le llegue: la bandeja sigue retenida
+    // (hasta que se conteste, o se pare la sesión).
+    assert!(state.inbox.held(&s.id), "soltada con el aviso en pantalla");
+    nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
+    assert!(released(&state, &s.id).await, "no se soltó al pararla");
 
     // «no MCP server configured»: la sesión queda sin channel, aunque acabara de recoger.
     let sin = tmp.path().join("sin");
@@ -389,6 +394,31 @@ async fn claude_launches_with_the_nido_channel() {
     assert!(!bloq.join("picked").exists());
     nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
 
+    // Retomada con mucha conversación: las filas de «blocked» ya no están en pantalla, pero sí
+    // en lo que ha sacado desde que arrancó.
+    let largo = tmp.path().join("bloqueado-largo");
+    let fixture_b = fixture("channels_bloqueados");
+    let (head, tail) = fixture_b.split_at(fixture_b.find('─').unwrap());
+    let mut talk = String::from("> sigue con lo de ayer\n\n");
+    for i in 0..80 {
+        talk.push_str(&format!("● Paso {i}: hecho.\n"));
+    }
+    folder(&largo, &format!("{head}{talk}{tail}"));
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(session("bloqueado-largo", &largo, &["claude"]))
+        .unwrap();
+    nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
+    let end = server::watch_startup(&state, &s.id, Duration::from_secs(20)).await;
+    assert_eq!(end, Startup::Blocked);
+    assert_eq!(
+        state.inbox.refusal(&s.id),
+        Some(nido::inbox::Refusal::Blocked)
+    );
+    nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
+
     // Parada, `send` la encola. Al volver a arrancarla, su `nido mcp` recoge enseguida, con el
     // aviso aún en pantalla, y Claude tira lo que le llegue antes de aceptarlo: la bandeja no da
     // nada hasta que se acepta y está su caja.
@@ -417,6 +447,11 @@ async fn claude_launches_with_the_nido_channel() {
     std::fs::remove_file(cola.join("picked")).unwrap();
     // Esta vez el aviso tarda en poder contestarse (3 s).
     std::fs::write(cola.join("before"), fixture("aviso_channels")).unwrap();
+    // Una recogida larga en marcha al mandar (la del `nido mcp` que se muere): no se lo lleva.
+    state.inbox.set_poll_wait(Duration::from_secs(3));
+    let id_ = s.id.clone();
+    let early = tokio::spawn(async move { inbox(addr, &id_, None, None).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let (code, r) = tool(
         addr,
         &caller,
@@ -426,9 +461,21 @@ async fn claude_launches_with_the_nido_channel() {
     .await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(r["status"], "queued", "{r}");
+    let (code, r) = early.await.unwrap();
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["messages"], json!([]), "se lo llevó parada");
     assert_eq!(state.inbox.pending(&s.id).len(), 1);
-    state.inbox.set_poll_wait(Duration::from_millis(300));
+    // Y otra que empieza antes de arrancarla: tampoco (el aviso no se puede aceptar hasta
+    // pasados 3 s).
+    let id_ = s.id.clone();
+    let before = tokio::spawn(async move { inbox(addr, &id_, None, None).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(rest(addr, &start).await, 200);
+    let (code, r) = before.await.unwrap();
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["messages"], json!([]), "se lo llevó al arrancar");
+    assert!(!cola.join("picked").exists());
+    state.inbox.set_poll_wait(Duration::from_millis(300));
     // Como su `nido mcp`, recogiendo sin parar desde que arranca.
     let until = std::time::Instant::now() + Duration::from_secs(30);
     let got = loop {
@@ -468,6 +515,13 @@ async fn claude_launches_with_the_nido_channel() {
         "{took:?}"
     );
     assert!(!trust.join("picked").exists());
+    // Sigue la pregunta: retenida aún, hasta que la conteste o se pare.
+    assert!(
+        state.inbox.held(&s.id),
+        "soltada con la pregunta en pantalla"
+    );
+    nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
+    assert!(released(&state, &s.id).await, "no se soltó al pararla");
 
     // Apagado: la sesión siguiente va sin opciones, sin `NIDO_CHANNEL` y sin que nadie teclee.
     assert!(nido_mcp(tmp.path(), false).contains("apagado"));
@@ -599,6 +653,17 @@ async fn claude_launches_with_the_nido_channel() {
             libc::kill(p as i32, libc::SIGKILL);
         }
     }
+}
+
+/// Espera (hasta 10 s) a que la bandeja de `id` deje de estar retenida.
+async fn released(state: &AppState, id: &str) -> bool {
+    for _ in 0..100 {
+        if !state.inbox.held(id) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 /// Un `POST` sin cuerpo a la API de la consola (arrancar, parar): su código.

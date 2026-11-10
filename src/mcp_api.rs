@@ -2091,6 +2091,7 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         let session = opened_session(&reg, cwd, name, model.as_deref(), &message, opener);
         reg.add(session).map_err(Fail::from)?
     };
+    let hold = st.launching(&created.id);
     if let Err(e) = launch::start(&st.paths, st.launcher, &created.id) {
         // Que no quede apuntada una sesión que no arrancó.
         let _ = st.registry.lock().await.remove(&created.id);
@@ -2100,7 +2101,7 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         ));
     }
     server::wait_alive(st, &created.id).await;
-    st.launched(&created.id);
+    st.launched(&created.id, hold);
     st.refresh.notify_one();
     let Some(v) = view(st, &created.id).await else {
         return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
