@@ -282,6 +282,7 @@ async fn mcp_api_end_to_end() {
     assert_eq!(s["name"], "otra");
     assert_eq!(s["state"], "stopped");
     assert_eq!(s["mine"], false);
+    assert_eq!(s["channel"], false);
     assert!(s["opened_by"].is_null());
 
     // `read`: la primera vez, todo; luego, solo lo nuevo.
@@ -462,6 +463,10 @@ async fn mcp_api_end_to_end() {
             json!({"machine": "Prueba", "folder": work, "prompt": "a".repeat(24 * 1024 + 1)}),
             "the prompt is longer than 24 KB",
         ),
+        (
+            json!({"machine": "Prueba", "folder": work, "prompt": "di hola", "model": "m".repeat(129)}),
+            "the model is longer than 128 characters",
+        ),
     ];
     for (args, want) in bad {
         let (code, e) = tool(addr, me, "open", args).await;
@@ -494,6 +499,10 @@ async fn mcp_api_end_to_end() {
     assert_eq!(opened["opened_by"], by.as_str());
     assert_eq!(opened["mine"], true);
     assert_eq!(opened["state"], "working", "viva y sin Claude a la vista");
+    assert_eq!(
+        opened["channel"], false,
+        "su nido mcp aún no recoge la bandeja"
+    );
     let new_id = opened["id"].as_str().unwrap().to_owned();
     assert_eq!(opened["session"], format!("Prueba/{new_id}"));
     // Lo que recibió la «shell»: la orden de Claude con el modelo y el mensaje inicial al final.

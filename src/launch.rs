@@ -220,6 +220,11 @@ pub fn holder_pid(paths: &Paths, id: &str) -> Option<i32> {
         .ok()
 }
 
+/// Cuándo arrancó el guardián de la sesión: cuando escribió su pid (al reiniciarla, otra vez).
+pub fn holder_started(paths: &Paths, id: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(paths.pidfile(id)).ok()?.modified().ok()
+}
+
 /// El proceso del guardián sigue existiendo (aunque ya no atienda en el socket).
 pub fn holder_running(paths: &Paths, id: &str) -> bool {
     holder_pid(paths, id)

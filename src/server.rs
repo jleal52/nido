@@ -41,6 +41,9 @@ pub struct AppState {
     pub(crate) answering: Mutex<()>,
     /// Hasta dónde ha leído cada sesión la conversación de otra (la herramienta `read` del MCP).
     pub(crate) mcp_cursors: crate::mcp_api::Cursors,
+    /// Los mensajes que esperan a cada sesión (la herramienta `send`) y qué sesiones tienen
+    /// channel.
+    pub inbox: crate::inbox::Inbox,
     /// Lo que cada sesión de Claude tiene en segundo plano (subagentes, órdenes), según su
     /// pantalla; lo pone al día `spawn_background` cada pocos segundos.
     background: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
@@ -281,6 +284,7 @@ impl AppState {
         let hub = hub::Hub::new(paths.config.join("hub.json"));
         let (alerts, alerts_rx) = tokio::sync::mpsc::unbounded_channel();
         let paths_config_pair = paths.config.join("pair-demo.json");
+        let inbox = crate::inbox::Inbox::load(paths.state.join("inbox.json"));
         let identity = e2e::Identity::load_or_create(&paths.config.join("hub.key"))
             .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
         let phones = e2e::Phones::load(paths.data.join("phones.json"));
@@ -308,6 +312,7 @@ impl AppState {
             accounts,
             answering: Mutex::new(()),
             mcp_cursors: Default::default(),
+            inbox,
             background: Default::default(),
             finished_pushed: Default::default(),
             alert_throttle: Default::default(),
@@ -987,6 +992,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sessions/{id}/live", get(ws_live))
         .route("/api/v1/sessions/{id}/term", get(ws_term))
         .route("/api/v1/events", get(ws_events))
+        .route("/api/v1/mcp/inbox", get(crate::mcp_api::api_inbox))
+        .route("/api/v1/mcp/inbox/ack", post(crate::mcp_api::api_inbox_ack))
         .route("/api/v1/mcp/{tool}", post(crate::mcp_api::api_mcp))
         .route(
             "/api/v1/upload",
@@ -1669,6 +1676,7 @@ pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), Regist
     let res = st.registry.lock().await.remove(id);
     let _ = std::fs::remove_dir_all(st.paths.session_state(id));
     st.mcp_cursors.forget(id);
+    st.inbox.forget(id);
     st.refresh.notify_one();
     res.map(|_| ())
 }

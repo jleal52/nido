@@ -2,14 +2,18 @@
 //!
 //! Claude Code lo lanza dentro de cada sesión de nido (que pone `NIDO_SESSION`). Se declara
 //! channel de Claude Code, para meter en la sesión los mensajes de otras, y da las herramientas,
-//! que pasa tal cual a la API local de `nido serve` (`POST /api/v1/mcp/<herramienta>`).
+//! que pasa tal cual a la API local de `nido serve` (`POST /api/v1/mcp/<herramienta>`). Un hilo
+//! recoge la bandeja de la sesión (`GET /api/v1/mcp/inbox`) y mete cada mensaje como evento del
+//! channel.
 //!
 //! JSON-RPC 2.0 por líneas. `handle` es pura (mensaje → lo que hay que escribir) y `run` la
 //! conecta con stdin y stdout.
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
@@ -26,6 +30,15 @@ pub trait Api: Send + Sync {
     fn call(&self, tool: &str, args: Value) -> Result<Value, String>;
 }
 
+/// La bandeja de la sesión: en la vida real, también la API local.
+pub trait Mailbox: Send + Sync {
+    /// Lo que espera, del más antiguo al más nuevo; si no hay nada, `nido serve` espera hasta
+    /// 25 s a que llegue algo.
+    fn fetch(&self) -> Result<Vec<Value>, String>;
+    /// Ya está en la sesión: que no vuelva a salir.
+    fn ack(&self, ids: &[String]) -> Result<(), String>;
+}
+
 #[derive(Clone)]
 pub struct State {
     /// La sesión de nido en la que corre (`NIDO_SESSION`); sin ella, ni herramientas ni channel.
@@ -40,20 +53,57 @@ pub struct LocalApi {
     pub session: String,
 }
 
+/// Cuánto se espera la respuesta de la bandeja: más que lo que la retiene `nido serve` (25 s).
+const FETCH_TIMEOUT: Duration = Duration::from_secs(40);
+const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Api for LocalApi {
     fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
-        // Sin límite de lectura: con `wait` la respuesta puede tardar media hora. Y sin
-        // `Accept-Language`: lo lee el modelo, en inglés. Por eso los errores de aquí también
+        // Sin límite de lectura: con `wait` la respuesta puede tardar media hora.
+        self.request("POST", &format!("/api/v1/mcp/{tool}"), Some(&args), None)
+    }
+}
+
+impl Mailbox for LocalApi {
+    fn fetch(&self) -> Result<Vec<Value>, String> {
+        let r = self.request("GET", "/api/v1/mcp/inbox", None, Some(FETCH_TIMEOUT))?;
+        match r.get("messages") {
+            Some(Value::Array(m)) => Ok(m.clone()),
+            _ => Err("nido serve gave a bad answer".to_owned()),
+        }
+    }
+
+    fn ack(&self, ids: &[String]) -> Result<(), String> {
+        let body = json!({ "ids": ids });
+        self.request(
+            "POST",
+            "/api/v1/mcp/inbox/ack",
+            Some(&body),
+            Some(ACK_TIMEOUT),
+        )
+        .map(drop)
+    }
+}
+
+impl LocalApi {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        // Sin `Accept-Language`: lo lee el modelo, en inglés. Por eso los errores de aquí también
         // van en inglés, y no los de `client` (los de la consola, en español).
         let addr = self.client.addr;
         let (code, json) = self
             .client
             .request_with(
-                "POST",
-                &format!("/api/v1/mcp/{tool}"),
-                Some(&args),
+                method,
+                path,
+                body,
                 &[("X-Nido-Session", &self.session)],
-                None,
+                timeout,
             )
             .map_err(|e| match e.kind() {
                 io::ErrorKind::InvalidData => format!("nido serve on {addr} gave a bad answer"),
@@ -110,13 +160,13 @@ const SESSION: Arg = req(
 const WAIT: Arg = opt(
     "wait",
     "boolean",
-    "Wait until the session finishes its answer, asks a question or a permission, or the \
-     timeout passes.",
+    "Wait until the session is no longer working (idle, question or stopped), or the timeout \
+     passes.",
 );
 const TIMEOUT: Arg = opt(
     "timeout_s",
     "integer",
-    "With wait: how many seconds to wait at most (default 600). If it passes, the session is \
+    "With wait: how many seconds to wait at most (default 600). If it passes, the state is \
      still working: call `read` with wait to keep waiting.",
 );
 
@@ -126,28 +176,38 @@ const TOOLS: &[Tool] = &[
         any_of: &[],
         name: "sessions",
         about: "List the Claude sessions on all the machines of the user's nido group: machine, \
-                id, name, folder, state (working, waiting, pending question, no channel) and \
-                whether this session opened it. Machines that don't answer show as offline.",
+                id, name, folder, state (working, idle, question or stopped), channel (whether \
+                it can receive messages) and whether this session opened it (mine). Machines \
+                that don't answer show as offline.",
         args: &[],
     },
     Tool {
         any_of: &[],
         name: "send",
         about: "Send a message to another session. It arrives there as a channel event from \
-                this session. Without wait, says whether it was delivered or queued. With wait, \
-                returns its answer, or its pending question or permission request.",
+                this session. Returns status sent (it has a channel and gets it now) or queued \
+                (the session is stopped or still starting: it gets it when it is up). A running \
+                session without a channel does not accept messages. With wait, also returns \
+                what `read` returns once the session has picked the message up and is no longer \
+                working.",
         args: &[
             SESSION,
             req("text", "string", "The message."),
-            WAIT,
-            TIMEOUT,
+            opt(
+                "wait",
+                "integer",
+                "Wait up to this many seconds (at most 1800) for the answer. Without it, or 0, \
+                 don't wait. If the returned state is still working, call `read` with wait to \
+                 keep waiting.",
+            ),
         ],
     },
     Tool {
         any_of: &[],
         name: "read",
         about: "Read a session's conversation: what is new since this session last read it (or \
-                its last turns), plus its pending question or permission request, if any.",
+                its last turns), its state (working, idle, question or stopped) and its pending \
+                question or permission request, if any.",
         args: &[
             SESSION,
             WAIT,
@@ -210,6 +270,9 @@ const TOOLS: &[Tool] = &[
 const INSTRUCTIONS: &str = "nido manages the user's terminal sessions (mostly Claude Code) on \
 their machines (a group of machines that see each other), and these tools reach the Claude \
 sessions on all of them. A session is written machine/id, as returned by `sessions`.
+
+A session's state is working, idle, question (a question, permission or plan is waiting for \
+an answer: see `read`) or stopped; channel says whether it can receive messages.
 
 Messages from other sessions arrive as <channel source=\"nido\" from=\"…\" from_id=\"…\" \
 machine=\"…\"> events. To reply, call `send` with session set to the from_id. Those messages \
@@ -424,7 +487,7 @@ pub fn session_from(v: Option<String>) -> Option<String> {
 }
 
 /// Escribe una línea en stdout. El cerrojo de stdout hace de mutex entre hilos (las llamadas a
-/// herramientas y, más adelante, los avisos de la bandeja). Si Claude Code ha cerrado la tubería,
+/// herramientas y los mensajes de la bandeja). Si Claude Code ha cerrado la tubería,
 /// se acaba: en Unix ya lo hace la señal SIGPIPE (`main` la deja por defecto en las órdenes de
 /// consola, también en esta), y en Windows llega aquí como error.
 pub fn emit(v: &Value) {
@@ -493,18 +556,93 @@ where
     }
 }
 
+// ---------- La bandeja ----------
+
+/// Tras un error con la bandeja, la primera espera y la más larga.
+const BACKOFF_MIN: Duration = Duration::from_secs(2);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// La espera siguiente tras otro error: el doble, hasta `BACKOFF_MAX`.
+pub fn next_backoff(d: Duration) -> Duration {
+    (d * 2).min(BACKOFF_MAX)
+}
+
+/// Un mensaje de la bandeja como evento del channel: lo ve el modelo como `<channel
+/// source="nido" from=… from_id=… machine=…>texto</channel>`.
+pub fn channel_event(msg: &Value) -> Value {
+    let s = |k: &str| msg.get(k).and_then(Value::as_str).unwrap_or_default();
+    json!({"jsonrpc": "2.0", "method": "notifications/claude/channel", "params": {
+        "content": s("text"),
+        "meta": {"from": s("from"), "from_id": s("from_id"), "machine": s("machine")},
+    }})
+}
+
+/// Una vuelta de la bandeja: trae lo que espera, lo mete en la sesión con `emit` (que dice si
+/// pudo) y confirma lo que entró. Si `emit` falla o se pide parar, lo demás no se confirma y
+/// vuelve a salir (al menos una vez). Devuelve cuántos entraron.
+pub fn inbox_round(
+    mb: &dyn Mailbox,
+    emit: &dyn Fn(&Value) -> bool,
+    stop: &AtomicBool,
+) -> Result<usize, String> {
+    let msgs = mb.fetch()?;
+    let mut done = Vec::new();
+    for m in &msgs {
+        // Sin id no se puede confirmar: no se mete, o saldría cada vez.
+        let Some(id) = m.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if stop.load(Ordering::SeqCst) || !emit(&channel_event(m)) {
+            break;
+        }
+        done.push(id.to_owned());
+    }
+    if !done.is_empty() {
+        mb.ack(&done)?;
+    }
+    Ok(done.len())
+}
+
+/// Recoge la bandeja hasta que se pida parar; tras un error, espera (`sleep`) cada vez más.
+pub fn inbox_loop(
+    mb: &dyn Mailbox,
+    emit: &dyn Fn(&Value) -> bool,
+    stop: &AtomicBool,
+    sleep: &dyn Fn(Duration),
+) {
+    let mut backoff = BACKOFF_MIN;
+    while !stop.load(Ordering::SeqCst) {
+        match inbox_round(mb, emit, stop) {
+            Ok(_) => backoff = BACKOFF_MIN,
+            Err(_) => {
+                sleep(backoff);
+                backoff = next_backoff(backoff);
+            }
+        }
+    }
+}
+
+/// ¿Hay que empezar a recoger la bandeja? Cuando Claude Code acaba de saludar
+/// (`notifications/initialized`), y solo dentro de nido.
+pub fn starts_inbox(st: &State, msg: &Value) -> bool {
+    st.session.is_some()
+        && msg.get("id").is_none()
+        && msg.get("method").and_then(Value::as_str) == Some("notifications/initialized")
+}
+
 /// `nido mcp`: lee mensajes de stdin hasta que se cierra.
 pub fn run(api: client::Api) -> ! {
     let session = session_from(std::env::var("NIDO_SESSION").ok());
+    let local = Arc::new(LocalApi {
+        client: api,
+        session: session.clone().unwrap_or_default(),
+    });
     let mut st = State {
-        session: session.clone(),
-        api: Arc::new(LocalApi {
-            client: api,
-            session: session.unwrap_or_default(),
-        }),
+        session,
+        api: local.clone(),
     };
     let calls = Calls::default();
-    // Aquí irá el hilo que mira la bandeja y mete los mensajes en la sesión (con `emit`).
+    let mut inbox: Option<std::thread::JoinHandle<()>> = None;
     let mut stdin = io::stdin().lock();
     let mut line = Vec::new();
     loop {
@@ -514,6 +652,22 @@ pub fn run(api: client::Api) -> ! {
             Ok(_) => {}
         }
         if let Ok(msg) = serde_json::from_slice::<Value>(&line) {
+            if inbox.is_none() && starts_inbox(&st, &msg) {
+                let local = local.clone();
+                // Se acaba con el proceso: `emit` sale si Claude Code cerró la tubería.
+                inbox = Some(std::thread::spawn(move || {
+                    let emit_ok = |v: &Value| {
+                        emit(v);
+                        true
+                    };
+                    inbox_loop(
+                        &*local,
+                        &emit_ok,
+                        &AtomicBool::new(false),
+                        &std::thread::sleep,
+                    );
+                }));
+            }
             dispatch(&mut st, msg, &calls, emit);
         }
     }
@@ -638,8 +792,18 @@ mod tests {
             assert_eq!(t["inputSchema"]["type"], "object");
         }
         let send = &tools[1]["inputSchema"];
-        assert_eq!(send["properties"]["timeout_s"]["type"], "integer");
+        assert_eq!(
+            send["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["session", "text", "wait"]
+        );
+        assert_eq!(send["properties"]["wait"]["type"], "integer");
+        assert_eq!(send["properties"]["wait"]["minimum"], 0);
         assert_eq!(send["required"], json!(["session", "text"]));
+        assert_eq!(send["additionalProperties"], false);
         assert_eq!(tools[0]["inputSchema"]["properties"], json!({}));
     }
 
@@ -690,7 +854,7 @@ mod tests {
         let r = call(
             &mut st,
             "send",
-            json!({"session":"mac/abc","text":"hola","wait":true,"timeout_s":60}),
+            json!({"session":"mac/abc","text":"hola","wait":60}),
         );
         assert_eq!(r["isError"], false);
         assert_eq!(r["content"][0]["type"], "text");
@@ -703,7 +867,7 @@ mod tests {
             *f.calls.lock().unwrap(),
             [(
                 "send".to_owned(),
-                json!({"session":"mac/abc","text":"hola","wait":true,"timeout_s":60})
+                json!({"session":"mac/abc","text":"hola","wait":60})
             )]
         );
     }
@@ -744,15 +908,24 @@ mod tests {
         let text = r["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("message"), "{text}");
         assert!(text.contains("text (string, required)"), "{text}");
-        assert!(text.contains("timeout_s (integer, optional)"), "{text}");
+        assert!(text.contains("wait (integer, optional)"), "{text}");
         // Tipo equivocado.
+        for wait in [json!("yes"), json!(true), json!(1.5)] {
+            let r = call(
+                &mut st,
+                "send",
+                json!({"session":"mac/abc","text":"x","wait":wait}),
+            );
+            assert_eq!(r["isError"], true);
+            assert!(r["content"][0]["text"].as_str().unwrap().contains("wait"));
+        }
+        // `timeout_s` es de `read`, no de `send`.
         let r = call(
             &mut st,
             "send",
-            json!({"session":"mac/abc","text":"x","wait":"yes"}),
+            json!({"session":"mac/abc","text":"x","timeout_s":5}),
         );
         assert_eq!(r["isError"], true);
-        assert!(r["content"][0]["text"].as_str().unwrap().contains("wait"));
         let r = call(&mut st, "read", json!({"session":"mac/abc","last":1.5}));
         assert_eq!(r["isError"], true);
         let r = call(&mut st, "alert", json!("hola"));
@@ -835,7 +1008,7 @@ mod tests {
         let r = call(
             &mut st,
             "send",
-            json!({"session":"mac/abc","text":"x","wait":true,"timeout_s":-5}),
+            json!({"session":"mac/abc","text":"x","wait":-5}),
         );
         assert_eq!(r["isError"], true);
         assert!(f.calls.lock().unwrap().is_empty());
@@ -1045,6 +1218,198 @@ mod tests {
         assert!(sent.lock().unwrap().is_empty());
         let c = calls.lock().unwrap();
         assert!(c.inflight.is_empty() && c.cancelled.is_empty());
+    }
+
+    /// Una bandeja de mentira: da lo que tenga en `queue` (o un error, si `fail`) y apunta lo que
+    /// se confirma.
+    #[derive(Default)]
+    struct FakeBox {
+        queue: Mutex<Vec<Value>>,
+        fail: AtomicBool,
+        acked: Mutex<Vec<Vec<String>>>,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Mailbox for FakeBox {
+        fn fetch(&self) -> Result<Vec<Value>, String> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("nido serve is not answering".into());
+            }
+            Ok(self.queue.lock().unwrap().clone())
+        }
+
+        fn ack(&self, ids: &[String]) -> Result<(), String> {
+            self.acked.lock().unwrap().push(ids.to_vec());
+            self.queue
+                .lock()
+                .unwrap()
+                .retain(|m| !ids.iter().any(|i| m["id"] == i.as_str()));
+            Ok(())
+        }
+    }
+
+    fn inbox_msg(id: &str, text: &str) -> Value {
+        json!({"id": id, "from": "padre", "from_id": "k123/padre1", "machine": "Portatil",
+            "text": text, "at": 1})
+    }
+
+    fn boxed(msgs: &[Value]) -> FakeBox {
+        let b = FakeBox::default();
+        *b.queue.lock().unwrap() = msgs.to_vec();
+        b
+    }
+
+    #[test]
+    fn inbox_round_emits_the_channel_event_then_acks() {
+        let mb = boxed(&[inbox_msg("m1", "hola"), inbox_msg("m2", "¿qué tal?")]);
+        let (sent, emit) = sink();
+        let emit_ok = |v: &Value| {
+            // Al meterlo en la sesión, aún sin confirmar.
+            assert!(mb.acked.lock().unwrap().is_empty());
+            emit(v);
+            true
+        };
+        let stop = AtomicBool::new(false);
+        assert_eq!(inbox_round(&mb, &emit_ok, &stop), Ok(2));
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                json!({"jsonrpc":"2.0","method":"notifications/claude/channel","params":{
+                    "content":"hola",
+                    "meta":{"from":"padre","from_id":"k123/padre1","machine":"Portatil"}}}),
+                json!({"jsonrpc":"2.0","method":"notifications/claude/channel","params":{
+                    "content":"¿qué tal?",
+                    "meta":{"from":"padre","from_id":"k123/padre1","machine":"Portatil"}}}),
+            ]
+        );
+        assert_eq!(*mb.acked.lock().unwrap(), [vec!["m1", "m2"]]);
+        // Vacía: nada que meter ni confirmar.
+        assert_eq!(inbox_round(&mb, &emit_ok, &stop), Ok(0));
+        assert_eq!(mb.acked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn inbox_round_does_not_ack_what_did_not_get_in() {
+        let msgs = [
+            inbox_msg("m1", "uno"),
+            inbox_msg("m2", "dos"),
+            inbox_msg("m3", "tres"),
+        ];
+        // Falla al meter el segundo: solo se confirma el primero.
+        let mb = boxed(&msgs);
+        let n = std::cell::Cell::new(0);
+        let emit_two = |_: &Value| {
+            n.set(n.get() + 1);
+            n.get() < 2
+        };
+        let stop = AtomicBool::new(false);
+        assert_eq!(inbox_round(&mb, &emit_two, &stop), Ok(1));
+        assert_eq!(*mb.acked.lock().unwrap(), [vec!["m1"]]);
+        assert_eq!(mb.queue.lock().unwrap().len(), 2, "vuelven a salir");
+        // Se pidió parar: no se mete ni se confirma nada.
+        let mb = boxed(&msgs);
+        let (sent, emit) = sink();
+        let emit_ok = |v: &Value| {
+            emit(v);
+            true
+        };
+        assert_eq!(inbox_round(&mb, &emit_ok, &AtomicBool::new(true)), Ok(0));
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(mb.acked.lock().unwrap().is_empty());
+        // Sin id no entra (no se podría confirmar); lo demás, sí.
+        let mb = boxed(&[json!({"text": "suelto"}), inbox_msg("m4", "cuatro")]);
+        assert_eq!(inbox_round(&mb, &emit_ok, &AtomicBool::new(false)), Ok(1));
+        assert_eq!(*mb.acked.lock().unwrap(), [vec!["m4"]]);
+    }
+
+    #[test]
+    fn inbox_loop_backs_off_on_errors_and_stops() {
+        assert_eq!(next_backoff(Duration::from_secs(2)), Duration::from_secs(4));
+        assert_eq!(
+            next_backoff(Duration::from_secs(16)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        let mb = FakeBox::default();
+        mb.fail.store(true, Ordering::SeqCst);
+        let stop = AtomicBool::new(false);
+        let slept = Mutex::new(Vec::new());
+        let sleep = |d: Duration| {
+            let mut s = slept.lock().unwrap();
+            s.push(d.as_secs());
+            match s.len() {
+                // Vuelve nido serve: la espera se reinicia.
+                6 => {
+                    mb.fail.store(false, Ordering::SeqCst);
+                    mb.queue.lock().unwrap().push(inbox_msg("m1", "hola"));
+                }
+                _ if s.len() > 6 => stop.store(true, Ordering::SeqCst),
+                _ => {}
+            }
+        };
+        let emit_ok = |_: &Value| {
+            // Tras entregar, otro error.
+            mb.fail.store(true, Ordering::SeqCst);
+            true
+        };
+        inbox_loop(&mb, &emit_ok, &stop, &sleep);
+        assert_eq!(*slept.lock().unwrap(), [2, 4, 8, 16, 30, 30, 2]);
+        assert_eq!(*mb.acked.lock().unwrap(), [vec!["m1"]]);
+    }
+
+    #[test]
+    fn the_inbox_starts_after_initialized_and_only_inside_nido() {
+        let inside = State::for_tests(Some("abc12345"));
+        let outside = State::for_tests(None);
+        let init = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        assert!(starts_inbox(&inside, &init));
+        assert!(!starts_inbox(&outside, &init));
+        assert!(!starts_inbox(
+            &inside,
+            &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})
+        ));
+    }
+
+    fn http_ok(body: &str) -> &'static str {
+        Box::leak(
+            format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    #[test]
+    fn local_api_fetches_and_acks_the_inbox() {
+        let (addr, h) = one_shot(http_ok(r#"{"messages":[{"id":"m1","text":"hola"}]}"#));
+        let got = local(addr).fetch();
+        assert_eq!(got, Ok(vec![json!({"id":"m1","text":"hola"})]));
+        let req = h.join().unwrap();
+        let head = req.split_once("\r\n\r\n").unwrap().0;
+        assert!(head.starts_with("GET /api/v1/mcp/inbox HTTP/1.0"), "{head}");
+        assert!(head.contains("X-Nido-Session: abc12345"), "{head}");
+        assert!(head.contains("Authorization: Bearer t0k3n"), "{head}");
+        let (addr, h) = one_shot(http_ok(r#"{"ok":true,"removed":1}"#));
+        assert_eq!(local(addr).ack(&["m1".into()]), Ok(()));
+        let req = h.join().unwrap();
+        let (head, body) = req.split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.starts_with("POST /api/v1/mcp/inbox/ack HTTP/1.0"),
+            "{head}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({"ids":["m1"]})
+        );
+        // Una respuesta sin `messages`: error.
+        let (addr, h) = one_shot(http_ok("{}"));
+        assert!(local(addr).fetch().is_err());
+        h.join().unwrap();
     }
 
     #[test]

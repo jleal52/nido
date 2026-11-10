@@ -16,6 +16,7 @@ pub mod holder;
 pub mod hub;
 pub mod i18n;
 pub mod import;
+pub mod inbox;
 pub mod ipc;
 pub mod launch;
 pub mod mcp;

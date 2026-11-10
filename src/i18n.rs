@@ -288,6 +288,46 @@ const TABLE: &[(&str, &str)] = &[
         "la pregunta no admite texto libre",
         "the pending question has no free-text field",
     ),
+    (
+        "el modelo pasa de {} caracteres",
+        "the model is longer than {0} characters",
+    ),
+    ("falta el texto", "the text is missing"),
+    ("el texto pasa de {} KB", "the text is longer than {0} KB"),
+    (
+        "no puedes mandarte mensajes a ti misma",
+        "you cannot send a message to yourself",
+    ),
+    (
+        "esa sesión no admite mensajes (no tiene channel)",
+        "this session does not accept messages (no channel)",
+    ),
+    (
+        "la bandeja de esa sesión está llena",
+        "the inbox of that session is full",
+    ),
+    (
+        "entregado; la sesión decide si lo atiende",
+        "delivered; the session decides whether to act on it",
+    ),
+    (
+        "en cola; se entregará cuando arranque la sesión",
+        "queued; it will be delivered when the session starts",
+    ),
+    (
+        "en cola; se entregará cuando arranque la sesión, y ella decide si lo atiende",
+        "queued; it will be delivered when the session starts, and the session decides \
+         whether to act on it",
+    ),
+    (
+        "en cola; se entregará cuando la sesión acabe de arrancar",
+        "queued; it will be delivered when the session has finished starting",
+    ),
+    (
+        "en cola; se entregará cuando la sesión acabe de arrancar, y ella decide si lo atiende",
+        "queued; it will be delivered when the session has finished starting, and the \
+         session decides whether to act on it",
+    ),
     // auth.rs
     (
         "falta el token o no es válido",

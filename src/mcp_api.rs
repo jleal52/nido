@@ -6,13 +6,17 @@
 //! se escriben en español, como en el resto de nido, y salen en inglés: `nido mcp` no manda
 //! `Accept-Language`.
 //!
+//! Los mensajes de `send` esperan en la bandeja de la sesión de destino (`inbox.rs`); su
+//! `nido mcp` la recoge con `GET /api/v1/mcp/inbox` y confirma lo recogido con `POST
+//! /api/v1/mcp/inbox/ack`.
+//!
 //! De momento, solo las sesiones de este equipo: las de otro dan error.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -23,12 +27,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::inbox::Msg;
 use crate::prompt::{self, Menu};
 use crate::proto::{Hello, Role};
-use crate::registry::{ClaudeLink, Registry, Session, new_id, now};
+use crate::registry::{ClaudeLink, Registry, Session, new_id, now, now_ms};
 use crate::server::{self, AppState, SessionView, error};
 use crate::transcript::{self, ChatItem};
-use crate::{auth, claude, e2e, launch};
+use crate::{auth, claude, e2e, i18n, launch};
 
 /// Lo más que ocupa la respuesta de `read` (el JSON entero): fuera antes los turnos más antiguos.
 pub const MAX_READ: usize = 48 * 1024;
@@ -37,8 +42,17 @@ pub const WAIT_STEP: Duration = Duration::from_secs(2);
 /// Con `wait`, cuánto se espera si no se dice, y como mucho (s).
 pub const WAIT_DEFAULT_S: u64 = 600;
 pub const WAIT_MAX_S: u64 = 1800;
-/// Lo más que puede ocupar el mensaje inicial de `open` (va en la orden de Claude).
+/// Lo más que puede ocupar el mensaje inicial de `open` (va en la orden de Claude), y un
+/// mensaje de `send`.
 pub const MAX_PROMPT: usize = 24 * 1024;
+/// Lo más largo que puede ser el modelo de `open` (en caracteres).
+pub const MAX_MODEL: usize = 128;
+/// `send` con `wait`: cuánto se espera, como mucho, a que la sesión recoja el mensaje y se ponga
+/// a trabajar.
+pub const PICKUP: Duration = Duration::from_secs(30);
+/// Una sesión viva sin channel recibe mensajes (en cola) si arrancó hace menos de esto: aún se
+/// está poniendo en marcha su `nido mcp` (p. ej., recién abierta con `open`).
+pub const STARTUP: Duration = Duration::from_secs(120);
 /// Con `last`, cuánto del final de la transcripción se lee primero (si no salen bastantes turnos,
 /// cada vez cuatro veces más).
 const TAIL: u64 = 256 * 1024;
@@ -334,6 +348,103 @@ pub fn wait_timeout(secs: Option<u64>) -> Duration {
     Duration::from_secs(secs.unwrap_or(WAIT_DEFAULT_S).min(WAIT_MAX_S))
 }
 
+// ---------- send ----------
+
+/// Qué pasó con un mensaje de `send`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// La sesión tiene channel: lo recoge ya.
+    Sent,
+    /// En la bandeja, hasta que la sesión arranque (o acabe de arrancar).
+    Queued,
+}
+
+/// Lo que se sabe de la sesión de destino al mandarle un mensaje.
+#[derive(Debug, Clone, Copy)]
+pub struct Dest {
+    pub alive: bool,
+    /// Tiene channel ahora (ver `inbox::live`).
+    pub channel: bool,
+    /// Hace cuánto arrancó su guardián, si se sabe.
+    pub started: Option<Duration>,
+    /// La abrió quien manda el mensaje.
+    pub mine: bool,
+}
+
+/// Lo que contesta `send`: el estado y, si hace falta, una nota para el modelo (en español; sale
+/// traducida).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Decision {
+    pub status: Delivery,
+    pub note: Option<&'static str>,
+}
+
+/// ¿Se manda el mensaje a sí misma la sesión `caller`?
+pub fn to_self(me: &Machine, address: &str, caller: &str) -> bool {
+    locate(me, address) == Where::Here(caller)
+}
+
+/// Qué hacer con un mensaje para `d`. Parada, a la cola (se entrega al arrancar); viva con
+/// channel, se entrega; viva sin channel pero recién arrancada, a la cola; viva sin channel desde
+/// hace rato, no admite mensajes (y nunca se escribe en su consola).
+pub fn decide(d: &Dest) -> Result<Decision, Fail> {
+    let status = if !d.alive {
+        Delivery::Queued
+    } else if d.channel {
+        Delivery::Sent
+    } else if d.started.is_some_and(|t| t < STARTUP) {
+        Delivery::Queued
+    } else {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "esa sesión no admite mensajes (no tiene channel)",
+        ));
+    };
+    let note = match (status, d.alive, d.mine) {
+        (Delivery::Sent, _, true) => None,
+        (Delivery::Sent, _, false) => Some("entregado; la sesión decide si lo atiende"),
+        (Delivery::Queued, false, true) => Some("en cola; se entregará cuando arranque la sesión"),
+        (Delivery::Queued, false, false) => {
+            Some("en cola; se entregará cuando arranque la sesión, y ella decide si lo atiende")
+        }
+        (Delivery::Queued, true, true) => {
+            Some("en cola; se entregará cuando la sesión acabe de arrancar")
+        }
+        (Delivery::Queued, true, false) => Some(
+            "en cola; se entregará cuando la sesión acabe de arrancar, y ella decide si lo atiende",
+        ),
+    };
+    Ok(Decision { status, note })
+}
+
+/// La espera de `send` con `wait`: primero, hasta `pickup`, a que la sesión recoja el mensaje y
+/// se ponga a trabajar (`picked`); luego, hasta que pase `total` desde el principio, a que se
+/// asiente. Si no llega a ponerse a trabajar (o se para), no se sigue esperando. Devuelve lo
+/// último que vio `poll`. No sabe de dónde sale lo que mira: sirve también para otro equipo.
+pub async fn wait_reply<T, F: Future<Output = T>>(
+    mut poll: impl FnMut() -> F,
+    picked: impl Fn(&T) -> bool,
+    state: impl Fn(&T) -> Status,
+    step: Duration,
+    pickup: Duration,
+    total: Duration,
+) -> T {
+    let start = tokio::time::Instant::now();
+    let v = wait_until(
+        &mut poll,
+        |v| picked(v) || state(v) == Status::Stopped,
+        step,
+        pickup.min(total),
+    )
+    .await;
+    if !picked(&v) {
+        return v;
+    }
+    let left = total.saturating_sub(start.elapsed());
+    wait_until(poll, |v| state(v).settled(), step, left).await
+}
+
 // ---------- open ----------
 
 /// Un nombre de sesión válido y libre a partir de la carpeta: su último trozo, con lo que no vale
@@ -425,6 +536,21 @@ struct ReadArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SendArgs {
+    session: String,
+    text: String,
+    /// Cuántos segundos esperar la respuesta (sin él, o 0, no se espera).
+    wait: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AckArgs {
+    ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpenArgs {
     machine: String,
     folder: String,
@@ -461,9 +587,11 @@ pub struct Entry {
     pub opened_by: Option<String>,
     /// La abrió quien llama: puede contestarla y cerrarla.
     pub mine: bool,
+    /// Recibe mensajes de `send`: su `nido mcp` está recogiendo la bandeja.
+    pub channel: bool,
 }
 
-fn entry(me: &Machine, caller: &str, v: &SessionView, state: Status) -> Entry {
+fn entry(st: &AppState, me: &Machine, caller: &str, v: &SessionView, state: Status) -> Entry {
     Entry {
         session: format!("{}/{}", me.name, v.id),
         machine: me.name.clone(),
@@ -473,6 +601,7 @@ fn entry(me: &Machine, caller: &str, v: &SessionView, state: Status) -> Entry {
         state,
         opened_by: v.opened_by.clone(),
         mine: opened_by(me, v.opened_by.as_deref(), caller),
+        channel: st.inbox.channel(&v.id),
     }
 }
 
@@ -480,7 +609,8 @@ type Reply = Result<Value, Fail>;
 
 /// Un error de una herramienta: el código y el mensaje, en español (sale como `server::error`,
 /// en el idioma de la petición).
-pub struct Fail(StatusCode, String);
+#[derive(Debug)]
+pub struct Fail(pub StatusCode, pub String);
 
 fn fail(status: StatusCode, msg: impl Into<String>) -> Fail {
     Fail(status, msg.into())
@@ -505,39 +635,18 @@ pub async fn api_mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Las sesiones van con el token de la consola, no con el de un teléfono.
-    if let Some(token) = &st.token {
-        let given = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if !given.is_some_and(|g| auth::ct_eq(g, token)) {
-            return error(
-                StatusCode::FORBIDDEN,
-                "la API del MCP solo va con el token de este equipo",
-            );
-        }
-    }
-    let caller = match caller(&st, &headers).await {
+    let caller = match authorize(&st, &headers).await {
         Ok(s) => s,
         Err(f) => return f.into_response(),
     };
-    let args: Value = if body.iter().all(u8::is_ascii_whitespace) {
-        json!({})
-    } else {
-        match serde_json::from_slice(&body) {
-            Ok(v) => v,
-            Err(e) => {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    format!("argumentos no válidos: {e}"),
-                );
-            }
-        }
+    let args = match body_args(&body) {
+        Ok(a) => a,
+        Err(f) => return f.into_response(),
     };
     let me = Machine::of(&st);
     let reply = match tool.as_str() {
         "sessions" => tool_sessions(&st, &me, &caller, args).await,
+        "send" => tool_send(&st, &me, &caller, args).await,
         "read" => tool_read(&st, &me, &caller, args).await,
         "open" => tool_open(&st, &me, &caller, args).await,
         "answer" => tool_answer(&st, &me, &caller, args).await,
@@ -552,6 +661,68 @@ pub async fn api_mcp(
         Ok(v) => Json(v).into_response(),
         Err(f) => f.into_response(),
     }
+}
+
+/// `GET /api/v1/mcp/inbox`: lo que espera en la bandeja de la sesión que llama, del más antiguo
+/// al más nuevo (`{messages: [...]}`). Si no hay nada, espera a que llegue algo (25 s como mucho;
+/// luego, vacío). Lo no confirmado vuelve a salir en la siguiente.
+pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let caller = match authorize(&st, &headers).await {
+        Ok(s) => s,
+        Err(f) => return f.into_response(),
+    };
+    let messages: Vec<Msg> = st.inbox.poll(&caller.id).await;
+    Json(json!({ "messages": messages })).into_response()
+}
+
+/// `POST /api/v1/mcp/inbox/ack {ids: [...]}`: ya están en la sesión; fuera de su bandeja (los
+/// de otras no se tocan).
+pub async fn api_inbox_ack(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let caller = match authorize(&st, &headers).await {
+        Ok(s) => s,
+        Err(f) => return f.into_response(),
+    };
+    let a: AckArgs = match body_args(&body).and_then(args_of) {
+        Ok(a) => a,
+        Err(f) => return f.into_response(),
+    };
+    let removed = st.inbox.ack(&caller.id, &a.ids);
+    Json(json!({ "ok": true, "removed": removed })).into_response()
+}
+
+/// Con el token principal (las sesiones van con el de la consola, no con el de un teléfono) y
+/// desde una sesión de aquí: cuál.
+async fn authorize(st: &AppState, headers: &HeaderMap) -> Result<Session, Fail> {
+    if let Some(token) = &st.token {
+        let given = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if !given.is_some_and(|g| auth::ct_eq(g, token)) {
+            return Err(fail(
+                StatusCode::FORBIDDEN,
+                "la API del MCP solo va con el token de este equipo",
+            ));
+        }
+    }
+    caller(st, headers).await
+}
+
+/// Los argumentos del cuerpo; vacío es `{}`.
+fn body_args(body: &Bytes) -> Result<Value, Fail> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        fail(
+            StatusCode::BAD_REQUEST,
+            format!("argumentos no válidos: {e}"),
+        )
+    })
 }
 
 /// La sesión que llama: la de `X-Nido-Session`, que tiene que existir aquí.
@@ -670,7 +841,7 @@ async fn tool_sessions(st: &AppState, me: &Machine, caller: &Session, args: Valu
     let list: Vec<Entry> = views
         .iter()
         .zip(states)
-        .map(|(v, (s, _))| entry(me, &caller.id, v, s))
+        .map(|(v, (s, _))| entry(st, me, &caller.id, v, s))
         .collect();
     to_json(&list)
 }
@@ -742,18 +913,50 @@ fn line_start(path: &Path, at: u64) -> std::io::Result<u64> {
     Ok(at - 1 + read as u64)
 }
 
+/// Cómo está la sesión `id` ahora. Hace un `scan()` entero (todas las sesiones): de sobra para
+/// una espera, pero hay que revisarlo en la tarea 9, con esperas de otros equipos.
+async fn poll_status(st: &AppState, id: &str) -> (Status, Option<Menu>) {
+    match view(st, id).await {
+        Some(v) => status_of(st, &v).await,
+        None => (Status::Stopped, None),
+    }
+}
+
+/// Lo que devuelve `read` de `s` para `reader`, con el estado y el menú que se acaban de ver: lo
+/// nuevo de su conversación (o los `last` últimos turnos) y la pregunta, recortado a `MAX_READ`.
+async fn read_out(
+    st: &AppState,
+    reader: &str,
+    s: &Session,
+    state: Status,
+    menu: Option<Menu>,
+    last: Option<usize>,
+) -> Result<ReadOut, Fail> {
+    // Mientras se esperaba pudo empezar otra conversación (`/clear`).
+    let link = st
+        .registry
+        .lock()
+        .await
+        .get(&s.id)
+        .and_then(|x| x.claude.clone())
+        .or_else(|| s.claude.clone())
+        .expect("sesión de Claude");
+    let turns = unread_turns(st, reader, &s.id, &link, last).await?;
+    let mut out = ReadOut {
+        state,
+        turns,
+        question: menu.as_ref().map(Question::from),
+        truncated: false,
+    };
+    fit(&mut out, MAX_READ);
+    Ok(out)
+}
+
 async fn tool_read(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
     let a: ReadArgs = args_of(args)?;
     let s = target(st, me, &a.session).await?;
     let id = s.id.as_str();
-    // Cada vuelta hace un `scan()` entero (todas las sesiones): de sobra para una espera, pero hay
-    // que revisarlo en la tarea 9, con esperas de otros equipos.
-    let poll = || async move {
-        match view(st, id).await {
-            Some(v) => status_of(st, &v).await,
-            None => (Status::Stopped, None),
-        }
-    };
+    let poll = || poll_status(st, id);
     let (state, menu) = if a.wait {
         wait_until(
             poll,
@@ -765,24 +968,70 @@ async fn tool_read(st: &AppState, me: &Machine, caller: &Session, args: Value) -
     } else {
         poll().await
     };
-    // Mientras se esperaba pudo empezar otra conversación (`/clear`).
-    let link = st
-        .registry
-        .lock()
-        .await
-        .get(&s.id)
-        .and_then(|x| x.claude.clone())
-        .or(s.claude)
-        .expect("sesión de Claude");
-    let turns = unread_turns(st, &caller.id, &s.id, &link, a.last).await?;
-    let mut out = ReadOut {
-        state,
-        turns,
-        question: menu.as_ref().map(Question::from),
-        truncated: false,
+    to_json(&read_out(st, &caller.id, &s, state, menu, a.last).await?)
+}
+
+async fn tool_send(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
+    let a: SendArgs = args_of(args)?;
+    let text = a.text.trim();
+    if text.is_empty() {
+        return Err(bad_request("falta el texto".into()));
+    }
+    if text.len() > MAX_PROMPT {
+        return Err(bad_request(format!(
+            "el texto pasa de {} KB",
+            MAX_PROMPT / 1024
+        )));
+    }
+    // Antes de buscarla: la que llama puede no ser de Claude, y saldría «no existe».
+    if to_self(me, &a.session, &caller.id) {
+        return Err(bad_request("no puedes mandarte mensajes a ti misma".into()));
+    }
+    let s = target(st, me, &a.session).await?;
+    let alive = view(st, &s.id).await.is_some_and(|v| v.alive);
+    let started = launch::holder_started(&st.paths, &s.id)
+        .map(|t| SystemTime::now().duration_since(t).unwrap_or_default());
+    let d = decide(&Dest {
+        alive,
+        channel: st.inbox.channel(&s.id),
+        started,
+        mine: opened_by(me, s.opened_by.as_deref(), &caller.id),
+    })?;
+    let msg = Msg {
+        id: server::uuid_v4(),
+        from: caller.name.clone(),
+        from_id: me.address(&caller.id),
+        machine: me.name.clone(),
+        text: text.to_owned(),
+        at: now_ms(),
     };
-    fit(&mut out, MAX_READ);
-    to_json(&out)
+    let msg_id = msg.id.clone();
+    st.inbox
+        .push(&s.id, msg)
+        .map_err(|_| bad_request("la bandeja de esa sesión está llena".into()))?;
+    let mut out = json!({ "status": d.status });
+    if let Some(note) = d.note {
+        out["note"] = i18n::tr(note).into();
+    }
+    let Some(secs) = a.wait.filter(|&w| w > 0) else {
+        return Ok(out);
+    };
+    let (id, msg_id) = (s.id.as_str(), msg_id.as_str());
+    let poll = || async move {
+        let (state, menu) = poll_status(st, id).await;
+        (state, menu, !st.inbox.has(id, msg_id))
+    };
+    let (state, menu, _) = wait_reply(
+        poll,
+        |(state, _, taken)| *taken && *state == Status::Working,
+        |(state, _, _)| *state,
+        WAIT_STEP,
+        PICKUP,
+        wait_timeout(Some(secs)),
+    )
+    .await;
+    out["read"] = to_json(&read_out(st, &caller.id, &s, state, menu, None).await?)?;
+    Ok(out)
 }
 
 async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
@@ -811,6 +1060,14 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -
         && (m.is_empty() || m.starts_with('-'))
     {
         return Err(bad_request(format!("modelo no válido: {m:?}")));
+    }
+    if model
+        .as_deref()
+        .is_some_and(|m| m.chars().count() > MAX_MODEL)
+    {
+        return Err(bad_request(format!(
+            "el modelo pasa de {MAX_MODEL} caracteres"
+        )));
     }
     if a.prompt.trim().is_empty() {
         return Err(bad_request("falta el mensaje".into()));
@@ -848,7 +1105,7 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -
         return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
     };
     let (state, _) = status_of(st, &v).await;
-    to_json(&entry(me, &caller.id, &v, state))
+    to_json(&entry(st, me, &caller.id, &v, state))
 }
 
 /// La sesión que apunta `open` en el registro (sin arrancarla): con el nombre pedido o uno libre
@@ -1275,6 +1532,147 @@ mod tests {
         assert_eq!(wait_timeout(Some(99_999)), Duration::from_secs(1800));
     }
 
+    fn dest(alive: bool, channel: bool, started: Option<u64>, mine: bool) -> Dest {
+        Dest {
+            alive,
+            channel,
+            started: started.map(Duration::from_secs),
+            mine,
+        }
+    }
+
+    fn decided(d: Dest) -> Result<(Delivery, Option<String>), StatusCode> {
+        decide(&d)
+            .map(|x| (x.status, x.note.map(crate::i18n::english)))
+            .map_err(|f| f.0)
+    }
+
+    #[test]
+    fn send_decision_table() {
+        use Delivery::*;
+        let note = |s: &str| Some(s.to_owned());
+        // Parada: a la cola, se entrega al arrancar (lo que diga su channel no cuenta).
+        assert_eq!(
+            decided(dest(false, false, None, true)),
+            Ok((
+                Queued,
+                note("queued; it will be delivered when the session starts")
+            ))
+        );
+        assert_eq!(
+            decided(dest(false, true, Some(9999), false)),
+            Ok((
+                Queued,
+                note(
+                    "queued; it will be delivered when the session starts, and the session \
+                     decides whether to act on it"
+                )
+            ))
+        );
+        // Viva con channel: entregado; si no es suya, decide ella.
+        assert_eq!(
+            decided(dest(true, true, Some(9999), true)),
+            Ok((Sent, None))
+        );
+        assert_eq!(
+            decided(dest(true, true, None, false)),
+            Ok((
+                Sent,
+                note("delivered; the session decides whether to act on it")
+            ))
+        );
+        // Viva, sin channel y recién arrancada: a la cola.
+        assert_eq!(
+            decided(dest(true, false, Some(0), true)),
+            Ok((
+                Queued,
+                note("queued; it will be delivered when the session has finished starting")
+            ))
+        );
+        let (status, n) = decided(dest(true, false, Some(119), false)).unwrap();
+        assert_eq!(status, Queued);
+        assert!(n.unwrap().ends_with("decides whether to act on it"));
+        // Sin channel desde hace rato (o sin saber cuándo arrancó): no admite mensajes.
+        for d in [
+            dest(true, false, Some(120), true),
+            dest(true, false, Some(5000), false),
+            dest(true, false, None, true),
+        ] {
+            assert_eq!(decided(d), Err(StatusCode::CONFLICT), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn sending_to_yourself() {
+        let m = me(Some("k123"));
+        for a in [
+            "padre1",
+            "Portatil/padre1",
+            "k123/padre1",
+            " portatil/padre1 ",
+        ] {
+            assert!(to_self(&m, a, "padre1"), "{a}");
+        }
+        assert!(!to_self(&m, "hija1", "padre1"));
+        assert!(!to_self(&m, "Sobremesa/padre1", "padre1"));
+    }
+
+    /// Lo que va viendo `wait_reply`: cada vuelta, el siguiente estado (y si ya lo recogió); el
+    /// último se repite.
+    async fn replay(seen: &[(Status, bool)], pickup_ms: u64, total_ms: u64) -> (usize, Status) {
+        let polls = std::cell::Cell::new(0);
+        let (state, _) = wait_reply(
+            || {
+                let i = polls.get();
+                polls.set(i + 1);
+                std::future::ready(seen[i.min(seen.len() - 1)])
+            },
+            |&(s, taken)| taken && s == Status::Working,
+            |&(s, _)| s,
+            Duration::from_millis(1),
+            Duration::from_millis(pickup_ms),
+            Duration::from_millis(total_ms),
+        )
+        .await;
+        (polls.get(), state)
+    }
+
+    #[tokio::test]
+    async fn send_waits_for_pickup_then_for_the_answer() {
+        use Status::*;
+        // Ya trabajaba en otra cosa (sin recogerlo), lo recoge, sigue trabajando y termina.
+        let seen = [
+            (Working, false),
+            (Idle, false),
+            (Working, true),
+            (Working, true),
+            (Idle, true),
+        ];
+        assert_eq!(replay(&seen, 5000, 10_000).await, (5, Idle));
+        // Pregunta: también se acaba la espera.
+        let seen = [(Working, true), (Question, true)];
+        assert_eq!(replay(&seen, 5000, 10_000).await, (2, Question));
+        // Parada: no se espera a que lo recoja.
+        assert_eq!(
+            replay(&[(Stopped, false)], 5000, 10_000).await,
+            (1, Stopped)
+        );
+        // No se pone a trabajar en el tiempo de recogida: lo que haya.
+        let start = std::time::Instant::now();
+        let (_, state) = replay(&[(Idle, false)], 50, 10_000).await;
+        assert_eq!(state, Idle);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // Se acaba la espera entera trabajando: «working».
+        let start = std::time::Instant::now();
+        let (_, state) = replay(&[(Working, true)], 5000, 80).await;
+        assert_eq!(state, Working);
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_millis(80) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+    }
+
     #[test]
     fn names_from_the_folder() {
         let none = |_: &str| false;
@@ -1377,6 +1775,27 @@ mod tests {
         assert_eq!(
             en("la API del MCP solo va con el token de este equipo"),
             "the MCP API only takes this machine's token"
+        );
+        assert_eq!(
+            en("el modelo pasa de 128 caracteres"),
+            "the model is longer than 128 characters"
+        );
+        assert_eq!(en("falta el texto"), "the text is missing");
+        assert_eq!(
+            en("el texto pasa de 24 KB"),
+            "the text is longer than 24 KB"
+        );
+        assert_eq!(
+            en("no puedes mandarte mensajes a ti misma"),
+            "you cannot send a message to yourself"
+        );
+        assert_eq!(
+            en("esa sesión no admite mensajes (no tiene channel)"),
+            "this session does not accept messages (no channel)"
+        );
+        assert_eq!(
+            en("la bandeja de esa sesión está llena"),
+            "the inbox of that session is full"
         );
     }
 }
