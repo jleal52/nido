@@ -37,6 +37,11 @@ pub const WAIT_STEP: Duration = Duration::from_secs(2);
 /// Con `wait`, cuánto se espera si no se dice, y como mucho (s).
 pub const WAIT_DEFAULT_S: u64 = 600;
 pub const WAIT_MAX_S: u64 = 1800;
+/// Lo más que puede ocupar el mensaje inicial de `open` (va en la orden de Claude).
+pub const MAX_PROMPT: usize = 24 * 1024;
+/// Con `last`, cuánto del final de la transcripción se lee primero (si no salen bastantes turnos,
+/// cada vez cuatro veces más).
+const TAIL: u64 = 256 * 1024;
 
 // ---------- Equipos y direcciones ----------
 
@@ -95,7 +100,9 @@ pub fn locate<'a>(me: &Machine, address: &'a str) -> Where<'a> {
 }
 
 /// ¿La abrió la sesión `caller` de este equipo? `opened_by` se lee como dirección: se apuntó con
-/// el id en el hub o, si entonces no había conexión, con el nombre del equipo.
+/// el id en el hub o, si entonces no había conexión, con el nombre del equipo. Guarda el id en el
+/// hub de cuando se abrió: si el equipo se vuelve a emparejar y el hub le da otro, la madre deja
+/// de poder contestar y cerrar a sus hijas.
 pub fn opened_by(me: &Machine, opened_by: Option<&str>, caller: &str) -> bool {
     opened_by.is_some_and(|o| locate(me, o) == Where::Here(caller))
 }
@@ -226,8 +233,10 @@ pub fn fit(out: &mut ReadOut, max: usize) {
         total -= json_len(&out.turns[drop]) + 1;
         drop += 1;
     }
-    out.turns.drain(..drop);
-    out.truncated = true;
+    if drop > 0 {
+        out.turns.drain(..drop);
+        out.truncated = true;
+    }
     let total = json_len(out);
     if total > max
         && let Some(t) = out.turns.first_mut()
@@ -245,6 +254,7 @@ pub fn fit(out: &mut ReadOut, max: usize) {
             .map_or(t.text.len(), |(i, _)| i);
         t.text.truncate(keep);
         t.text.push_str(CUT);
+        out.truncated = true;
     }
 }
 
@@ -273,11 +283,20 @@ impl Cursors {
             .map_or(0, |(_, o)| *o)
     }
 
-    pub fn set(&self, reader: &str, target: &str, path: PathBuf, offset: u64) {
-        self.0
-            .lock()
-            .expect("cursores")
-            .insert((reader.to_owned(), target.to_owned()), (path, offset));
+    /// Lo lleva de `from` a `to`, si sigue en `from` (lo que daría `get`). Si no, otra lectura
+    /// de la misma sesión se adelantó y ya devolvió esos turnos: `false`, y no se toca.
+    pub fn advance(&self, reader: &str, target: &str, path: &Path, from: u64, to: u64) -> bool {
+        let mut map = self.0.lock().expect("cursores");
+        let key = (reader.to_owned(), target.to_owned());
+        let now = map
+            .get(&key)
+            .filter(|(p, _)| p == path)
+            .map_or(0, |(_, o)| *o);
+        if now != from {
+            return false;
+        }
+        map.insert(key, (path.to_owned(), to));
+        true
     }
 
     /// Una sesión que ya no está: fuera lo suyo, como lectora y como leída.
@@ -576,11 +595,15 @@ async fn target(st: &AppState, me: &Machine, address: &str) -> Result<Session, F
             .registry
             .lock()
             .await
-            .find(id)
+            .get(id)
             .filter(|s| s.claude.is_some())
             .cloned()
             .ok_or_else(|| fail(StatusCode::NOT_FOUND, "no existe esa sesión")),
     }
+}
+
+fn to_json<T: Serialize>(v: &T) -> Reply {
+    serde_json::to_value(v).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 fn bad_request(msg: String) -> Fail {
@@ -649,11 +672,11 @@ async fn tool_sessions(st: &AppState, me: &Machine, caller: &Session, args: Valu
         .zip(states)
         .map(|(v, (s, _))| entry(me, &caller.id, v, s))
         .collect();
-    Ok(serde_json::to_value(list).unwrap_or_default())
+    to_json(&list)
 }
 
-/// Los turnos que `reader` aún no ha leído de la conversación de `target` (o los `last`
-/// últimos), y avanza su posición hasta el final.
+/// Los turnos que `reader` aún no ha leído de la conversación de `target`, y su posición hasta el
+/// final; con `last`, los `last` últimos, sin mover la posición.
 async fn unread_turns(
     st: &AppState,
     reader: &str,
@@ -665,28 +688,66 @@ async fn unread_turns(
         // Un Claude recién abierto aún no ha escrito nada.
         return Ok(vec![]);
     };
-    let from = match last {
-        Some(_) => 0,
-        None => st.mcp_cursors.get(reader, target, &path),
-    };
-    let p = path.clone();
-    let chunk = tokio::task::spawn_blocking(move || transcript::read_chunk(&p, from, None))
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|r| r.map_err(|e| e.to_string()))
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    st.mcp_cursors.set(reader, target, path, chunk.offset);
-    let mut t = turns(chunk.items);
+    let internal = |e: String| fail(StatusCode::INTERNAL_SERVER_ERROR, e);
     if let Some(n) = last {
-        t.drain(..t.len().saturating_sub(n));
+        return tokio::task::spawn_blocking(move || last_turns(&path, n))
+            .await
+            .map_err(|e| internal(e.to_string()))?
+            .map_err(|e| internal(e.to_string()));
     }
-    Ok(t)
+    // Dos lecturas a la vez de la misma sesión: la que llega tarde al cursor vuelve a leer desde
+    // donde lo dejó la otra, para no devolver dos veces lo mismo.
+    loop {
+        let from = st.mcp_cursors.get(reader, target, &path);
+        let p = path.clone();
+        let chunk = tokio::task::spawn_blocking(move || transcript::read_chunk(&p, from, None))
+            .await
+            .map_err(|e| internal(e.to_string()))?
+            .map_err(|e| internal(e.to_string()))?;
+        if st
+            .mcp_cursors
+            .advance(reader, target, &path, from, chunk.offset)
+        {
+            return Ok(turns(chunk.items));
+        }
+    }
+}
+
+/// Los `n` últimos turnos, leyendo solo el final de la transcripción (y más hacia atrás si en ese
+/// trozo no salen bastantes).
+pub fn last_turns(path: &Path, n: usize) -> std::io::Result<Vec<Turn>> {
+    let len = std::fs::metadata(path)?.len();
+    let mut window = TAIL;
+    loop {
+        let from = line_start(path, len.saturating_sub(window))?;
+        let mut t = turns(transcript::read_chunk(path, from, None)?.items);
+        if t.len() >= n || from == 0 {
+            t.drain(..t.len().saturating_sub(n));
+            return Ok(t);
+        }
+        window = window.saturating_mul(4);
+    }
+}
+
+/// El principio de la primera línea entera a partir de `at` (lo de antes es media línea).
+fn line_start(path: &Path, at: u64) -> std::io::Result<u64> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    if at == 0 {
+        return Ok(0);
+    }
+    let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
+    f.seek(SeekFrom::Start(at - 1))?;
+    let mut skipped = Vec::new();
+    let read = f.read_until(b'\n', &mut skipped)?;
+    Ok(at - 1 + read as u64)
 }
 
 async fn tool_read(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
     let a: ReadArgs = args_of(args)?;
     let s = target(st, me, &a.session).await?;
     let id = s.id.as_str();
+    // Cada vuelta hace un `scan()` entero (todas las sesiones): de sobra para una espera, pero hay
+    // que revisarlo en la tarea 9, con esperas de otros equipos.
     let poll = || async move {
         match view(st, id).await {
             Some(v) => status_of(st, &v).await,
@@ -721,7 +782,7 @@ async fn tool_read(st: &AppState, me: &Machine, caller: &Session, args: Value) -
         truncated: false,
     };
     fit(&mut out, MAX_READ);
-    Ok(serde_json::to_value(out).unwrap_or_default())
+    to_json(&out)
 }
 
 async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -> Reply {
@@ -754,6 +815,12 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -
     if a.prompt.trim().is_empty() {
         return Err(bad_request("falta el mensaje".into()));
     }
+    if a.prompt.trim().len() > MAX_PROMPT {
+        return Err(bad_request(format!(
+            "el mensaje pasa de {} KB",
+            MAX_PROMPT / 1024
+        )));
+    }
     let message = first_message(
         &caller.name,
         &me.name,
@@ -781,7 +848,7 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Session, args: Value) -
         return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
     };
     let (state, _) = status_of(st, &v).await;
-    Ok(serde_json::to_value(entry(me, &caller.id, &v, state)).unwrap_or_default())
+    to_json(&entry(me, &caller.id, &v, state))
 }
 
 /// La sesión que apunta `open` en el registro (sin arrancarla): con el nombre pedido o uno libre
@@ -1059,6 +1126,10 @@ mod tests {
         let mut small = out(vec![turn("user", "hola")]);
         fit(&mut small, MAX_READ);
         assert!(!small.truncated);
+        // No cabe, pero no hay turnos que quitar ni texto que cortar: no se dice que se recortó.
+        let mut no_turns = out(vec![]);
+        fit(&mut no_turns, 5);
+        assert!(!no_turns.truncated);
         assert!(
             serde_json::to_value(&small)
                 .unwrap()
@@ -1110,13 +1181,61 @@ mod tests {
         let c = Cursors::default();
         let p = PathBuf::from("/t/a.jsonl");
         assert_eq!(c.get("padre", "hija", &p), 0);
-        c.set("padre", "hija", p.clone(), 120);
+        assert!(c.advance("padre", "hija", &p, 0, 120));
         assert_eq!(c.get("padre", "hija", &p), 120);
         assert_eq!(c.get("otra", "hija", &p), 0, "cada una lleva la suya");
+        // Otra lectura a la vez, que empezó en 0: llega tarde y no lo mueve.
+        assert!(!c.advance("padre", "hija", &p, 0, 120));
+        assert!(c.advance("padre", "hija", &p, 120, 300));
+        assert_eq!(c.get("padre", "hija", &p), 300);
         // Otra transcripción (tras `/clear`): desde el principio.
-        assert_eq!(c.get("padre", "hija", Path::new("/t/b.jsonl")), 0);
+        let b = Path::new("/t/b.jsonl");
+        assert_eq!(c.get("padre", "hija", b), 0);
+        assert!(c.advance("padre", "hija", b, 0, 10));
         c.forget("hija");
-        assert_eq!(c.get("padre", "hija", &p), 0);
+        assert_eq!(c.get("padre", "hija", b), 0);
+    }
+
+    fn assistant_line(id: usize, text: &str) -> String {
+        json!({"type":"assistant","uuid":format!("a{id}"),"message":{"content":[{"type":"text","text":text}]}})
+            .to_string()
+    }
+
+    #[test]
+    fn last_turns_reads_only_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        // Turnos grandes: los 3 últimos no caben en el primer trozo y hay que ir más atrás.
+        let big = "x".repeat(200 * 1024);
+        let lines: Vec<String> = (0..6)
+            .map(|i| assistant_line(i, &format!("{i}{big}")))
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let t = last_turns(&path, 3).unwrap();
+        let firsts: Vec<char> = t.iter().map(|t| t.text.chars().next().unwrap()).collect();
+        assert_eq!(firsts, ['3', '4', '5']);
+        assert!(t.iter().all(|t| t.text.len() == big.len() + 1), "enteros");
+        // Más de los que hay: todos.
+        assert_eq!(last_turns(&path, 99).unwrap().len(), 6);
+        assert_eq!(last_turns(&path, 0).unwrap(), vec![]);
+        // Una línea a medias al final tampoco cuenta.
+        std::fs::write(
+            &path,
+            assistant_line(0, "a") + "\n" + &assistant_line(1, "b"),
+        )
+        .unwrap();
+        assert_eq!(last_turns(&path, 5).unwrap(), vec![turn("assistant", "a")]);
+    }
+
+    #[test]
+    fn line_start_skips_half_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        std::fs::write(&path, "abc\ndef\n").unwrap();
+        assert_eq!(line_start(&path, 0).unwrap(), 0);
+        assert_eq!(line_start(&path, 1).unwrap(), 4);
+        assert_eq!(line_start(&path, 4).unwrap(), 4, "ya es principio de línea");
+        assert_eq!(line_start(&path, 5).unwrap(), 8);
     }
 
     #[tokio::test]
@@ -1241,6 +1360,10 @@ mod tests {
             "the option or the text is missing"
         );
         assert_eq!(en("falta el mensaje"), "the prompt is missing");
+        assert_eq!(
+            en("el mensaje pasa de 24 KB"),
+            "the prompt is longer than 24 KB"
+        );
         assert_eq!(en("modelo no válido: \"-x\""), "invalid model: \"-x\"");
         assert_eq!(
             en("«Sobremesa» es otro equipo (aún no se puede)"),

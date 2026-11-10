@@ -357,10 +357,8 @@ fn call_tool(st: &State, params: &Value) -> Value {
     };
     match st.api.call(tool.name, args) {
         Ok(Value::String(s)) => tool_result(s, false),
-        Ok(v) => tool_result(
-            serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
-            false,
-        ),
+        // Compacto: el límite de 48 KB de `read` es lo que le llega al modelo.
+        Ok(v) => tool_result(v.to_string(), false),
         Err(e) => tool_result(e, true),
     }
 }

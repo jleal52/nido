@@ -265,6 +265,10 @@ const TABLE: &[(&str, &str)] = &[
     ("modelo no válido: {}", "invalid model: {0}"),
     ("falta el mensaje", "the prompt is missing"),
     (
+        "el mensaje pasa de {} KB",
+        "the prompt is longer than {0} KB",
+    ),
+    (
         "solo puedes contestar las sesiones que abriste",
         "you can only answer sessions you opened",
     ),

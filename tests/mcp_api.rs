@@ -22,12 +22,24 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 /// Una herramienta, como la llama `nido mcp`: sin `Accept-Language` (en inglés) y con la sesión
 /// que llama en `X-Nido-Session` (`None`: sin la cabecera).
 async fn tool(addr: SocketAddr, caller: Option<&str>, name: &str, args: Value) -> (u16, Value) {
+    tool_as(addr, TOKEN, caller, name, args).await
+}
+
+/// Como `tool`, con otro token.
+async fn tool_as(
+    addr: SocketAddr,
+    token: &str,
+    caller: Option<&str>,
+    name: &str,
+    args: Value,
+) -> (u16, Value) {
     let caller = caller.map(str::to_owned);
+    let token = token.to_owned();
     let path = format!("/api/v1/mcp/{name}");
     tokio::task::spawn_blocking(move || {
         let api = Api {
             addr,
-            token: Some(TOKEN.into()),
+            token: Some(token),
         };
         let headers: Vec<(&str, &str)> = caller
             .as_deref()
@@ -111,6 +123,55 @@ fn roles_texts(read: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Un programa que hace de Claude con un menú en pantalla: enseña `screen1`, apunta en `picked`
+/// la tecla que le llega y, si hay `screen2` (el cursor ya en el campo de texto), la enseña y
+/// apunta en `typed` lo que se escriba hasta Enter. Luego, otra pantalla sin menú.
+const MENU_PROGRAM: &str = r#"#!/bin/sh
+stty -icanon -echo min 1 time 0
+printf '\033[2J\033[H'; cat screen1
+k=$(dd bs=1 count=1 2>/dev/null)
+printf '%s' "$k" > picked
+if [ -f screen2 ]; then
+  printf '\033[2J\033[H'; cat screen2
+  cr=$(printf '\r')
+  t=''
+  while c=$(dd bs=1 count=1 2>/dev/null); [ -n "$c" ] && [ "$c" != "$cr" ]; do t="$t$c"; done
+  printf '%s' "$t" > typed
+fi
+printf '\033[2J\033[Hlisto\n'
+exec sleep 60
+"#;
+
+fn fixture(name: &str) -> String {
+    std::fs::read_to_string(format!(
+        "{}/tests/pantallas/{name}.txt",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+/// Una carpeta con `program` (ver `MENU_PROGRAM`) y sus pantallas.
+fn menu_folder(dir: &Path, screen1: &str, screen2: Option<&str>) {
+    std::fs::create_dir_all(dir).unwrap();
+    let program = dir.join("program");
+    std::fs::write(&program, MENU_PROGRAM).unwrap();
+    std::fs::set_permissions(
+        &program,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(dir.join("screen1"), screen1).unwrap();
+    if let Some(s) = screen2 {
+        std::fs::write(dir.join("screen2"), s).unwrap();
+    }
+}
+
+async fn read_file(path: &Path) -> Option<String> {
+    wait_file(path)
+        .await
+        .then(|| std::fs::read_to_string(path).unwrap())
+}
+
 async fn wait_file(path: &Path) -> bool {
     for _ in 0..100 {
         if std::fs::metadata(path).is_ok_and(|m| m.len() > 0) {
@@ -127,14 +188,15 @@ async fn wait_file(path: &Path) -> bool {
 async fn mcp_api_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let _cleanup = KillHolders(tmp.path().join("nido/run"));
-    // La «shell» de las sesiones: apunta sus argumentos en la carpeta de la sesión y duerme. Así
-    // `open` no arranca ningún Claude.
+    // La «shell» de las sesiones: apunta sus argumentos en la carpeta de la sesión y duerme (o
+    // corre el `program` que haya en ella). Así `open` no arranca ningún Claude.
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shell = bin.join("shell");
     std::fs::write(
         &shell,
-        "#!/bin/sh\nprintf '%s\\0' \"$@\" > args.tmp && mv args.tmp args\nexec sleep 60\n",
+        "#!/bin/sh\nprintf '%s\\0' \"$@\" > args.tmp && mv args.tmp args\n\
+         if [ -x ./program ]; then exec ./program; fi\nexec sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
@@ -197,6 +259,16 @@ async fn mcp_api_end_to_end() {
     assert_eq!(code, 400, "{e}");
     let (code, _) = tool(addr, me, "nada", json!({})).await;
     assert_eq!(code, 404);
+    // Con el token de un teléfono, no.
+    let phone = state
+        .phones
+        .lock()
+        .unwrap()
+        .add(&[7u8; 32], "teléfono", None)
+        .unwrap();
+    let (code, e) = tool_as(addr, &phone.token, me, "sessions", json!({})).await;
+    assert_eq!(code, 403, "{e}");
+    assert_eq!(e["error"], "the MCP API only takes this machine's token");
 
     // `sessions`: solo las de Claude, con su dirección; parada.
     let (code, list) = tool(addr, me, "sessions", json!({})).await;
@@ -254,6 +326,39 @@ async fn mcp_api_end_to_end() {
             ("assistant".into(), "Hecho.".into()),
         ]
     );
+    // `last` no mueve la posición: lo nuevo sigue siendo nuevo después.
+    let a3 = json!({"type":"assistant","uuid":"a3","message":{"content":[{"type":"text","text":"Otra cosa."}]}});
+    append(&transcript, &[a3]);
+    let (_, r) = tool(addr, me, "read", json!({"session": other, "last": 1})).await;
+    assert_eq!(
+        roles_texts(&r),
+        vec![("assistant".into(), "Otra cosa.".into())]
+    );
+    let (_, r) = tool(addr, me, "read", json!({"session": other})).await;
+    assert_eq!(
+        roles_texts(&r),
+        vec![("assistant".into(), "Otra cosa.".into())]
+    );
+    // Dos lecturas a la vez: lo nuevo sale en una sola.
+    for round in 0..5 {
+        let line = json!({"type":"assistant","uuid":format!("p{round}"),"message":{"content":[{"type":"text","text":format!("a la vez {round}")}]}});
+        append(&transcript, &[line]);
+        let ((_, r1), (_, r2)) = tokio::join!(
+            tool(addr, me, "read", json!({"session": other})),
+            tool(addr, me, "read", json!({"session": other})),
+        );
+        let mut both = roles_texts(&r1);
+        both.extend(roles_texts(&r2));
+        assert_eq!(
+            both,
+            vec![("assistant".into(), format!("a la vez {round}"))]
+        );
+    }
+    // Por nombre, no: solo `equipo/id` o el id.
+    let (code, _) = tool(addr, me, "read", json!({"session": "otra"})).await;
+    assert_eq!(code, 404);
+    let (code, _) = tool(addr, me, "read", json!({"session": "Prueba/otra"})).await;
+    assert_eq!(code, 404);
     // Con `wait` y parada, no espera.
     let (code, r) = tool(addr, me, "read", json!({"session": other, "wait": true})).await;
     assert_eq!(code, 200);
@@ -342,6 +447,40 @@ async fn mcp_api_end_to_end() {
         "{e}"
     );
     std::fs::create_dir_all(&work).unwrap();
+    let count = || async { state.registry.lock().await.sessions().len() };
+    let before = count().await;
+    let bad = [
+        (
+            json!({"machine": "Prueba", "folder": "rel/x", "prompt": "di hola"}),
+            "is not a full path",
+        ),
+        (
+            json!({"machine": "Prueba", "folder": work, "prompt": "di hola", "model": "-x"}),
+            "invalid model",
+        ),
+        (
+            json!({"machine": "Prueba", "folder": work, "prompt": "a".repeat(24 * 1024 + 1)}),
+            "the prompt is longer than 24 KB",
+        ),
+    ];
+    for (args, want) in bad {
+        let (code, e) = tool(addr, me, "open", args).await;
+        assert_eq!(code, 400, "{e}");
+        assert!(e["error"].as_str().unwrap().contains(want), "{e}");
+    }
+    assert_eq!(count().await, before, "no se apuntó ninguna");
+    // Justo en el límite, sí.
+    let (code, max) = tool(
+        addr,
+        me,
+        "open",
+        json!({"machine": "Prueba", "folder": work, "prompt": "a".repeat(24 * 1024)}),
+    )
+    .await;
+    assert_eq!(code, 200, "{max}");
+    let (code, _) = tool(addr, me, "close", json!({"session": max["session"]})).await;
+    assert_eq!(code, 200);
+    let _ = std::fs::remove_file(work.join("args"));
     let (code, opened) = tool(
         addr,
         me,
@@ -411,4 +550,71 @@ async fn mcp_api_end_to_end() {
     }
     let (code, _) = tool(addr, me, "close", json!({"session": new_id})).await;
     assert_eq!(code, 404);
+
+    // `answer` de verdad, contra un programa con un menú en pantalla. Un permiso: por número.
+    let menu = tmp.path().join("menu");
+    menu_folder(&menu, &fixture("permiso"), None);
+    // Una pregunta con campo de texto: solo con texto (se va al campo y escribe).
+    let sola = fixture("pregunta_sola");
+    let on_text = sola
+        .replace("❯ 1. Rojo", "  1. Rojo")
+        .replace("  3. Type something.", "❯ 3. Type something.");
+    assert_ne!(on_text, sola);
+    let texto = tmp.path().join("texto");
+    menu_folder(&texto, &sola, Some(&on_text));
+    let mut opened_ids = vec![];
+    for (dir, answer, kind) in [
+        (&menu, json!({"option": "1"}), "permission"),
+        (&texto, json!({"text": "azul cielo"}), "question"),
+    ] {
+        let (code, o) = tool(
+            addr,
+            me,
+            "open",
+            json!({"machine": "Prueba", "folder": dir, "prompt": "pregunta"}),
+        )
+        .await;
+        assert_eq!(code, 200, "{o}");
+        let session = o["session"].as_str().unwrap().to_owned();
+        opened_ids.push(session.clone());
+        // Espera a que salga la pregunta.
+        let (code, r) = tool(
+            addr,
+            me,
+            "read",
+            json!({"session": session, "wait": true, "timeout_s": 15}),
+        )
+        .await;
+        assert_eq!(code, 200, "{r}");
+        assert_eq!(r["state"], "question", "{r}");
+        assert_eq!(r["question"]["kind"], kind, "{r}");
+        let mut args = answer.clone();
+        args["session"] = session.clone().into();
+        let (code, a) = tool(addr, me, "answer", args).await;
+        assert_eq!(code, 200, "{a}");
+        assert_eq!(a["ok"], true);
+    }
+    assert_eq!(read_file(&menu.join("picked")).await.as_deref(), Some("1"));
+    assert_eq!(read_file(&texto.join("picked")).await.as_deref(), Some("3"));
+    assert_eq!(
+        read_file(&texto.join("typed")).await.as_deref(),
+        Some("azul cielo")
+    );
+    // Ya sin menú: no hay nada que contestar. (Sin un Claude que se apunte, sale «trabajando».)
+    let (_, r) = tool(addr, me, "read", json!({"session": opened_ids[0]})).await;
+    assert_eq!(r["state"], "working", "{r}");
+    assert!(r.get("question").is_none(), "{r}");
+    let (code, e) = tool(
+        addr,
+        me,
+        "answer",
+        json!({"session": opened_ids[0], "option": "1"}),
+    )
+    .await;
+    assert_eq!(code, 409, "{e}");
+    assert_eq!(e["error"], "no question is pending");
+    for s in opened_ids {
+        let (code, r) = tool(addr, me, "close", json!({"session": s})).await;
+        assert_eq!(code, 200, "{r}");
+    }
 }
