@@ -312,6 +312,7 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
         state: root.join("state"),
         config: root.join("config"),
         home: Paths::from_env().home,
+        server: None,
     };
     let here = AppState::new(here_paths, Launcher::Detached, Some(TOKEN.into()), true).unwrap();
     hub_id(&here, "aqui-id");

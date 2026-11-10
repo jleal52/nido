@@ -707,6 +707,8 @@ pub struct Dest {
     pub started: Option<Duration>,
     /// La abrió quien manda el mensaje.
     pub mine: bool,
+    /// Su pantalla dijo que no tiene channel, y por qué (ver `Inbox::refusal`).
+    pub refused: Option<inbox::Refusal>,
 }
 
 /// Lo que contesta `send`: el estado y, si hace falta, una nota para el modelo (en español; sale
@@ -740,6 +742,20 @@ pub fn to_self(me: &Machine, address: &str, caller: &str) -> bool {
 /// channel, se entrega; viva sin channel pero recién arrancada, a la cola; viva sin channel desde
 /// hace rato, no admite mensajes (y nunca se escribe en su consola).
 pub fn decide(d: &Dest) -> Result<Decision, Fail> {
+    // Su pantalla ya dijo que no tiene channel: no, aunque acabe de arrancar, y por qué.
+    if let (true, Some(why)) = (d.alive, d.refused) {
+        let msg = match why {
+            inbox::Refusal::Blocked => {
+                "esa sesión no admite mensajes (no tiene channel): la organización de su cuenta \
+                 de Claude no permite channels (channelsEnabled)"
+            }
+            inbox::Refusal::NoServer => {
+                "esa sesión no admite mensajes (no tiene channel): su Claude no tiene el MCP de \
+                 nido"
+            }
+        };
+        return Err(fail(StatusCode::CONFLICT, msg));
+    }
     let status = if !d.alive {
         Delivery::Queued
     } else if d.channel {
@@ -1014,6 +1030,9 @@ pub struct Entry {
     pub mine: bool,
     /// Recibe mensajes de `send`: su `nido mcp` está recogiendo la bandeja.
     pub channel: bool,
+    /// Por qué no tiene channel, si su pantalla lo dijo (ver `inbox::Refusal::code`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_error: Option<&'static str>,
 }
 
 fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: Status) -> Entry {
@@ -1028,6 +1047,7 @@ fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: S
         opened_by: v.opened_by.clone(),
         mine: caller.owns(me, v.opened_by.as_deref()),
         channel: st.inbox.channel(&v.id),
+        channel_error: st.inbox.refusal(&v.id).map(inbox::Refusal::code),
     }
 }
 
@@ -1346,6 +1366,16 @@ pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
             return Json(json!({ "messages": [] })).into_response();
         }
         Err(f) => return f.into_response(),
+    }
+    // Sin channel (Claude tiraría los mensajes), o mientras se mira su arranque: nada, y sin
+    // contar como channel. Lo que espera sigue en la cola.
+    if st.inbox.held(&caller.id) {
+        let wait = match st.inbox.refusal(&caller.id) {
+            Some(_) => st.inbox.poll_wait(),
+            None => st.inbox.poll_wait().min(WAIT_UNKNOWN),
+        };
+        tokio::time::sleep(wait).await;
+        return Json(json!({ "messages": [] })).into_response();
     }
     let messages: Vec<Msg> = st.inbox.poll(&caller.id).await;
     Json(json!({ "messages": messages })).into_response()
@@ -1958,6 +1988,7 @@ async fn send_here(st: &AppState, me: &Machine, caller: &Caller, id: &str, text:
         channel: st.inbox.channel(&s.id),
         started: Some(started(holder, st.inbox.uptime())),
         mine: caller.owns(me, s.opened_by.as_deref()),
+        refused: st.inbox.refusal(&s.id),
     })?;
     let msg = Msg {
         id: server::uuid_v4(),
@@ -2864,6 +2895,7 @@ mod tests {
             opened_by: Some("mac-id/padre".into()),
             mine: false,
             channel: true,
+            channel_error: None,
         }
     }
 
@@ -2939,6 +2971,7 @@ mod tests {
             channel,
             started: started.map(Duration::from_secs),
             mine,
+            refused: None,
         }
     }
 
@@ -2952,6 +2985,40 @@ mod tests {
     fn send_decision_table() {
         use Delivery::*;
         let note = |s: &str| Some(s.to_owned());
+        // Su pantalla dijo que no tiene channel: no, aunque acabe de arrancar, y con el porqué.
+        let refused = |why| {
+            let d = Dest {
+                refused: Some(why),
+                ..dest(true, false, Some(0), true)
+            };
+            decide(&d)
+                .map(|_| ())
+                .map_err(|f| (f.0, crate::i18n::english(&f.1)))
+        };
+        assert_eq!(
+            refused(inbox::Refusal::Blocked),
+            Err((
+                StatusCode::CONFLICT,
+                "this session does not accept messages (no channel): the organization of its \
+                 Claude account does not allow channels (channelsEnabled)"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            refused(inbox::Refusal::NoServer),
+            Err((
+                StatusCode::CONFLICT,
+                "this session does not accept messages (no channel): its Claude does not have \
+                 nido's MCP server"
+                    .to_owned()
+            ))
+        );
+        // Parada, a la cola: al volver a lanzarla puede tenerlo.
+        let d = Dest {
+            refused: Some(inbox::Refusal::Blocked),
+            ..dest(false, false, None, true)
+        };
+        assert_eq!(decide(&d).unwrap().status, Queued);
         // Parada: a la cola, se entrega al arrancar (lo que diga su channel no cuenta).
         assert_eq!(
             decided(dest(false, false, None, true)),

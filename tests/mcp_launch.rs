@@ -63,13 +63,15 @@ impl Drop for KillHolders {
 }
 
 /// Enseña `before` 3 s (si lo hay) y luego `screen`; apunta en `picked` las teclas que le
-/// lleguen, tal cual (Enter es `\r`): la primera, y tras ella, quitada la pantalla, las demás.
+/// lleguen, tal cual (Enter es `\r`): la primera, y tras ella, quitada la pantalla (y puesta
+/// `after`, si la hay), las demás.
 const PROGRAM: &str = r#"#!/bin/sh
 stty -icanon -echo -icrnl min 1 time 0
 if [ -f before ]; then printf '\033[2J\033[H'; cat before; sleep 3; fi
 printf '\033[2J\033[H'; cat screen
 dd bs=1 count=1 of=picked.tmp 2>/dev/null && mv picked.tmp picked
-printf '\033[2J\033[Hlisto\n'
+printf '\033[2J\033[H'
+if [ -f after ]; then cat after; else printf 'listo\n'; fi
 exec cat >> picked
 "#;
 
@@ -166,6 +168,7 @@ async fn claude_launches_with_the_nido_channel() {
         &shell,
         "#!/bin/sh\nprintf '%s\\0' \"$@\" > args.tmp && mv args.tmp args\n\
          printf '%s' \"${NIDO_CHANNEL:-no}\" > channel\n\
+         printf '%s' \"${NIDO_SERVER:-no}\" > server\n\
          if [ -x ./program ]; then exec ./program; fi\nexec sleep 60\n",
     )
     .unwrap();
@@ -181,11 +184,15 @@ async fn claude_launches_with_the_nido_channel() {
         // Aunque el gestor lo tuviera, a una sesión sin channel no le llega.
         std::env::set_var("NIDO_CHANNEL", "1");
     }
-    let paths = Paths::from_env();
-    let state = AppState::new(paths.clone(), Launcher::Detached, Some(TOKEN.into()), true).unwrap();
-    server::spawn_startup_watch(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    // Como `nido serve`: sus sesiones, con su dirección (aunque no haya `NIDO_SERVER`).
+    let paths = Paths {
+        server: Some(addr),
+        ..Paths::from_env()
+    };
+    let state = AppState::new(paths.clone(), Launcher::Detached, Some(TOKEN.into()), true).unwrap();
+    server::spawn_startup_watch(state.clone());
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -226,6 +233,11 @@ async fn claude_launches_with_the_nido_channel() {
     assert!(message.ends_with("\n\ndi hola"), "{message}");
     assert!(wait_file(&aviso.join("channel"), 50).await);
     assert_eq!(std::fs::read_to_string(aviso.join("channel")).unwrap(), "1");
+    // Su `nido mcp` hablará con este nido.
+    assert_eq!(
+        std::fs::read_to_string(aviso.join("server")).unwrap(),
+        addr.to_string()
+    );
     assert!(
         wait_file(&aviso.join("picked"), 100).await,
         "no aceptó el aviso"
@@ -302,6 +314,139 @@ async fn claude_launches_with_the_nido_channel() {
     assert_eq!(end, Startup::NoServer);
     assert!(!state.inbox.channel(&s.id));
     assert!(!sin.join("picked").exists());
+
+    // La organización de la cuenta de Claude no permite channels: sin aviso, ya con su caja, y
+    // Claude tiraría los mensajes. Sin channel, `send` dice por qué y no se le da nada.
+    let bloq = tmp.path().join("bloqueado");
+    folder(&bloq, &fixture("channels_bloqueados"));
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(Session {
+            // De Claude: a esas manda `send`.
+            claude: Some(nido::registry::ClaudeLink {
+                session_id: "conv-bloq".into(),
+                config_dir: None,
+                account: None,
+                inside_shell: false,
+            }),
+            ..session("bloqueado", &bloq, &["claude"])
+        })
+        .unwrap();
+    state
+        .inbox
+        .push(
+            &s.id,
+            nido::inbox::Msg {
+                id: "b1".into(),
+                from: "padre".into(),
+                from_id: "Prueba/x".into(),
+                machine: "Prueba".into(),
+                text: "hola".into(),
+                at: 1,
+            },
+        )
+        .unwrap();
+    nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
+    let end = server::watch_startup(&state, &s.id, Duration::from_secs(20)).await;
+    assert_eq!(end, Startup::Blocked);
+    assert_eq!(
+        state.inbox.refusal(&s.id),
+        Some(nido::inbox::Refusal::Blocked)
+    );
+    assert!(!state.inbox.channel(&s.id));
+    let (code, r) = inbox(addr, &s.id, None, None).await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(
+        r["messages"],
+        json!([]),
+        "no se le da a un channel que se tira"
+    );
+    assert_eq!(state.inbox.pending(&s.id).len(), 1);
+    let (code, e) = tool(
+        addr,
+        &caller,
+        "send",
+        json!({"session": s.id, "text": "hola"}),
+    )
+    .await;
+    assert_eq!(code, 409, "{e}");
+    assert!(
+        e["error"].as_str().unwrap().contains("channelsEnabled"),
+        "{e}"
+    );
+    let (_, list) = tool(addr, &caller, "sessions", json!({})).await;
+    let me = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == s.id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(me["channel"], false, "{me}");
+    assert_eq!(me["channel_error"], "blocked by org policy", "{me}");
+    assert!(!bloq.join("picked").exists());
+    nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
+
+    // Parada, `send` la encola. Al volver a arrancarla, su `nido mcp` recoge enseguida, con el
+    // aviso aún en pantalla, y Claude tira lo que le llegue antes de aceptarlo: la bandeja no da
+    // nada hasta que se acepta y está su caja.
+    let cola = tmp.path().join("cola");
+    folder(&cola, &fixture("aviso_channels"));
+    std::fs::write(cola.join("after"), fixture("normal")).unwrap();
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(Session {
+            claude: Some(nido::registry::ClaudeLink {
+                session_id: "conv-cola".into(),
+                config_dir: None,
+                account: None,
+                inside_shell: false,
+            }),
+            ..session("cola", &cola, &["claude"])
+        })
+        .unwrap();
+    let start = format!("/api/v1/sessions/{}/start", s.id);
+    let stop = format!("/api/v1/sessions/{}/stop", s.id);
+    assert_eq!(rest(addr, &start).await, 200);
+    assert!(wait_file(&cola.join("picked"), 100).await, "no aceptó");
+    assert_eq!(rest(addr, &stop).await, 200);
+    std::fs::remove_file(cola.join("picked")).unwrap();
+    // Esta vez el aviso tarda en poder contestarse (3 s).
+    std::fs::write(cola.join("before"), fixture("aviso_channels")).unwrap();
+    let (code, r) = tool(
+        addr,
+        &caller,
+        "send",
+        json!({"session": s.id, "text": "hola"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["status"], "queued", "{r}");
+    assert_eq!(state.inbox.pending(&s.id).len(), 1);
+    state.inbox.set_poll_wait(Duration::from_millis(300));
+    assert_eq!(rest(addr, &start).await, 200);
+    // Como su `nido mcp`, recogiendo sin parar desde que arranca.
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let got = loop {
+        assert!(std::time::Instant::now() < until, "nunca se le dio");
+        let accepted = cola.join("picked").exists();
+        let (code, r) = inbox(addr, &s.id, None, None).await;
+        assert_eq!(code, 200, "{r}");
+        if r["messages"] != json!([]) {
+            assert!(accepted, "se le dio con el aviso aún sin aceptar: {r}");
+            break r;
+        }
+    };
+    assert_eq!(got["messages"][0]["text"], "hola", "{got}");
+    let id = got["messages"][0]["id"].as_str().unwrap().to_owned();
+    let (code, r) = inbox(addr, &s.id, None, Some(json!({"ids": [id]}))).await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["removed"], 1);
+    assert_eq!(rest(addr, &stop).await, 200);
 
     // La de confiar en la carpeta es del usuario: mientras está, se sigue mirando, hasta el tope
     // (cinco plazos).
@@ -456,6 +601,20 @@ async fn claude_launches_with_the_nido_channel() {
     }
 }
 
+/// Un `POST` sin cuerpo a la API de la consola (arrancar, parar): su código.
+async fn rest(addr: SocketAddr, path: &str) -> u16 {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let api = Api {
+            addr,
+            token: Some(TOKEN.into()),
+        };
+        api.request("POST", &path, None).unwrap().0
+    })
+    .await
+    .unwrap()
+}
+
 /// La bandeja como la pide `nido mcp`: `GET` para recoger, o `POST …/ack` con `ack`.
 async fn inbox(
     addr: SocketAddr,
@@ -489,4 +648,24 @@ async fn inbox(
     })
     .await
     .unwrap()
+}
+
+/// El `nido mcp` de una sesión de un nido con `NIDO_HOME` usa el token de ese nido: ni crea ni
+/// lee el de verdad.
+#[test]
+fn the_console_token_follows_nido_home() {
+    let _limit = nido::watchdog::limit(Duration::from_secs(60));
+    let tmp = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nido"))
+        .arg("mcp")
+        .env("NIDO_HOME", tmp.path().join("nido"))
+        .env("HOME", tmp.path().join("home"))
+        .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+        .env_remove("NIDO_SESSION")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(tmp.path().join("nido/config/token").exists(), "{out:?}");
+    assert!(!tmp.path().join("config/nido/token").exists());
+    assert!(!tmp.path().join("home/.config/nido/token").exists());
 }

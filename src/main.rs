@@ -220,15 +220,6 @@ enum ServiceCmd {
     Uninstall,
 }
 
-fn token_file() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| nido::sys::home().map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("nido")
-        .join("token")
-}
-
 /// Escucha con IP_FREEBIND: la IP de la VPN puede no existir aún al arrancar.
 fn listen(addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
@@ -277,7 +268,8 @@ fn main() -> ExitCode {
             unsafe {
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             }
-            let token = auth::load_or_create_token(&token_file()).ok();
+            // Con `NIDO_HOME`, el de ese nido (ver `Paths::token`).
+            let token = auth::load_or_create_token(&paths.token()).ok();
             let api = Api {
                 addr: cli.server,
                 token,
@@ -296,12 +288,17 @@ const REGISTER_WARN: std::time::Duration = std::time::Duration::from_secs(20);
 const REGISTER_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[tokio::main]
-async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: bool) -> ExitCode {
+async fn serve(
+    mut paths: Paths,
+    bind: Vec<SocketAddr>,
+    no_auth: bool,
+    no_restore: bool,
+) -> ExitCode {
     nido::sys::keep_stdio_to_self();
     let token = if no_auth {
         None
     } else {
-        match auth::load_or_create_token(&token_file()) {
+        match auth::load_or_create_token(&paths.token()) {
             Ok(t) => Some(t),
             Err(e) => return fail(format!("no se pudo leer ni crear el token: {e}")),
         }
@@ -313,6 +310,12 @@ async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: b
             Err(e) => return fail(format!("no se pudo escuchar en {addr}: {e}")),
         }
     }
+    // Sus sesiones hablan con este nido, esté donde esté (sin depender de `NIDO_SERVER`).
+    let bound: Vec<SocketAddr> = listeners
+        .iter()
+        .map(|(a, l)| l.local_addr().unwrap_or(*a))
+        .collect();
+    paths.server = nido::launch::sessions_server(&bound);
     let launcher = Launcher::detect();
     let loopback_only = bind.iter().all(|a| a.ip().is_loopback());
     let state = match AppState::new(paths, launcher, token.clone(), loopback_only) {

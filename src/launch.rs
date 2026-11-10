@@ -18,6 +18,8 @@ pub struct Paths {
     /// Configuración (`~/.config/nido`): el token, la clave de los avisos de Apple…
     pub config: PathBuf,
     pub home: PathBuf,
+    /// La API de este nido (`nido serve`), para el `nido mcp` de sus sesiones (`NIDO_SERVER`).
+    pub server: Option<std::net::SocketAddr>,
 }
 
 impl Paths {
@@ -30,6 +32,7 @@ impl Paths {
                 state: root.join("state"),
                 config: root.join("config"),
                 home,
+                server: None,
             };
         }
         let xdg = |var: &str, default: &str| {
@@ -49,7 +52,13 @@ impl Paths {
             state: xdg("XDG_STATE_HOME", ".local/state"),
             config: xdg("XDG_CONFIG_HOME", ".config"),
             home,
+            server: None,
         }
+    }
+
+    /// El token de la consola (y de los `nido mcp` de sus sesiones).
+    pub fn token(&self) -> PathBuf {
+        self.config.join("token")
     }
 
     pub fn registry(&self) -> PathBuf {
@@ -71,6 +80,24 @@ impl Paths {
     pub fn history(&self, id: &str) -> PathBuf {
         self.session_state(id).join("history.ans")
     }
+}
+
+/// Con qué dirección hablan las sesiones de un `nido serve` que escucha en `bind`: la de
+/// loopback (la de la consola; la API del MCP solo atiende ahí), y si escucha en todas, por
+/// loopback.
+pub fn sessions_server(bind: &[std::net::SocketAddr]) -> Option<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut a = *bind
+        .iter()
+        .find(|a| a.ip().is_loopback() || a.ip().is_unspecified())
+        .or_else(|| bind.first())?;
+    if a.ip().is_unspecified() {
+        a.set_ip(match a.ip() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        });
+    }
+    Some(a)
 }
 
 /// Cómo se lanzan los guardianes.
@@ -152,6 +179,9 @@ pub fn start(paths: &Paths, launcher: Launcher, id: &str) -> io::Result<()> {
             for (k, v) in passthrough_env() {
                 cmd.arg(format!("--setenv={k}={v}"));
             }
+            if let Some(a) = paths.server {
+                cmd.arg(format!("--setenv=NIDO_SERVER={a}"));
+            }
             let out = cmd.arg(&exe).args(["holder", id]).output()?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
@@ -170,6 +200,9 @@ pub fn start(paths: &Paths, launcher: Launcher, id: &str) -> io::Result<()> {
                 .stdin(Stdio::null())
                 .stdout(log.try_clone()?)
                 .stderr(log);
+            if let Some(a) = paths.server {
+                cmd.env("NIDO_SERVER", a.to_string());
+            }
             let mut child = spawn_detached(&mut cmd)?;
             // Recogerlo al terminar para no dejar un zombi mientras viva el gestor.
             std::thread::spawn(move || {
@@ -380,7 +413,39 @@ mod tests {
             state: root.join("state"),
             config: root.join("config"),
             home: root.join("home"),
+            server: None,
         }
+    }
+
+    #[test]
+    fn the_token_lives_with_the_config() {
+        // Con `NIDO_HOME`, debajo de él, como lo demás: un nido de pruebas no usa (ni crea) el
+        // token de verdad.
+        assert_eq!(paths(Path::new("/r")).token(), Path::new("/r/config/token"));
+    }
+
+    #[test]
+    fn sessions_talk_to_the_console_address() {
+        let a = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert_eq!(
+            sessions_server(&[a("127.0.0.1:7693")]),
+            Some(a("127.0.0.1:7693"))
+        );
+        assert_eq!(
+            sessions_server(&[a("192.0.2.5:7690"), a("127.0.0.1:7695")]),
+            Some(a("127.0.0.1:7695"))
+        );
+        // Escuchando en todas: por la de loopback.
+        assert_eq!(
+            sessions_server(&[a("0.0.0.0:7690")]),
+            Some(a("127.0.0.1:7690"))
+        );
+        assert_eq!(sessions_server(&[a("[::]:7690")]), Some(a("[::1]:7690")));
+        assert_eq!(
+            sessions_server(&[a("192.0.2.5:7690")]),
+            Some(a("192.0.2.5:7690"))
+        );
+        assert_eq!(sessions_server(&[]), None);
     }
 
     fn claude_session(inside_shell: bool) -> Session {

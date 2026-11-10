@@ -1393,8 +1393,43 @@ pub enum Startup {
     /// Claude no tiene el servidor `nido` (su fila de `Channels:` dice «server:nido · no MCP
     /// server configured»): la sesión no tiene channel.
     NoServer,
+    /// La organización de la cuenta de Claude no permite channels («blocked by org policy
+    /// (server:nido)… Inbound messages will be silently dropped»): la sesión no tiene channel.
+    Blocked,
     /// Nada de eso (aún, o la pregunta de confiar en la carpeta, que es del usuario).
     Nothing,
+}
+
+/// Claude ya espera peticiones: su caja está en pantalla (y no la pregunta de confiar en la
+/// carpeta).
+pub fn repl(screen: &str) -> bool {
+    if trust_screen(screen) {
+        return false;
+    }
+    let screen = strip_sgr(screen);
+    let all: Vec<&str> = screen.lines().collect();
+    prompt_box(&all).is_some()
+}
+
+/// El aviso de Claude de que la organización de la cuenta no deja usar channels, para el de
+/// nido: en el saludo (con su rótulo, ver `startup_rows`), la fila «…blocked by org policy
+/// (…server:nido…)» y, justo debajo, «Inbound messages will be silently dropped». Con la caja ya
+/// en pantalla: no hay aviso que aceptar.
+fn channels_blocked(rows: &[&str]) -> bool {
+    const BLOCKED: &str = "--dangerously-load-development-channels blocked by org policy (";
+    const DROPPED: &str = "Inbound messages will be silently dropped";
+    let row = |l: &str| l.trim().trim_start_matches('▎').trim().to_owned();
+    rows.iter().any(|l| l.contains("Claude Code"))
+        && rows.windows(2).any(|w| {
+            let (first, next) = (row(w[0]), row(w[1]));
+            let Some(list) = first
+                .strip_prefix(BLOCKED)
+                .and_then(|r| r.strip_suffix(')'))
+            else {
+                return false;
+            };
+            next == DROPPED && list.split([',', ' ']).any(|c| c == "server:nido")
+        })
 }
 
 pub fn startup(screen: &str) -> Startup {
@@ -1412,6 +1447,9 @@ pub fn startup(screen: &str) -> Startup {
     let screen = strip_sgr(screen);
     let all: Vec<&str> = screen.lines().collect();
     let rows = startup_rows(&all);
+    if channels_blocked(rows) {
+        return Startup::Blocked;
+    }
     let no_server = rows.iter().any(|l| l.contains("Claude Code"))
         && rows.iter().map(|l| l.trim()).any(|l| {
             l.starts_with("Channels:") && l.contains("server:nido · no MCP server configured")
@@ -1917,6 +1955,45 @@ mod tests {
         assert_eq!(startup(&cortado), Startup::Nothing);
         // La de verdad, con la caja debajo, sí.
         assert_eq!(startup(sin), Startup::NoServer);
+        // Channels prohibidos por la organización de la cuenta: sin aviso, ya con la caja.
+        let bloqueado = include_str!("../tests/pantallas/channels_bloqueados.txt");
+        assert_eq!(startup(bloqueado), Startup::Blocked);
+        assert_eq!(dev_channels(bloqueado), None);
+        let rows: Vec<&str> = bloqueado.lines().collect();
+        let with =
+            |f: &dyn Fn(&str) -> String| rows.iter().map(|l| f(l)).collect::<Vec<_>>().join("\n");
+        // Las dos filas, y con `server:nido` en la lista.
+        let solo = with(&|l| {
+            if l.contains("Inbound messages") {
+                String::new()
+            } else {
+                l.to_owned()
+            }
+        });
+        assert_eq!(startup(&solo), Startup::Nothing);
+        let otro = with(&|l| l.replace("(server:nido)", "(server:otro)"));
+        assert_eq!(startup(&otro), Startup::Nothing);
+        let varios = with(&|l| l.replace("(server:nido)", "(server:otro, server:nido)"));
+        assert_eq!(startup(&varios), Startup::Blocked);
+        // Citado en la conversación, debajo de una petición, no cuenta.
+        let citado = with(&|l| {
+            if l.starts_with('▎') && l.contains("blocked") {
+                format!("> ¿qué es esto?\n\n● Esto:\n  {l}")
+            } else if l.starts_with('▎') {
+                format!("  {l}")
+            } else {
+                l.to_owned()
+            }
+        });
+        assert_eq!(startup(&citado), Startup::Nothing);
+        // Sin el rótulo de Claude Code encima (ya se fue de la pantalla), tampoco.
+        let sin_rotulo = rows[3..].join("\n");
+        assert_eq!(startup(&sin_rotulo), Startup::Nothing);
+        // Claude ya espera peticiones (su caja), y no en el aviso ni en la pregunta de confiar.
+        assert!(repl(bloqueado));
+        assert!(repl(sin));
+        assert!(!repl(aviso));
+        assert!(!repl(include_str!("../tests/pantallas/confianza.txt")));
         // «no MCP server configured» solo cuenta en la fila de Channels de nido: no en lo que
         // diga la conversación retomada.
         let normal = include_str!("../tests/pantallas/normal.txt");

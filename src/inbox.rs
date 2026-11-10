@@ -9,8 +9,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,41 @@ pub fn starting(age: Option<Duration>) -> bool {
     age.is_none_or(|a| a < CLAIM_STARTUP)
 }
 
+/// Por qué no tiene channel una sesión, según su pantalla al arrancar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Claude no tiene el servidor `nido` («no MCP server configured»).
+    NoServer,
+    /// La organización de la cuenta de Claude no permite channels (`channelsEnabled`): Claude
+    /// tira lo que le llegue por el channel.
+    Blocked,
+}
+
+impl Refusal {
+    /// Para `sessions` (`channel_error`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Refusal::NoServer => "no nido MCP server",
+            Refusal::Blocked => "blocked by org policy",
+        }
+    }
+}
+
+/// Mientras vive, la bandeja de la sesión no da nada (ver `Inbox::hold`).
+pub struct Hold {
+    channels: Arc<Mutex<HashMap<String, Channel>>>,
+    id: String,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        // Si entretanto se borró la sesión, no se vuelve a apuntar.
+        if let Some(c) = self.channels.lock().expect("channels").get_mut(&self.id) {
+            c.holding = c.holding.saturating_sub(1);
+        }
+    }
+}
+
 /// Lo más que se encola para una sesión.
 pub const MAX_QUEUED: usize = 100;
 /// Cuánto espera `GET /api/v1/mcp/inbox` a que llegue algo.
@@ -91,9 +126,11 @@ struct Channel {
     polling: usize,
     /// Cuándo acabó (o empezó) la última.
     last: Option<Instant>,
-    /// Su pantalla dice que no tiene channel («no MCP server configured» al arrancar). Dura lo
-    /// que dure ese arranque: lo quita `relaunched` (o `forget`), no una recogida.
-    refused: bool,
+    /// Su pantalla dice que no tiene channel, y por qué (ver `Refusal`). Dura lo que dure ese
+    /// arranque: lo quita `relaunched` (o `forget`), no una recogida.
+    refused: Option<Refusal>,
+    /// Arranques que se están mirando (ver `Inbox::hold`).
+    holding: usize,
     /// Ya se dijo que su bandeja va sin proteger (`unguarded`). Lo quita `relaunched`.
     unguarded: bool,
 }
@@ -107,7 +144,8 @@ pub fn live(polling: usize, last: Option<Instant>, refused: bool, now: Instant) 
 pub struct Inbox {
     path: PathBuf,
     queues: Mutex<HashMap<String, Vec<Msg>>>,
-    channels: Mutex<HashMap<String, Channel>>,
+    /// Compartido con los `Hold`, que lo sueltan al acabar.
+    channels: Arc<Mutex<HashMap<String, Channel>>>,
     /// Cambia con cada mensaje nuevo: despierta a las recogidas que esperan.
     arrived: watch::Sender<()>,
     /// `POLL_WAIT` en ms (las pruebas la acortan).
@@ -138,7 +176,7 @@ impl Inbox {
         Self {
             path,
             queues: Mutex::new(queues.into_iter().collect()),
-            channels: Mutex::default(),
+            channels: Arc::default(),
             arrived: watch::Sender::new(()),
             wait_ms: AtomicU64::new(POLL_WAIT.as_millis() as u64),
             loaded_at: Mutex::new(Instant::now()),
@@ -256,21 +294,54 @@ impl Inbox {
             .lock()
             .expect("channels")
             .get(id)
-            .is_some_and(|c| live(c.polling, c.last, c.refused, Instant::now()))
+            .is_some_and(|c| live(c.polling, c.last, c.refused.is_some(), Instant::now()))
     }
 
     /// La sesión `id` no tiene channel, según su pantalla (hasta que se vuelva a lanzar).
-    pub fn refuse(&self, id: &str) {
+    pub fn refuse(&self, id: &str, why: Refusal) {
         self.channels
             .lock()
             .expect("channels")
             .entry(id.to_owned())
             .or_default()
-            .refused = true;
+            .refused = Some(why);
     }
 
-    /// La sesión `id` se acaba de lanzar otra vez: lo que se sabía de su channel era del
-    /// arranque anterior.
+    /// Por qué no tiene channel la sesión `id`, si su pantalla lo dijo en este arranque.
+    pub fn refusal(&self, id: &str) -> Option<Refusal> {
+        self.channels
+            .lock()
+            .expect("channels")
+            .get(id)
+            .and_then(|c| c.refused)
+    }
+
+    /// ¿Se le retiene la bandeja a su `nido mcp`? Sin channel (Claude tiraría los mensajes), o
+    /// mientras se mira su arranque (`hold`).
+    pub fn held(&self, id: &str) -> bool {
+        self.channels
+            .lock()
+            .expect("channels")
+            .get(id)
+            .is_some_and(|c| c.refused.is_some() || c.holding > 0)
+    }
+
+    /// Mientras se mira el arranque de `id` y aún no se sabe si Claude acepta el channel: su
+    /// `nido mcp` puede estar ya recogiendo, y lo que se le diera antes de ver un «blocked by
+    /// org policy» se perdería. Hasta que se suelte (`drop`).
+    pub fn hold(&self, id: &str) -> Hold {
+        self.channels
+            .lock()
+            .expect("channels")
+            .entry(id.to_owned())
+            .or_default()
+            .holding += 1;
+        Hold {
+            channels: self.channels.clone(),
+            id: id.to_owned(),
+        }
+    }
+
     /// Su bandeja va sin proteger (no se encuentra su Claude, ver `claim`): `true` la primera
     /// vez en este arranque, para decirlo una vez.
     pub fn unguarded(&self, id: &str) -> bool {
@@ -279,9 +350,11 @@ impl Inbox {
         !std::mem::replace(&mut c.unguarded, true)
     }
 
+    /// La sesión `id` se acaba de lanzar otra vez: lo que se sabía de su channel era del
+    /// arranque anterior.
     pub fn relaunched(&self, id: &str) {
         if let Some(c) = self.channels.lock().expect("channels").get_mut(id) {
-            c.refused = false;
+            c.refused = None;
             c.unguarded = false;
         }
     }
@@ -495,19 +568,47 @@ mod tests {
         assert!(inbox.poll("hija").await.is_empty());
         assert!(start.elapsed() >= Duration::from_millis(200));
         // La pantalla dice que no tiene: así hasta que se vuelva a lanzar, aunque recoja.
-        inbox.refuse("hija");
+        assert_eq!(inbox.refusal("hija"), None);
+        inbox.refuse("hija", Refusal::Blocked);
         assert!(!inbox.channel("hija"));
+        assert_eq!(inbox.refusal("hija"), Some(Refusal::Blocked));
+        assert!(inbox.held("hija"), "sin channel, no se le da nada");
         inbox.poll("hija").await;
         assert!(!inbox.channel("hija"), "la recogida no quita el rechazo");
         inbox.relaunched("hija");
+        assert_eq!(inbox.refusal("hija"), None);
+        assert!(!inbox.held("hija"));
         inbox.poll("hija").await;
         assert!(inbox.channel("hija"));
         // Borrada, nada (y el rechazo tampoco queda para otra con el mismo id).
-        inbox.refuse("hija");
+        inbox.refuse("hija", Refusal::NoServer);
         inbox.forget("hija");
+        assert_eq!(inbox.refusal("hija"), None);
         assert!(!inbox.channel("hija"));
         inbox.poll("hija").await;
         assert!(inbox.channel("hija"));
+    }
+
+    #[test]
+    fn the_inbox_waits_while_the_startup_is_watched() {
+        // Mientras se mira el arranque (y no se sabe aún si Claude va a tirar los mensajes), no
+        // se da nada; con dos mirando, hasta que acaban los dos.
+        let inbox = Inbox::load(std::env::temp_dir().join("nido-no-existe/inbox.json"));
+        assert!(!inbox.held("s"));
+        let a = inbox.hold("s");
+        let b = inbox.hold("s");
+        assert!(inbox.held("s"));
+        assert!(!inbox.held("t"));
+        drop(a);
+        assert!(inbox.held("s"));
+        drop(b);
+        assert!(!inbox.held("s"));
+        // Borrada mientras se mira: al acabar no vuelve a apuntarse.
+        let c = inbox.hold("s");
+        inbox.forget("s");
+        drop(c);
+        assert!(!inbox.held("s"));
+        assert!(inbox.channels.lock().unwrap().get("s").is_none());
     }
 
     #[test]

@@ -82,10 +82,13 @@ pub struct AppState {
     /// pruebas, lo que se ponga con `set_peer_link`.
     peer_link: std::sync::OnceLock<PeerLink>,
     /// Las sesiones que se acaban de arrancar, para mirar su pantalla de arranque (ver
-    /// `spawn_startup_watch`).
-    launched: tokio::sync::mpsc::UnboundedSender<String>,
-    launched_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    /// `spawn_startup_watch`), con su bandeja ya retenida mientras tanto.
+    launched: tokio::sync::mpsc::UnboundedSender<Launched>,
+    launched_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Launched>>>,
 }
+
+/// Una sesión recién arrancada y, si hay quien mire los arranques, su bandeja retenida.
+type Launched = (String, Option<crate::inbox::Hold>);
 
 /// Otra forma de llegar a los demás equipos del grupo (en vez del hub), para las pruebas: recibe
 /// el miembro, el método y los parámetros, y devuelve lo que contestaría ese equipo.
@@ -514,7 +517,11 @@ impl AppState {
     pub(crate) fn launched(&self, id: &str) {
         // Lo que se sabía de su channel (rechazo, su Claude) era del arranque anterior.
         self.inbox.relaunched(id);
-        let _ = self.launched.send(id.to_owned());
+        // Retenida ya, antes de que su `nido mcp` pueda recoger (ver `Inbox::hold`), si alguien
+        // va a mirar su arranque (`spawn_startup_watch`) y a soltarla.
+        let watched = self.launched_rx.lock().expect("arranques").is_none();
+        let hold = watched.then(|| self.inbox.hold(id));
+        let _ = self.launched.send((id.to_owned(), hold));
     }
 }
 
@@ -630,6 +637,9 @@ pub async fn registration_done(
     }
 }
 
+/// Cuánto tiene que estar la caja de Claude en pantalla para dar por pintado su saludo.
+const REPL_SETTLE: Duration = Duration::from_secs(1);
+
 /// Cuánto se mira la pantalla de un Claude recién lanzado con el channel de nido.
 pub const STARTUP_WINDOW: Duration = Duration::from_secs(60);
 /// Lo más que se alarga mientras el usuario contesta si confía en la carpeta: este número de
@@ -642,7 +652,8 @@ pub fn spawn_startup_watch(state: Arc<AppState>) {
         return;
     };
     tokio::spawn(async move {
-        while let Some(id) = rx.recv().await {
+        // Sin channel (o ya borrada), su bandeja se suelta al tirar `hold`.
+        while let Some((id, hold)) = rx.recv().await {
             let Some(s) = state.registry.lock().await.get(&id).cloned() else {
                 continue;
             };
@@ -650,7 +661,8 @@ pub fn spawn_startup_watch(state: Arc<AppState>) {
                 continue;
             }
             let st = state.clone();
-            tokio::spawn(async move { watch_startup(&st, &id, STARTUP_WINDOW).await });
+            let hold = hold.unwrap_or_else(|| st.inbox.hold(&id));
+            tokio::spawn(async move { watch_held(&st, &id, STARTUP_WINDOW, hold).await });
         }
     });
 }
@@ -658,11 +670,22 @@ pub fn spawn_startup_watch(state: Arc<AppState>) {
 /// La pantalla de arranque de un Claude lanzado con el channel de nido, como visor y durante
 /// `window`. El aviso de los channels de desarrollo se acepta (un Enter) solo si lista
 /// exactamente `server:nido`; con otra lista no se toca. Si Claude dice que no tiene el servidor
-/// `nido`, la sesión queda sin channel. Lo demás (la pregunta de confiar en la carpeta) es del
+/// `nido`, o que la organización de su cuenta no permite channels, la sesión queda sin channel.
+/// Lo demás (la pregunta de confiar en la carpeta) es del
 /// usuario: se sigue mirando, y cuando se va el plazo vuelve a empezar (como mucho
 /// `STARTUP_CAP` plazos en total). Devuelve en qué quedó: `Accept` si se aceptó, `Nothing` si no salió
 /// nada (o se cerró la sesión).
 pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt::Startup {
+    watch_held(st, id, window, st.inbox.hold(id)).await
+}
+
+/// `watch_startup`, con la bandeja ya retenida (`hold`, ver `AppState::launched`).
+async fn watch_held(
+    st: &AppState,
+    id: &str,
+    window: Duration,
+    hold: crate::inbox::Hold,
+) -> prompt::Startup {
     use prompt::Startup;
     let started = tokio::time::Instant::now();
     let mut deadline = started + window;
@@ -677,6 +700,10 @@ pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt:
         .map_or_else(|| id.to_owned(), |s| s.name.clone());
     let mut scr = None;
     let mut accepted = false;
+    // Hasta ver a Claude ya esperando peticiones sin decir que tira el channel (con el aviso
+    // aceptado), su bandeja no da nada (ver `Inbox::hold`); al acabar de mirar, se suelta igual.
+    let mut hold = Some(hold);
+    let mut repl_since: Option<tokio::time::Instant> = None;
     while tokio::time::Instant::now() < deadline {
         if scr.is_none() {
             let hello = Hello {
@@ -742,11 +769,29 @@ pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt:
                 return Startup::Foreign(list);
             }
             Startup::NoServer => {
-                st.inbox.refuse(id);
+                st.inbox.refuse(id, crate::inbox::Refusal::NoServer);
                 eprintln!("nido: {name}: Claude no tiene el MCP de nido; queda sin channel");
                 return Startup::NoServer;
             }
+            Startup::Blocked => {
+                st.inbox.refuse(id, crate::inbox::Refusal::Blocked);
+                eprintln!(
+                    "nido: la organización de la cuenta de Claude no permite channels \
+                     (channelsEnabled): la sesión {name} ({id}) no recibe mensajes"
+                );
+                return Startup::Blocked;
+            }
             _ => {}
+        }
+        // Con su caja un rato (lo de arranque ya se ha pintado) y nada de lo anterior: la
+        // bandeja ya puede dar. Se sigue mirando hasta el plazo.
+        if hold.is_some() && prompt::repl(&text) {
+            let since = *repl_since.get_or_insert_with(tokio::time::Instant::now);
+            if since.elapsed() >= REPL_SETTLE {
+                hold = None;
+            }
+        } else {
+            repl_since = None;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -2747,6 +2792,7 @@ mod tests {
             state: dir.join("state"),
             config: dir.join("config"),
             home: dir.to_owned(),
+            server: None,
         };
         let st = AppState::new(paths, Launcher::Detached, None, true).unwrap();
         st.group.add_member("mac-id", "bWFj", "Mac");

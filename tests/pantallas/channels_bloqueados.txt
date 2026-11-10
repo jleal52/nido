@@ -1,0 +1,10 @@
+ ▐▛███▛█   Claude Code v2.1.322
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /home/ana/proyecto · /rc
+▎ --dangerously-load-development-channels blocked by org policy (server:nido)
+▎ Inbound messages will be silently dropped
+▎ Have an administrator set channelsEnabled: true in managed settings to enable
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "fix lint errors"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
