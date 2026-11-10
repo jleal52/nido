@@ -709,12 +709,12 @@ async fn watch_held(
     // aceptado), su bandeja no da nada (ver `Inbox::hold`).
     let mut hold = Some(hold);
     let mut repl_since: Option<tokio::time::Instant> = None;
-    // El guardián de este arranque (su pid), desde que se conecta: si se reinicia, lo de este
-    // arranque ya no vale para el nuevo.
-    let mut holder: Option<i32> = None;
+    // El guardián de este arranque (ver `launch::HolderId`), desde que se conecta: si se
+    // reinicia, lo de este arranque ya no vale para el nuevo.
+    let mut holder: Option<launch::HolderId> = None;
     while tokio::time::Instant::now() < deadline {
         if scr.is_none() {
-            if holder.is_some() && launch::holder_pid(&st.paths, id) != holder {
+            if holder.is_some() && launch::holder_id(&st.paths, id) != holder {
                 return Startup::Nothing;
             }
             let hello = Hello {
@@ -727,7 +727,7 @@ async fn watch_held(
                     let (rd, wr) = crate::ipc::split(stream);
                     scr = Some(prompt::Screen::new(rd, wr));
                     // Escribe su pid antes de atender.
-                    holder = holder.or_else(|| launch::holder_pid(&st.paths, id));
+                    holder = holder.or_else(|| launch::holder_id(&st.paths, id));
                 }
                 // Aún no atiende (al restaurar no se espera a que arranque).
                 Err(_) => {
@@ -872,14 +872,14 @@ enum Present {
 
 /// ¿Sigue habiendo un Claude (ver `claude::session_claude`) con `holder`, el guardián de la
 /// sesión `id` en este arranque?
-async fn claude_with(paths: &Paths, id: &str, holder: i32) -> Present {
+async fn claude_with(paths: &Paths, id: &str, holder: launch::HolderId) -> Present {
     let paths = paths.clone();
     let id = id.to_owned();
     tokio::task::spawn_blocking(move || {
-        let found = u32::try_from(holder)
+        let found = u32::try_from(holder.0)
             .is_ok_and(|h| claude::session_claude(&Procfs::default(), h, &paths.home).is_some());
         // Después de mirar: si entretanto se reinició, lo visto no vale para el nuevo.
-        if launch::holder_pid(&paths, &id) != Some(holder) || !launch::is_alive(&paths, &id) {
+        if launch::holder_id(&paths, &id) != Some(holder) || !launch::is_alive(&paths, &id) {
             Present::Replaced
         } else if found {
             Present::Claude
@@ -992,7 +992,7 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
 /// reinicia, acaba sin tocar nada.
 async fn keep_held(
     paths: Paths,
-    mut holder: Option<i32>,
+    mut holder: Option<launch::HolderId>,
     mut scr: Option<HolderScreen>,
     hold: crate::inbox::Hold,
     name: String,
@@ -1010,7 +1010,7 @@ async fn keep_held(
     loop {
         tokio::time::sleep(keep_pace(begun.elapsed())).await;
         // Otro guardián (reiniciada) o ninguno (se cerró): no es ya este arranque.
-        let now = launch::holder_pid(&paths, &id);
+        let now = launch::holder_id(&paths, &id);
         match holder {
             Some(h) if now != Some(h) => return,
             Some(_) => {}
@@ -3329,8 +3329,23 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn keep_held_leaves_a_restarted_session_alone() {
-        use std::os::unix::process::CommandExt;
         let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        left_alone_after_restart(false).await;
+    }
+
+    /// Igual con el mismo pid (Windows los reutiliza enseguida): lo distingue cuándo arrancó.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_held_tells_a_restart_with_the_same_pid() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        left_alone_after_restart(true).await;
+    }
+
+    /// Ver `keep_held_leaves_a_restarted_session_alone`; `same_pid`: el guardián nuevo tiene el
+    /// pid del de antes (y su Claude sigue ahí).
+    #[cfg(unix)]
+    async fn left_alone_after_restart(same_pid: bool) {
+        use std::os::unix::process::CommandExt;
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let paths = Paths {
@@ -3370,21 +3385,46 @@ mod tests {
         ));
         // Que vea su Claude.
         tokio::time::sleep(Duration::from_millis(2500)).await;
-        // Reiniciada: otro guardián, aún sin Claude.
-        let mut new = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
+        // Reiniciada: otro guardián, aún sin Claude; o con el mismo pid, escrito después.
+        let mut new = (!same_pid).then(|| {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap()
+        });
+        let pid = new.as_ref().map_or(std::process::id(), |c| c.id());
+        let pidfile = paths.pidfile(id);
+        let before = std::fs::metadata(&pidfile).unwrap().modified().unwrap();
+        std::fs::write(&pidfile, pid.to_string()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&pidfile)
+            .unwrap()
+            .set_modified(before + Duration::from_secs(2))
             .unwrap();
-        std::fs::write(paths.pidfile(id), new.id().to_string()).unwrap();
         let ended = tokio::time::timeout(Duration::from_secs(20), task).await;
+        // Lo que se ve con el de antes tampoco vale (aún atiende, y su Claude sigue): es otro.
+        let old = (std::process::id() as i32, Some(before));
+        let seen_before = claude_with(&paths, id, old).await;
+        let now = launch::holder_id(&paths, id).unwrap();
+        let seen_now = claude_with(&paths, id, now).await;
         unsafe {
             libc::kill(-(claude.id() as i32), libc::SIGKILL);
         }
         let _ = claude.wait();
-        let _ = new.kill();
-        let _ = new.wait();
+        if let Some(n) = new.as_mut() {
+            let _ = n.kill();
+            let _ = n.wait();
+        }
         mute.abort();
         assert!(ended.is_ok(), "sigue mirando el arranque nuevo");
+        assert_eq!(seen_before, Present::Replaced);
+        let expected = if same_pid {
+            Present::Claude
+        } else {
+            Present::NoClaude
+        };
+        assert_eq!(seen_now, expected);
         assert_eq!(inbox.refusal(id), None, "rechazó el arranque nuevo");
         assert!(!inbox.held(id));
     }

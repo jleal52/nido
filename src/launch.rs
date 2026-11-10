@@ -262,6 +262,14 @@ pub fn holder_started(paths: &Paths, id: &str) -> Option<std::time::SystemTime> 
     std::fs::metadata(paths.pidfile(id)).ok()?.modified().ok()
 }
 
+/// Quién es el guardián de una sesión: su pid y cuándo lo escribió (`holder_started`). Solo el
+/// pid no basta: Windows los reutiliza enseguida, y al reiniciarla el nuevo puede tener el mismo.
+pub type HolderId = (i32, Option<std::time::SystemTime>);
+
+pub fn holder_id(paths: &Paths, id: &str) -> Option<HolderId> {
+    Some((holder_pid(paths, id)?, holder_started(paths, id)))
+}
+
 /// El proceso del guardián sigue existiendo (aunque ya no atienda en el socket).
 pub fn holder_running(paths: &Paths, id: &str) -> bool {
     holder_pid(paths, id)
