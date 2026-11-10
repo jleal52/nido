@@ -50,6 +50,9 @@ pub const WAIT_MAX_S: u64 = 1800;
 pub const MAX_PROMPT: usize = 24 * 1024;
 /// Lo más largo que puede ser el modelo de `open` (en caracteres).
 pub const MAX_MODEL: usize = 128;
+/// Cuántas sesiones abiertas con `open` desde un mismo equipo puede haber aquí a la vez (las que
+/// siguen apuntadas, en marcha o no): un equipo del grupo no llena este de Claudes.
+pub const MAX_REMOTE_OPEN: usize = 10;
 /// `send` con `wait`: cuánto se espera, como mucho, a que la sesión recoja el mensaje y se ponga
 /// a trabajar.
 pub const PICKUP: Duration = Duration::from_secs(30);
@@ -133,11 +136,20 @@ pub struct Caller {
     pub local: bool,
 }
 
+/// `params.caller` de una petición de otro equipo. Lo que no conoce se deja: una versión más
+/// nueva puede mandar más.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CallerArg {
     id: String,
+    #[serde(default)]
     name: String,
+}
+
+/// Un nombre que llega de otro equipo: sin caracteres de control, sin espacios a los lados y de
+/// 64 caracteres como mucho.
+fn clean_name(n: &str) -> String {
+    let n: String = n.chars().filter(|c| !c.is_control()).collect();
+    n.trim().chars().take(64).collect()
 }
 
 impl Caller {
@@ -154,8 +166,19 @@ impl Caller {
 
     /// Una sesión de otro equipo del grupo. El equipo sale de su clave Noise, ya comprobada
     /// (`member`), nunca de lo que diga; la sesión, de `caller` (`{id, name}`), que vale porque
-    /// el equipo es del grupo. El id, como los de nido (lo mismo que `NIDO_SESSION`).
-    pub fn remote(member: &crate::group::Member, caller: Option<Value>) -> Result<Self, Fail> {
+    /// el equipo es del grupo. El id, como los de nido (lo mismo que `NIDO_SESSION`). Un miembro
+    /// que se llama como este equipo (por su id o su nombre) no: su dirección sería de aquí.
+    pub fn remote(
+        me: &Machine,
+        member: &crate::group::Member,
+        caller: Option<Value>,
+    ) -> Result<Self, Fail> {
+        let machine_name = clean_name(&member.name);
+        if me.is_me(&member.id) || me.is_me(&machine_name) {
+            return Err(bad_request(
+                "la sesión que llama no puede ser de este equipo".into(),
+            ));
+        }
         let invalid = |e: String| bad_request(format!("sesión que llama no válida: {e}"));
         let c: CallerArg = serde_json::from_value(
             caller.ok_or_else(|| bad_request("falta la sesión que llama".into()))?,
@@ -164,11 +187,14 @@ impl Caller {
         let id = crate::mcp::session_from(Some(c.id.clone()))
             .filter(|id| id.len() <= 64)
             .ok_or_else(|| invalid(format!("{:?}", c.id)))?;
-        let name: String = c.name.chars().filter(|c| !c.is_control()).collect();
-        let name: String = name.trim().chars().take(64).collect();
+        let name = clean_name(&c.name);
         Ok(Self {
             machine_key: member.id.clone(),
-            machine_name: member.name.clone(),
+            machine_name: if machine_name.is_empty() {
+                member.id.clone()
+            } else {
+                machine_name
+            },
             name: if name.is_empty() { id.clone() } else { name },
             id,
             local: false,
@@ -182,7 +208,9 @@ impl Caller {
 
     /// Con qué lleva sus posiciones de lectura (`Cursors`): la de aquí, con su id, que es como
     /// se olvidan al borrarla; la de otro equipo, con su dirección (un id no lleva «/»: no se
-    /// confunden).
+    /// confunden). La posición se mueve al leer, antes de contestar: si la respuesta no le llega
+    /// a la de otro equipo (el hub tarda más de la cuenta), esos turnos ya cuentan como leídos y
+    /// los pierde (con `last` los puede volver a pedir).
     pub fn reader(&self) -> String {
         if self.local {
             self.id.clone()
@@ -370,10 +398,22 @@ fn json_width(c: char) -> usize {
     }
 }
 
+/// Lo más que se guardan posiciones de lectoras de otros equipos (las que llevan «/» en su
+/// clave, ver `Caller::reader`): pasado eso, fuera las usadas hace más tiempo. Las de aquí se
+/// olvidan al borrar la sesión; de las de otro equipo no se entera nadie.
+pub const MAX_REMOTE_READERS: usize = 256;
+
 /// Hasta dónde leyó cada sesión la conversación de otra: (la que lee, la leída) → (su
 /// transcripción, posición). Solo en memoria: al reiniciar nido, se vuelve a leer todo.
 #[derive(Default)]
-pub struct Cursors(std::sync::Mutex<HashMap<(String, String), (PathBuf, u64)>>);
+pub struct Cursors(std::sync::Mutex<CursorMap>);
+
+#[derive(Default)]
+struct CursorMap {
+    /// Con la vuelta en que se movió por última vez (para saber cuáles son las más antiguas).
+    map: HashMap<(String, String), (PathBuf, u64, u64)>,
+    tick: u64,
+}
 
 impl Cursors {
     /// Dónde seguir leyendo: 0 si no la leyó nunca o la transcripción es otra (tras `/clear`).
@@ -381,24 +421,42 @@ impl Cursors {
         self.0
             .lock()
             .expect("cursores")
+            .map
             .get(&(reader.to_owned(), target.to_owned()))
-            .filter(|(p, _)| p == path)
-            .map_or(0, |(_, o)| *o)
+            .filter(|(p, _, _)| p == path)
+            .map_or(0, |(_, o, _)| *o)
     }
 
     /// Lo lleva de `from` a `to`, si sigue en `from` (lo que daría `get`). Si no, otra lectura
     /// de la misma sesión se adelantó y ya devolvió esos turnos: `false`, y no se toca.
     pub fn advance(&self, reader: &str, target: &str, path: &Path, from: u64, to: u64) -> bool {
-        let mut map = self.0.lock().expect("cursores");
+        let mut c = self.0.lock().expect("cursores");
         let key = (reader.to_owned(), target.to_owned());
-        let now = map
+        let now = c
+            .map
             .get(&key)
-            .filter(|(p, _)| p == path)
-            .map_or(0, |(_, o)| *o);
+            .filter(|(p, _, _)| p == path)
+            .map_or(0, |(_, o, _)| *o);
         if now != from {
             return false;
         }
-        map.insert(key, (path.to_owned(), to));
+        c.tick += 1;
+        let tick = c.tick;
+        c.map.insert(key, (path.to_owned(), to, tick));
+        if reader.contains('/') {
+            let remote = |r: &str| r.contains('/');
+            while c.map.keys().filter(|(r, _)| remote(r)).count() > MAX_REMOTE_READERS {
+                let oldest = c
+                    .map
+                    .iter()
+                    .filter(|((r, _), _)| remote(r))
+                    .min_by_key(|(_, (_, _, t))| *t)
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest {
+                    c.map.remove(&k);
+                }
+            }
+        }
         true
     }
 
@@ -407,6 +465,7 @@ impl Cursors {
         self.0
             .lock()
             .expect("cursores")
+            .map
             .retain(|(r, t), _| r != id && t != id);
     }
 }
@@ -788,16 +847,19 @@ pub async fn peer_call(
     member: &crate::group::Member,
     method: &str,
     mut params: Value,
-) -> Result<Value, String> {
+) -> e2e::PeerResult {
+    let code = |f: Fail| (f.0.as_u16(), f.1);
     if !PEER_TOOLS.contains(&method) {
-        return Err(format!("«{method}» no se puede pedir desde otro equipo"));
+        return Err(code(bad_request(format!(
+            "«{method}» no se puede pedir desde otro equipo"
+        ))));
     }
-    let caller = params.as_object_mut().and_then(|p| p.remove("caller"));
-    let caller = Caller::remote(member, caller).map_err(|f| f.1)?;
     let me = Machine::of(st);
+    let caller = params.as_object_mut().and_then(|p| p.remove("caller"));
+    let caller = Caller::remote(&me, member, caller).map_err(code)?;
     run_tool(st, &me, &caller, method, params)
         .await
-        .map_err(|f| f.1)
+        .map_err(code)
 }
 
 /// `GET /api/v1/mcp/inbox`: lo que espera en la bandeja de la sesión que llama, del más antiguo
@@ -990,7 +1052,33 @@ async fn tool_sessions(st: &AppState, me: &Machine, caller: &Caller, args: Value
         .zip(states)
         .map(|(v, (s, _))| entry(st, me, caller, v, s))
         .collect();
-    to_json(&list)
+    if caller.local {
+        return to_json(&list);
+    }
+    // A otro equipo va en un solo mensaje Noise: con tope, y diciendo si se recortó.
+    Ok(fit_sessions(list, MAX_READ))
+}
+
+/// La lista de `sessions` para otro equipo: `{sessions: [...]}` con las primeras que quepan en
+/// `max` bytes de JSON y, si no cupieron todas, `truncated: true`.
+pub fn fit_sessions(mut list: Vec<Entry>, max: usize) -> Value {
+    let mut used = r#"{"sessions":[],"truncated":true}"#.len();
+    let mut keep = 0;
+    for e in &list {
+        let n = json_len(e) + 1;
+        if used + n > max {
+            break;
+        }
+        used += n;
+        keep += 1;
+    }
+    let truncated = keep < list.len();
+    list.truncate(keep);
+    let mut out = json!({ "sessions": list });
+    if truncated {
+        out["truncated"] = true.into();
+    }
+    out
 }
 
 /// Los turnos que `reader` aún no ha leído de la conversación de `target`, y su posición hasta el
@@ -1260,6 +1348,20 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
     let name = a.name.as_deref().map(str::trim).map(str::to_owned);
     let created = {
         let mut reg = st.registry.lock().await;
+        if !caller.local {
+            let from = format!("{}/", caller.machine_key);
+            let opened = reg
+                .sessions()
+                .iter()
+                .filter(|s| s.opened_by.as_deref().is_some_and(|o| o.starts_with(&from)))
+                .count();
+            if opened >= MAX_REMOTE_OPEN {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "demasiadas sesiones abiertas desde ese equipo",
+                ));
+            }
+        }
         let session = opened_session(&reg, cwd, name, model.as_deref(), &message, opener);
         reg.add(session).map_err(Fail::from)?
     };
@@ -1462,7 +1564,12 @@ mod tests {
     }
 
     fn remote(id: &str) -> Caller {
-        Caller::remote(&mac(), Some(json!({"id": id, "name": "padre"}))).unwrap()
+        Caller::remote(
+            &me(Some("k123")),
+            &mac(),
+            Some(json!({"id": id, "name": "padre"})),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1513,26 +1620,81 @@ mod tests {
 
     #[test]
     fn remote_caller_must_be_valid() {
-        let bad = |v: Option<Value>| Caller::remote(&mac(), v).unwrap_err().1;
-        assert_eq!(bad(None), "falta la sesión que llama");
+        let m = me(Some("k123"));
+        let remote_with = |v: Option<Value>| Caller::remote(&m, &mac(), v);
+        let bad = |v: Option<Value>| remote_with(v).unwrap_err();
+        assert_eq!(bad(None).1, "falta la sesión que llama");
+        assert_eq!(bad(None).0, StatusCode::BAD_REQUEST);
         for id in ["", "a/b", "../x", "x y", "ñ", &"a".repeat(65)] {
             assert!(
-                bad(Some(json!({"id": id, "name": "n"}))).starts_with("sesión que llama no válida"),
+                bad(Some(json!({"id": id, "name": "n"})))
+                    .1
+                    .starts_with("sesión que llama no válida"),
                 "{id:?}"
             );
         }
-        assert!(bad(Some(json!({"id": "ab"}))).starts_with("sesión que llama no válida"));
-        assert!(bad(Some(json!("ab"))).starts_with("sesión que llama no válida"));
-        // El nombre, sin caracteres de control y no muy largo.
-        let c = Caller::remote(
-            &mac(),
-            Some(json!({"id": "a_B-9", "name": format!("  pa\u{7}dre{}", "x".repeat(100))})),
-        )
+        assert!(
+            bad(Some(json!("ab")))
+                .1
+                .starts_with("sesión que llama no válida")
+        );
+        assert!(
+            bad(Some(json!({"name": "n"})))
+                .1
+                .starts_with("sesión que llama no válida")
+        );
+        // Lo que no conoce, se deja (versiones más nuevas pueden mandar más).
+        let c = remote_with(Some(json!({"id": "ab", "name": "n", "luego": 1}))).unwrap();
+        assert_eq!(c.id, "ab");
+        // El nombre, sin caracteres de control y no muy largo; sin nombre, el id.
+        let c = remote_with(Some(
+            json!({"id": "a_B-9", "name": format!("  pa\u{7}dre{}", "x".repeat(100))}),
+        ))
         .unwrap();
         assert!(c.name.starts_with("padre"), "{}", c.name);
         assert_eq!(c.name.chars().count(), 64);
-        let c = Caller::remote(&mac(), Some(json!({"id": "ab", "name": "  "}))).unwrap();
-        assert_eq!(c.name, "ab", "sin nombre, el id");
+        for v in [json!({"id": "ab", "name": "  "}), json!({"id": "ab"})] {
+            assert_eq!(
+                remote_with(Some(v)).unwrap().name,
+                "ab",
+                "sin nombre, el id"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_machine_name_is_cleaned_and_never_this_one() {
+        let m = me(Some("k123"));
+        let who = Some(json!({"id": "ab", "name": "padre"}));
+        let member = |id: &str, name: &str| crate::group::Member {
+            id: id.into(),
+            name: name.into(),
+            ..mac()
+        };
+        let c = Caller::remote(
+            &m,
+            &member("mac-id", &format!(" \u{1b}[31mMac{}\n", "x".repeat(100))),
+            who.clone(),
+        )
+        .unwrap();
+        assert!(c.machine_name.starts_with("[31mMac"), "{}", c.machine_name);
+        assert_eq!(c.machine_name.chars().count(), 64);
+        let c = Caller::remote(&m, &member("mac-id", " \t "), who.clone()).unwrap();
+        assert_eq!(c.machine_name, "mac-id", "sin nombre, su id");
+        // Un miembro que dice ser este equipo (por su id o su nombre): no.
+        for (id, name) in [
+            ("k123", "Mac"),
+            ("Portatil", "Mac"),
+            ("mac-id", "portatil"),
+            ("mac-id", "k123"),
+            ("mac-id", " Portatil\u{7} "),
+        ] {
+            let e = Caller::remote(&m, &member(id, name), who.clone()).unwrap_err();
+            assert_eq!(
+                e.1, "la sesión que llama no puede ser de este equipo",
+                "{id} {name}"
+            );
+        }
     }
 
     #[test]
@@ -1708,6 +1870,64 @@ mod tests {
         assert!(c.advance("padre", "hija", b, 0, 10));
         c.forget("hija");
         assert_eq!(c.get("padre", "hija", b), 0);
+    }
+
+    #[test]
+    fn remote_readers_are_capped() {
+        let c = Cursors::default();
+        let p = PathBuf::from("/t/a.jsonl");
+        // Las de aquí no tienen tope.
+        for i in 0..(MAX_REMOTE_READERS + 10) {
+            assert!(c.advance(&format!("r{i}"), "hija", &p, 0, 5));
+        }
+        // Las de otros equipos, sí: fuera las más antiguas.
+        for i in 0..(MAX_REMOTE_READERS + 2) {
+            assert!(c.advance(&format!("mac/r{i}"), "hija", &p, 0, 7));
+        }
+        assert_eq!(c.get("mac/r0", "hija", &p), 0);
+        assert_eq!(c.get("mac/r1", "hija", &p), 0);
+        assert_eq!(c.get("mac/r2", "hija", &p), 7);
+        assert_eq!(
+            c.get(&format!("mac/r{}", MAX_REMOTE_READERS + 1), "hija", &p),
+            7
+        );
+        assert_eq!(c.get("r0", "hija", &p), 5);
+        // La que se vuelve a usar ya no es de las antiguas.
+        assert!(c.advance("mac/r2", "hija", &p, 7, 9));
+        assert!(c.advance("mac/nueva", "hija", &p, 0, 1));
+        assert_eq!(c.get("mac/r2", "hija", &p), 9);
+        assert_eq!(c.get("mac/r3", "hija", &p), 0);
+    }
+
+    fn entry_n(i: usize) -> Entry {
+        Entry {
+            session: format!("Portatil/{i:08}"),
+            machine: "Portatil".into(),
+            id: format!("{i:08}"),
+            name: format!("sesion-{i}"),
+            cwd: PathBuf::from(format!("/home/ana/proyectos/{}", "carpeta".repeat(20))),
+            state: Status::Idle,
+            opened_by: Some("mac-id/padre".into()),
+            mine: false,
+            channel: true,
+        }
+    }
+
+    #[test]
+    fn sessions_for_another_machine_fit_a_budget() {
+        let few = fit_sessions((0..3).map(entry_n).collect(), MAX_READ);
+        assert_eq!(few["sessions"].as_array().unwrap().len(), 3);
+        assert!(few.get("truncated").is_none(), "{few}");
+        let many = fit_sessions((0..2000).map(entry_n).collect(), MAX_READ);
+        let len = serde_json::to_vec(&many).unwrap().len();
+        assert!(len <= MAX_READ && MAX_READ < e2e::PEER_ROOM, "{len}");
+        assert_eq!(many["truncated"], true);
+        let kept = many["sessions"].as_array().unwrap();
+        assert!(kept.len() > 10, "{}", kept.len());
+        // Las primeras, en orden, y no cabía otra más.
+        assert_eq!(kept[0]["id"], "00000000");
+        assert_eq!(kept.last().unwrap()["id"], format!("{:08}", kept.len() - 1));
+        assert!(len + json_len(&entry_n(kept.len())) + 1 > MAX_READ);
     }
 
     fn assistant_line(id: usize, text: &str) -> String {

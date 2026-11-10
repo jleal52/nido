@@ -315,10 +315,22 @@ const TABLE: &[(&str, &str)] = &[
         "that session is not on this machine",
     ),
     ("«{}» no es este equipo", "“{0}” is not this machine"),
+    (
+        "la sesión que llama no puede ser de este equipo",
+        "the calling session cannot be on this machine",
+    ),
+    (
+        "demasiadas sesiones abiertas desde ese equipo",
+        "too many sessions opened from that machine",
+    ),
     // server.rs (canal «peer»)
     (
         "«{}» no es ningún equipo del grupo",
         "“{0}” is not a machine in the group",
+    ),
+    (
+        "hay varios equipos «{}» en el grupo: usa su id",
+        "there are several machines “{0}” in the group: use its id",
     ),
     (
         "esa sesión no admite mensajes (no tiene channel)",
@@ -549,6 +561,14 @@ const TABLE: &[(&str, &str)] = &[
         "no connection or old version",
     ),
     ("la respuesta es demasiado grande", "the reply is too large"),
+    (
+        "la petición es demasiado grande",
+        "the request is too large",
+    ),
+    (
+        "petición caducada o repetida",
+        "expired or repeated request",
+    ),
     (
         "respuesta no válida del otro equipo",
         "invalid reply from the other machine",

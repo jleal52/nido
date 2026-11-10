@@ -51,7 +51,8 @@ async fn ask(state: &Arc<AppState>, from: &Identity, method: &str, params: Value
     let (to_nido, nido_rx) = tokio::sync::mpsc::channel(4);
     let (nido_tx, mut from_nido) = tokio::sync::mpsc::channel(4);
     tokio::spawn(e2e::serve(state.clone(), nido_rx, nido_tx));
-    let payload = json!({"method": method, "params": params}).to_string();
+    let payload =
+        json!({"method": method, "params": params, "at": nido::group::now_ms()}).to_string();
     let key = state.identity().public;
     let (dial, first) =
         e2e::Dial::start_mode(from, &key, None, e2e::MODE_PEER, payload.as_bytes()).unwrap();
@@ -75,11 +76,22 @@ fn ok(r: Option<Value>) -> Value {
 }
 
 fn err(r: Option<Value>) -> String {
+    failed(r).1
+}
+
+/// El error y su código (el estado HTTP que tendría en la API local).
+fn failed(r: Option<Value>) -> (u64, String) {
     let r = r.expect("contesta");
-    r["error"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{r}"))
-        .to_owned()
+    let msg = r["error"].as_str().unwrap_or_else(|| panic!("{r}"));
+    let code = r["code"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("sin código: {r}"));
+    (code, msg.to_owned())
+}
+
+/// La lista de `sessions` que ve otro equipo (`{sessions, truncated?}`).
+fn listed(r: Option<Value>) -> Vec<Value> {
+    ok(r)["sessions"].as_array().unwrap().clone()
 }
 
 /// Al acabar (también si la prueba falla), mata los guardianes que queden.
@@ -232,25 +244,26 @@ async fn peer_calls_end_to_end() {
 
     // Solo la lista cerrada de métodos; `alert` va siempre al nido de quien la manda.
     for m in ["alert", "inbox", "nada"] {
-        let e = err(ask(&state, &mac, m, p(json!({"text": "x"}))).await);
+        let (code, e) = failed(ask(&state, &mac, m, p(json!({"text": "x"}))).await);
+        assert_eq!(code, 400);
         assert!(
             e.contains("no se puede pedir desde otro equipo"),
             "{m}: {e}"
         );
     }
     // Quién llama: hace falta, y con un id como los de nido.
-    let e = err(ask(&state, &mac, "sessions", json!({})).await);
+    let (code, e) = failed(ask(&state, &mac, "sessions", json!({})).await);
+    assert_eq!(code, 400);
     assert!(e.contains("falta la sesión que llama"), "{e}");
     for bad in ["", "a/b", "../x", "x y", "ñ"] {
         let e = err(ask(&state, &mac, "sessions", with_caller(bad, json!({}))).await);
         assert!(e.contains("sesión que llama no válida"), "{bad:?}: {e}");
     }
-    let e = err(ask(&state, &mac, "sessions", json!({"caller": {"id": "ab"}})).await);
-    assert!(e.contains("sesión que llama no válida"), "{e}");
 
     // `sessions`: la de Claude, sin abrir por nadie.
-    let list = ok(ask(&state, &mac, "sessions", p(json!({}))).await);
-    let list = list.as_array().unwrap();
+    let r = ok(ask(&state, &mac, "sessions", p(json!({}))).await);
+    assert!(r.get("truncated").is_none(), "{r}");
+    let list = listed(Some(json!({"ok": r})));
     assert_eq!(list.len(), 1, "{list:?}");
     assert_eq!(list[0]["session"], format!("Prueba/{other}"));
     assert_eq!(list[0]["mine"], false);
@@ -271,8 +284,8 @@ async fn peer_calls_end_to_end() {
     assert_eq!(texts(&r), Vec::<String>::new());
     // Nada de pasar a un tercer equipo (ni volver al de quien llama).
     for s in [format!("Otro/{other}"), format!("mac-id/{other}")] {
-        let e = err(ask(&state, &mac, "read", p(json!({"session": s}))).await);
-        assert_eq!(e, "esa sesión no es de este equipo");
+        let e = failed(ask(&state, &mac, "read", p(json!({"session": s}))).await);
+        assert_eq!(e, (400, "esa sesión no es de este equipo".into()));
     }
     assert_eq!(
         nido::i18n::english("esa sesión no es de este equipo"),
@@ -331,6 +344,48 @@ async fn peer_calls_end_to_end() {
     let a = opened["id"].as_str().unwrap().to_owned();
     let reg_a = state.registry.lock().await.get(&a).cloned().unwrap();
     assert_eq!(reg_a.opened_by.as_deref(), Some(remote_addr.as_str()));
+    // Como mucho 10 abiertas desde un mismo equipo (cuentan las que siguen apuntadas).
+    let filler: Vec<String> = {
+        let mut reg = state.registry.lock().await;
+        let mut ids = vec![];
+        for i in 0..9 {
+            let mut s = session(&format!("relleno-{i}"), tmp.path(), None);
+            s.opened_by = Some(format!("mac-id/zz{i}"));
+            ids.push(reg.add(s).unwrap().id);
+        }
+        // Las de otro equipo con un id que empieza igual no cuentan.
+        let mut s = session("de-otro", tmp.path(), None);
+        s.opened_by = Some("mac-id-2/zz".into());
+        ids.push(reg.add(s).unwrap().id);
+        ids
+    };
+    let open_again = p(json!({"machine": "Prueba", "folder": work, "prompt": "otra"}));
+    let e = failed(ask(&state, &mac, "open", open_again.clone()).await);
+    assert_eq!(
+        e,
+        (409, "demasiadas sesiones abiertas desde ese equipo".into())
+    );
+    assert_eq!(
+        nido::i18n::english("demasiadas sesiones abiertas desde ese equipo"),
+        "too many sessions opened from that machine"
+    );
+    // Las de aquí no tienen ese tope.
+    let (code, local_one) = tool(
+        addr,
+        &local,
+        "open",
+        json!({"machine": "Prueba", "folder": work, "prompt": "x"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{local_one}");
+    let (code, _) = tool(addr, &local, "close", json!({"session": local_one["id"]})).await;
+    assert_eq!(code, 200);
+    {
+        let mut reg = state.registry.lock().await;
+        for id in &filler {
+            reg.remove(id).unwrap();
+        }
+    }
     assert!(wait_file(&work.join("args")).await, "la sesión no arrancó");
     let args = String::from_utf8_lossy(&std::fs::read(work.join("args")).unwrap()).into_owned();
     assert!(
@@ -365,31 +420,33 @@ async fn peer_calls_end_to_end() {
     let (code, _) = tool(addr, &local, "close", json!({"session": a})).await;
     assert_eq!(code, 403);
     // Otra sesión del Mac, tampoco.
-    let e = err(ask(
-        &state,
-        &mac,
-        "close",
-        with_caller("otra2", json!({"session": a})),
-    )
-    .await);
-    assert_eq!(e, "solo puedes cerrar las sesiones que abriste");
+    let e = failed(
+        ask(
+            &state,
+            &mac,
+            "close",
+            with_caller("otra2", json!({"session": a})),
+        )
+        .await,
+    );
+    assert_eq!(
+        e,
+        (403, "solo puedes cerrar las sesiones que abriste".into())
+    );
     // La del Mac que la abrió, sí: pasa del permiso (no hay pregunta en pantalla).
-    let list = ok(ask(&state, &mac, "sessions", p(json!({}))).await);
-    let entry = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["id"] == a.as_str())
-        .unwrap();
+    let list = listed(ask(&state, &mac, "sessions", p(json!({}))).await);
+    let entry = list.iter().find(|e| e["id"] == a.as_str()).unwrap();
     assert_eq!(entry["mine"], true);
-    let e = err(ask(
-        &state,
-        &mac,
-        "answer",
-        p(json!({"session": a, "option": "1"})),
-    )
-    .await);
-    assert_eq!(e, "no hay ninguna pregunta pendiente");
+    let e = failed(
+        ask(
+            &state,
+            &mac,
+            "answer",
+            p(json!({"session": a, "option": "1"})),
+        )
+        .await,
+    );
+    assert_eq!(e, (409, "no hay ninguna pregunta pendiente".into()));
 
     // Y al revés: la que abre la de aquí no es del Mac.
     let (code, b) = tool(
@@ -422,19 +479,55 @@ async fn peer_calls_end_to_end() {
     );
     assert!(state.registry.lock().await.get(&a).is_none());
 
-    // Del lado del que pide: sin hub, «sin conexión o versión antigua»; a uno que no es del
-    // grupo, ni se intenta.
+    // Muchas sesiones: la lista que va a otro equipo se recorta para que quepa.
+    {
+        let mut reg = state.registry.lock().await;
+        let link = reg.get(&other).unwrap().claude.clone();
+        let deep = tmp.path().join("carpeta".repeat(20));
+        for i in 0..400 {
+            reg.add(session(&format!("muchas-{i}"), &deep, link.clone()))
+                .unwrap();
+        }
+    }
+    let r = ok(ask(&state, &mac, "sessions", p(json!({}))).await);
     assert_eq!(
-        state.peer("mac-id", "sessions", json!({})).await,
-        Err("sin conexión o versión antigua".into())
+        r["truncated"],
+        true,
+        "{}",
+        r["sessions"].as_array().unwrap().len()
     );
-    assert_eq!(
-        state.peer("Mac", "sessions", json!({})).await,
-        Err("sin conexión o versión antigua".into())
-    );
-    let e = state
+    let n = r["sessions"].as_array().unwrap().len();
+    assert!(n > 10 && n < 401, "{n}");
+    assert!(serde_json::to_vec(&r).unwrap().len() <= 48 * 1024);
+
+    // Del lado del que pide: sin hub, «sin conexión o versión antigua» (502); a uno que no es
+    // del grupo, ni se intenta.
+    let no_peer = Err((502, "sin conexión o versión antigua".to_owned()));
+    assert_eq!(state.peer("mac-id", "sessions", json!({})).await, no_peer);
+    assert_eq!(state.peer("Mac", "sessions", json!({})).await, no_peer);
+    let (code, e) = state
         .peer("viejo-id", "sessions", json!({}))
         .await
         .unwrap_err();
+    assert_eq!(code, 404);
     assert!(e.contains("no es ningún equipo del grupo"), "{e}");
+    // Dos con el mismo nombre: por el nombre no, por el id sí.
+    for (id, name) in [("g1", "Gemelo"), ("g2", "gemelo"), ("Gemelo", "Otro")] {
+        state
+            .group
+            .add_member(id, &B64.encode(key(id).public), name);
+    }
+    let (code, e) = state
+        .peer("gemelo", "sessions", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(code, 400);
+    assert_eq!(e, "hay varios equipos «gemelo» en el grupo: usa su id");
+    assert_eq!(
+        nido::i18n::english("hay varios equipos «gemelo» en el grupo: usa su id"),
+        "there are several machines “gemelo” in the group: use its id"
+    );
+    assert_eq!(state.peer("g2", "sessions", json!({})).await, no_peer);
+    // Un id que es exactamente el pedido gana a los nombres.
+    assert_eq!(state.peer("Gemelo", "sessions", json!({})).await, no_peer);
 }
