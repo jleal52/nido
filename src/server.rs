@@ -38,7 +38,9 @@ pub struct AppState {
     /// Las cuentas de Claude de este equipo y su uso.
     accounts: Arc<accounts::Accounts>,
     /// Contestar un menú de Claude es teclear paso a paso: de uno en uno.
-    answering: Mutex<()>,
+    pub(crate) answering: Mutex<()>,
+    /// Hasta dónde ha leído cada sesión la conversación de otra (la herramienta `read` del MCP).
+    pub(crate) mcp_cursors: crate::mcp_api::Cursors,
     /// Lo que cada sesión de Claude tiene en segundo plano (subagentes, órdenes), según su
     /// pantalla; lo pone al día `spawn_background` cada pocos segundos.
     background: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
@@ -215,7 +217,7 @@ fn alert_body(count: usize, last: &str) -> String {
 }
 
 /// El texto de una alerta, sin espacios alrededor y recortado. `None` si queda vacío.
-fn alert_text(text: &str) -> Option<String> {
+pub(crate) fn alert_text(text: &str) -> Option<String> {
     let t: String = text.trim().chars().take(ALERT_MAX_CHARS).collect();
     let t = t.trim_end();
     (!t.is_empty()).then(|| t.to_owned())
@@ -305,6 +307,7 @@ impl AppState {
             last_status: Default::default(),
             accounts,
             answering: Mutex::new(()),
+            mcp_cursors: Default::default(),
             background: Default::default(),
             finished_pushed: Default::default(),
             alert_throttle: Default::default(),
@@ -984,6 +987,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sessions/{id}/live", get(ws_live))
         .route("/api/v1/sessions/{id}/term", get(ws_term))
         .route("/api/v1/events", get(ws_events))
+        .route("/api/v1/mcp/{tool}", post(crate::mcp_api::api_mcp))
         .route(
             "/api/v1/upload",
             post(upload::api_upload).layer(DefaultBodyLimit::max(upload::MAX_BYTES)),
@@ -1004,12 +1008,16 @@ pub fn error(status: StatusCode, msg: impl Into<String>) -> Response {
 }
 
 fn registry_error(e: RegistryError) -> Response {
-    let status = match e {
+    error(registry_status(&e), e.to_string())
+}
+
+/// El código HTTP de un error del registro.
+pub(crate) fn registry_status(e: &RegistryError) -> StatusCode {
+    match e {
         RegistryError::NotFound(_) => StatusCode::NOT_FOUND,
         RegistryError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
-    };
-    error(status, e.to_string())
+    }
 }
 
 async fn api_info(State(st): State<Arc<AppState>>) -> Response {
@@ -1271,7 +1279,7 @@ fn yes() -> bool {
 }
 
 /// Un uuid v4 para `claude --session-id`.
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     let mut b = [0u8; 16];
     getrandom::fill(&mut b).expect("sin aleatoriedad del sistema");
     b[6] = (b[6] & 0x0f) | 0x40;
@@ -1288,7 +1296,7 @@ fn uuid_v4() -> String {
 }
 
 /// «~» es la carpeta de inicio de este equipo (cada uno del grupo tiene la suya).
-fn expand_home(home: &std::path::Path, cwd: Option<PathBuf>) -> PathBuf {
+pub(crate) fn expand_home(home: &std::path::Path, cwd: Option<PathBuf>) -> PathBuf {
     match cwd {
         Some(c) if c == std::path::Path::new("~") => home.to_owned(),
         Some(c) => match c.strip_prefix("~") {
@@ -1399,7 +1407,7 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
     (StatusCode::CREATED, Json(created)).into_response()
 }
 
-async fn wait_alive(st: &AppState, id: &str) -> bool {
+pub(crate) async fn wait_alive(st: &AppState, id: &str) -> bool {
     for _ in 0..60 {
         if launch::is_alive(&st.paths, id) {
             return true;
@@ -1509,7 +1517,7 @@ async fn api_order_folders(
     }
 }
 
-async fn stop_and_wait(st: &AppState, id: &str) {
+pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
     // Bloquea un momento (en Windows espera a que el guardián recoja la orden): fuera del hilo
     // de tokio.
     let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
@@ -1649,14 +1657,20 @@ async fn api_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> 
         Ok(s) => s,
         Err(r) => return r,
     };
-    stop_and_wait(&st, &s.id).await;
-    let res = st.registry.lock().await.remove(&s.id);
-    let _ = std::fs::remove_dir_all(st.paths.session_state(&s.id));
-    st.refresh.notify_one();
-    match res {
-        Ok(_) => Json(serde_json::json!({ "ok": true })).into_response(),
+    match delete_session(&st, &s.id).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => registry_error(e),
     }
+}
+
+/// La para, la quita del registro y borra su estado (historial, registro del guardián).
+pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), RegistryError> {
+    stop_and_wait(st, id).await;
+    let res = st.registry.lock().await.remove(id);
+    let _ = std::fs::remove_dir_all(st.paths.session_state(id));
+    st.mcp_cursors.forget(id);
+    st.refresh.notify_one();
+    res.map(|_| ())
 }
 
 #[derive(Deserialize)]
@@ -1668,7 +1682,7 @@ struct HistoryQuery {
     screen: bool,
 }
 
-async fn holder_connect(
+pub(crate) async fn holder_connect(
     st: &AppState,
     id: &str,
     hello: Hello,
@@ -1759,6 +1773,15 @@ struct ChatQuery {
     limit: Option<usize>,
 }
 
+/// La transcripción de la conversación de Claude, si ya la ha empezado a escribir.
+pub(crate) fn transcript_of(st: &AppState, link: &ClaudeLink) -> Option<PathBuf> {
+    let config = link
+        .config_dir
+        .clone()
+        .unwrap_or_else(|| claude::default_config_dir(&st.paths.home));
+    crate::transcript::find(&config, &link.session_id)
+}
+
 /// La conversación de Claude de la sesión, leída de su transcripción, por trozos.
 async fn api_chat(
     State(st): State<Arc<AppState>>,
@@ -1772,11 +1795,7 @@ async fn api_chat(
     let Some(link) = s.claude else {
         return error(StatusCode::NOT_FOUND, "en esta sesión no hay ningún Claude");
     };
-    let config = link
-        .config_dir
-        .clone()
-        .unwrap_or_else(|| claude::default_config_dir(&st.paths.home));
-    let Some(path) = crate::transcript::find(&config, &link.session_id) else {
+    let Some(path) = transcript_of(&st, &link) else {
         // Un Claude recién creado aún no ha escrito nada.
         let empty = serde_json::json!({ "session_id": link.session_id, "offset": 0, "items": [], "results": [], "truncated": false });
         return Json(empty).into_response();

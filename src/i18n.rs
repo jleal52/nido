@@ -242,6 +242,48 @@ const TABLE: &[(&str, &str)] = &[
         "{0}: not connected to the hub",
     ),
     ("{}: el hub no contestó", "{0}: the hub did not answer"),
+    // mcp_api.rs
+    (
+        "la API del MCP solo va con el token de este equipo",
+        "the MCP API only takes this machine's token",
+    ),
+    (
+        "no se llamó desde una sesión de nido",
+        "not called from a nido session",
+    ),
+    ("no hay ninguna herramienta {}", "there is no tool {0}"),
+    ("argumentos no válidos: {}", "invalid arguments: {0}"),
+    (
+        "la sesión está en otro equipo (aún no se puede)",
+        "session is on another machine (not supported yet)",
+    ),
+    ("no existe esa sesión", "no such session"),
+    (
+        "«{}» es otro equipo (aún no se puede)",
+        "“{0}” is another machine (not supported yet)",
+    ),
+    ("modelo no válido: {}", "invalid model: {0}"),
+    ("falta el mensaje", "the prompt is missing"),
+    (
+        "solo puedes contestar las sesiones que abriste",
+        "you can only answer sessions you opened",
+    ),
+    (
+        "solo puedes cerrar las sesiones que abriste",
+        "you can only close sessions you opened",
+    ),
+    (
+        "falta la opción o el texto",
+        "the option or the text is missing",
+    ),
+    (
+        "no hay ninguna pregunta pendiente",
+        "no question is pending",
+    ),
+    (
+        "la pregunta no admite texto libre",
+        "the pending question has no free-text field",
+    ),
     // auth.rs
     (
         "falta el token o no es válido",

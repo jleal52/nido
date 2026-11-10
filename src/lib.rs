@@ -19,6 +19,7 @@ pub mod import;
 pub mod ipc;
 pub mod launch;
 pub mod mcp;
+pub mod mcp_api;
 pub mod oauth;
 pub mod prompt;
 pub mod proto;
