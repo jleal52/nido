@@ -1303,6 +1303,20 @@ pub fn waiting_for_limit(screen: &str) -> bool {
     strip_sgr(screen).contains("esc to cancel the wait")
 }
 
+/// La pantalla de aviso de `--dangerously-load-development-channels`: los channels que lista.
+/// Solo si está la opción «I am using this for local development» (la que nido acepta).
+pub fn dev_channels(screen: &str) -> Option<Vec<String>> {
+    if !screen.contains("Loading development channels")
+        || !screen.contains("I am using this for local development")
+    {
+        return None;
+    }
+    let line = screen
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Channels:"))?;
+    Some(line.split_whitespace().map(str::to_owned).collect())
+}
+
 /// Tras cambiar de cuenta: si la sesión se quedó parada por el límite (`stopped`, según su
 /// transcripción, o por lo que hay en pantalla), quita el aviso (su menú o la espera) y le dice a
 /// Claude que siga. Devuelve si lo ha hecho.
@@ -1672,6 +1686,18 @@ mod tests {
         assert!(waiting_for_limit(
             "Claude Code will continue automatically at 5pm. Keep this session open; it may still pause for permission prompts. Press esc to cancel the wait."
         ));
+    }
+
+    #[test]
+    fn dev_channels_warning() {
+        let s = include_str!("../tests/pantallas/aviso_channels.txt");
+        assert_eq!(dev_channels(s), Some(vec!["server:nido".to_string()]));
+        let o = include_str!("../tests/pantallas/aviso_channels_otro.txt");
+        assert_eq!(
+            dev_channels(o),
+            Some(vec!["server:nido".into(), "server:otro".into()])
+        );
+        assert_eq!(dev_channels("❯ Try \"fix lint errors\""), None);
     }
 
     #[test]
