@@ -261,6 +261,10 @@ const TABLE: &[(&str, &str)] = &[
         "the prompt is longer than {0} KB",
     ),
     (
+        "no es el Claude de esta sesión",
+        "not this session's claude",
+    ),
+    (
         "solo puedes contestar las sesiones que abriste",
         "you can only answer sessions you opened",
     ),

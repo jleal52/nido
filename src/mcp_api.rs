@@ -1334,6 +1334,9 @@ pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
         Ok(s) => s,
         Err(f) => return f.into_response(),
     };
+    if let Err(f) = own_claude(&st, &caller.id, &headers).await {
+        return f.into_response();
+    }
     let messages: Vec<Msg> = st.inbox.poll(&caller.id).await;
     Json(json!({ "messages": messages })).into_response()
 }
@@ -1353,8 +1356,37 @@ pub async fn api_inbox_ack(
         Ok(a) => a,
         Err(f) => return f.into_response(),
     };
+    if let Err(f) = own_claude(&st, &caller.id, &headers).await {
+        return f.into_response();
+    }
     let removed = st.inbox.ack(&caller.id, &a.ids);
     Json(json!({ "ok": true, "removed": removed })).into_response()
+}
+
+/// La bandeja de la sesión `id` solo la recoge (y confirma) el `nido mcp` de su Claude: el que
+/// lo lanzó viene en `X-Nido-Claude-Pid` (ver `Inbox::claim`). Si no, 409.
+async fn own_claude(st: &AppState, id: &str, headers: &HeaderMap) -> Result<(), Fail> {
+    let pid = headers
+        .get("X-Nido-Claude-Pid")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    if pid.is_none() {
+        return Ok(());
+    }
+    let paths = st.paths.clone();
+    let session = id.to_owned();
+    let known = tokio::task::spawn_blocking(move || {
+        let holder = launch::holder_pid(&paths, &session).and_then(|p| u32::try_from(p).ok())?;
+        claude::find_claude(&claude::Procfs::default(), holder, &paths.home).map(|f| f.pid)
+    })
+    .await
+    .ok()
+    .flatten();
+    if st.inbox.claim(id, pid, known, crate::sys::pid_alive) {
+        Ok(())
+    } else {
+        Err(fail(StatusCode::CONFLICT, "no es el Claude de esta sesión"))
+    }
 }
 
 /// Con el token principal (las sesiones van con el de la consola, no con el de un teléfono) y

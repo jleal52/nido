@@ -353,7 +353,7 @@ pub fn resume_argv(link: &ClaudeLink) -> (Vec<String>, Vec<(String, String)>) {
     (argv, env)
 }
 
-/// ¿La orden es `claude`? (Con ruta o sin ella, y en Windows `claude.exe`.)
+/// ¿La orden es `claude`? (Con ruta o sin ella, y en Windows `claude.exe` o `claude.cmd`.)
 pub fn is_claude(argv: &[String]) -> bool {
     argv.first().is_some_and(|a| {
         let name = a
@@ -361,7 +361,11 @@ pub fn is_claude(argv: &[String]) -> bool {
             .next()
             .unwrap_or(a)
             .to_ascii_lowercase();
-        name.strip_suffix(".exe").unwrap_or(&name) == "claude"
+        let name = name
+            .strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".cmd"))
+            .unwrap_or(&name);
+        name == "claude"
     })
 }
 
@@ -442,36 +446,30 @@ pub fn with_nido_mcp(argv: &[String], on: bool) -> Vec<String> {
 /// nido), las del MCP de nido (las pone en cada arranque) y lo que no es una opción (el mensaje
 /// inicial). `argv` es la orden de la sesión.
 pub fn extra_args(argv: &[String]) -> Vec<String> {
-    if argv.first().map(|a| a.rsplit('/').next().unwrap_or(a)) != Some("claude") {
+    if !is_claude(argv) {
         return Vec::new();
     }
     // Opciones que llevan valor detrás (las demás son interruptores).
     const DROP_WITH_VALUE: [&str; 5] = ["--resume", "-r", "--session-id", "-n", "--name"];
     const DROP_FLAGS: [&str; 3] = ["--continue", "-c", "--fork-session"];
-    let nido_pair = |opt: &str, value: Option<&str>| {
-        (opt == CHANNELS_OPT && value == Some(NIDO_CHANNEL))
-            || (ALLOWED_OPTS.contains(&opt) && value == Some(NIDO_TOOLS))
+    // El valor que pone nido en cada arranque: ese sale, los demás de la opción se quedan.
+    let nido_value = |opt: &str, value: &str| {
+        (opt == CHANNELS_OPT && value == NIDO_CHANNEL)
+            || (ALLOWED_OPTS.contains(&opt) && value == NIDO_TOOLS)
     };
     let mut out = Vec::new();
     let mut i = 1;
     while i < argv.len() {
-        let a = &argv[i];
+        let a = argv[i].as_str();
         // Tras `--`, solo textos sueltos (el mensaje inicial).
         if a == "--" {
             break;
         }
-        if DROP_WITH_VALUE.contains(&a.as_str())
-            || nido_pair(a, argv.get(i + 1).map(String::as_str))
-        {
+        if DROP_WITH_VALUE.contains(&a) {
             i += 2;
             continue;
         }
-        if DROP_FLAGS.contains(&a.as_str())
-            || a.starts_with("--resume=")
-            || a.starts_with("--session-id=")
-            || a.split_once('=')
-                .is_some_and(|(o, v)| nido_pair(o, Some(v)))
-        {
+        if DROP_FLAGS.contains(&a) || a.starts_with("--resume=") || a.starts_with("--session-id=") {
             i += 1;
             continue;
         }
@@ -480,18 +478,55 @@ pub fn extra_args(argv: &[String]) -> Vec<String> {
             i += 1;
             continue;
         }
-        out.push(a.clone());
-        // Su valor, si lo lleva aparte (lo siguiente no es otra opción).
-        if !a.contains('=')
-            && argv.get(i + 1).is_some_and(|v| !v.starts_with('-'))
-            && takes_value(a)
-        {
-            out.push(argv[i + 1].clone());
+        if let Some((opt, value)) = a.split_once('=') {
+            if !nido_value(opt, value) {
+                out.push(a.to_owned());
+            }
             i += 1;
+            continue;
+        }
+        // Sus valores, si los lleva aparte: todo lo que sigue hasta otra opción si admite varios
+        // (como lo lee Claude); si no, uno.
+        let many = variadic(a);
+        let mut values = Vec::new();
+        if many || takes_value(a) {
+            while let Some(v) = argv.get(i + 1).filter(|v| !v.starts_with('-')) {
+                values.push(v.clone());
+                i += 1;
+                if !many {
+                    break;
+                }
+            }
+        }
+        let had = !values.is_empty();
+        values.retain(|v| !nido_value(a, v));
+        // Si solo llevaba el de nido, fuera también la opción.
+        if !had || !values.is_empty() {
+            out.push(a.to_owned());
+            out.extend(values);
         }
         i += 1;
     }
     out
+}
+
+/// Opciones de `claude` que admiten varios valores (`<x...>` en su ayuda): se queda con todo lo
+/// que las sigue hasta la siguiente opción.
+fn variadic(opt: &str) -> bool {
+    [
+        "--add-dir",
+        "--allowedTools",
+        "--allowed-tools",
+        "--betas",
+        "--channels",
+        CHANNELS_OPT,
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--file",
+        "--mcp-config",
+        "--tools",
+    ]
+    .contains(&opt)
 }
 
 /// Opciones de `claude` que llevan un valor detrás (las que suelen usarse al lanzar una sesión).
@@ -510,6 +545,8 @@ fn takes_value(opt: &str) -> bool {
         "--disallowedTools",
         "--disallowed-tools",
         "--effort",
+        "--channels",
+        CHANNELS_OPT,
         "--fallback-model",
         "--plugin-dir",
         "--setting-sources",
@@ -531,14 +568,21 @@ pub struct Program {
     pub path: PathBuf,
     /// Su `HOME` (y en Windows `USERPROFILE`), si no es el de nido.
     pub home: Option<PathBuf>,
+    /// Dónde se ejecuta: una carpeta neutra, para que no cuente el `.mcp.json` de la carpeta en
+    /// la que se arrancó nido.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Lo más que se espera a `claude mcp …` (`get` arranca el servidor para ver si conecta).
-const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Terminado `claude`, lo más que se espera a que se cierre su salida: un nieto que siguiera
+/// con ella abierta dejaría esperando a nido.
+const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl ClaudeCli for Program {
     fn run(&self, config_dir: Option<&Path>, args: &[&str]) -> std::io::Result<(bool, String)> {
         use std::io::Read;
+        use std::sync::{Arc, Mutex};
         let mut cmd = std::process::Command::new(&self.path);
         cmd.args(args)
             .stdin(std::process::Stdio::null())
@@ -554,15 +598,25 @@ impl ClaudeCli for Program {
                 cmd.env("USERPROFILE", h);
             }
         }
+        if let Some(d) = &self.cwd {
+            cmd.current_dir(d);
+        }
         let mut child = cmd.spawn()?;
+        // Cada salida, a medida que llega: si no se cierra, se queda con lo que haya.
         let read = |r: Option<Box<dyn Read + Send>>| {
-            std::thread::spawn(move || {
-                let mut s = String::new();
-                if let Some(mut r) = r {
-                    let _ = r.read_to_string(&mut s);
+            let text = Arc::new(Mutex::new(Vec::new()));
+            let into = text.clone();
+            let done = std::thread::spawn(move || {
+                let Some(mut r) = r else { return };
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = r.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    into.lock().expect("salida").extend_from_slice(&buf[..n]);
                 }
-                s
-            })
+            });
+            (text, done)
         };
         let out = read(child.stdout.take().map(|r| Box::new(r) as _));
         let err = read(child.stderr.take().map(|r| Box::new(r) as _));
@@ -578,24 +632,57 @@ impl ClaudeCli for Program {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        let mut text = out.join().unwrap_or_default();
-        text.push_str(&err.join().unwrap_or_default());
+        let grace = std::time::Instant::now();
+        while !(out.1.is_finished() && err.1.is_finished()) && grace.elapsed() < OUTPUT_GRACE {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut text = String::from_utf8_lossy(&out.0.lock().expect("salida")).into_owned();
+        text.push_str(&String::from_utf8_lossy(&err.0.lock().expect("salida")));
         Ok((status.success(), text))
     }
 }
 
+/// Las extensiones con las que se busca `claude` en Windows: `.exe` primero y luego las de
+/// `PATHEXT` (`.cmd` de npm…; `Command` las ejecuta a través de `cmd`).
+pub fn windows_exts(pathext: Option<&str>) -> Vec<String> {
+    let mut out = vec![".exe".to_owned()];
+    for e in pathext.unwrap_or(".COM;.EXE;.BAT;.CMD").split(';') {
+        let e = e.trim().to_ascii_lowercase();
+        if !e.is_empty() && !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// Dónde está `claude`: en el `PATH` (`path`) o donde lo deja su instalador (`~/.local/bin`).
 pub fn find_program(path: Option<&std::ffi::OsStr>, home: &Path) -> Option<PathBuf> {
-    let name = if cfg!(windows) {
-        "claude.exe"
+    if cfg!(windows) {
+        let exts = windows_exts(std::env::var("PATHEXT").ok().as_deref());
+        let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
+        find_program_in(path, home, &exts)
     } else {
-        "claude"
-    };
-    path.into_iter()
+        find_program_in(path, home, &[""])
+    }
+}
+
+/// `claude` con cada extensión de `exts`, por orden (todas las carpetas con la primera, luego
+/// con la segunda…).
+pub fn find_program_in(
+    path: Option<&std::ffi::OsStr>,
+    home: &Path,
+    exts: &[&str],
+) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = path
+        .into_iter()
         .flat_map(std::env::split_paths)
         .chain([home.join(".local").join("bin")])
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
+        .collect();
+    exts.iter().find_map(|ext| {
+        dirs.iter()
+            .map(|d| d.join(format!("claude{ext}")))
+            .find(|p| p.is_file())
+    })
 }
 
 /// Los `CLAUDE_CONFIG_DIR` con los que corren las sesiones: el de siempre (`None`) y cada perfil
@@ -616,14 +703,33 @@ pub fn config_dirs<'a>(
     out
 }
 
-/// La orden y sus argumentos del `nido` que tiene registrado Claude, según `claude mcp get nido`.
-pub fn registered_command(get: &str) -> Option<(&str, &str)> {
+/// Lo que tiene registrado Claude como `nido`, según `claude mcp get nido`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Registered<'a> {
+    /// «User config (…)», «Local config (…)», «Project config (…)».
+    pub scope: &'a str,
+    pub command: &'a str,
+    pub args: &'a str,
+}
+
+impl Registered<'_> {
+    fn user_scope(&self) -> bool {
+        // Sin la fila (otra versión de Claude), como si fuera de usuario.
+        self.scope.is_empty() || self.scope.starts_with("User")
+    }
+}
+
+pub fn registered_command(get: &str) -> Option<Registered<'_>> {
     let field = |name: &str| {
         get.lines()
             .find_map(|l| l.trim().strip_prefix(name))
             .map(str::trim)
     };
-    Some((field("Command:")?, field("Args:").unwrap_or("")))
+    Some(Registered {
+        scope: field("Scope:").unwrap_or(""),
+        command: field("Command:")?,
+        args: field("Args:").unwrap_or(""),
+    })
 }
 
 /// Qué hubo que hacer para que un perfil de Claude tenga el MCP de nido.
@@ -633,6 +739,8 @@ pub enum Registration {
     Added,
     /// Apuntaba a otro `nido` (se movió, o el `.exe` en Windows): quitado y vuelto a poner.
     Replaced,
+    /// Hay un `nido` en otro ámbito (de una carpeta): no se toca.
+    OtherScope(String),
     Failed(String),
 }
 
@@ -664,9 +772,11 @@ pub fn ensure_mcp_registered(
                 let (found, text) = cli.run(d, &["mcp", "get", "nido"])?;
                 let mut res = Registration::Added;
                 if found {
-                    if registered_command(&text)
-                        .is_some_and(|(c, a)| same_program(c, nido) && a == "mcp")
-                    {
+                    let reg = registered_command(&text);
+                    if let Some(r) = reg.as_ref().filter(|r| !r.user_scope()) {
+                        return Ok(Registration::OtherScope(r.scope.to_owned()));
+                    }
+                    if reg.is_some_and(|r| same_program(r.command, nido) && r.args == "mcp") {
                         return Ok(Registration::Already);
                     }
                     // Si no se puede quitar (de otro ámbito), el `add` dirá por qué.
@@ -918,6 +1028,54 @@ mod tests {
             extra_args(&v(&["claude", "--model", "x", "--", "-no-es-opción"])),
             v(&["--model", "x"])
         );
+        // Las opciones de varios valores se quedan con todos; de las de nido, solo sale su valor
+        // (y la opción, si se queda sin ninguno).
+        assert_eq!(
+            extra_args(&v(&[
+                "claude",
+                "--allowedTools",
+                "mcp__nido__*",
+                "Bash",
+                "--add-dir",
+                "/a",
+                "/b",
+                "--dangerously-load-development-channels",
+                "server:otro",
+                "server:nido",
+                "--channels",
+                "plugin:x",
+                "--resume",
+                "u"
+            ])),
+            v(&[
+                "--allowedTools",
+                "Bash",
+                "--add-dir",
+                "/a",
+                "/b",
+                "--dangerously-load-development-channels",
+                "server:otro",
+                "--channels",
+                "plugin:x"
+            ])
+        );
+        assert_eq!(
+            extra_args(&v(&["claude", "--mcp-config", "a.json", "b.json", "-c"])),
+            v(&["--mcp-config", "a.json", "b.json"])
+        );
+        // La de una sola: su valor, y lo siguiente es el mensaje.
+        assert_eq!(
+            extra_args(&v(&["claude", "--model", "haiku", "hola"])),
+            v(&["--model", "haiku"])
+        );
+        // También en Windows (`claude.exe`, `claude.cmd`).
+        for program in [r"C:\bin\claude.exe", "claude.cmd"] {
+            assert!(is_claude(&v(&[program])), "{program}");
+            assert_eq!(
+                extra_args(&v(&[program, "--model", "haiku"])),
+                v(&["--model", "haiku"])
+            );
+        }
     }
 
     /// Un `claude` de pruebas: contesta a `mcp get` lo que se le diga y apunta lo que le piden.
@@ -947,8 +1105,12 @@ mod tests {
     }
 
     fn get_output(command: &str) -> String {
+        get_output_in("User config (available in all your projects)", command)
+    }
+
+    fn get_output_in(scope: &str, command: &str) -> String {
         format!(
-            "nido:\n  Scope: User config (available in all your projects)\n  Status: ✓ Connected\n  \
+            "nido:\n  Scope: {scope}\n  Status: ✓ Connected\n  \
              Type: stdio\n  Command: {command}\n  Args: mcp\n  Environment:\n\n\
              To remove this server, run: claude mcp remove nido -s user\n"
         )
@@ -959,6 +1121,8 @@ mod tests {
         let nido = Path::new("/opt/con espacio/nido");
         let moved = PathBuf::from("/perfil-movido");
         let fine = PathBuf::from("/perfil-bien");
+        let local = PathBuf::from("/perfil-local");
+        let local_scope = "Local config (private to you in this project)";
         let cli = FakeCli {
             get: [
                 (None, (false, "No MCP server named \"nido\".".into())),
@@ -967,13 +1131,22 @@ mod tests {
                     Some(fine.clone()),
                     (true, get_output("/opt/con espacio/nido")),
                 ),
+                (
+                    Some(local.clone()),
+                    (true, get_output_in(local_scope, "/otro/nido")),
+                ),
             ]
             .into_iter()
             .collect(),
             fail_add: false,
             calls: Default::default(),
         };
-        let dirs = [None, Some(moved.clone()), Some(fine.clone())];
+        let dirs = [
+            None,
+            Some(moved.clone()),
+            Some(fine.clone()),
+            Some(local.clone()),
+        ];
         let got = ensure_mcp_registered(&cli, nido, &dirs);
         assert_eq!(
             got,
@@ -981,6 +1154,11 @@ mod tests {
                 (None, Registration::Added),
                 (Some(moved.clone()), Registration::Replaced),
                 (Some(fine.clone()), Registration::Already),
+                // De otro ámbito: no se toca (cada arranque lo quitaría y pondría otra vez).
+                (
+                    Some(local.clone()),
+                    Registration::OtherScope(local_scope.into())
+                ),
             ]
         );
         let add = v(&[
@@ -1005,7 +1183,8 @@ mod tests {
                     v(&["mcp", "remove", "nido", "-s", "user"])
                 ),
                 (Some(moved), add),
-                (Some(fine), get),
+                (Some(fine), get.clone()),
+                (Some(local), get),
             ]
         );
         // Si no se puede añadir, se dice (con lo que contestó claude).
@@ -1025,7 +1204,11 @@ mod tests {
     fn mcp_get_output_gives_the_command() {
         assert_eq!(
             registered_command(&get_output("/a b/nido")),
-            Some(("/a b/nido", "mcp"))
+            Some(Registered {
+                scope: "User config (available in all your projects)",
+                command: "/a b/nido",
+                args: "mcp"
+            })
         );
         assert_eq!(registered_command("No MCP server named \"nido\"."), None);
     }
@@ -1051,6 +1234,36 @@ mod tests {
             config_dirs(links.iter(), home),
             [None, Some(PathBuf::from("/perfil-2"))]
         );
+    }
+
+    #[test]
+    fn finds_the_claude_program_with_its_windows_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let home = tmp.path().join("home");
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        let exts = [".exe", ".cmd"];
+        std::fs::write(a.join("claude.cmd"), "").unwrap();
+        assert_eq!(
+            find_program_in(Some(&path), &home, &exts),
+            Some(a.join("claude.cmd"))
+        );
+        // `.exe` antes, aunque esté más adelante en el PATH.
+        std::fs::write(b.join("claude.exe"), "").unwrap();
+        assert_eq!(
+            find_program_in(Some(&path), &home, &exts),
+            Some(b.join("claude.exe"))
+        );
+        assert_eq!(
+            windows_exts(Some(".COM;.EXE;.BAT;.CMD")),
+            [".exe", ".com", ".bat", ".cmd"]
+        );
+        assert_eq!(windows_exts(None), [".exe", ".com", ".bat", ".cmd"]);
+        assert_eq!(windows_exts(Some(".CMD")), [".exe", ".cmd"]);
     }
 
     #[test]
@@ -1093,7 +1306,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"HOME=$HOME CCD=${{CLAUDE_CONFIG_DIR:-no}} $*\" >> '{}'\n\
+                "#!/bin/sh\necho \"HOME=$HOME CCD=${{CLAUDE_CONFIG_DIR:-no}} PWD=$(pwd) $*\" >> '{}'\n\
                  [ \"$2\" = get ] && {{ echo 'No MCP server named \"nido\".'; exit 1; }}\nexit 0\n",
                 log.display()
             ),
@@ -1102,9 +1315,13 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let home = tmp.path().join("home");
+        // En una carpeta neutra: un `.mcp.json` en la de `nido serve` no cuenta.
+        let neutral = std::fs::canonicalize(tmp.path()).unwrap().join("estado");
+        std::fs::create_dir_all(&neutral).unwrap();
         let cli = Program {
             path: script,
             home: Some(home.clone()),
+            cwd: Some(neutral.clone()),
         };
         let profile = tmp.path().join("perfil");
         let got = ensure_mcp_registered(&cli, Path::new("/x/nido"), &[None, Some(profile.clone())]);
@@ -1117,22 +1334,63 @@ mod tests {
         );
         let h = home.display();
         let p = profile.display();
+        let w = neutral.display();
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             format!(
-                "HOME={h} CCD=no mcp get nido\nHOME={h} CCD=no mcp add -s user nido -- /x/nido mcp\n\
-                 HOME={h} CCD={p} mcp get nido\nHOME={h} CCD={p} mcp add -s user nido -- /x/nido mcp\n"
+                "HOME={h} CCD=no PWD={w} mcp get nido\nHOME={h} CCD=no PWD={w} mcp add -s user nido -- /x/nido mcp\n\
+                 HOME={h} CCD={p} PWD={w} mcp get nido\nHOME={h} CCD={p} PWD={w} mcp add -s user nido -- /x/nido mcp\n"
             )
         );
         // Si no se puede ejecutar, un fallo (no un pánico).
         let gone = Program {
             path: tmp.path().join("no-existe"),
             home: None,
+            cwd: None,
         };
         assert!(matches!(
             &ensure_mcp_registered(&gone, Path::new("/x/nido"), &[None])[..],
             [(None, Registration::Failed(_))]
         ));
+    }
+
+    /// Un nieto que se queda con la salida abierta no deja esperando a nido.
+    #[cfg(unix)]
+    #[test]
+    fn a_grandchild_holding_the_output_does_not_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("claude");
+        let pidfile = tmp.path().join("nieto");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\necho hecho\nexit 0\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let cli = Program {
+            path: script,
+            home: None,
+            cwd: None,
+        };
+        let start = std::time::Instant::now();
+        let got = cli.run(None, &["mcp", "get", "nido"]);
+        let took = start.elapsed();
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+        let (ok, text) = got.unwrap();
+        assert!(ok);
+        assert!(text.contains("hecho"), "{text:?}");
     }
 
     #[test]

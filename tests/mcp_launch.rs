@@ -62,14 +62,15 @@ impl Drop for KillHolders {
     }
 }
 
-/// Enseña `screen`, apunta en `picked` la tecla que le llegue (tal cual: Enter es `\r`) y se
-/// queda.
+/// Enseña `before` 3 s (si lo hay) y luego `screen`; apunta en `picked` las teclas que le
+/// lleguen, tal cual (Enter es `\r`): la primera, y tras ella, quitada la pantalla, las demás.
 const PROGRAM: &str = r#"#!/bin/sh
 stty -icanon -echo -icrnl min 1 time 0
+if [ -f before ]; then printf '\033[2J\033[H'; cat before; sleep 3; fi
 printf '\033[2J\033[H'; cat screen
 dd bs=1 count=1 of=picked.tmp 2>/dev/null && mv picked.tmp picked
 printf '\033[2J\033[Hlisto\n'
-exec sleep 60
+exec cat >> picked
 "#;
 
 fn fixture(name: &str) -> String {
@@ -172,6 +173,8 @@ async fn claude_launches_with_the_nido_channel() {
     // Esta prueba es su propio proceso (un fichero de tests/): cambiar el entorno no toca a otras.
     unsafe {
         std::env::set_var("NIDO_HOME", tmp.path().join("nido"));
+        // Ni el `HOME` de verdad: nada de lo que se mire o escriba sale del temporal.
+        std::env::set_var("HOME", tmp.path().join("home"));
         std::env::set_var("NIDO_EXE", env!("CARGO_BIN_EXE_nido"));
         std::env::set_var("NIDO_NAME", "Prueba");
         std::env::set_var("SHELL", &shell);
@@ -231,6 +234,39 @@ async fn claude_launches_with_the_nido_channel() {
     let (code, _) = tool(addr, &caller, "close", json!({"session": o["session"]})).await;
     assert_eq!(code, 200);
 
+    // Dos que miran a la vez (p. ej. arrancada dos veces): un solo Enter.
+    let doble = tmp.path().join("doble");
+    folder(&doble, &fixture("aviso_channels"));
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(session("doble", &doble, &["claude"]))
+        .unwrap();
+    nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
+    let (a, b) = tokio::join!(
+        server::watch_startup(&state, &s.id, Duration::from_secs(4)),
+        server::watch_startup(&state, &s.id, Duration::from_secs(4)),
+    );
+    assert!(a == Startup::Accept || b == Startup::Accept, "{a:?} {b:?}");
+    assert_eq!(std::fs::read_to_string(doble.join("picked")).unwrap(), "\r");
+
+    // Primero la pregunta de confiar en la carpeta (la contesta el usuario): el plazo vuelve a
+    // empezar cuando se va, y luego se acepta el aviso.
+    let tarde = tmp.path().join("tarde");
+    folder(&tarde, &fixture("aviso_channels"));
+    std::fs::write(tarde.join("before"), fixture("confianza")).unwrap();
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(session("tarde", &tarde, &["claude"]))
+        .unwrap();
+    nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
+    let end = server::watch_startup(&state, &s.id, Duration::from_millis(1500)).await;
+    assert_eq!(end, Startup::Accept);
+    assert_eq!(std::fs::read_to_string(tarde.join("picked")).unwrap(), "\r");
+
     // Con otro channel en la lista, no se toca nada.
     let otro = tmp.path().join("otro");
     folder(&otro, &fixture("aviso_channels_otro"));
@@ -267,7 +303,8 @@ async fn claude_launches_with_the_nido_channel() {
     assert!(!state.inbox.channel(&s.id));
     assert!(!sin.join("picked").exists());
 
-    // La de confiar en la carpeta es del usuario: se mira hasta que se acaba el tiempo.
+    // La de confiar en la carpeta es del usuario: mientras está, se sigue mirando, hasta el tope
+    // (cinco plazos).
     let trust = tmp.path().join("confianza");
     folder(&trust, &fixture("confianza"));
     let s = state
@@ -278,9 +315,13 @@ async fn claude_launches_with_the_nido_channel() {
         .unwrap();
     nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
     let start = std::time::Instant::now();
-    let end = server::watch_startup(&state, &s.id, Duration::from_secs(3)).await;
+    let end = server::watch_startup(&state, &s.id, Duration::from_secs(1)).await;
     assert_eq!(end, Startup::Nothing);
-    assert!(start.elapsed() >= Duration::from_secs(3));
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_secs(5) && took < Duration::from_secs(10),
+        "{took:?}"
+    );
     assert!(!trust.join("picked").exists());
 
     // Apagado: la sesión siguiente va sin opciones, sin `NIDO_CHANNEL` y sin que nadie teclee.
@@ -309,4 +350,101 @@ async fn claude_launches_with_the_nido_channel() {
     );
     assert!(nido_mcp(tmp.path(), true).contains("encendido"));
     assert!(!paths.config.join("mcp-off").exists());
+
+    // La bandeja es del Claude de la sesión: otro `claude` de dentro (con su `NIDO_SESSION` y
+    // `NIDO_CHANNEL` heredados) recibe 409 y no se lleva los mensajes.
+    state.inbox.set_poll_wait(Duration::from_millis(300));
+    let mine = std::process::id();
+    let mut other_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let other = other_child.id();
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(session("bandeja", tmp.path(), &["true"]))
+        .unwrap();
+    let (code, r) = inbox(addr, &s.id, Some(mine), None).await;
+    assert_eq!(code, 200, "{r}");
+    let (code, r) = inbox(addr, &s.id, Some(other), None).await;
+    assert_eq!(code, 409, "{r}");
+    assert_eq!(r["error"], "not this session's claude");
+    state
+        .inbox
+        .push(
+            &s.id,
+            nido::inbox::Msg {
+                id: "m1".into(),
+                from: "padre".into(),
+                from_id: "Prueba/x".into(),
+                machine: "Prueba".into(),
+                text: "hola".into(),
+                at: 1,
+            },
+        )
+        .unwrap();
+    let (code, _) = inbox(addr, &s.id, Some(other), None).await;
+    assert_eq!(code, 409);
+    let (code, _) = inbox(addr, &s.id, Some(other), Some(json!({"ids": ["m1"]}))).await;
+    assert_eq!(code, 409, "tampoco confirma");
+    let (code, r) = inbox(addr, &s.id, Some(mine), None).await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["messages"][0]["id"], "m1");
+    let (code, r) = inbox(addr, &s.id, Some(mine), Some(json!({"ids": ["m1"]}))).await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["removed"], 1);
+    // Rechazado, no marca el channel: aquí el primero solo confirmó (eso no es recoger).
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(session("bandeja-2", tmp.path(), &["true"]))
+        .unwrap();
+    let (code, _) = inbox(addr, &s.id, Some(mine), Some(json!({"ids": []}))).await;
+    assert_eq!(code, 200);
+    let (code, _) = inbox(addr, &s.id, Some(other), None).await;
+    assert_eq!(code, 409);
+    assert!(!state.inbox.channel(&s.id));
+    // Sin pid (un `nido mcp` que no lo manda), como siempre.
+    let (code, _) = inbox(addr, &s.id, None, None).await;
+    assert_eq!(code, 200);
+    let _ = other_child.kill();
+    let _ = other_child.wait();
+}
+
+/// La bandeja como la pide `nido mcp`: `GET` para recoger, o `POST …/ack` con `ack`.
+async fn inbox(
+    addr: SocketAddr,
+    session: &str,
+    pid: Option<u32>,
+    ack: Option<Value>,
+) -> (u16, Value) {
+    let session = session.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let api = Api {
+            addr,
+            token: Some(TOKEN.into()),
+        };
+        let pid = pid.map(|p| p.to_string());
+        let mut headers = vec![("X-Nido-Session", session.as_str())];
+        if let Some(p) = &pid {
+            headers.push(("X-Nido-Claude-Pid", p.as_str()));
+        }
+        let (method, path) = match &ack {
+            Some(_) => ("POST", "/api/v1/mcp/inbox/ack"),
+            None => ("GET", "/api/v1/mcp/inbox"),
+        };
+        api.request_with(
+            method,
+            path,
+            ack.as_ref(),
+            &headers,
+            Some(Duration::from_secs(30)),
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap()
 }

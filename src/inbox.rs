@@ -50,9 +50,12 @@ struct Channel {
     polling: usize,
     /// Cuándo acabó (o empezó) la última.
     last: Option<Instant>,
-    /// Su pantalla dice que no tiene channel (lo pondrá la tarea 10, al ver «no MCP server
-    /// configured» al arrancar). La quita la siguiente recogida.
+    /// Su pantalla dice que no tiene channel («no MCP server configured» al arrancar). Dura lo
+    /// que dure ese arranque: lo quita `relaunched` (o `forget`), no una recogida.
     refused: bool,
+    /// El Claude de la sesión (su pid) en este arranque: solo el `nido mcp` que él lanzó recoge
+    /// la bandeja (ver `claim`).
+    pid: Option<u32>,
 }
 
 /// ¿Tiene channel? Si no se sabe que no, y está recogiendo o recogió hace poco.
@@ -216,8 +219,7 @@ impl Inbox {
             .is_some_and(|c| live(c.polling, c.last, c.refused, Instant::now()))
     }
 
-    /// La sesión `id` no tiene channel, según su pantalla. El gancho de la tarea 10: aún no lo
-    /// llama nadie.
+    /// La sesión `id` no tiene channel, según su pantalla (hasta que se vuelva a lanzar).
     pub fn refuse(&self, id: &str) {
         self.channels
             .lock()
@@ -225,6 +227,47 @@ impl Inbox {
             .entry(id.to_owned())
             .or_default()
             .refused = true;
+    }
+
+    /// La sesión `id` se acaba de lanzar otra vez: lo que se sabía de su channel era del
+    /// arranque anterior.
+    pub fn relaunched(&self, id: &str) {
+        if let Some(c) = self.channels.lock().expect("channels").get_mut(id) {
+            c.refused = false;
+            c.pid = None;
+        }
+    }
+
+    /// ¿Puede recoger (o confirmar) la bandeja de `id` el `nido mcp` lanzado por el Claude `pid`?
+    /// Claude pasa su entorno a lo que ejecuta: otro `claude` dentro de la sesión heredaría
+    /// `NIDO_SESSION` y `NIDO_CHANNEL`, y su `nido mcp` se llevaría los mensajes de esta.
+    ///
+    /// Sin pid (un `nido mcp` que no lo sabe), sí. Si se sabe cuál es el Claude de la sesión
+    /// (`known`, el que encuentra `claude::find_claude`), solo ese. Si aún no, el primero que
+    /// llegue en este arranque, y otro solo si aquel ya no existe (`alive`).
+    pub fn claim(
+        &self,
+        id: &str,
+        pid: Option<u32>,
+        known: Option<u32>,
+        alive: impl Fn(u32) -> bool,
+    ) -> bool {
+        let Some(pid) = pid else {
+            return true;
+        };
+        let mut channels = self.channels.lock().expect("channels");
+        let c = channels.entry(id.to_owned()).or_default();
+        if let Some(k) = known {
+            c.pid = Some(k);
+            return pid == k;
+        }
+        match c.pid {
+            Some(p) if p != pid && alive(p) => false,
+            _ => {
+                c.pid = Some(pid);
+                true
+            }
+        }
     }
 
     /// Cuánto espera una recogida.
@@ -269,7 +312,6 @@ impl<'a> Polling<'a> {
         let c = channels.entry(id.to_owned()).or_default();
         c.polling += 1;
         c.last = Some(Instant::now());
-        c.refused = false;
         Self {
             inbox,
             id: id.to_owned(),
@@ -436,12 +478,49 @@ mod tests {
         let start = Instant::now();
         assert!(inbox.poll("hija").await.is_empty());
         assert!(start.elapsed() >= Duration::from_millis(200));
-        // La pantalla dice que no tiene; la siguiente recogida lo quita. Borrada, nada.
+        // La pantalla dice que no tiene: así hasta que se vuelva a lanzar, aunque recoja.
         inbox.refuse("hija");
         assert!(!inbox.channel("hija"));
         inbox.poll("hija").await;
+        assert!(!inbox.channel("hija"), "la recogida no quita el rechazo");
+        inbox.relaunched("hija");
+        inbox.poll("hija").await;
         assert!(inbox.channel("hija"));
+        // Borrada, nada (y el rechazo tampoco queda para otra con el mismo id).
+        inbox.refuse("hija");
         inbox.forget("hija");
         assert!(!inbox.channel("hija"));
+        inbox.poll("hija").await;
+        assert!(inbox.channel("hija"));
+    }
+
+    #[test]
+    fn the_inbox_belongs_to_the_sessions_own_claude() {
+        let inbox = Inbox::load(std::env::temp_dir().join("nido-no-existe/inbox.json"));
+        let alive = |_: u32| true;
+        // Sin pid (Windows sin él, o un `nido mcp` de antes): como siempre.
+        assert!(inbox.claim("s", None, None, alive));
+        // Sin saber aún cuál es su Claude: el primero que recoge se queda con ella.
+        assert!(inbox.claim("s", Some(10), None, alive));
+        assert!(inbox.claim("s", Some(10), None, alive));
+        assert!(
+            !inbox.claim("s", Some(20), None, alive),
+            "otro Claude de dentro"
+        );
+        // Si ese ya no existe, el siguiente.
+        assert!(inbox.claim("s", Some(20), None, |p| p != 10));
+        assert!(!inbox.claim("s", Some(10), None, alive));
+        // Cuando se sabe cuál es (lo encuentra `find_claude`), manda eso.
+        assert!(inbox.claim("s", Some(30), Some(30), alive));
+        assert!(!inbox.claim("s", Some(20), Some(30), alive));
+        assert!(
+            !inbox.claim("s", Some(20), None, alive),
+            "se queda con el de verdad"
+        );
+        // Al volver a lanzarla, se empieza de cero.
+        inbox.relaunched("s");
+        assert!(inbox.claim("s", Some(40), None, alive));
+        // Rechazado, no cuenta como channel.
+        assert!(!inbox.channel("s"));
     }
 }

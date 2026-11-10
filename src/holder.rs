@@ -191,13 +191,14 @@ pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("NIDO_SESSION", &cfg.id);
+    for (k, v) in &cfg.env {
+        cmd.env(k, v);
+    }
+    // Después del entorno propio de la sesión: el channel solo lo decide nido.
     if cfg.channel {
         cmd.env("NIDO_CHANNEL", "1");
     } else {
         cmd.env_remove("NIDO_CHANNEL");
-    }
-    for (k, v) in &cfg.env {
-        cmd.env(k, v);
     }
     let mut child = pair
         .slave

@@ -290,6 +290,9 @@ fn main() -> ExitCode {
     }
 }
 
+/// Lo más que se espera a registrar el MCP en Claude antes de restaurar las sesiones.
+const REGISTER_CAP: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[tokio::main]
 async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: bool) -> ExitCode {
     nido::sys::keep_stdio_to_self();
@@ -330,12 +333,24 @@ async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: b
             .collect(),
     );
     listeners.push((tunnel.local_addr().unwrap_or(bind[0]), tunnel));
-    if !no_restore {
-        state.restore().await;
-    }
     server::spawn_scanner(state.clone());
-    // Que Claude tenga `nido mcp` (sin esperar: `claude mcp …` tarda unos segundos).
-    tokio::spawn(server::register_mcp(state.clone()));
+    // Primero que Claude tenga `nido mcp` y luego las sesiones: así las restauradas arrancan ya
+    // con el channel, y `claude mcp add` no reescribe su configuración mientras ellas la usan. En
+    // segundo plano (la API atiende ya) y con tope: `claude mcp …` tarda unos segundos.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            if tokio::time::timeout(REGISTER_CAP, server::register_mcp(st.clone()))
+                .await
+                .is_err()
+            {
+                eprintln!("nido: registrar el MCP en Claude tarda demasiado; se sigue sin esperar");
+            }
+            if !no_restore {
+                st.restore().await;
+            }
+        });
+    }
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut servers = Vec::new();

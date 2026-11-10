@@ -223,10 +223,12 @@ async fn claude_code_session_marks_do_not_reach_the_session() {
     }
     for channel in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = HolderConfig {
+        let mut cfg = HolderConfig {
             channel,
             ..config(dir.path())
         };
+        // Ni aunque lo traiga el entorno propio de la sesión.
+        cfg.env.push(("NIDO_CHANNEL".into(), "1".into()));
         let socket = cfg.socket.clone();
         let holder = tokio::spawn(holder::run(cfg));
 

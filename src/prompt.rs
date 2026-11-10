@@ -1303,42 +1303,90 @@ pub fn waiting_for_limit(screen: &str) -> bool {
     strip_sgr(screen).contains("esc to cancel the wait")
 }
 
-/// La pantalla de aviso de `--dangerously-load-development-channels`: los channels que lista.
-/// Solo si está la opción «I am using this for local development» (la que nido acepta).
-pub fn dev_channels(screen: &str) -> Option<Vec<String>> {
-    let screen = strip_sgr(screen);
-    if !screen.contains("Loading development channels")
-        || !screen.contains("I am using this for local development")
-    {
+/// El aviso de `--dangerously-load-development-channels`, leído fila a fila: los channels que
+/// lista y si el cursor está en «1. I am using this for local development» (la opción que nido
+/// acepta). Cada fila tiene que ser exactamente la del aviso y en su orden: el rótulo, la fila de
+/// `Channels:` (con las que la siguen si no cabe en una) y la opción. En la pregunta de confiar
+/// en una carpeta no se reconoce nunca: su ruta podría llevar esas filas.
+fn channels_warning(screen: &str) -> Option<(Vec<String>, bool)> {
+    const OPTION: &str = "1. I am using this for local development";
+    if trust_screen(screen) {
         return None;
     }
-    let line = screen
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Channels:"))?;
-    Some(line.split_whitespace().map(str::to_owned).collect())
+    let screen = strip_sgr(screen);
+    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    let warning = lines
+        .iter()
+        .position(|l| *l == "WARNING: Loading development channels")?;
+    let header = warning
+        + lines[warning..]
+            .iter()
+            .position(|l| l.starts_with("Channels:"))?;
+    let option = header
+        + lines[header..]
+            .iter()
+            .position(|l| l.strip_prefix('❯').map_or(*l, str::trim_start) == OPTION)?;
+    let mut list: Vec<String> = Vec::new();
+    let first = lines[header].strip_prefix("Channels:").unwrap_or_default();
+    for l in std::iter::once(first).chain(lines[header + 1..option].iter().copied()) {
+        list.extend(l.split_whitespace().map(str::to_owned));
+    }
+    Some((list, lines[option].starts_with('❯')))
+}
+
+/// La pantalla de aviso de `--dangerously-load-development-channels`: los channels que lista
+/// (ver `channels_warning`).
+pub fn dev_channels(screen: &str) -> Option<Vec<String>> {
+    channels_warning(screen).map(|(list, _)| list)
+}
+
+/// La pregunta de Claude de si confías en la carpeta. La contesta el usuario, nunca nido.
+pub fn trust_screen(screen: &str) -> bool {
+    let screen = strip_sgr(screen);
+    [
+        "trust this folder",
+        "Yes, I trust",
+        "Quick safety check",
+        "Accessing workspace",
+    ]
+    .iter()
+    .any(|t| screen.contains(t))
 }
 
 /// Lo que hay que hacer con la pantalla de una sesión de Claude recién lanzada con el channel
 /// de nido.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Startup {
-    /// El aviso de los channels de desarrollo, solo con el de nido: se acepta (Enter).
+    /// El aviso de los channels de desarrollo, solo con el de nido y el cursor en «I am using
+    /// this for local development»: se acepta (Enter).
     Accept,
     /// El aviso, con otra lista de channels: no se toca (que conteste el usuario).
     Foreign(Vec<String>),
-    /// Claude no tiene el servidor `nido` («no MCP server configured with that name»): la
-    /// sesión no tiene channel.
+    /// Claude no tiene el servidor `nido` (su fila de `Channels:` dice «server:nido · no MCP
+    /// server configured»): la sesión no tiene channel.
     NoServer,
     /// Nada de eso (aún, o la pregunta de confiar en la carpeta, que es del usuario).
     Nothing,
 }
 
 pub fn startup(screen: &str) -> Startup {
-    match dev_channels(screen) {
-        Some(list) if list == ["server:nido"] => Startup::Accept,
-        Some(list) => Startup::Foreign(list),
-        None if strip_sgr(screen).contains("no MCP server configured") => Startup::NoServer,
-        None => Startup::Nothing,
+    if trust_screen(screen) {
+        return Startup::Nothing;
+    }
+    match channels_warning(screen) {
+        Some((list, true)) if list == ["server:nido"] => return Startup::Accept,
+        // Con el cursor en otra opción, Enter no sería aceptar: se espera.
+        Some((list, false)) if list == ["server:nido"] => return Startup::Nothing,
+        Some((list, _)) => return Startup::Foreign(list),
+        None => {}
+    }
+    let no_server = strip_sgr(screen).lines().map(str::trim).any(|l| {
+        l.starts_with("Channels:") && l.contains("server:nido · no MCP server configured")
+    });
+    if no_server {
+        Startup::NoServer
+    } else {
+        Startup::Nothing
     }
 }
 
@@ -1777,6 +1825,61 @@ mod tests {
             Startup::Nothing
         );
         assert_eq!(startup(""), Startup::Nothing);
+
+        // Partida en dos filas (una terminal estrecha), la lista es la de las dos.
+        let partido = include_str!("../tests/pantallas/aviso_channels_partido.txt");
+        assert_eq!(
+            dev_channels(partido),
+            Some(vec!["server:nido".into(), "server:otro".into()])
+        );
+        assert_eq!(
+            startup(partido),
+            Startup::Foreign(vec!["server:nido".into(), "server:otro".into()])
+        );
+        // Una carpeta cuyo nombre lleva esas líneas, en la pregunta de confiar en ella: ni Enter
+        // (sería confiar en la carpeta) ni «sin servidor».
+        let trampa = include_str!("../tests/pantallas/confianza_trampa.txt");
+        assert!(trust_screen(trampa));
+        assert_eq!(dev_channels(trampa), None);
+        assert_eq!(startup(trampa), Startup::Nothing);
+        assert!(trust_screen(include_str!(
+            "../tests/pantallas/confianza.txt"
+        )));
+        assert!(!trust_screen(aviso));
+        // Los textos, sueltos o en otro orden, no son el aviso.
+        assert_eq!(
+            dev_channels(
+                "WARNING: Loading development channels\n❯ 1. I am using this for local development\nChannels: server:nido"
+            ),
+            None
+        );
+        assert_eq!(
+            dev_channels(
+                "● dijo: WARNING: Loading development channels\nChannels: server:nido\n❯ 1. I am using this for local development"
+            ),
+            None
+        );
+        // Con el cursor en «2. Exit», Enter saldría de Claude: se espera.
+        let en_salir = aviso
+            .replace("❯ 1. I am", "  1. I am")
+            .replace("    2. Exit", "  ❯ 2. Exit");
+        assert_ne!(en_salir, aviso);
+        assert_eq!(dev_channels(&en_salir), Some(vec!["server:nido".into()]));
+        assert_eq!(startup(&en_salir), Startup::Nothing);
+        // «no MCP server configured» solo cuenta en la fila de Channels de nido: no en lo que
+        // diga la conversación retomada.
+        let normal = include_str!("../tests/pantallas/normal.txt");
+        for other in [
+            "● Si sale «no MCP server configured with that name», el channel no va.",
+            "  Channels: server:otro · no MCP server configured with that name",
+            "  server:nido · no MCP server configured with that name",
+        ] {
+            assert_eq!(
+                startup(&format!("{other}\n{normal}")),
+                Startup::Nothing,
+                "{other}"
+            );
+        }
     }
 
     #[test]

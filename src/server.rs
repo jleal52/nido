@@ -393,7 +393,7 @@ impl AppState {
                 .and_then(|pid| claude::find_claude(&procfs, pid, &self.paths.home));
             let mut link = s.claude.clone();
             if let Some(f) = &found {
-                let inside_shell = !runs_claude_directly(&s.argv);
+                let inside_shell = !claude::is_claude(&s.argv);
                 let account = link.as_ref().and_then(|l| l.account.clone());
                 let fresh = ClaudeLink {
                     session_id: f.info.session_id.clone(),
@@ -512,6 +512,8 @@ impl AppState {
     /// Se acaba de arrancar la sesión `id`: si es un Claude con el channel de nido, que se mire
     /// su pantalla de arranque.
     pub(crate) fn launched(&self, id: &str) {
+        // Lo que se sabía de su channel (rechazo, su Claude) era del arranque anterior.
+        self.inbox.relaunched(id);
         let _ = self.launched.send(id.to_owned());
     }
 }
@@ -524,8 +526,18 @@ pub async fn register_mcp(st: Arc<AppState>) {
     if !launch::mcp_on(&st.paths) {
         return;
     }
+    if !registers_mcp(
+        std::env::var_os("NIDO_HOME"),
+        std::env::var("NIDO_REGISTER_MCP").ok(),
+    ) {
+        eprintln!(
+            "nido: con NIDO_HOME no se registra el MCP de nido en Claude (NIDO_REGISTER_MCP=1 para hacerlo)"
+        );
+        return;
+    }
     let path = std::env::var_os("PATH");
     let Some(program) = claude::find_program(path.as_deref(), &st.paths.home) else {
+        eprintln!("nido: no encuentro claude: el MCP de nido no se registra");
         return;
     };
     let nido = match launch::nido_exe() {
@@ -542,9 +554,13 @@ pub async fn register_mcp(st: Arc<AppState>) {
             &st.paths.home,
         )
     };
+    // En una carpeta neutra: el `.mcp.json` de donde se arrancó nido no cuenta.
+    let neutral = st.paths.state.clone();
+    let _ = std::fs::create_dir_all(&neutral);
     let cli = claude::Program {
         path: program,
         home: None,
+        cwd: Some(neutral),
     };
     let done =
         tokio::task::spawn_blocking(move || claude::ensure_mcp_registered(&cli, &nido, &dirs))
@@ -562,6 +578,11 @@ pub async fn register_mcp(st: Arc<AppState>) {
                     "nido: MCP de nido registrado de nuevo en Claude ({profile}): apuntaba a otro nido"
                 )
             }
+            claude::Registration::OtherScope(scope) => {
+                eprintln!(
+                    "nido: Claude ya tiene un MCP «nido» de otro ámbito ({profile}: {scope}); no se toca"
+                )
+            }
             claude::Registration::Failed(e) => {
                 eprintln!("nido: no se pudo registrar el MCP de nido en Claude ({profile}): {e}")
             }
@@ -569,8 +590,18 @@ pub async fn register_mcp(st: Arc<AppState>) {
     }
 }
 
+/// ¿Registra este nido su MCP en Claude? No si es uno de pruebas o de demostración (con
+/// `NIDO_HOME`): el Claude es el de verdad del usuario, y lo dejaría apuntando a ese nido. Con
+/// `NIDO_REGISTER_MCP=1`, sí.
+fn registers_mcp(nido_home: Option<std::ffi::OsString>, flag: Option<String>) -> bool {
+    nido_home.is_none() || flag.as_deref() == Some("1")
+}
+
 /// Cuánto se mira la pantalla de un Claude recién lanzado con el channel de nido.
 pub const STARTUP_WINDOW: Duration = Duration::from_secs(60);
+/// Lo más que se alarga mientras el usuario contesta si confía en la carpeta: este número de
+/// plazos (con el de 60 s, 5 minutos).
+const STARTUP_CAP: u32 = 5;
 
 /// Mira la pantalla de cada Claude que se lanza con el channel de nido (ver `watch_startup`).
 pub fn spawn_startup_watch(state: Arc<AppState>) {
@@ -595,11 +626,16 @@ pub fn spawn_startup_watch(state: Arc<AppState>) {
 /// `window`. El aviso de los channels de desarrollo se acepta (un Enter) solo si lista
 /// exactamente `server:nido`; con otra lista no se toca. Si Claude dice que no tiene el servidor
 /// `nido`, la sesión queda sin channel. Lo demás (la pregunta de confiar en la carpeta) es del
-/// usuario: se sigue mirando. Devuelve en qué quedó: `Accept` si se aceptó, `Nothing` si no
-/// salió nada (o se cerró la sesión).
+/// usuario: se sigue mirando, y cuando se va el plazo vuelve a empezar (como mucho
+/// `STARTUP_CAP` plazos en total). Devuelve en qué quedó: `Accept` si se aceptó, `Nothing` si no salió
+/// nada (o se cerró la sesión).
 pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt::Startup {
     use prompt::Startup;
-    let deadline = tokio::time::Instant::now() + window;
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + window;
+    // La pregunta de confiar en la carpeta alarga el plazo, hasta este tope.
+    let cap = started + window * STARTUP_CAP;
+    let mut trusting = false;
     let name = st
         .registry
         .lock()
@@ -631,14 +667,39 @@ pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt:
         let Ok(text) = s.screen().await else {
             break;
         };
+        // Mientras está, y al irse, el plazo empieza de nuevo.
+        let trust = prompt::trust_screen(&text);
+        if trust || trusting {
+            deadline = (tokio::time::Instant::now() + window)
+                .min(cap)
+                .max(deadline);
+        }
+        trusting = trust;
         match prompt::startup(&text) {
             Startup::Accept if !accepted => {
+                // De uno en uno, y mirando otra vez ya con el turno: otro que mire la misma
+                // sesión puede haberlo aceptado entretanto.
                 let _one = st.answering.lock().await;
-                if s.keys(b"\r").await.is_err() {
+                let Ok(text) = s.screen().await else {
                     break;
+                };
+                if prompt::startup(&text) == Startup::Accept {
+                    if s.keys(b"\r").await.is_err() {
+                        break;
+                    }
+                    eprintln!("nido: {name}: aceptado el aviso del channel de nido");
+                    // Con el turno hasta que se vaya el aviso: así nadie lo ve aún y pulsa otra vez.
+                    let gone = tokio::time::Instant::now() + Duration::from_secs(3);
+                    while tokio::time::Instant::now() < gone {
+                        match s.screen().await {
+                            Ok(t) if prompt::startup(&t) == Startup::Accept => {
+                                tokio::time::sleep(Duration::from_millis(100)).await
+                            }
+                            _ => break,
+                        }
+                    }
                 }
                 accepted = true;
-                eprintln!("nido: {name}: aceptado el aviso del channel de nido");
             }
             Startup::Foreign(list) => {
                 eprintln!(
@@ -661,18 +722,6 @@ pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt:
     } else {
         Startup::Nothing
     }
-}
-
-fn runs_claude_directly(argv: &[String]) -> bool {
-    argv.first().is_some_and(|a| {
-        let name = a
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(a)
-            .to_ascii_lowercase();
-        let name = name.strip_suffix(".exe").unwrap_or(&name);
-        name == "claude"
-    })
 }
 
 /// ¿Sigue mereciendo aviso? Si no la has visto y sigue igual.
@@ -2890,6 +2939,16 @@ mod tests {
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].text, "nueva");
         assert!(unread_alerts(&alerts, 30).is_empty());
+    }
+
+    #[test]
+    fn test_nidos_do_not_register_the_mcp() {
+        assert!(registers_mcp(None, None));
+        assert!(registers_mcp(None, Some("0".into())));
+        // Con `NIDO_HOME` (pruebas, demos), no: tocaría el Claude de verdad del usuario.
+        assert!(!registers_mcp(Some("/tmp/nido-a".into()), None));
+        assert!(!registers_mcp(Some("/tmp/nido-a".into()), Some("0".into())));
+        assert!(registers_mcp(Some("/tmp/nido-a".into()), Some("1".into())));
     }
 
     #[test]
