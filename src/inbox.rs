@@ -137,8 +137,20 @@ pub struct Msg {
 /// Dónde acababa la transcripción de una sesión: desde ahí se busca lo que entró después.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mark {
+    /// La transcripción o, si su Claude aún no la había escrito, solo su nombre
+    /// (`<session_id>.jsonl`, sin carpeta: aún no se sabe en cuál estará), con `offset` 0.
     pub path: PathBuf,
     pub offset: u64,
+}
+
+impl Mark {
+    /// ¿Es de la transcripción `path`? La misma o, si al marcar aún no existía, la que tiene
+    /// ese nombre (el id de la conversación).
+    pub fn on(&self, path: &Path) -> bool {
+        self.path == path
+            || (self.path.parent() == Some(Path::new(""))
+                && path.file_name() == self.path.file_name())
+    }
 }
 
 /// Lo que se sabe de un mensaje ya dado a su `nido mcp` (con `Queued`; se guarda).
@@ -173,10 +185,15 @@ struct Queued {
 /// Lo que se ve de un evento del channel de nido en la transcripción.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivered {
-    /// Con su id (`msg_id`).
+    /// Con su id (`msg_id`, que pone este `nido mcp`).
     Id(String),
-    /// Sin él (lo metió un `nido mcp` de antes): quién lo manda y el texto.
-    Text { from_id: String, text: String },
+    /// Sin él (lo metió un `nido mcp` de antes): el `delivery_id` de Claude Code si llegó
+    /// mientras trabajaba (un `queued_command`; se prueba como id), quién lo manda y el texto.
+    Text {
+        delivery_id: Option<String>,
+        from_id: Option<String>,
+        text: String,
+    },
 }
 
 /// Cuánto se espera a ver en la transcripción un mensaje ya metido, sin contar el rato en que
@@ -184,6 +201,8 @@ pub enum Delivered {
 pub const CONFIRM_WAIT: Duration = Duration::from_secs(30);
 /// Sin escribir en su transcripción en este rato, Claude no está trabajando.
 pub const TRANSCRIPT_QUIET: Duration = Duration::from_secs(5);
+/// Lo mismo cuando nido no sabe en qué está Claude (sin estado): hace falta más rato.
+pub const TRANSCRIPT_QUIET_UNKNOWN: Duration = Duration::from_secs(90);
 /// Las veces que se da un mensaje antes de dejarlo (sigue en la cola, con un error de entrega).
 pub const MAX_TRIES: u32 = 3;
 
@@ -253,9 +272,14 @@ pub struct Inbox {
     waits: Mutex<HashMap<String, Duration>>,
     /// Hasta dónde se ha mirado la transcripción de cada sesión.
     cursors: Mutex<HashMap<String, Mark>>,
-    /// `CONFIRM_WAIT` y `TRANSCRIPT_QUIET` en ms (las pruebas los acortan).
+    /// La transcripción ya encontrada de cada sesión, con la conversación de la que es (ver
+    /// `transcript`): así no se busca en cada vuelta.
+    transcripts: Mutex<HashMap<String, (String, PathBuf)>>,
+    /// `CONFIRM_WAIT`, `TRANSCRIPT_QUIET` y `TRANSCRIPT_QUIET_UNKNOWN` en ms (las pruebas los
+    /// acortan).
     confirm_ms: AtomicU64,
     quiet_ms: AtomicU64,
+    quiet_unknown_ms: AtomicU64,
     /// Compartido con los `Hold`, que lo sueltan al acabar.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
     /// Cambia con cada mensaje nuevo: despierta a las recogidas que esperan.
@@ -291,8 +315,10 @@ impl Inbox {
             queues: Mutex::new(queues.into_iter().collect()),
             waits: Mutex::default(),
             cursors: Mutex::default(),
+            transcripts: Mutex::default(),
             confirm_ms: AtomicU64::new(CONFIRM_WAIT.as_millis() as u64),
             quiet_ms: AtomicU64::new(TRANSCRIPT_QUIET.as_millis() as u64),
+            quiet_unknown_ms: AtomicU64::new(TRANSCRIPT_QUIET_UNKNOWN.as_millis() as u64),
             channels: Arc::default(),
             arrived: Arc::new(watch::Sender::new(())),
             wait_ms: AtomicU64::new(POLL_WAIT.as_millis() as u64),
@@ -426,11 +452,13 @@ impl Inbox {
         acked
     }
 
-    /// Lo que se ha visto en la transcripción de `id` (en `path`, mirada hasta `upto`): fuera de
-    /// su cola. Un evento con id quita ese mensaje; uno sin él (de un `nido mcp` de antes), el más
-    /// antiguo ya dado sin id que lo mande el mismo y con el mismo texto (uno por evento).
-    /// Devuelve cuántos quitó.
-    pub fn confirm(&self, id: &str, path: &Path, upto: u64, seen: &[Delivered]) -> usize {
+    /// Lo que se ha visto en la transcripción de `id` (en `path`, mirada hasta `upto`; cada uno
+    /// con dónde empieza su línea): fuera de su cola. Un evento con id quita ese mensaje; uno sin
+    /// él (de un `nido mcp` de antes), el de su `delivery_id` si lo hay o, si no, el más antiguo ya
+    /// dado sin id que lo mande el mismo y con el mismo texto, y solo si su línea es de después de
+    /// darlo (en la misma transcripción y desde donde acababa entonces: si no, puede ser uno
+    /// anterior igual). Uno por evento. Devuelve cuántos quitó.
+    pub fn confirm(&self, id: &str, path: &Path, upto: u64, seen: &[(u64, Delivered)]) -> usize {
         self.cursors.lock().expect("cursores").insert(
             id.to_owned(),
             Mark {
@@ -444,14 +472,28 @@ impl Inbox {
         };
         let before = q.len();
         let mut gone: Vec<String> = Vec::new();
-        for d in seen {
+        for (line, d) in seen {
             let at = match d {
                 Delivered::Id(msg) => q.iter().position(|m| &m.msg.id == msg),
-                Delivered::Text { from_id, text } => q.iter().position(|m| {
-                    m.out.as_ref().is_some_and(|o| !o.tracked)
-                        && &m.msg.from_id == from_id
-                        && &m.msg.text == text
-                }),
+                Delivered::Text {
+                    delivery_id,
+                    from_id,
+                    text,
+                } => delivery_id
+                    .as_ref()
+                    .and_then(|d| q.iter().position(|m| &m.msg.id == d))
+                    .or_else(|| {
+                        let from_id = from_id.as_ref()?;
+                        q.iter().position(|m| {
+                            m.out.as_ref().is_some_and(|o| {
+                                !o.tracked
+                                    && o.from
+                                        .as_ref()
+                                        .is_some_and(|f| f.on(path) && *line >= f.offset)
+                            }) && &m.msg.from_id == from_id
+                                && &m.msg.text == text
+                        })
+                    }),
             };
             if let Some(i) = at {
                 gone.push(q.remove(i).msg.id);
@@ -486,6 +528,10 @@ impl Inbox {
     /// Desde dónde mirar la transcripción de `id` (en `path`) para ver lo ya dado: hasta donde se
     /// miró la otra vez o, si no, desde donde acababa al darlo (de cero si era otra o no la había).
     /// `None`: no hay nada dado que buscar.
+    ///
+    /// Si cambia la transcripción (`/clear`, otra conversación), se empieza a mirar la nueva y no
+    /// se vuelve a la de antes: lo que entró en ella justo antes del cambio y aún no se había
+    /// mirado se da otra vez (una). Se acepta: mejor «al menos una vez» que perderlo.
     pub fn scan_from(&self, id: &str, path: &Path) -> Option<u64> {
         let queues = self.queues.lock().expect("bandeja");
         let outs: Vec<&Out> = queues
@@ -499,7 +545,7 @@ impl Inbox {
         let earliest = outs
             .iter()
             .map(|o| match &o.from {
-                Some(f) if f.path == path => f.offset,
+                Some(f) if f.on(path) => f.offset,
                 _ => 0,
             })
             .min()
@@ -574,17 +620,51 @@ impl Inbox {
         })
     }
 
-    /// Para las pruebas: cuánto se espera a ver un mensaje y cuánto sin escribir es no trabajar.
-    pub fn set_confirm_wait(&self, wait: Duration, quiet: Duration) {
+    /// Para las pruebas: cuánto se espera a ver un mensaje y cuánto sin escribir es no trabajar
+    /// (sabiendo el estado de Claude y sin saberlo).
+    pub fn set_confirm_wait(&self, wait: Duration, quiet: Duration, quiet_unknown: Duration) {
         self.confirm_ms
             .store(wait.as_millis() as u64, Ordering::Relaxed);
         self.quiet_ms
             .store(quiet.as_millis() as u64, Ordering::Relaxed);
+        self.quiet_unknown_ms
+            .store(quiet_unknown.as_millis() as u64, Ordering::Relaxed);
     }
 
-    /// Sin escribir en su transcripción en este rato, Claude no está trabajando.
-    pub fn transcript_quiet(&self) -> Duration {
-        Duration::from_millis(self.quiet_ms.load(Ordering::Relaxed))
+    /// Sin escribir en su transcripción en este rato, Claude no está trabajando: sabiendo su
+    /// estado, y sin saberlo (`TRANSCRIPT_QUIET_UNKNOWN`).
+    pub fn transcript_quiet(&self) -> (Duration, Duration) {
+        (
+            Duration::from_millis(self.quiet_ms.load(Ordering::Relaxed)),
+            Duration::from_millis(self.quiet_unknown_ms.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// La transcripción ya encontrada de `id`, si es de la conversación `conversation` (si no, ya
+    /// no vale: se olvida).
+    pub fn transcript(&self, id: &str, conversation: &str) -> Option<PathBuf> {
+        let mut t = self.transcripts.lock().expect("transcripciones");
+        match t.get(id) {
+            Some((c, p)) if c == conversation => Some(p.clone()),
+            Some(_) => {
+                t.remove(id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Apunta la transcripción encontrada de `id` (de la conversación `conversation`).
+    pub fn set_transcript(&self, id: &str, conversation: &str, path: PathBuf) {
+        self.transcripts
+            .lock()
+            .expect("transcripciones")
+            .insert(id.to_owned(), (conversation.to_owned(), path));
+    }
+
+    /// La de `id` ya no vale (no se pudo leer): se buscará otra vez.
+    pub fn forget_transcript(&self, id: &str) {
+        self.transcripts.lock().expect("transcripciones").remove(id);
     }
 
     /// Una sesión que ya no está: fuera su cola y lo que se sabía de su channel.
@@ -598,6 +678,7 @@ impl Inbox {
             }
         }
         self.cursors.lock().expect("cursores").remove(id);
+        self.forget_transcript(id);
         drop(queues);
         self.channels.lock().expect("channels").remove(id);
     }
@@ -686,6 +767,7 @@ impl Inbox {
     /// Lo dado al arranque de antes que no se ha visto en su transcripción se da otra vez al
     /// nuevo, desde el primer intento (antes de darlo se mira la transcripción: ver `scan_from`).
     pub fn relaunched(&self, id: &str) {
+        self.forget_transcript(id);
         if let Some(c) = self.channels.lock().expect("channels").get_mut(id) {
             c.refused = None;
             c.stopped = false;
@@ -730,10 +812,10 @@ impl Inbox {
             .collect()
     }
 
-    /// `poll`, con dónde acaba ahora la transcripción de la sesión (`from`, si la tiene): lo que
-    /// se da por primera vez se buscará desde ahí. Da lo que no se ha metido aún (ni se dejó),
-    /// cada uno con su intento.
-    pub async fn poll_from(&self, id: &str, from: Option<Mark>) -> Vec<(Msg, u32)> {
+    /// `poll`, con la transcripción de la sesión (`transcript`; si aún no existe, su nombre: ver
+    /// `Mark`): lo que se da por primera vez se buscará desde donde acaba al darlo. Da lo que no
+    /// se ha metido aún (ni se dejó), cada uno con su intento.
+    pub async fn poll_from(&self, id: &str, transcript: Option<PathBuf>) -> Vec<(Msg, u32)> {
         let _polling = Polling::start(self, id);
         // Antes de mirar la cola: así no se pierde un mensaje que llegue entre medias.
         let mut rx = self.arrived.subscribe();
@@ -743,6 +825,19 @@ impl Inbox {
             let msgs = if self.held(id) {
                 Vec::new()
             } else {
+                // Dónde acaba ahora, al darlo (no al empezar a esperar).
+                // Solo con su nombre (aún no existe): desde el principio, sin mirar nada.
+                let from = match &transcript {
+                    Some(path) if path.parent() == Some(Path::new("")) => Some(Mark {
+                        path: path.clone(),
+                        offset: 0,
+                    }),
+                    Some(path) => Some(Mark {
+                        path: path.clone(),
+                        offset: tokio::fs::metadata(path).await.map_or(0, |m| m.len()),
+                    }),
+                    None => None,
+                };
                 self.offer(id, from.as_ref())
             };
             if !msgs.is_empty() {
@@ -796,7 +891,7 @@ impl Inbox {
 /// el valor de `origin.kind`): un turno de
 /// Claude con el evento (`origin.kind == "channel"`), o el mismo metido mientras trabajaba (un
 /// `queued_command` con ese origen).
-pub fn channel_deliveries(path: &Path, from: u64) -> std::io::Result<(Vec<Delivered>, u64)> {
+pub fn channel_deliveries(path: &Path, from: u64) -> std::io::Result<(Vec<(u64, Delivered)>, u64)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
     let len = f.metadata()?.len();
@@ -819,11 +914,16 @@ pub fn channel_deliveries(path: &Path, from: u64) -> std::io::Result<(Vec<Delive
         return Ok((Vec::new(), start + skip as u64));
     }
     let upto = start + complete as u64;
-    let found = buf[skip..complete]
-        .split(|&b| b == b'\n')
-        .filter(|line| line.windows(9).any(|w| w == b"\"channel\""))
-        .filter_map(|line| std::str::from_utf8(line).ok().and_then(delivered))
-        .collect();
+    let mut found = Vec::new();
+    let mut at = start + skip as u64;
+    for line in buf[skip..complete - 1].split(|&b| b == b'\n') {
+        if line.windows(9).any(|w| w == b"\"channel\"")
+            && let Some(d) = std::str::from_utf8(line).ok().and_then(delivered)
+        {
+            found.push((at, d));
+        }
+        at += line.len() as u64 + 1;
+    }
     Ok((found, upto))
 }
 
@@ -848,15 +948,24 @@ fn delivered(line: &str) -> Option<Delivered> {
             if a.get("type").and_then(|t| t.as_str()) != Some("queued_command") || !channel(a) {
                 return None;
             }
-            a.get("prompt")?.as_str()?.to_owned()
+            let d = channel_tag(a.get("prompt")?.as_str()?)?;
+            let delivery_id = a.get("delivery_id").and_then(|d| d.as_str());
+            return Some(match (d, delivery_id) {
+                (Delivered::Text { from_id, text, .. }, Some(id)) => Delivered::Text {
+                    delivery_id: Some(id.to_owned()),
+                    from_id,
+                    text,
+                },
+                (d, _) => d,
+            });
         }
         _ => return None,
     };
     channel_tag(&text)
 }
 
-/// `<channel source="nido" … msg_id="…">\ntexto\n</channel>`: su id o, sin él, quién lo manda y
-/// el texto. No se mira `source` (es el nombre con que Claude tiene el servidor): los ids son
+/// `<channel source="nido" … msg_id="…">\ntexto\n</channel>`: su id o, sin él, quién lo manda (si
+/// se sabe) y el texto. No se mira `source` (es el nombre con que Claude tiene el servidor): los ids son
 /// únicos, y sin id se compara con lo dado (quién y qué).
 fn channel_tag(text: &str) -> Option<Delivered> {
     let rest = text.trim_start().strip_prefix("<channel")?;
@@ -872,7 +981,8 @@ fn channel_tag(text: &str) -> Option<Delivered> {
     let body = body.strip_suffix("</channel>")?;
     let body = body.strip_suffix('\n').unwrap_or(body);
     Some(Delivered::Text {
-        from_id: get("from_id")?,
+        delivery_id: None,
+        from_id: get("from_id"),
         text: body.to_owned(),
     })
 }
@@ -969,7 +1079,7 @@ mod tests {
         assert!(inbox.taken("hija", "m1") && !inbox.taken("hija", "m2"));
         let path = Path::new("/t.jsonl");
         assert_eq!(
-            inbox.confirm("hija", path, 0, &[Delivered::Id("m1".into())]),
+            inbox.confirm("hija", path, 0, &[(0, Delivered::Id("m1".into()))]),
             1
         );
         assert_eq!(ids(&inbox.pending("hija")), ["m2"]);
@@ -997,7 +1107,7 @@ mod tests {
             "hija",
             Path::new("/t.jsonl"),
             9,
-            &[Delivered::Id("m1".into())],
+            &[(0, Delivered::Id("m1".into()))],
         );
         inbox.forget("otra");
         drop(inbox);
@@ -1071,7 +1181,12 @@ mod tests {
         // Las demás sesiones, aparte.
         inbox.push("otra", msg("m", "x")).unwrap();
         inbox.ack("hija", &["m0".into()], true);
-        inbox.confirm("hija", Path::new("/t"), 0, &[Delivered::Id("m0".into())]);
+        inbox.confirm(
+            "hija",
+            Path::new("/t"),
+            0,
+            &[(0, Delivered::Id("m0".into()))],
+        );
         inbox.push("hija", msg("otro", "x")).unwrap();
     }
 
@@ -1214,20 +1329,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let inbox = Inbox::load(dir.path().join("inbox.json"));
         inbox.set_poll_wait(Duration::from_millis(50));
-        let t = Path::new("/t.jsonl");
-        let mark = |offset| Mark {
-            path: t.to_owned(),
-            offset,
-        };
+        let t = &dir.path().join("t.jsonl");
+        let grow = |len: usize| std::fs::write(t, "x".repeat(len)).unwrap();
         let tries = |v: Vec<(Msg, u32)>| -> Vec<(String, u32)> {
             v.into_iter().map(|(m, n)| (m.id, n)).collect()
         };
         inbox.push("s", msg("m1", "uno")).unwrap();
         assert_eq!(inbox.outstanding(), Vec::<String>::new());
         assert_eq!(inbox.scan_from("s", t), None, "nada dado: nada que buscar");
-        // Dado: primer intento, buscado desde donde acababa la transcripción.
+        // Dado: primer intento, buscado desde donde acababa la transcripción al darlo.
+        grow(40);
         assert_eq!(
-            tries(inbox.poll_from("s", Some(mark(40))).await),
+            tries(inbox.poll_from("s", Some(t.clone())).await),
             [("m1".into(), 1)]
         );
         assert_eq!(inbox.outstanding(), ["s"]);
@@ -1235,8 +1348,9 @@ mod tests {
         assert_eq!(inbox.scan_from("s", Path::new("/otra.jsonl")), Some(0));
         // Sin que diga que lo metió, sale igual en la siguiente (y no cuenta el tiempo).
         assert_eq!(inbox.tick("s", true, CONFIRM_WAIT * 2), (0, 0));
+        grow(50);
         assert_eq!(
-            tries(inbox.poll_from("s", Some(mark(50))).await),
+            tries(inbox.poll_from("s", Some(t.clone())).await),
             [("m1".into(), 1)]
         );
         assert_eq!(inbox.scan_from("s", t), Some(40), "desde la primera vez");
@@ -1247,7 +1361,7 @@ mod tests {
         assert_eq!(inbox.tick("s", true, CONFIRM_WAIT / 2), (0, 0));
         // Visto lo de otro (y hasta dónde se miró): sigue.
         assert_eq!(
-            inbox.confirm("s", t, 60, &[Delivered::Id("otro".into())]),
+            inbox.confirm("s", t, 60, &[(0, Delivered::Id("otro".into()))]),
             0
         );
         assert_eq!(inbox.scan_from("s", t), Some(60));
@@ -1273,7 +1387,10 @@ mod tests {
         assert_eq!(tries(inbox.poll_from("s", None).await), [("m1".into(), 1)]);
         inbox.ack("s", &["m1".into()], true);
         // Visto: fuera, y ya no se busca ni se vuelve a dar.
-        assert_eq!(inbox.confirm("s", t, 90, &[Delivered::Id("m1".into())]), 1);
+        assert_eq!(
+            inbox.confirm("s", t, 90, &[(0, Delivered::Id("m1".into()))]),
+            1
+        );
         assert!(inbox.pending("s").is_empty());
         assert_eq!(inbox.outstanding(), Vec::<String>::new());
         assert_eq!(inbox.tick("s", true, CONFIRM_WAIT * 9), (0, 0));
@@ -1284,34 +1401,107 @@ mod tests {
     fn without_an_id_it_is_recognised_by_sender_and_text() {
         let dir = tempfile::tempdir().unwrap();
         let inbox = Inbox::load(dir.path().join("inbox.json"));
-        let t = Path::new("/t.jsonl");
+        let t = Path::new("/c/7a0ae70e.jsonl");
         for (id, text) in [("a", "hola"), ("b", "hola"), ("c", "otro")] {
             inbox.push("s", msg(id, text)).unwrap();
         }
         inbox.push("s", msg("d", "hola")).unwrap();
-        // Un `nido mcp` de antes (sin `msg_id`) metió a, b y c; d aún no se ha dado.
-        inbox.offer("s", None);
+        // Un `nido mcp` de antes (sin `msg_id`) metió a, b y c cuando la transcripción acababa
+        // en 100; d aún no se ha dado.
+        let from = Mark {
+            path: t.to_owned(),
+            offset: 100,
+        };
+        inbox.offer("s", Some(&from));
         inbox.ack("s", &["a".into(), "b".into(), "c".into()], false);
         inbox.ack("s", &["d".into()], true);
-        let text = |from_id: &str, text: &str| Delivered::Text {
-            from_id: from_id.into(),
-            text: text.into(),
+        let text = |at: u64, from_id: &str, text: &str| {
+            (
+                at,
+                Delivered::Text {
+                    delivery_id: None,
+                    from_id: Some(from_id.into()),
+                    text: text.into(),
+                },
+            )
         };
+        // De antes de darlo (otro igual que entró antes), o en otra transcripción: no.
+        assert_eq!(
+            inbox.confirm("s", t, 0, &[text(40, "k123/padre1", "hola")]),
+            0
+        );
+        let other = Path::new("/c/otra.jsonl");
+        assert_eq!(
+            inbox.confirm("s", other, 0, &[text(400, "k123/padre1", "hola")]),
+            0
+        );
         // Un evento es un mensaje: el más antiguo de ese que lo manda y con ese texto.
-        assert_eq!(inbox.confirm("s", t, 0, &[text("k123/padre1", "hola")]), 1);
+        assert_eq!(
+            inbox.confirm("s", t, 0, &[text(100, "k123/padre1", "hola")]),
+            1
+        );
         assert_eq!(ids(&inbox.pending("s")), ["b", "c", "d"]);
         // De otro, o con otro texto: no.
-        assert_eq!(inbox.confirm("s", t, 0, &[text("k9/otra", "hola")]), 0);
-        assert_eq!(inbox.confirm("s", t, 0, &[text("k123/padre1", "hola!")]), 0);
+        assert_eq!(inbox.confirm("s", t, 0, &[text(200, "k9/otra", "hola")]), 0);
+        assert_eq!(
+            inbox.confirm("s", t, 0, &[text(200, "k123/padre1", "hola!")]),
+            0
+        );
         // Dos eventos iguales, dos mensajes; el de id (d) no se toma por el texto.
-        let two = [text("k123/padre1", "hola"), text("k123/padre1", "hola")];
+        let two = [
+            text(300, "k123/padre1", "hola"),
+            text(400, "k123/padre1", "hola"),
+        ];
         assert_eq!(inbox.confirm("s", t, 0, &two), 1);
         assert_eq!(ids(&inbox.pending("s")), ["c", "d"]);
+        // Con el `delivery_id` de Claude Code: ese, aunque el texto no cuadre (y aunque tenga id).
+        let queued = Delivered::Text {
+            delivery_id: Some("d".into()),
+            from_id: Some("k123/padre1".into()),
+            text: "otro".into(),
+        };
+        assert_eq!(inbox.confirm("s", t, 0, &[(500, queued)]), 1);
+        assert_eq!(ids(&inbox.pending("s")), ["c"]);
+        // Sin `from_id` (ni `delivery_id` que cuadre): no hay con qué compararlo.
+        let anon = Delivered::Text {
+            delivery_id: Some("zz".into()),
+            from_id: None,
+            text: "otro".into(),
+        };
+        assert_eq!(inbox.confirm("s", t, 0, &[(600, anon)]), 0);
+        // Sin dónde acababa al darlo: por el texto no se confirma.
+        inbox.push("s", msg("e", "tarde")).unwrap();
+        inbox.offer("s", None);
+        inbox.ack("s", &["e".into()], false);
+        assert_eq!(
+            inbox.confirm("s", t, 0, &[text(900, "k123/padre1", "tarde")]),
+            0
+        );
+        // Dado antes de que su Claude escribiera la transcripción (solo su nombre): toda cuenta,
+        // pero solo la de ese nombre.
+        inbox.push("s", msg("f", "nueva")).unwrap();
+        let unwritten = Mark {
+            path: "7a0ae70e.jsonl".into(),
+            offset: 0,
+        };
+        inbox.offer("s", Some(&unwritten));
+        inbox.ack("s", &["f".into()], false);
+        assert!(unwritten.on(t) && !unwritten.on(other));
+        assert_eq!(inbox.scan_from("s", other), Some(0));
+        assert_eq!(
+            inbox.confirm("s", other, 0, &[text(0, "k123/padre1", "nueva")]),
+            0
+        );
+        assert_eq!(
+            inbox.confirm("s", t, 0, &[text(0, "k123/padre1", "nueva")]),
+            1
+        );
+        assert_eq!(ids(&inbox.pending("s")), ["c", "e"]);
     }
 
     /// Dos líneas de verdad de una transcripción de Claude Code 2.1.322 (con la ruta cambiada):
     /// un evento del channel con Claude esperando, y otro que llegó mientras trabajaba.
-    const DELIVERED_IDLE: &str = r#"{"parentUuid":"bd8fc7db-f0ee-42dc-b7c5-de6896853ea0","isSidechain":false,"promptId":"44fee0fa-00cb-4eda-871d-a84d3d354e70","type":"user","message":{"role":"user","content":"<channel source=\"nido\" from=\"padre\" from_id=\"k123/padre1\" machine=\"Portatil\" msg_id=\"5e5c4756-9e96-4225-9d4c-ee4453697737\">\nHola, ¿cuánto es 2+2?\n</channel>"},"isMeta":true,"uuid":"a7cfc6c0-6d8e-4e40-baf6-50b3d0ebd382","timestamp":"2026-11-10T09:58:06.693Z","permissionMode":"auto","origin":{"kind":"channel","server":"nido"},"promptSource":"system","queueSkipSlashCommands":true,"turnOrigin":"peer","turnPosition":{"promptIndex":0,"turnIndex":1},"queueSkipAttachments":true,"userType":"external","entrypoint":"cli","cwd":"/home/ana/proyecto","sessionId":"7a0ae70e-d2c0-4be6-9bbb-92c3be2eb706","version":"2.1.322","gitBranch":"HEAD"}"#;
+    const DELIVERED_IDLE: &str = r#"{"parentUuid":"bd8fc7db-f0ee-42dc-b7c5-de6896853ea0","isSidechain":false,"promptId":"44fee0fa-00cb-4eda-871d-a84d3d354e70","type":"user","message":{"role":"user","content":"<channel source=\"nido\" from=\"padre\" from_id=\"k123/padre1\" machine=\"Portatil\" msg_id=\"0b1f8a52-3c3e-4d7a-9a41-6f2d8e5b7c10\">\nHola, ¿cuánto es 2+2?\n</channel>"},"isMeta":true,"uuid":"a7cfc6c0-6d8e-4e40-baf6-50b3d0ebd382","timestamp":"2026-11-10T09:58:06.693Z","permissionMode":"auto","origin":{"kind":"channel","server":"nido"},"promptSource":"system","queueSkipSlashCommands":true,"turnOrigin":"peer","turnPosition":{"promptIndex":0,"turnIndex":1},"queueSkipAttachments":true,"userType":"external","entrypoint":"cli","cwd":"/home/ana/proyecto","sessionId":"7a0ae70e-d2c0-4be6-9bbb-92c3be2eb706","version":"2.1.322","gitBranch":"HEAD"}"#;
     const DELIVERED_BUSY: &str = r#"{"parentUuid":"fd471423-b95c-434b-9e53-91cab74e1a5e","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<channel source=\"nido\" from=\"padre\" from_id=\"k123/padre1\" machine=\"Portatil\">\nMensaje enviado mientras trabajas: di la palabra GIRASOL.\n</channel>","source_uuid":"e7446d97-604a-49b7-865c-3075ffd969bd","delivery_id":"5e5c4756-9e96-4225-9d4c-ee4453697737","commandMode":"prompt","origin":{"kind":"channel","server":"nido"},"timestamp":"2026-11-10T09:58:37.471Z","isMeta":true},"type":"attachment","uuid":"b9aa7fd6-dcd1-418d-bbea-3b523113a334","timestamp":"2026-11-10T09:58:37.471Z","rendered":[{"content":"<system-reminder>\nA message arrived from nido while you were working:\n<channel source=\"nido\" from=\"padre\">\nMensaje enviado mientras trabajas: di la palabra GIRASOL.\n</channel>\n</system-reminder>"}],"renderedRole":"system","session_id":"7a0ae70e-d2c0-4be6-9bbb-92c3be2eb706","userType":"external","entrypoint":"cli","cwd":"/home/ana/proyecto","sessionId":"7a0ae70e-d2c0-4be6-9bbb-92c3be2eb706","version":"2.1.322","gitBranch":"HEAD"}"#;
 
     #[test]
@@ -1326,14 +1516,24 @@ mod tests {
         std::fs::write(&path, format!("{head}{DELIVERED_IDLE}\n{DELIVERED_BUSY}\n")).unwrap();
         let len = std::fs::metadata(&path).unwrap().len();
         let (found, upto) = channel_deliveries(&path, 0).unwrap();
+        // Cada uno con dónde empieza su línea; el de la cola, con el `delivery_id` de Claude Code.
+        let idle_at = head.len() as u64;
+        let busy_at = idle_at + DELIVERED_IDLE.len() as u64 + 1;
         assert_eq!(
             found,
             [
-                Delivered::Id("5e5c4756-9e96-4225-9d4c-ee4453697737".into()),
-                Delivered::Text {
-                    from_id: "k123/padre1".into(),
-                    text: "Mensaje enviado mientras trabajas: di la palabra GIRASOL.".into()
-                },
+                (
+                    idle_at,
+                    Delivered::Id("0b1f8a52-3c3e-4d7a-9a41-6f2d8e5b7c10".into())
+                ),
+                (
+                    busy_at,
+                    Delivered::Text {
+                        delivery_id: Some("5e5c4756-9e96-4225-9d4c-ee4453697737".into()),
+                        from_id: Some("k123/padre1".into()),
+                        text: "Mensaje enviado mientras trabajas: di la palabra GIRASOL.".into()
+                    }
+                ),
             ]
         );
         assert_eq!(upto, len);
@@ -1342,7 +1542,8 @@ mod tests {
         let mid = head.len() as u64 + 10;
         let (found, _) = channel_deliveries(&path, mid).unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(matches!(found[0], Delivered::Text { .. }));
+        assert_eq!(found[0].0, busy_at);
+        assert!(matches!(found[0].1, Delivered::Text { .. }));
         // Una línea a medio escribir no cuenta (ni se salta): hasta la última entera.
         let mut f = std::fs::OpenOptions::new()
             .append(true)

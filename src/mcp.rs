@@ -64,6 +64,8 @@ pub struct LocalApi {
     pub mcp_pid: Option<u32>,
     /// La última petición a la bandeja dio 409: no es el Claude de la sesión.
     pub refused: AtomicBool,
+    /// `nido serve` es de antes de `tracked` (dio 400 al ack con él): ya no se manda.
+    pub legacy: AtomicBool,
 }
 
 /// El pid de este `nido mcp`. Con él, `nido serve` sube por sus padres hasta su Claude (aunque
@@ -97,9 +99,20 @@ impl Mailbox for LocalApi {
         }
     }
 
+    /// Con `tracked` (el evento lleva `msg_id`). Un `nido serve` de antes (se actualizó el
+    /// binario y aún no se ha reiniciado el servicio) no lo conoce y da 400: se manda sin él, y
+    /// a ese ya siempre así.
     fn ack(&self, ids: &[String]) -> Result<(), String> {
-        let body = json!({ "ids": ids, "tracked": true });
-        self.inbox_request("POST", "/api/v1/mcp/inbox/ack", Some(&body), ACK_TIMEOUT)
+        const PATH: &str = "/api/v1/mcp/inbox/ack";
+        if !self.legacy.load(Ordering::SeqCst) {
+            let body = json!({ "ids": ids, "tracked": true });
+            match self.inbox_request_with("POST", PATH, Some(&body), ACK_TIMEOUT) {
+                Err((Some(400), _)) => self.legacy.store(true, Ordering::SeqCst),
+                r => return r.map(drop).map_err(|(_, msg)| msg),
+            }
+        }
+        let body = json!({ "ids": ids });
+        self.inbox_request("POST", PATH, Some(&body), ACK_TIMEOUT)
             .map(drop)
     }
 
@@ -117,6 +130,18 @@ impl LocalApi {
         body: Option<&Value>,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.inbox_request_with(method, path, body, timeout)
+            .map_err(|(_, msg)| msg)
+    }
+
+    /// `inbox_request`, con el código HTTP si falla.
+    fn inbox_request_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<Value, (Option<u16>, String)> {
         let pid = self.mcp_pid.map(|p| p.to_string());
         let extra: Vec<(&str, &str)> = pid
             .as_deref()
@@ -125,7 +150,7 @@ impl LocalApi {
         let r = self.request_with(method, path, body, &extra, Some(timeout));
         let no = matches!(r, Err((Some(409), _)));
         self.refused.store(no, Ordering::SeqCst);
-        r.map_err(|(_, msg)| msg)
+        r
     }
 
     fn request(
@@ -797,6 +822,7 @@ pub fn run(api: client::Api) -> ! {
         session: session.clone().unwrap_or_default(),
         mcp_pid: mcp_pid(),
         refused: AtomicBool::new(false),
+        legacy: AtomicBool::new(false),
     });
     let mut st = State {
         session,
@@ -1212,33 +1238,47 @@ mod tests {
 
     /// Un servidor de una sola petición: devuelve lo que le llegó, y contesta `reply`.
     fn one_shot(reply: &'static str) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
-        use std::io::Read;
+        let (addr, h) = serve(vec![reply]);
+        (
+            addr,
+            std::thread::spawn(move || h.join().unwrap().remove(0)),
+        )
+    }
+
+    /// Contesta cada petición (una por conexión, HTTP/1.0) con la siguiente de `replies`, y da
+    /// las peticiones.
+    fn serve(
+        replies: Vec<&'static str>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        let h = std::thread::spawn(move || {
-            let (mut s, _) = l.accept().unwrap();
-            let mut raw = Vec::new();
-            let mut buf = [0u8; 4096];
-            // Hasta tener las cabeceras y el cuerpo entero (Content-Length).
-            loop {
-                let n = s.read(&mut buf).unwrap();
-                raw.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&raw).into_owned();
-                if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                    let len: usize = head
-                        .lines()
-                        .find_map(|l| l.strip_prefix("Content-Length: "))
-                        .map_or(0, |v| v.trim().parse().unwrap());
-                    if body.len() >= len {
-                        break;
-                    }
-                }
-                assert!(n > 0, "petición cortada");
-            }
-            s.write_all(reply.as_bytes()).unwrap();
-            String::from_utf8(raw).unwrap()
-        });
+        let h = std::thread::spawn(move || replies.into_iter().map(|r| answer(&l, r)).collect());
         (addr, h)
+    }
+
+    fn answer(l: &std::net::TcpListener, reply: &str) -> String {
+        use std::io::Read;
+        let (mut s, _) = l.accept().unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        // Hasta tener las cabeceras y el cuerpo entero (Content-Length).
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .map_or(0, |v| v.trim().parse().unwrap());
+                if body.len() >= len {
+                    break;
+                }
+            }
+            assert!(n > 0, "petición cortada");
+        }
+        s.write_all(reply.as_bytes()).unwrap();
+        String::from_utf8(raw).unwrap()
     }
 
     fn local(addr: std::net::SocketAddr) -> LocalApi {
@@ -1250,6 +1290,7 @@ mod tests {
             session: "abc12345".into(),
             mcp_pid: Some(4321),
             refused: AtomicBool::new(false),
+            legacy: AtomicBool::new(false),
         }
     }
 
@@ -1714,6 +1755,49 @@ mod tests {
             )
             .into_boxed_str(),
         )
+    }
+
+    #[test]
+    fn an_old_nido_serve_gets_the_ack_without_tracked() {
+        // Binario nuevo, servicio aún sin reiniciar: su `AckArgs` no conoce `tracked` (400).
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let body = r#"{"error":"unknown field `tracked`"}"#;
+        let bad: &'static str = Box::leak(
+            format!(
+                "HTTP/1.0 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let ok = http_ok(r#"{"ok":true,"removed":1}"#);
+        let (addr, h) = serve(vec![bad, ok, ok]);
+        let api = local(addr);
+        assert_eq!(api.ack(&["m1".into()]), Ok(()));
+        assert_eq!(api.ack(&["m2".into()]), Ok(()));
+        let bodies: Vec<Value> = h
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_str(r.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        // Una vez con `tracked`; luego, y para siempre con este, sin él.
+        assert_eq!(
+            bodies,
+            [
+                json!({"ids":["m1"], "tracked": true}),
+                json!({"ids":["m1"]}),
+                json!({"ids":["m2"]}),
+            ]
+        );
+        assert!(api.legacy.load(Ordering::SeqCst));
+        // Otro error (no 400) no lo hace de antes: se reintenta luego como siempre.
+        let (addr, h) = serve(vec![
+            "HTTP/1.0 500 Internal Server Error\r\nContent-Length: 2\r\n\r\n{}",
+        ]);
+        let api = local(addr);
+        assert!(api.ack(&["m1".into()]).is_err());
+        assert!(!api.legacy.load(Ordering::SeqCst));
+        h.join().unwrap();
     }
 
     #[test]

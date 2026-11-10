@@ -762,28 +762,35 @@ async fn claude_launches_with_the_nido_channel() {
     // en su transcripción, se vuelve a dar y el mismo `nido mcp` lo mete otra vez; al verse con
     // su id, fuera de la bandeja, y no se da más. Un «claude» de mentira (bash por un enlace
     // `claude`) con su `nido mcp` de verdad, hablándole por dos tuberías: el primer evento lo
-    // tira, el segundo lo apunta en su transcripción como lo hace Claude.
-    state
-        .inbox
-        .set_confirm_wait(Duration::from_secs(3), Duration::from_millis(500));
+    // tira, el segundo lo apunta en su transcripción como lo hace Claude. Retomada (ya tiene
+    // transcripción) y nueva (aún no: la escribe al meter el segundo).
+    state.inbox.set_confirm_wait(
+        Duration::from_secs(3),
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+    );
     std::fs::write(paths.token(), TOKEN).unwrap();
-    let retry = tmp.path().join("reintento");
-    std::fs::create_dir_all(&retry).unwrap();
-    std::os::unix::fs::symlink("/bin/bash", retry.join("claude")).unwrap();
-    std::fs::write(retry.join("screen"), fixture("normal")).unwrap();
-    std::fs::write(
-        retry.join("program"),
-        "#!/bin/sh\nprintf '\\033[2J\\033[H'; cat screen\nexec ./claude fake.sh\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(
-        retry.join("program"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .unwrap();
-    std::fs::write(
-        retry.join("fake.sh"),
-        r#"T="$HOME/.claude/projects/p/conv-retry.jsonl"
+    for (name, conv, msg, resumed) in [
+        ("reintento", "conv-retry", "t1", true),
+        ("reintento-nueva", "conv-fresh", "t2", false),
+    ] {
+        let retry = tmp.path().join(name);
+        std::fs::create_dir_all(&retry).unwrap();
+        std::os::unix::fs::symlink("/bin/bash", retry.join("claude")).unwrap();
+        std::fs::write(retry.join("screen"), fixture("normal")).unwrap();
+        std::fs::write(
+            retry.join("program"),
+            "#!/bin/sh\nprintf '\\033[2J\\033[H'; cat screen\nexec ./claude fake.sh\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            retry.join("program"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(
+            retry.join("fake.sh"),
+            r#"T="$HOME/.claude/projects/p/CONV.jsonl"
 rm -f in out; mkfifo in out
 "$NIDO_EXE" mcp < in > out 2> mcp.err &
 exec 3> in 4< out
@@ -798,84 +805,90 @@ while IFS= read -r l <&4; do
     printf '%s\n' "$l" >> events
     if [ "$n" -ge 2 ]; then
       id=$(printf '%s' "$l" | sed -n 's/.*"msg_id":"\([^"]*\)".*/\1/p')
+      mkdir -p "$(dirname "$T")"
       printf '{"type":"user","origin":{"kind":"channel","server":"nido"},"message":{"role":"user","content":"<channel source=\\"nido\\" msg_id=\\"%s\\">\\nhola\\n</channel>"}}\n' "$id" >> "$T"
     fi;;
   esac
 done
-"#,
-    )
-    .unwrap();
-    // Retomada: ya tiene transcripción.
-    let projects = tmp.path().join("home/.claude/projects/p");
-    std::fs::create_dir_all(&projects).unwrap();
-    let transcript = projects.join("conv-retry.jsonl");
-    std::fs::write(
-        &transcript,
-        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"empieza\"}}\n",
-    )
-    .unwrap();
-    let s = state
-        .registry
-        .lock()
-        .await
-        .add(Session {
-            claude: Some(nido::registry::ClaudeLink {
-                session_id: "conv-retry".into(),
-                config_dir: None,
-                account: None,
-                inside_shell: false,
-            }),
-            ..session("reintento", &retry, &["claude"])
-        })
-        .unwrap();
-    state
-        .inbox
-        .push(
-            &s.id,
-            nido::inbox::Msg {
-                id: "t1".into(),
-                from: "padre".into(),
-                from_id: "Prueba/x".into(),
-                machine: "Prueba".into(),
-                text: "hola".into(),
-                at: 1,
-            },
+"#
+            .replace("CONV", conv),
         )
         .unwrap();
-    let start = format!("/api/v1/sessions/{}/start", s.id);
-    assert_eq!(rest(addr, &start).await, 200);
-    let until = std::time::Instant::now() + Duration::from_secs(40);
-    while !state.inbox.pending(&s.id).is_empty() {
-        // Como `spawn_scanner` (aquí no corre): si está viva y si Claude trabaja.
-        state.scan().await;
-        let events = std::fs::read_to_string(retry.join("events")).unwrap_or_default();
-        let err = std::fs::read_to_string(retry.join("mcp.err")).unwrap_or_default();
-        assert!(
-            std::time::Instant::now() < until,
-            "no se vio en su transcripción: {:?}; eventos: {events}; nido mcp: {err}",
-            state.inbox.out(&s.id, "t1")
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let transcript = tmp
+            .path()
+            .join(format!("home/.claude/projects/p/{conv}.jsonl"));
+        if resumed {
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"empieza\"}}\n",
+            )
+            .unwrap();
+        }
+        let s = state
+            .registry
+            .lock()
+            .await
+            .add(Session {
+                claude: Some(nido::registry::ClaudeLink {
+                    session_id: conv.into(),
+                    config_dir: None,
+                    account: None,
+                    inside_shell: false,
+                }),
+                ..session(name, &retry, &["claude"])
+            })
+            .unwrap();
+        state
+            .inbox
+            .push(
+                &s.id,
+                nido::inbox::Msg {
+                    id: msg.into(),
+                    from: "padre".into(),
+                    from_id: "Prueba/x".into(),
+                    machine: "Prueba".into(),
+                    text: "hola".into(),
+                    at: 1,
+                },
+            )
+            .unwrap();
+        let start = format!("/api/v1/sessions/{}/start", s.id);
+        assert_eq!(rest(addr, &start).await, 200);
+        let until = std::time::Instant::now() + Duration::from_secs(40);
+        while !state.inbox.pending(&s.id).is_empty() {
+            // Como `spawn_scanner` (aquí no corre): si está viva y si Claude trabaja.
+            state.scan().await;
+            let events = std::fs::read_to_string(retry.join("events")).unwrap_or_default();
+            let err = std::fs::read_to_string(retry.join("mcp.err")).unwrap_or_default();
+            assert!(
+                std::time::Instant::now() < until,
+                "{name}: no se vio en su transcripción: {:?}; eventos: {events}; nido mcp: {err}",
+                state.inbox.out(&s.id, msg)
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let events = || -> Vec<Value> {
+            std::fs::read_to_string(retry.join("events"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let got = events();
+        assert_eq!(got.len(), 2, "{name}: {got:?}");
+        for e in &got {
+            assert_eq!(e["params"]["content"], "hola");
+            assert_eq!(e["params"]["meta"]["msg_id"], msg);
+        }
+        assert!(transcript.is_file(), "{name}");
+        // Visto: no se vuelve a dar.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(events().len(), 2, "{name}");
+        assert!(!state.inbox.has(&s.id, msg));
+        let stop = format!("/api/v1/sessions/{}/stop", s.id);
+        assert_eq!(rest(addr, &stop).await, 200);
     }
-    let events = || -> Vec<Value> {
-        std::fs::read_to_string(retry.join("events"))
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
-    };
-    let got = events();
-    assert_eq!(got.len(), 2, "{got:?}");
-    for e in &got {
-        assert_eq!(e["params"]["content"], "hola");
-        assert_eq!(e["params"]["meta"]["msg_id"], "t1");
-    }
-    // Visto: no se vuelve a dar.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(events().len(), 2);
-    assert!(!state.inbox.has(&s.id, "t1"));
-    let stop = format!("/api/v1/sessions/{}/stop", s.id);
-    assert_eq!(rest(addr, &stop).await, 200);
 
     // Apagado: la sesión siguiente va sin opciones, sin `NIDO_CHANNEL` y sin que nadie teclee.
     assert!(nido_mcp(tmp.path(), false).contains("apagado"));

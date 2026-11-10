@@ -1405,17 +1405,12 @@ pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
         tokio::time::sleep(wait).await;
         return Json(json!({ "messages": [] })).into_response();
     }
-    let path = transcript_now(&st, &caller.id).await;
-    if path.is_some() {
-        check_delivery(&st, &caller.id, None).await;
-    }
-    let from = path.and_then(|p| {
-        let offset = std::fs::metadata(&p).ok()?.len();
-        Some(inbox::Mark { path: p, offset })
-    });
+    check_delivery(&st, &caller.id, None).await;
+    // Dónde se buscará lo que se dé (desde donde acabe al darlo: ver `poll_from`).
+    let transcript = transcript_where(&st, &caller.id).await;
     let messages: Vec<Value> = st
         .inbox
-        .poll_from(&caller.id, from)
+        .poll_from(&caller.id, transcript)
         .await
         .into_iter()
         .map(|(m, n)| {
@@ -1454,50 +1449,68 @@ pub async fn api_inbox_ack(
 /// Mira en la transcripción de `id` si ya entró lo dado a su `nido mcp` (desde donde se miró la
 /// otra vez: ver `Inbox::scan_from`), y lo quita de su bandeja. Con `tick` (el rato desde la
 /// vuelta anterior de `spawn_delivery_watch`), lo que sigue sin verse cuenta ese rato si Claude
-/// no trabajaba (no está `busy` ni ha escrito en su transcripción hace poco), y se vuelve a dar
-/// o se deja (ver `inbox::step`). Sin transcripción aún, se espera a que la tenga.
+/// no trabajaba (ver `clock_runs`), y se vuelve a dar o se deja (ver `inbox::step`). Sin
+/// transcripción aún (un Claude nuevo que tiró el primer evento no escribe nada) también corre:
+/// si no hay fichero, no está escribiendo.
 pub async fn check_delivery(st: &AppState, id: &str, tick: Option<Duration>) {
-    let Some(path) = transcript_now(st, id).await else {
-        return;
-    };
-    let Some(from) = st.inbox.scan_from(id, &path) else {
-        return;
-    };
-    let scan = {
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || {
-            let found = inbox::channel_deliveries(&path, from)?;
-            let written = std::fs::metadata(&path)?.modified()?;
-            Ok::<_, std::io::Error>((found, written))
-        })
-        .await
-    };
-    let Ok(Ok(((found, upto), written))) = scan else {
-        return;
-    };
-    st.inbox.confirm(id, &path, upto, &found);
+    let mut silent = None;
+    if let Some(path) = transcript_now(st, id).await {
+        let Some(from) = st.inbox.scan_from(id, &path) else {
+            return;
+        };
+        let scan = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                let found = inbox::channel_deliveries(&path, from)?;
+                let written = std::fs::metadata(&path)?.modified()?;
+                Ok::<_, std::io::Error>((found, written))
+            })
+            .await
+        };
+        let Ok(Ok(((found, upto), written))) = scan else {
+            // Ya no está (o no se puede leer): se buscará otra vez.
+            st.inbox.forget_transcript(id);
+            return;
+        };
+        st.inbox.confirm(id, &path, upto, &found);
+        silent = Some(
+            SystemTime::now()
+                .duration_since(written)
+                .unwrap_or_default(),
+        );
+    }
     let Some(elapsed) = tick else {
         return;
     };
-    let idle = idle_for_delivery(st.views.borrow().sessions.iter().find(|v| v.id == id));
-    let writing = SystemTime::now()
-        .duration_since(written)
-        .is_ok_and(|age| age < st.inbox.transcript_quiet());
-    st.inbox.tick(id, idle && !writing, elapsed);
+    let runs = clock_runs(
+        st.views.borrow().sessions.iter().find(|v| v.id == id),
+        silent,
+        st.inbox.transcript_quiet(),
+    );
+    st.inbox.tick(id, runs, elapsed);
 }
 
-/// ¿Corre el reloj de un mensaje emitido y aún no visto? Solo con la sesión viva y su Claude
-/// ni trabajando (`busy`) ni esperándote (`waiting`: un permiso o una pregunta en pantalla);
-/// en esos casos Claude Code guarda el evento y lo pasa a la conversación después, y darlo
-/// otra vez lo duplicaría.
-fn idle_for_delivery(v: Option<&SessionView>) -> bool {
-    v.is_some_and(|v| {
-        v.alive
-            && !v
-                .claude
-                .as_ref()
-                .is_some_and(|c| matches!(c.status.as_deref(), Some("busy" | "waiting")))
-    })
+/// ¿Corre el reloj de un mensaje emitido y aún no visto? Con la sesión viva, su Claude ni
+/// trabajando (`busy`) ni esperándote (`waiting`: un permiso o una pregunta en pantalla; en esos
+/// casos Claude Code guarda el evento y lo pasa a la conversación después, y darlo otra vez lo
+/// duplicaría), y su transcripción sin escribirse (`silent`: cuánto hace; `None`, no la hay) en
+/// `quiet.0`. Sin saber su estado, el rato es `quiet.1`, más largo. Se supone que al compactar
+/// Claude dice `busy` (no se ha podido comprobar).
+fn clock_runs(
+    v: Option<&SessionView>,
+    silent: Option<Duration>,
+    quiet: (Duration, Duration),
+) -> bool {
+    let Some(v) = v.filter(|v| v.alive) else {
+        return false;
+    };
+    let status = v.claude.as_ref().and_then(|c| c.status.as_deref());
+    let need = match status {
+        Some("busy" | "waiting") => return false,
+        Some(_) => quiet.0,
+        None => quiet.1,
+    };
+    silent.is_none_or(|s| s >= need)
 }
 
 /// La bandeja de la sesión `id` solo la recoge (y confirma) el `nido mcp` de su Claude. Su pid
@@ -1824,13 +1837,41 @@ async fn poll_status(st: &AppState, id: &str) -> (Status, Option<Menu>) {
 
 /// La transcripción de ahora de la sesión `id`, si ya la tiene.
 async fn transcript_now(st: &AppState, id: &str) -> Option<PathBuf> {
+    transcript_where(st, id)
+        .await
+        .filter(|p| p.parent() != Some(Path::new("")))
+}
+
+/// La transcripción de la conversación de `id` (guardada en la bandeja tras encontrarla la
+/// primera vez, y buscada fuera del runtime) o, si su Claude aún no la ha escrito, su nombre
+/// (`<session_id>.jsonl`, ver `inbox::Mark`). `None`: la sesión no tiene Claude.
+async fn transcript_where(st: &AppState, id: &str) -> Option<PathBuf> {
     let link = st
         .registry
         .lock()
         .await
         .get(id)
         .and_then(|s| s.claude.clone())?;
-    server::transcript_of(st, &link)
+    let config = link
+        .config_dir
+        .clone()
+        .unwrap_or_else(|| claude::default_config_dir(&st.paths.home));
+    let conversation = format!("{}\n{}", link.session_id, config.display());
+    if let Some(p) = st.inbox.transcript(id, &conversation) {
+        return Some(p);
+    }
+    let sid = link.session_id.clone();
+    let found = tokio::task::spawn_blocking(move || transcript::find(&config, &sid))
+        .await
+        .ok()
+        .flatten();
+    match found {
+        Some(p) => {
+            st.inbox.set_transcript(id, &conversation, p.clone());
+            Some(p)
+        }
+        None => Some(PathBuf::from(format!("{}.jsonl", link.session_id))),
+    }
 }
 
 /// Lo que devuelve `read` de `s` para `reader`, con el estado y el menú que se acaban de ver: lo
@@ -2456,15 +2497,28 @@ mod tests {
             opened_by: None,
             alerts: vec![],
         };
-        let idle = |v: SessionView| idle_for_delivery(Some(&v));
-        assert!(idle(view(true, Some("idle"))));
-        assert!(idle(view(true, None)));
+        let secs = Duration::from_secs;
+        let quiet = (secs(5), secs(90));
+        let runs =
+            |v: SessionView, silent: Option<u64>| clock_runs(Some(&v), silent.map(secs), quiet);
+        // Quieta y sin escribir en un rato; o sin transcripción (no está escribiendo).
+        assert!(runs(view(true, Some("idle")), Some(5)));
+        assert!(runs(view(true, Some("idle")), None));
+        assert!(!runs(view(true, Some("idle")), Some(4)), "aún escribe");
         // Trabajando, o con un permiso o una pregunta en pantalla: Claude lo guarda para luego.
-        assert!(!idle(view(true, Some("busy"))));
-        assert!(!idle(view(true, Some("waiting"))));
+        assert!(!runs(view(true, Some("busy")), Some(500)));
+        assert!(!runs(view(true, Some("waiting")), None));
+        // Sin saber su estado: solo tras mucho más rato sin escribir (o sin transcripción).
+        assert!(!runs(view(true, None), Some(60)));
+        assert!(runs(view(true, None), Some(90)));
+        assert!(runs(view(true, None), None));
+        let mut unseen = view(true, None);
+        unseen.claude = None;
+        assert!(!runs(unseen.clone(), Some(60)));
+        assert!(runs(unseen, None));
         // Parada, o aún sin ver por el escáner: no.
-        assert!(!idle(view(false, Some("idle"))));
-        assert!(!idle_for_delivery(None));
+        assert!(!runs(view(false, Some("idle")), None));
+        assert!(!clock_runs(None, None, quiet));
     }
 
     fn me(key: Option<&str>) -> Machine {
