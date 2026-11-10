@@ -133,15 +133,40 @@ const ALERT_EVERY: Duration = Duration::from_secs(30);
 /// El texto de una alerta, como mucho (en caracteres).
 const ALERT_MAX_CHARS: usize = 500;
 
+/// Qué hacer con una alerta según el freno.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Offer {
+    /// Sale ya (con las que esperaban).
+    Now,
+    /// Es la primera que espera: sale con las que se junten cuando pase este tiempo.
+    Schedule(Duration),
+    /// Ya hay otras esperando: sale con ellas.
+    Joined,
+}
+
 /// El freno de las alertas: cuándo salió el último push de cada sesión y las que se juntaron
-/// mientras tanto.
+/// mientras tanto (cuántas y la última).
 #[derive(Debug, Default)]
 struct AlertThrottle {
     last: std::collections::HashMap<String, std::time::Instant>,
-    held: std::collections::HashMap<String, Vec<String>>,
+    held: std::collections::HashMap<String, (usize, String)>,
 }
 
 impl AlertThrottle {
+    /// Una alerta nueva: se apunta y dice si sale ya, si hay que poner el reloj o si se junta.
+    fn offer(&mut self, session: &str, text: &str, now: std::time::Instant) -> Offer {
+        // Antes de mirar el freno: si sale ya, se lleva también las que esperaban, y si no,
+        // `pending` dice si es la primera (la que pone el reloj).
+        self.hold(session, text);
+        if self.allow(session, now) {
+            Offer::Now
+        } else if self.pending(session) == 1 {
+            Offer::Schedule(self.remaining(session, now))
+        } else {
+            Offer::Joined
+        }
+    }
+
     /// Si puede salir un push ahora; si puede, cuenta desde ahora.
     fn allow(&mut self, session: &str, now: std::time::Instant) -> bool {
         if self
@@ -156,7 +181,7 @@ impl AlertThrottle {
     }
 
     /// Cuánto falta para que pueda salir el siguiente.
-    fn wait(&self, session: &str, now: std::time::Instant) -> Duration {
+    fn remaining(&self, session: &str, now: std::time::Instant) -> Duration {
         self.last.get(session).map_or(Duration::ZERO, |t| {
             ALERT_EVERY.saturating_sub(now.saturating_duration_since(*t))
         })
@@ -164,36 +189,36 @@ impl AlertThrottle {
 
     /// Apunta una para el siguiente push.
     fn hold(&mut self, session: &str, text: &str) {
-        self.held
-            .entry(session.to_owned())
-            .or_default()
-            .push(text.to_owned());
+        let h = self.held.entry(session.to_owned()).or_default();
+        h.0 += 1;
+        h.1 = text.to_owned();
     }
 
     /// Cuántas hay juntas esperando.
     fn pending(&self, session: &str) -> usize {
-        self.held.get(session).map_or(0, Vec::len)
+        self.held.get(session).map_or(0, |h| h.0)
     }
 
-    /// Las que se juntaron, y queda vacío.
-    fn take(&mut self, session: &str) -> Vec<String> {
-        self.held.remove(session).unwrap_or_default()
+    /// Las que se juntaron (cuántas y la última), y queda vacío.
+    fn take(&mut self, session: &str) -> Option<(usize, String)> {
+        self.held.remove(session)
     }
 }
 
 /// El cuerpo del push: el texto, o «N alertas: <la última>» si se juntaron varias.
-fn alert_body(texts: &[String]) -> String {
-    match texts {
-        [one] => one.clone(),
-        [.., last] => format!("{} alertas: {last}", texts.len()),
-        [] => String::new(),
+fn alert_body(count: usize, last: &str) -> String {
+    if count > 1 {
+        format!("{count} alertas: {last}")
+    } else {
+        last.to_owned()
     }
 }
 
 /// El texto de una alerta, sin espacios alrededor y recortado. `None` si queda vacío.
 fn alert_text(text: &str) -> Option<String> {
-    let t = text.trim();
-    (!t.is_empty()).then(|| t.chars().take(ALERT_MAX_CHARS).collect())
+    let t: String = text.trim().chars().take(ALERT_MAX_CHARS).collect();
+    let t = t.trim_end();
+    (!t.is_empty()).then(|| t.to_owned())
 }
 
 /// Las alertas que el usuario aún no ha visto.
@@ -509,20 +534,24 @@ impl AppState {
         failed
     }
 
+    /// La vista de una sesión y el número del icono, según la última lista.
+    fn view_and_badge(&self, id: &str) -> (Option<SessionView>, usize) {
+        let l = self.views.borrow();
+        (
+            l.sessions.iter().find(|v| v.id == id).cloned(),
+            attention(&l.sessions),
+        )
+    }
+
     async fn alert(&self, a: Alert) {
         tokio::time::sleep(match a.kind {
             AlertKind::Waiting => ALERT_DELAY,
             AlertKind::Finished => FINISHED_DELAY,
-            AlertKind::Requested => Duration::ZERO,
+            // Van por `session_alert`/`flush_alerts`.
+            AlertKind::Requested => return,
         })
         .await;
-        let (view, badge) = {
-            let l = self.views.borrow();
-            (
-                l.sessions.iter().find(|v| v.id == a.session).cloned(),
-                attention(&l.sessions),
-            )
-        };
+        let (view, badge) = self.view_and_badge(&a.session);
         let Some(v) = view.filter(|v| still_alerting(v, a.kind)) else {
             return;
         };
@@ -553,14 +582,15 @@ impl AppState {
                 Some(t) if t != v.name => format!("Terminó · {t}"),
                 _ => "Terminó".to_owned(),
             },
-            AlertKind::Requested => v.alerts.last().map(|a| a.text.clone()).unwrap_or_default(),
+            AlertKind::Requested => return,
         };
         self.push_all(&v.name, &body, &v.id, badge).await;
     }
 
     /// Si hay a quién mandar avisos: algún teléfono con handle y el hub conectado.
     fn can_push(&self) -> bool {
-        self.hub.status.borrow().connected
+        let connected = self.hub.status.borrow().connected;
+        connected
             && self
                 .phones
                 .lock()
@@ -570,79 +600,67 @@ impl AppState {
                 .any(|p| p.handle.is_some())
     }
 
-    /// Una sesión manda una alerta al usuario: se apunta, se redibuja la lista y sale un push a
-    /// los teléfonos (como mucho uno cada 30 s por sesión; las demás se juntan en el siguiente).
-    pub async fn session_alert(self: &Arc<Self>, id: &str, text: &str) -> Result<(), String> {
-        let text = alert_text(text).ok_or("la alerta no tiene texto")?;
+    /// Una sesión manda una alerta al usuario (`text` ya limpio, de `alert_text`): se apunta,
+    /// se redibuja la lista y sale un push a los teléfonos (como mucho uno cada 30 s por
+    /// sesión; las demás se juntan en el siguiente). No espera al push.
+    pub async fn session_alert(
+        self: &Arc<Self>,
+        id: &str,
+        text: &str,
+    ) -> Result<(), RegistryError> {
         let id = {
             let mut reg = self.registry.lock().await;
             let id = reg
                 .find(id)
                 .map(|s| s.id.clone())
-                .ok_or_else(|| format!("no hay ninguna sesión {id:?}"))?;
-            reg.add_alert(&id, &text, now_ms())
-                .map_err(|e| e.to_string())?;
+                .ok_or_else(|| RegistryError::NotFound(id.to_owned()))?;
+            reg.add_alert(&id, text, now_ms())?;
             id
         };
         self.scan().await;
         if !self.can_push() {
             return Ok(());
         }
-        let now = std::time::Instant::now();
-        let wait = {
-            let mut t = self.alert_throttle.lock().expect("freno");
-            t.hold(&id, &text);
-            if t.allow(&id, now) {
-                None
-            } else {
-                // Solo la primera que se aparta pone el reloj; las demás salen con ella.
-                Some((t.pending(&id) == 1).then(|| t.wait(&id, now)))
+        let offer =
+            self.alert_throttle
+                .lock()
+                .expect("freno")
+                .offer(&id, text, std::time::Instant::now());
+        let st = self.clone();
+        match offer {
+            Offer::Now => {
+                tokio::spawn(async move { st.flush_alerts(&id).await });
             }
-        };
-        match wait {
-            None => self.flush_alerts(&id).await,
-            Some(Some(d)) => {
-                let st = self.clone();
+            Offer::Schedule(d) => {
                 tokio::spawn(async move {
                     tokio::time::sleep(d).await;
-                    if st
-                        .alert_throttle
-                        .lock()
-                        .expect("freno")
-                        .allow(&id, std::time::Instant::now())
-                    {
+                    let now = std::time::Instant::now();
+                    if st.alert_throttle.lock().expect("freno").allow(&id, now) {
                         st.flush_alerts(&id).await;
                     }
                 });
             }
-            Some(None) => {}
+            Offer::Joined => {}
         }
         Ok(())
     }
 
-    /// Manda en un push las alertas apartadas de una sesión.
+    /// Manda en un push las alertas apartadas de una sesión, si aún no se han leído.
     async fn flush_alerts(&self, id: &str) {
-        let texts = self.alert_throttle.lock().expect("freno").take(id);
-        if texts.is_empty() {
+        let Some((count, last)) = self.alert_throttle.lock().expect("freno").take(id) else {
+            return;
+        };
+        if !self.can_push() {
             return;
         }
-        let (name, badge) = {
-            let l = self.views.borrow();
-            (
-                l.sessions
-                    .iter()
-                    .find(|v| v.id == id)
-                    .map(|v| v.name.clone()),
-                attention(&l.sessions),
-            )
-        };
-        let Some(name) = name else {
+        let (view, badge) = self.view_and_badge(id);
+        let Some(v) = view.filter(|v| still_alerting(v, AlertKind::Requested)) else {
             return;
         };
         let host = <Self as e2e::Host>::host_name(self);
         self.push_all(
-            &format!("🔔 {name} ({host})"),
-            &alert_body(&texts),
+            &format!("🔔 {} ({host})", v.name),
+            &alert_body(count, &last),
             id,
             badge,
         )
@@ -1562,13 +1580,12 @@ async fn api_alert(
     Path(id): Path<String>,
     Json(req): Json<AlertRequest>,
 ) -> Response {
-    let s = match find_session(&st, &id).await {
-        Ok(s) => s,
-        Err(r) => return r,
+    let Some(text) = alert_text(&req.text) else {
+        return error(StatusCode::BAD_REQUEST, "la alerta no tiene texto");
     };
-    match st.session_alert(&s.id, &req.text).await {
+    match st.session_alert(&id, &text).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Err(e) => error(StatusCode::BAD_REQUEST, e),
+        Err(e) => registry_error(e),
     }
 }
 
@@ -2313,10 +2330,11 @@ mod tests {
     fn throttle_one_push_every_30_s() {
         let mut t = AlertThrottle::default();
         let t0 = Instant::now();
+        assert_eq!(t.remaining("s", t0), Duration::ZERO);
         assert!(t.allow("s", t0));
         assert!(!t.allow("s", t0 + Duration::from_secs(10)));
         assert_eq!(
-            t.wait("s", t0 + Duration::from_secs(10)),
+            t.remaining("s", t0 + Duration::from_secs(10)),
             Duration::from_secs(20)
         );
         // Otra sesión no espera.
@@ -2327,26 +2345,36 @@ mod tests {
     }
 
     #[test]
-    fn throttle_holds_and_takes() {
+    fn throttle_offer_sequence() {
         let mut t = AlertThrottle::default();
-        assert_eq!(t.pending("s"), 0);
-        t.hold("s", "una");
-        assert_eq!(t.pending("s"), 1);
-        t.hold("s", "dos");
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        assert_eq!(t.offer("s", "una", t0), Offer::Now);
+        assert_eq!(t.take("s"), Some((1, "una".to_owned())));
+        assert_eq!(
+            t.offer("s", "dos", at(10)),
+            Offer::Schedule(Duration::from_secs(20))
+        );
+        assert_eq!(t.offer("s", "tres", at(12)), Offer::Joined);
         assert_eq!(t.pending("s"), 2);
-        assert_eq!(t.pending("otra"), 0);
-        assert_eq!(t.take("s"), vec!["una".to_owned(), "dos".to_owned()]);
+        // Otra sesión, por su cuenta.
+        assert_eq!(t.offer("otra", "x", at(12)), Offer::Now);
+        assert_eq!(t.take("s"), Some((2, "tres".to_owned())));
         assert_eq!(t.pending("s"), 0);
-        assert!(t.take("s").is_empty());
+        assert_eq!(t.take("s"), None);
+        assert_eq!(
+            t.offer("s", "cuatro", at(20)),
+            Offer::Schedule(Duration::from_secs(10))
+        );
+        // Si sale ya, se lleva también las que esperaban.
+        assert_eq!(t.offer("s", "cinco", at(30)), Offer::Now);
+        assert_eq!(t.take("s"), Some((2, "cinco".to_owned())));
     }
 
     #[test]
     fn alert_body_joins_held_ones() {
-        assert_eq!(alert_body(&["listo".into()]), "listo");
-        assert_eq!(
-            alert_body(&["una".into(), "dos".into(), "tres".into()]),
-            "3 alertas: tres"
-        );
+        assert_eq!(alert_body(1, "listo"), "listo");
+        assert_eq!(alert_body(3, "tres"), "3 alertas: tres");
     }
 
     #[test]
@@ -2355,5 +2383,8 @@ mod tests {
         assert_eq!(alert_text("   "), None);
         let long = "á".repeat(600);
         assert_eq!(alert_text(&long).unwrap().chars().count(), 500);
+        // El corte puede dejar un espacio al final: fuera también.
+        let cut = format!("{} {}", "a".repeat(499), "b".repeat(10));
+        assert_eq!(alert_text(&cut), Some("a".repeat(499)));
     }
 }
