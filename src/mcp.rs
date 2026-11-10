@@ -101,7 +101,8 @@ impl Mailbox for LocalApi {
 
     /// Con `tracked` (el evento lleva `msg_id`). Un `nido serve` de antes (se actualizó el
     /// binario y aún no se ha reiniciado el servicio) no lo conoce y da 400: se manda sin él, y
-    /// a ese ya siempre así.
+    /// a ese ya siempre así. Sigue así aunque luego se reinicie con la versión nueva: no pasa
+    /// nada, porque el evento lleva `msg_id` y la entrega se confirma por él, no por `tracked`.
     fn ack(&self, ids: &[String]) -> Result<(), String> {
         const PATH: &str = "/api/v1/mcp/inbox/ack";
         if !self.legacy.load(Ordering::SeqCst) {

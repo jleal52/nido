@@ -1494,7 +1494,8 @@ pub async fn check_delivery(st: &AppState, id: &str, tick: Option<Duration>) {
 /// trabajando (`busy`) ni esperándote (`waiting`: un permiso o una pregunta en pantalla; en esos
 /// casos Claude Code guarda el evento y lo pasa a la conversación después, y darlo otra vez lo
 /// duplicaría), y su transcripción sin escribirse (`silent`: cuánto hace; `None`, no la hay) en
-/// `quiet.0`. Sin saber su estado, el rato es `quiet.1`, más largo. Se supone que al compactar
+/// `quiet.0`. Sin saber su estado, el rato es `quiet.1`, más largo; sin transcripción no se espera
+/// ningún rato, porque entonces nada ha llegado a la conversación. Se supone que al compactar
 /// Claude dice `busy` (no se ha podido comprobar).
 fn clock_runs(
     v: Option<&SessionView>,
