@@ -709,8 +709,14 @@ async fn watch_held(
     // aceptado), su bandeja no da nada (ver `Inbox::hold`).
     let mut hold = Some(hold);
     let mut repl_since: Option<tokio::time::Instant> = None;
+    // El guardián de este arranque (su pid), desde que se conecta: si se reinicia, lo de este
+    // arranque ya no vale para el nuevo.
+    let mut holder: Option<i32> = None;
     while tokio::time::Instant::now() < deadline {
         if scr.is_none() {
+            if holder.is_some() && launch::holder_pid(&st.paths, id) != holder {
+                return Startup::Nothing;
+            }
             let hello = Hello {
                 role: Role::Viewer,
                 cols: 80,
@@ -720,6 +726,8 @@ async fn watch_held(
                 Ok(stream) => {
                     let (rd, wr) = crate::ipc::split(stream);
                     scr = Some(prompt::Screen::new(rd, wr));
+                    // Escribe su pid antes de atender.
+                    holder = holder.or_else(|| launch::holder_pid(&st.paths, id));
                 }
                 // Aún no atiende (al restaurar no se espera a que arranque).
                 Err(_) => {
@@ -781,6 +789,7 @@ async fn watch_held(
                 if let Some(h) = hold.take() {
                     tokio::spawn(keep_held(
                         st.paths.clone(),
+                        holder,
                         scr.take(),
                         h,
                         name.clone(),
@@ -820,6 +829,7 @@ async fn watch_held(
     if let Some(h) = hold.take() {
         tokio::spawn(keep_held(
             st.paths.clone(),
+            holder,
             scr.take(),
             h,
             name,
@@ -845,21 +855,40 @@ fn keep_pace(elapsed: Duration) -> Duration {
     }
 }
 
-/// ¿Hay un Claude en la sesión `id` (ver `claude::session_claude`)? `None` si no hay guardián
-/// (se cerró).
-async fn claude_running(paths: &Paths, id: &str) -> Option<bool> {
+/// Cada cuánto mira `keep_held` si sigue el Claude de la sesión: recorrer los procesos cuesta
+/// (más en Windows), y al restaurar puede haber muchas retenidas.
+const CLAUDE_EVERY: Duration = Duration::from_secs(5);
+
+/// Si sigue el Claude de una sesión, con su guardián de este arranque.
+#[derive(Debug, PartialEq, Eq)]
+enum Present {
+    Claude,
+    NoClaude,
+    /// Ya no está ese guardián: se cerró o se reinició la sesión.
+    Replaced,
+    /// No se pudo mirar.
+    Unknown,
+}
+
+/// ¿Sigue habiendo un Claude (ver `claude::session_claude`) con `holder`, el guardián de la
+/// sesión `id` en este arranque?
+async fn claude_with(paths: &Paths, id: &str, holder: i32) -> Present {
     let paths = paths.clone();
     let id = id.to_owned();
     tokio::task::spawn_blocking(move || {
-        if !launch::is_alive(&paths, &id) {
-            return None;
+        let found = u32::try_from(holder)
+            .is_ok_and(|h| claude::session_claude(&Procfs::default(), h, &paths.home).is_some());
+        // Después de mirar: si entretanto se reinició, lo visto no vale para el nuevo.
+        if launch::holder_pid(&paths, &id) != Some(holder) || !launch::is_alive(&paths, &id) {
+            Present::Replaced
+        } else if found {
+            Present::Claude
+        } else {
+            Present::NoClaude
         }
-        let holder = launch::holder_pid(&paths, &id).and_then(|p| u32::try_from(p).ok())?;
-        let procfs = Procfs::default();
-        Some(claude::session_claude(&procfs, holder, &paths.home).is_some())
     })
     .await
-    .unwrap_or(None)
+    .unwrap_or(Present::Unknown)
 }
 
 /// Tras tantas veces seguidas sin que su guardián conteste (con `keep_held`, un minuto o más), se
@@ -958,9 +987,12 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
 /// tiene channel). Solo se suelta sin mirar si se cierra la sesión (nadie atiende en su socket).
 /// Si su Claude se va y la sesión sigue (p. ej. una shell de login que no le hace `exec`), sin
 /// channel hasta que se vuelva a lanzar, y se deja de mirar. Si su guardián lleva mucho sin
-/// contestar, se dice una vez. Mira cada vez menos (ver `keep_pace`).
+/// contestar, se dice una vez. Mira cada vez menos (ver `keep_pace`; su Claude, cada
+/// `CLAUDE_EVERY`). Es de un arranque (`holder`: su guardián, si se sabe): si la sesión se
+/// reinicia, acaba sin tocar nada.
 async fn keep_held(
     paths: Paths,
+    mut holder: Option<i32>,
     mut scr: Option<HolderScreen>,
     hold: crate::inbox::Hold,
     name: String,
@@ -974,17 +1006,31 @@ async fn keep_held(
     // Si se ha visto su Claude: sin verlo nunca no se sabe si se fue (instalado con npm su
     // proceso es `node`, y no se encuentra).
     let mut seen = false;
+    let mut claude_at = begun;
     loop {
         tokio::time::sleep(keep_pace(begun.elapsed())).await;
+        // Otro guardián (reiniciada) o ninguno (se cerró): no es ya este arranque.
+        let now = launch::holder_pid(&paths, &id);
+        match holder {
+            Some(h) if now != Some(h) => return,
+            Some(_) => {}
+            None => holder = now,
+        }
         // Antes que la pantalla: sin Claude, la de la shell no dice nada.
-        match claude_running(&paths, &id).await {
-            Some(true) => seen = true,
-            Some(false) if seen => {
-                hold.refuse(crate::inbox::Refusal::NoClaude);
-                log_refusal(crate::inbox::Refusal::NoClaude, &name, &id);
-                return;
+        if let Some(h) = holder
+            && tokio::time::Instant::now() >= claude_at
+        {
+            claude_at = tokio::time::Instant::now() + CLAUDE_EVERY;
+            match claude_with(&paths, &id, h).await {
+                Present::Claude => seen = true,
+                Present::NoClaude if seen => {
+                    hold.refuse(crate::inbox::Refusal::NoClaude);
+                    log_refusal(crate::inbox::Refusal::NoClaude, &name, &id);
+                    return;
+                }
+                Present::Replaced => return,
+                Present::NoClaude | Present::Unknown => {}
             }
-            _ => {}
         }
         if scr.is_none() {
             let Ok(s) = viewer_at(&socket).await else {
@@ -3276,6 +3322,71 @@ mod tests {
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].text, "nueva");
         assert!(unread_alerts(&alerts, 30).is_empty());
+    }
+
+    /// Un arranque que se mira en `keep_held` (ya visto su Claude) y se reinicia: el guardián
+    /// nuevo aún sin Claude no es «su Claude se fue». Acaba sin tocar la bandeja.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_held_leaves_a_restarted_session_alone() {
+        use std::os::unix::process::CommandExt;
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let paths = Paths {
+            runtime: d.join("run"),
+            data: d.join("data"),
+            state: d.join("state"),
+            config: d.join("config"),
+            home: d.to_owned(),
+            server: None,
+        };
+        std::fs::create_dir_all(&paths.runtime).unwrap();
+        let id = "s";
+        // Su guardián atiende sin contestar (`look` tarda).
+        let listener = tokio::net::UnixListener::bind(paths.socket(id)).unwrap();
+        let mute = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((c, _)) = listener.accept().await {
+                open.push(c);
+            }
+        });
+        // El guardián de antes: esta prueba, con un «claude» debajo (bash por un enlace).
+        std::os::unix::fs::symlink("/bin/bash", d.join("claude")).unwrap();
+        let mut claude = std::process::Command::new(d.join("claude"))
+            .args(["-c", "sleep 60 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::fs::write(paths.pidfile(id), std::process::id().to_string()).unwrap();
+        let inbox = crate::inbox::Inbox::load(d.join("inbox.json"));
+        let task = tokio::spawn(keep_held(
+            paths.clone(),
+            None,
+            None,
+            inbox.hold(id),
+            "s".into(),
+            id.into(),
+        ));
+        // Que vea su Claude.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        // Reiniciada: otro guardián, aún sin Claude.
+        let mut new = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        std::fs::write(paths.pidfile(id), new.id().to_string()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(20), task).await;
+        unsafe {
+            libc::kill(-(claude.id() as i32), libc::SIGKILL);
+        }
+        let _ = claude.wait();
+        let _ = new.kill();
+        let _ = new.wait();
+        mute.abort();
+        assert!(ended.is_ok(), "sigue mirando el arranque nuevo");
+        assert_eq!(inbox.refusal(id), None, "rechazó el arranque nuevo");
+        assert!(!inbox.held(id));
     }
 
     #[test]

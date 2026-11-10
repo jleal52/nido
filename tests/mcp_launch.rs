@@ -587,6 +587,8 @@ async fn claude_launches_with_the_nido_channel() {
         "Select login method:\n\n❯ 1. Claude account with subscription\n",
     )
     .unwrap();
+    // `sleep 5 & wait`, y no `sleep 5` a secas: con una sola orden, bash se convierte en ella
+    // (`exec`) y ya no hay ningún proceso que se llame `claude`.
     std::fs::write(
         ida.join("program"),
         "#!/bin/sh\nprintf '\\033[2J\\033[H'; cat screen\n./claude -c 'sleep 5 & wait'\n\
@@ -670,6 +672,89 @@ async fn claude_launches_with_the_nido_channel() {
     assert!(released(&state, &s.id).await, "se sigue mirando");
     assert_eq!(state.inbox.pending(&s.id).len(), 1);
     nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
+
+    // Reiniciada mientras se mira su bandeja retenida (ya visto su Claude): lo que mira el
+    // arranque de antes no toca el nuevo, aunque su Claude tarde en aparecer. El mensaje llega.
+    let again = tmp.path().join("reiniciada");
+    std::fs::create_dir_all(&again).unwrap();
+    std::os::unix::fs::symlink("/bin/bash", again.join("claude")).unwrap();
+    std::fs::write(
+        again.join("screen"),
+        "Select login method:\n\n❯ 1. Claude account with subscription\n",
+    )
+    .unwrap();
+    std::fs::write(again.join("normal"), fixture("normal")).unwrap();
+    // La segunda vez, 6 s sin Claude antes de enseñar su caja. (Con `& wait`: ver «sin-claude».)
+    std::fs::write(
+        again.join("program"),
+        "#!/bin/sh\nif [ -f again ]; then sleep 6; printf '\\033[2J\\033[H'; cat normal; \
+         exec ./claude -c 'sleep 60 & wait'; fi\ntouch again\n\
+         printf '\\033[2J\\033[H'; cat screen\nexec ./claude -c 'sleep 60 & wait'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        again.join("program"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let s = state
+        .registry
+        .lock()
+        .await
+        .add(Session {
+            claude: Some(nido::registry::ClaudeLink {
+                session_id: "conv-again".into(),
+                config_dir: None,
+                account: None,
+                inside_shell: false,
+            }),
+            ..session("reiniciada", &again, &["claude"])
+        })
+        .unwrap();
+    nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
+    let end = server::watch_startup(&state, &s.id, Duration::from_secs(1)).await;
+    assert_eq!(end, Startup::Nothing);
+    // Que `keep_held` vea su Claude.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(state.inbox.held(&s.id));
+    assert_eq!(state.inbox.refusal(&s.id), None);
+    state
+        .inbox
+        .push(
+            &s.id,
+            nido::inbox::Msg {
+                id: "r1".into(),
+                from: "padre".into(),
+                from_id: "Prueba/x".into(),
+                machine: "Prueba".into(),
+                text: "otra vez".into(),
+                at: 1,
+            },
+        )
+        .unwrap();
+    let restart = format!("/api/v1/sessions/{}/restart", s.id);
+    assert_eq!(rest(addr, &restart).await, 200);
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let got = loop {
+        assert!(std::time::Instant::now() < until, "nunca se le dio");
+        assert_eq!(
+            state.inbox.refusal(&s.id),
+            None,
+            "lo de antes rechazó el arranque nuevo"
+        );
+        let (code, r) = inbox(addr, &s.id, None, None).await;
+        assert_eq!(code, 200, "{r}");
+        if r["messages"] != json!([]) {
+            break r;
+        }
+    };
+    assert_eq!(got["messages"][0]["id"], "r1", "{got}");
+    let (code, r) = inbox(addr, &s.id, None, Some(json!({"ids": ["r1"]}))).await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["removed"], 1);
+    assert_eq!(state.inbox.refusal(&s.id), None);
+    let stop = format!("/api/v1/sessions/{}/stop", s.id);
+    assert_eq!(rest(addr, &stop).await, 200);
 
     // Apagado: la sesión siguiente va sin opciones, sin `NIDO_CHANNEL` y sin que nadie teclee.
     assert!(nido_mcp(tmp.path(), false).contains("apagado"));
