@@ -108,6 +108,9 @@ enum Cmd {
     /// (Interno) el guardián de una sesión.
     #[command(hide = true)]
     Holder { id: String },
+    /// (Interno) el servidor MCP de una sesión de Claude: lo lanza Claude Code.
+    #[command(hide = true)]
+    Mcp,
     /// Lista las sesiones.
     Ls,
     /// Las alertas de las sesiones que aún no has visto.
@@ -929,6 +932,7 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             }
         }
         Cmd::Attach { name } => return attach_cmd(api, paths, name),
+        Cmd::Mcp => nido::mcp::run(api.clone()),
         Cmd::Serve { .. } | Cmd::Holder { .. } => unreachable!(),
         #[cfg(windows)]
         Cmd::Service { .. } => unreachable!(),

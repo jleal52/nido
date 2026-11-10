@@ -18,6 +18,7 @@ pub mod i18n;
 pub mod import;
 pub mod ipc;
 pub mod launch;
+pub mod mcp;
 pub mod oauth;
 pub mod prompt;
 pub mod proto;

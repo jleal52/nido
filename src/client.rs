@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct Api {
     pub addr: SocketAddr,
     pub token: Option<String>,
@@ -17,6 +18,26 @@ impl Api {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> io::Result<(u16, serde_json::Value)> {
+        // La terminal habla español: los mensajes del gestor, también (la API, por defecto, en
+        // inglés para la app y la web).
+        self.request_with(
+            method,
+            path,
+            body,
+            &[("Accept-Language", "es")],
+            Some(Duration::from_secs(30)),
+        )
+    }
+
+    /// Como `request`, con cabeceras propias y otro límite de lectura (`None`: sin límite).
+    pub fn request_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        headers: &[(&str, &str)],
+        read_timeout: Option<Duration>,
+    ) -> io::Result<(u16, serde_json::Value)> {
         let mut s =
             TcpStream::connect_timeout(&self.addr, Duration::from_secs(3)).map_err(|e| {
                 io::Error::new(
@@ -27,12 +48,12 @@ impl Api {
                     ),
                 )
             })?;
-        s.set_read_timeout(Some(Duration::from_secs(30)))?;
+        s.set_read_timeout(read_timeout)?;
         let body = body.map(|b| b.to_string()).unwrap_or_default();
         let mut req = format!("{method} {path} HTTP/1.0\r\nHost: {}\r\n", self.addr);
-        // La terminal habla español: los mensajes del gestor, también (la API, por defecto, en
-        // inglés para la app y la web).
-        req.push_str("Accept-Language: es\r\n");
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
         if let Some(t) = &self.token {
             req.push_str(&format!("Authorization: Bearer {t}\r\n"));
         }
@@ -62,16 +83,33 @@ impl Api {
         body: Option<&serde_json::Value>,
     ) -> io::Result<serde_json::Value> {
         let (code, json) = self.request(method, path, body)?;
-        if (200..300).contains(&code) {
-            Ok(json)
-        } else {
-            let msg = json
-                .get("error")
-                .and_then(|e| e.as_str())
-                .map(str::to_owned);
-            Err(io::Error::other(
-                msg.unwrap_or_else(|| format!("el gestor respondió {code}")),
-            ))
-        }
+        ok_or_message(code, json)
+    }
+
+    /// Como `request_with`, pero un código de error se convierte en error con el mensaje del gestor.
+    pub fn call_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        headers: &[(&str, &str)],
+        read_timeout: Option<Duration>,
+    ) -> io::Result<serde_json::Value> {
+        let (code, json) = self.request_with(method, path, body, headers, read_timeout)?;
+        ok_or_message(code, json)
+    }
+}
+
+fn ok_or_message(code: u16, json: serde_json::Value) -> io::Result<serde_json::Value> {
+    if (200..300).contains(&code) {
+        Ok(json)
+    } else {
+        let msg = json
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(str::to_owned);
+        Err(io::Error::other(
+            msg.unwrap_or_else(|| format!("el gestor respondió {code}")),
+        ))
     }
 }
