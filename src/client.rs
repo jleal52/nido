@@ -85,19 +85,6 @@ impl Api {
         let (code, json) = self.request(method, path, body)?;
         ok_or_message(code, json)
     }
-
-    /// Como `request_with`, pero un código de error se convierte en error con el mensaje del gestor.
-    pub fn call_with(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<&serde_json::Value>,
-        headers: &[(&str, &str)],
-        read_timeout: Option<Duration>,
-    ) -> io::Result<serde_json::Value> {
-        let (code, json) = self.request_with(method, path, body, headers, read_timeout)?;
-        ok_or_message(code, json)
-    }
 }
 
 fn ok_or_message(code: u16, json: serde_json::Value) -> io::Result<serde_json::Value> {

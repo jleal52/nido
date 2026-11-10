@@ -43,16 +43,29 @@ pub struct LocalApi {
 impl Api for LocalApi {
     fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
         // Sin límite de lectura: con `wait` la respuesta puede tardar media hora. Y sin
-        // `Accept-Language`: lo lee el modelo, en inglés.
-        self.client
-            .call_with(
+        // `Accept-Language`: lo lee el modelo, en inglés. Por eso los errores de aquí también
+        // van en inglés, y no los de `client` (los de la consola, en español).
+        let addr = self.client.addr;
+        let (code, json) = self
+            .client
+            .request_with(
                 "POST",
                 &format!("/api/v1/mcp/{tool}"),
                 Some(&args),
                 &[("X-Nido-Session", &self.session)],
                 None,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::InvalidData => format!("nido serve on {addr} gave a bad answer"),
+                kind => format!("nido serve is not answering on {addr} ({kind})"),
+            })?;
+        if (200..300).contains(&code) {
+            return Ok(json);
+        }
+        match json.get("error").and_then(Value::as_str) {
+            Some(msg) => Err(msg.to_owned()),
+            None => Err(format!("nido serve answered {code}")),
+        }
     }
 }
 
@@ -67,6 +80,8 @@ struct Tool {
     name: &'static str,
     about: &'static str,
     args: &'static [Arg],
+    /// Opcionales de los que hace falta al menos uno.
+    any_of: &'static [&'static str],
 }
 
 const fn req(name: &'static str, ty: &'static str, about: &'static str) -> Arg {
@@ -108,6 +123,7 @@ const TIMEOUT: Arg = opt(
 /// Las herramientas, en el orden en que salen en `tools/list`.
 const TOOLS: &[Tool] = &[
     Tool {
+        any_of: &[],
         name: "sessions",
         about: "List the Claude sessions on all the machines of the user's nido group: machine, \
                 id, name, folder, state (working, waiting, pending question, no channel) and \
@@ -115,6 +131,7 @@ const TOOLS: &[Tool] = &[
         args: &[],
     },
     Tool {
+        any_of: &[],
         name: "send",
         about: "Send a message to another session. It arrives there as a channel event from \
                 this session. Without wait, says whether it was delivered or queued. With wait, \
@@ -127,6 +144,7 @@ const TOOLS: &[Tool] = &[
         ],
     },
     Tool {
+        any_of: &[],
         name: "read",
         about: "Read a session's conversation: what is new since this session last read it (or \
                 its last turns), plus its pending question or permission request, if any.",
@@ -142,6 +160,7 @@ const TOOLS: &[Tool] = &[
         ],
     },
     Tool {
+        any_of: &[],
         name: "open",
         about: "Open a new Claude session on a machine of the group, in an existing folder, \
                 with a first message. The new session is told that messages from this session \
@@ -159,6 +178,7 @@ const TOOLS: &[Tool] = &[
         ],
     },
     Tool {
+        any_of: &["option", "text"],
         name: "answer",
         about: "Answer the pending question or permission request of a session this session \
                 opened (see `read`): pick an option, or reply with text.",
@@ -173,11 +193,13 @@ const TOOLS: &[Tool] = &[
         ],
     },
     Tool {
+        any_of: &[],
         name: "close",
         about: "Close a session this session opened.",
         args: &[SESSION],
     },
     Tool {
+        any_of: &[],
         name: "alert",
         about: "Notify the user on their phone. Use it when the user asked to be notified \
                 about something.",
@@ -207,7 +229,11 @@ fn schema(tool: &Tool) -> Value {
         .map(|a| {
             (
                 a.name.to_owned(),
-                json!({"type": a.ty, "description": a.about}),
+                if a.ty == "integer" {
+                    json!({"type": a.ty, "description": a.about, "minimum": 0})
+                } else {
+                    json!({"type": a.ty, "description": a.about})
+                },
             )
         })
         .collect();
@@ -217,7 +243,8 @@ fn schema(tool: &Tool) -> Value {
         .filter(|a| a.required)
         .map(|a| a.name)
         .collect();
-    json!({"type": "object", "properties": props, "required": required})
+    json!({"type": "object", "properties": props, "required": required,
+        "additionalProperties": false})
 }
 
 /// Lo que espera la herramienta, para los errores: el modelo a veces se inventa los nombres.
@@ -233,15 +260,37 @@ fn expected(tool: &Tool) -> String {
             format!("{} ({}, {need})", a.name, a.ty)
         })
         .collect();
-    format!("`{}` expects: {}.", tool.name, list.join(", "))
+    let mut s = format!("`{}` expects: {}.", tool.name, list.join(", "));
+    if !tool.any_of.is_empty() {
+        s.push_str(&format!(
+            " Give at least one of: {}.",
+            tool.any_of.join(", ")
+        ));
+    }
+    s
 }
 
-fn type_ok(ty: &str, v: &Value) -> bool {
-    match ty {
-        "string" => v.is_string(),
-        "boolean" => v.is_boolean(),
-        "integer" => v.is_i64() || v.is_u64(),
-        _ => false,
+/// Qué tiene de malo un valor dado para un argumento, si algo.
+fn bad_value(a: &Arg, v: &Value) -> Option<String> {
+    let k = a.name;
+    match a.ty {
+        "string" if !v.is_string() => Some(format!("`{k}` must be a string")),
+        // Uno obligatorio vacío es como no darlo; el modelo a veces manda "".
+        "string" if a.required && v.as_str().is_some_and(|s| s.trim().is_empty()) => {
+            Some(format!("`{k}` must not be empty"))
+        }
+        "boolean" if !v.is_boolean() => Some(format!("`{k}` must be a boolean")),
+        "integer" if !v.is_u64() => Some(format!("`{k}` must be an integer >= 0")),
+        _ => None,
+    }
+}
+
+/// Dado y con algo: ni ausente, ni `null`, ni una cadena vacía.
+fn given_some(m: &Map<String, Value>, k: &str) -> bool {
+    match m.get(k) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(_) => true,
     }
 }
 
@@ -259,16 +308,22 @@ fn check(tool: &Tool, args: Option<&Value>) -> Result<Value, String> {
         match tool.args.iter().find(|a| a.name == k) {
             None => problems.push(format!("unknown argument `{k}`")),
             Some(_) if v.is_null() => {}
-            Some(a) if !type_ok(a.ty, v) => problems.push(format!("`{k}` must be {}", a.ty)),
-            Some(_) => {
-                out.insert(k.clone(), v.clone());
-            }
+            Some(a) => match bad_value(a, v) {
+                Some(p) => problems.push(p),
+                None => {
+                    out.insert(k.clone(), v.clone());
+                }
+            },
         }
     }
     for a in tool.args.iter().filter(|a| a.required) {
         if given.get(a.name).is_none_or(Value::is_null) {
             problems.push(format!("missing `{}`", a.name));
         }
+    }
+    if !tool.any_of.is_empty() && !tool.any_of.iter().any(|k| given_some(given, k)) {
+        let names: Vec<String> = tool.any_of.iter().map(|k| format!("`{k}`")).collect();
+        problems.push(format!("give {}", names.join(" or ")));
     }
     if problems.is_empty() {
         Ok(Value::Object(out))
@@ -360,8 +415,20 @@ pub fn handle(st: &mut State, msg: Value) -> Vec<Value> {
     vec![json!({"jsonrpc": "2.0", "id": id, "result": result})]
 }
 
+/// La sesión de `NIDO_SESSION`, si parece un id de nido. Va en una cabecera HTTP: con cualquier
+/// otra cosa, como fuera de nido.
+pub fn session_from(v: Option<String>) -> Option<String> {
+    v.filter(|s| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
+}
+
 /// Escribe una línea en stdout. El cerrojo de stdout hace de mutex entre hilos (las llamadas a
-/// herramientas y, más adelante, los avisos de la bandeja). Si nadie escucha, se acaba.
+/// herramientas y, más adelante, los avisos de la bandeja). Si Claude Code ha cerrado la tubería,
+/// se acaba: en Unix ya lo hace la señal SIGPIPE (`main` la deja por defecto en las órdenes de
+/// consola, también en esta), y en Windows llega aquí como error.
 pub fn emit(v: &Value) {
     let mut out = io::stdout().lock();
     if writeln!(out, "{v}").and_then(|()| out.flush()).is_err() {
@@ -369,11 +436,68 @@ pub fn emit(v: &Value) {
     }
 }
 
+/// Las llamadas a herramientas en marcha y, de ellas, las que Claude Code ha cancelado.
+#[derive(Default)]
+pub struct InFlight {
+    inflight: HashSet<String>,
+    cancelled: HashSet<String>,
+}
+
+pub type Calls = Arc<Mutex<InFlight>>;
+
+/// Un mensaje de stdin: `tools/call` va a su hilo (con `wait` puede tardar mucho, y entretanto
+/// llegan `ping` y cancelaciones), y lo demás se contesta ya. Devuelve el hilo, si lo hay.
+///
+/// Cancelar solo calla la respuesta: la llamada HTTP sigue hasta que el gestor contesta (y lo
+/// que haga, lo hace).
+pub fn dispatch<E>(
+    st: &mut State,
+    msg: Value,
+    calls: &Calls,
+    emit: E,
+) -> Option<std::thread::JoinHandle<()>>
+where
+    E: Fn(&Value) + Send + 'static,
+{
+    match msg.get("method").and_then(Value::as_str) {
+        Some("tools/call") if msg.get("id").is_some() => {
+            let key = msg["id"].to_string();
+            calls.lock().unwrap().inflight.insert(key.clone());
+            let mut st = st.clone();
+            let calls = calls.clone();
+            Some(std::thread::spawn(move || {
+                let out = handle(&mut st, msg);
+                let cancelled = {
+                    let mut c = calls.lock().unwrap();
+                    c.inflight.remove(&key);
+                    c.cancelled.remove(&key)
+                };
+                if !cancelled {
+                    out.iter().for_each(emit);
+                }
+            }))
+        }
+        Some("notifications/cancelled") => {
+            if let Some(id) = msg.pointer("/params/requestId") {
+                let key = id.to_string();
+                let mut c = calls.lock().unwrap();
+                // Solo si sigue en marcha: lo ya contestado no se recuerda.
+                if c.inflight.contains(&key) {
+                    c.cancelled.insert(key);
+                }
+            }
+            None
+        }
+        _ => {
+            handle(st, msg).iter().for_each(emit);
+            None
+        }
+    }
+}
+
 /// `nido mcp`: lee mensajes de stdin hasta que se cierra.
 pub fn run(api: client::Api) -> ! {
-    let session = std::env::var("NIDO_SESSION")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let session = session_from(std::env::var("NIDO_SESSION").ok());
     let mut st = State {
         session: session.clone(),
         api: Arc::new(LocalApi {
@@ -381,8 +505,7 @@ pub fn run(api: client::Api) -> ! {
             session: session.unwrap_or_default(),
         }),
     };
-    // Las llamadas que Claude Code ha cancelado y aún no han acabado: su respuesta no se manda.
-    let cancelled: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let calls = Calls::default();
     // Aquí irá el hilo que mira la bandeja y mete los mensajes en la sesión (con `emit`).
     let mut stdin = io::stdin().lock();
     let mut line = Vec::new();
@@ -392,29 +515,8 @@ pub fn run(api: client::Api) -> ! {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let Ok(msg) = serde_json::from_slice::<Value>(&line) else {
-            continue;
-        };
-        match msg.get("method").and_then(Value::as_str) {
-            // Cada llamada en su hilo: con `wait` puede tardar mucho, y entretanto llegan
-            // `ping` y cancelaciones.
-            Some("tools/call") if msg.get("id").is_some() => {
-                let key = msg["id"].to_string();
-                let mut st = st.clone();
-                let cancelled = cancelled.clone();
-                std::thread::spawn(move || {
-                    let out = handle(&mut st, msg);
-                    if !cancelled.lock().unwrap().remove(&key) {
-                        out.iter().for_each(emit);
-                    }
-                });
-            }
-            Some("notifications/cancelled") => {
-                if let Some(id) = msg.pointer("/params/requestId") {
-                    cancelled.lock().unwrap().insert(id.to_string());
-                }
-            }
-            _ => handle(&mut st, msg).iter().for_each(emit),
+        if let Ok(msg) = serde_json::from_slice::<Value>(&line) {
+            dispatch(&mut st, msg, &calls, emit);
         }
     }
     // Claude Code se ha ido: fuera, aunque quede alguna llamada esperando.
@@ -667,5 +769,295 @@ mod tests {
                 .contains("sessions")
         );
         assert!(f.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn schemas_close_the_arguments_and_forbid_negative_numbers() {
+        let mut st = State::for_tests(Some("abc12345"));
+        let out = handle(
+            &mut st,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        );
+        for t in out[0]["result"]["tools"].as_array().unwrap() {
+            assert_eq!(
+                t["inputSchema"]["additionalProperties"], false,
+                "{}",
+                t["name"]
+            );
+        }
+        let read = &out[0]["result"]["tools"][2]["inputSchema"]["properties"];
+        assert_eq!(read["timeout_s"]["minimum"], 0);
+        assert_eq!(read["last"]["minimum"], 0);
+        assert!(read["session"].get("minimum").is_none());
+    }
+
+    #[test]
+    fn answer_needs_an_option_or_a_text() {
+        let (mut st, f) = with(Ok(json!("ok")));
+        let r = call(&mut st, "answer", json!({"session":"mac/abc"}));
+        assert_eq!(r["isError"], true);
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("`option` or `text`"), "{text}");
+        let r = call(
+            &mut st,
+            "answer",
+            json!({"session":"mac/abc","option":null,"text":""}),
+        );
+        assert_eq!(r["isError"], true);
+        assert!(f.calls.lock().unwrap().is_empty());
+        let r = call(&mut st, "answer", json!({"session":"mac/abc","option":"2"}));
+        assert_eq!(r["isError"], false);
+        let r = call(&mut st, "answer", json!({"session":"mac/abc","text":"yes"}));
+        assert_eq!(r["isError"], false);
+        assert_eq!(f.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn required_strings_must_not_be_empty() {
+        let (mut st, f) = with(Ok(json!("ok")));
+        let r = call(&mut st, "send", json!({"session":"","text":"hola"}));
+        assert_eq!(r["isError"], true);
+        assert!(
+            r["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("`session`")
+        );
+        let r = call(&mut st, "alert", json!({"text":"  "}));
+        assert_eq!(r["isError"], true);
+        assert!(f.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn numbers_must_not_be_negative() {
+        let (mut st, f) = with(Ok(json!("ok")));
+        let r = call(&mut st, "read", json!({"session":"mac/abc","last":-1}));
+        assert_eq!(r["isError"], true);
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("`last`"));
+        let r = call(
+            &mut st,
+            "send",
+            json!({"session":"mac/abc","text":"x","wait":true,"timeout_s":-5}),
+        );
+        assert_eq!(r["isError"], true);
+        assert!(f.calls.lock().unwrap().is_empty());
+        let r = call(
+            &mut st,
+            "read",
+            json!({"session":"mac/abc","last":0,"timeout_s":0}),
+        );
+        assert_eq!(r["isError"], false);
+    }
+
+    #[test]
+    fn nido_session_must_look_like_an_id() {
+        assert_eq!(
+            session_from(Some("abc12345".into())).as_deref(),
+            Some("abc12345")
+        );
+        assert_eq!(
+            session_from(Some("a-b_C9".into())).as_deref(),
+            Some("a-b_C9")
+        );
+        for bad in ["", " ", "ab c", "ab/c", "abc\r\nX-Evil: 1", "ñandú"] {
+            assert_eq!(session_from(Some(bad.into())), None, "{bad:?}");
+        }
+        assert_eq!(session_from(None), None);
+    }
+
+    /// Un servidor de una sola petición: devuelve lo que le llegó, y contesta `reply`.
+    fn one_shot(reply: &'static str) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
+        use std::io::Read;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Hasta tener las cabeceras y el cuerpo entero (Content-Length).
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .map_or(0, |v| v.trim().parse().unwrap());
+                    if body.len() >= len {
+                        break;
+                    }
+                }
+                assert!(n > 0, "petición cortada");
+            }
+            s.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8(raw).unwrap()
+        });
+        (addr, h)
+    }
+
+    fn local(addr: std::net::SocketAddr) -> LocalApi {
+        LocalApi {
+            client: client::Api {
+                addr,
+                token: Some("t0k3n".into()),
+            },
+            session: "abc12345".into(),
+        }
+    }
+
+    #[test]
+    fn local_api_posts_the_tool_with_token_and_session() {
+        let body = r#"{"delivered":true}"#;
+        let reply: &'static str = Box::leak(
+            format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (addr, h) = one_shot(reply);
+        let args = json!({"session":"mac/abc","text":"hola"});
+        let r = local(addr).call("send", args.clone());
+        assert_eq!(r, Ok(json!({"delivered": true})));
+        let req = h.join().unwrap();
+        let (head, sent) = req.split_once("\r\n\r\n").unwrap();
+        let lines: Vec<&str> = head.lines().collect();
+        assert_eq!(lines[0], "POST /api/v1/mcp/send HTTP/1.0");
+        assert!(lines.contains(&"Authorization: Bearer t0k3n"), "{head}");
+        assert!(lines.contains(&"X-Nido-Session: abc12345"), "{head}");
+        assert!(lines.contains(&"Content-Type: application/json"), "{head}");
+        assert!(!head.contains("Accept-Language"), "{head}");
+        assert_eq!(serde_json::from_str::<Value>(sent).unwrap(), args);
+    }
+
+    #[test]
+    fn local_api_errors_are_the_server_message_or_english() {
+        let (addr, h) = one_shot(
+            "HTTP/1.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"no such session\"}",
+        );
+        assert_eq!(
+            local(addr).call("close", json!({"session":"mac/x"})),
+            Err("no such session".to_owned())
+        );
+        h.join().unwrap();
+        let (addr, h) = one_shot("HTTP/1.0 500 Internal Server Error\r\n\r\n");
+        assert_eq!(
+            local(addr).call("sessions", json!({})),
+            Err("nido serve answered 500".to_owned())
+        );
+        h.join().unwrap();
+        // Nadie escuchando: el puerto de un listener ya cerrado.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let e = local(addr).call("sessions", json!({})).unwrap_err();
+        assert!(
+            e.starts_with(&format!("nido serve is not answering on {addr}")),
+            "{e}"
+        );
+    }
+
+    /// Una API que se queda en la llamada hasta que el canal la suelta.
+    struct Blocked(Mutex<std::sync::mpsc::Receiver<()>>);
+
+    impl Api for Blocked {
+        fn call(&self, _: &str, _: Value) -> Result<Value, String> {
+            self.0.lock().unwrap().recv().unwrap();
+            Ok(json!("done"))
+        }
+    }
+
+    fn blocked() -> (State, std::sync::mpsc::Sender<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let st = State {
+            session: Some("abc12345".into()),
+            api: Arc::new(Blocked(Mutex::new(rx))),
+        };
+        (st, tx)
+    }
+
+    type Sent = Arc<Mutex<Vec<Value>>>;
+
+    fn sink() -> (Sent, impl Fn(&Value) + Clone + Send + 'static) {
+        let sent: Sent = Arc::default();
+        let s = sent.clone();
+        (sent, move |v: &Value| s.lock().unwrap().push(v.clone()))
+    }
+
+    fn ids(sent: &Sent) -> Vec<Value> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].clone())
+            .collect()
+    }
+
+    const SLOW: &str =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sessions"}}"#;
+
+    #[test]
+    fn ping_is_answered_while_a_call_waits_and_the_call_answers_later() {
+        let (mut st, tx) = blocked();
+        let calls = Calls::default();
+        let (sent, emit) = sink();
+        let worker = dispatch(
+            &mut st,
+            serde_json::from_str(SLOW).unwrap(),
+            &calls,
+            emit.clone(),
+        );
+        assert!(worker.is_some());
+        let none = dispatch(
+            &mut st,
+            json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+            &calls,
+            emit.clone(),
+        );
+        assert!(none.is_none());
+        assert_eq!(ids(&sent), [json!(2)]);
+        tx.send(()).unwrap();
+        worker.unwrap().join().unwrap();
+        assert_eq!(ids(&sent), [json!(2), json!(1)]);
+        assert_eq!(
+            sent.lock().unwrap()[1]["result"]["content"][0]["text"],
+            "done"
+        );
+        assert!(calls.lock().unwrap().inflight.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_call_answers_nothing() {
+        let (mut st, tx) = blocked();
+        let calls = Calls::default();
+        let (sent, emit) = sink();
+        let worker = dispatch(
+            &mut st,
+            serde_json::from_str(SLOW).unwrap(),
+            &calls,
+            emit.clone(),
+        )
+        .unwrap();
+        let cancel = json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":1,"reason":"user"}});
+        dispatch(&mut st, cancel, &calls, emit.clone());
+        tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(sent.lock().unwrap().is_empty());
+        let c = calls.lock().unwrap();
+        assert!(c.inflight.is_empty() && c.cancelled.is_empty());
+    }
+
+    #[test]
+    fn cancelling_what_is_not_running_is_not_remembered() {
+        let (mut st, _tx) = blocked();
+        let calls = Calls::default();
+        let (sent, emit) = sink();
+        let cancel = json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":7}});
+        dispatch(&mut st, cancel, &calls, emit);
+        assert!(calls.lock().unwrap().cancelled.is_empty());
+        assert!(sent.lock().unwrap().is_empty());
     }
 }
