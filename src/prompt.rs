@@ -1306,6 +1306,7 @@ pub fn waiting_for_limit(screen: &str) -> bool {
 /// La pantalla de aviso de `--dangerously-load-development-channels`: los channels que lista.
 /// Solo si está la opción «I am using this for local development» (la que nido acepta).
 pub fn dev_channels(screen: &str) -> Option<Vec<String>> {
+    let screen = strip_sgr(screen);
     if !screen.contains("Loading development channels")
         || !screen.contains("I am using this for local development")
     {
@@ -1698,6 +1699,22 @@ mod tests {
             Some(vec!["server:nido".into(), "server:otro".into()])
         );
         assert_eq!(dev_channels("❯ Try \"fix lint errors\""), None);
+        // La pantalla llega con colores.
+        let c = s
+            .replace(
+                "WARNING: Loading development channels",
+                "\x1b[1mWARNING: Loading development channels\x1b[0m",
+            )
+            .replace(
+                "Channels: server:nido",
+                "\x1b[38;5;214mChannels:\x1b[39m \x1b[1mserver:nido\x1b[0m",
+            )
+            .replace(
+                "❯ 1. I am using this for local development",
+                "\x1b[38;5;214m❯ 1. I am using this for local development\x1b[39m",
+            );
+        assert_ne!(c, s);
+        assert_eq!(dev_channels(&c), Some(vec!["server:nido".to_string()]));
     }
 
     #[test]
