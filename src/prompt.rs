@@ -1068,7 +1068,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Screen<R, W> {
         }
     }
 
-    async fn keys(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) async fn keys(&mut self, bytes: &[u8]) -> Result<(), String> {
         proto::write_frame(&mut self.wr, &Frame::Input(bytes.to_vec()))
             .await
             .map_err(|_| "la sesión se ha cerrado".into())
@@ -1316,6 +1316,30 @@ pub fn dev_channels(screen: &str) -> Option<Vec<String>> {
         .lines()
         .find_map(|l| l.trim().strip_prefix("Channels:"))?;
     Some(line.split_whitespace().map(str::to_owned).collect())
+}
+
+/// Lo que hay que hacer con la pantalla de una sesión de Claude recién lanzada con el channel
+/// de nido.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Startup {
+    /// El aviso de los channels de desarrollo, solo con el de nido: se acepta (Enter).
+    Accept,
+    /// El aviso, con otra lista de channels: no se toca (que conteste el usuario).
+    Foreign(Vec<String>),
+    /// Claude no tiene el servidor `nido` («no MCP server configured with that name»): la
+    /// sesión no tiene channel.
+    NoServer,
+    /// Nada de eso (aún, o la pregunta de confiar en la carpeta, que es del usuario).
+    Nothing,
+}
+
+pub fn startup(screen: &str) -> Startup {
+    match dev_channels(screen) {
+        Some(list) if list == ["server:nido"] => Startup::Accept,
+        Some(list) => Startup::Foreign(list),
+        None if strip_sgr(screen).contains("no MCP server configured") => Startup::NoServer,
+        None => Startup::Nothing,
+    }
 }
 
 /// Tras cambiar de cuenta: si la sesión se quedó parada por el límite (`stopped`, según su
@@ -1715,6 +1739,44 @@ mod tests {
             );
         assert_ne!(c, s);
         assert_eq!(dev_channels(&c), Some(vec!["server:nido".to_string()]));
+    }
+
+    #[test]
+    fn what_to_do_with_the_startup_screen() {
+        let aviso = include_str!("../tests/pantallas/aviso_channels.txt");
+        assert_eq!(startup(aviso), Startup::Accept);
+        assert_eq!(
+            startup(include_str!("../tests/pantallas/aviso_channels_otro.txt")),
+            Startup::Foreign(vec!["server:nido".into(), "server:otro".into()])
+        );
+        // Solo el channel de nido, y ninguno más.
+        assert_eq!(
+            startup(&aviso.replace("server:nido", "server:otro")),
+            Startup::Foreign(vec!["server:otro".into()])
+        );
+        assert_eq!(
+            startup(&aviso.replace("Channels: server:nido", "Channels:")),
+            Startup::Foreign(vec![])
+        );
+        let sin = include_str!("../tests/pantallas/channels_sin_servidor.txt");
+        assert_eq!(startup(sin), Startup::NoServer);
+        assert_eq!(
+            startup(&sin.replace(
+                "no MCP server configured",
+                "\x1b[33mno MCP server configured\x1b[39m"
+            )),
+            Startup::NoServer
+        );
+        // La de confiar en la carpeta la contesta el usuario: se sigue esperando.
+        assert_eq!(
+            startup(include_str!("../tests/pantallas/confianza.txt")),
+            Startup::Nothing
+        );
+        assert_eq!(
+            startup(include_str!("../tests/pantallas/normal.txt")),
+            Startup::Nothing
+        );
+        assert_eq!(startup(""), Startup::Nothing);
     }
 
     #[test]

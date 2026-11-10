@@ -108,9 +108,12 @@ enum Cmd {
     /// (Interno) el guardián de una sesión.
     #[command(hide = true)]
     Holder { id: String },
-    /// (Interno) el servidor MCP de una sesión de Claude: lo lanza Claude Code.
-    #[command(hide = true)]
-    Mcp,
+    /// El MCP de nido en las sesiones de Claude: `on` u `off` (sin más, el servidor por stdio,
+    /// que lanza Claude Code).
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpCmd>,
+    },
     /// Lista las sesiones.
     Ls,
     /// Las alertas de las sesiones que aún no has visto.
@@ -193,6 +196,14 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Las próximas sesiones de Claude, con el MCP de nido (lo normal).
+    On,
+    /// Las próximas sesiones de Claude, sin él.
+    Off,
+}
+
 #[cfg(windows)]
 #[derive(Subcommand)]
 enum ServiceCmd {
@@ -250,6 +261,10 @@ fn main() -> ExitCode {
             no_restore,
         } => serve(paths, bind, no_auth, no_restore),
         Cmd::Holder { id } => run_holder(paths, &id),
+        Cmd::Mcp { action: Some(a) } => match mcp_switch(&paths, a) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(e),
+        },
         #[cfg(windows)]
         Cmd::Service { action } => match windows_service(action) {
             Ok(()) => ExitCode::SUCCESS,
@@ -319,6 +334,8 @@ async fn serve(paths: Paths, bind: Vec<SocketAddr>, no_auth: bool, no_restore: b
         state.restore().await;
     }
     server::spawn_scanner(state.clone());
+    // Que Claude tenga `nido mcp` (sin esperar: `claude mcp …` tarda unos segundos).
+    tokio::spawn(server::register_mcp(state.clone()));
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut servers = Vec::new();
@@ -928,10 +945,28 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             }
         }
         Cmd::Attach { name } => return attach_cmd(api, paths, name),
-        Cmd::Mcp => nido::mcp::run(api.clone()),
-        Cmd::Serve { .. } | Cmd::Holder { .. } => unreachable!(),
+        Cmd::Mcp { action: None } => nido::mcp::run(api.clone()),
+        Cmd::Serve { .. } | Cmd::Holder { .. } | Cmd::Mcp { .. } => unreachable!(),
         #[cfg(windows)]
         Cmd::Service { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+/// `nido mcp on|off`: crea o borra `<config>/mcp-off`. Vale para las sesiones que arranquen luego.
+fn mcp_switch(paths: &Paths, action: McpCmd) -> io::Result<()> {
+    let on = matches!(action, McpCmd::On);
+    launch::set_mcp(paths, on)?;
+    if on {
+        println!(
+            "MCP de nido encendido: las próximas sesiones de Claude lo tendrán (nido lo registra \
+             en Claude al arrancar `nido serve`)."
+        );
+    } else {
+        println!(
+            "MCP de nido apagado: las próximas sesiones de Claude arrancarán sin él (las que ya \
+             están en marcha siguen igual)."
+        );
     }
     Ok(())
 }

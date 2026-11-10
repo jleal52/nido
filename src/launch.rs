@@ -129,12 +129,17 @@ fn passthrough_env() -> Vec<(String, String)> {
     .collect()
 }
 
+/// El ejecutable de nido. `NIDO_EXE`: en las pruebas, el binario de nido (`current_exe` sería el
+/// del test).
+pub fn nido_exe() -> io::Result<PathBuf> {
+    match std::env::var_os("NIDO_EXE") {
+        Some(p) => Ok(PathBuf::from(p)),
+        None => std::env::current_exe(),
+    }
+}
+
 pub fn start(paths: &Paths, launcher: Launcher, id: &str) -> io::Result<()> {
-    // NIDO_EXE: en las pruebas, el binario de nido (current_exe sería el del test).
-    let exe = match std::env::var_os("NIDO_EXE") {
-        Some(p) => PathBuf::from(p),
-        None => std::env::current_exe()?,
-    };
+    let exe = nido_exe()?;
     match launcher {
         Launcher::Systemd => {
             let mut cmd = Command::new("systemd-run");
@@ -294,8 +299,33 @@ pub fn login_shell_wrap(argv: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Si existe, las sesiones de Claude de este equipo se lanzan sin el MCP de nido (`nido mcp off`).
+pub fn mcp_off_file(paths: &Paths) -> PathBuf {
+    paths.config.join("mcp-off")
+}
+
+/// ¿Se lanzan las sesiones de Claude con el MCP de nido? Sí, salvo `nido mcp off`.
+pub fn mcp_on(paths: &Paths) -> bool {
+    !mcp_off_file(paths).exists()
+}
+
+/// `nido mcp on|off`: para las sesiones que arranquen a partir de ahora.
+pub fn set_mcp(paths: &Paths, on: bool) -> io::Result<()> {
+    let file = mcp_off_file(paths);
+    if on {
+        match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    } else {
+        std::fs::create_dir_all(&paths.config)?;
+        std::fs::write(&file, "")
+    }
+}
+
 /// La configuración con la que arranca el guardián de esta sesión: la orden tal cual, o, si
 /// dentro hay un Claude con conversación, retomarla (directamente o escribiéndolo en la shell).
+/// Si la orden es `claude` y el MCP está encendido, con el channel de nido (`channel`).
 pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> HolderConfig {
     let mut argv = session.argv.clone();
     let mut env = session.env.clone();
@@ -317,10 +347,17 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
             }
         }
     }
+    // Un Claude escrito en una shell va sin él: `NIDO_CHANNEL` se quedaría en la shell, y otro
+    // `claude` lanzado luego en ella recogería la bandeja sin channel.
+    let channel = claude::is_claude(&argv) && mcp_on(paths);
+    if channel {
+        argv = claude::with_nido_mcp(&argv, true);
+    }
     HolderConfig {
         id: session.id.clone(),
         cwd: session.cwd.clone(),
         argv: login_shell_wrap(argv),
+        channel,
         env,
         socket: paths.socket(&session.id),
         history_file: Some(paths.history(&session.id)),
@@ -380,7 +417,7 @@ mod tests {
         let s = claude_session(false);
         let cfg = holder_config(&p, &s, 80, 24);
         assert!(
-            cfg.argv.ends_with(&s.argv),
+            cfg.argv.ends_with(&claude::with_nido_mcp(&s.argv, true)),
             "sin transcripción: se lanza nuevo: {:?}",
             cfg.argv
         );
@@ -389,15 +426,70 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("sid-1.jsonl"), "{}").unwrap();
         let cfg = holder_config(&p, &s, 80, 24);
+        let resume = ["claude".to_string(), "--resume".into(), "sid-1".into()];
         assert!(
+            cfg.argv.ends_with(&claude::with_nido_mcp(&resume, true)),
+            "{:?}",
             cfg.argv
-                .ends_with(&["claude".to_string(), "--resume".into(), "sid-1".into()])
         );
         // En Windows no hay shell de login: la orden va tal cual.
         if cfg!(unix) {
             assert_eq!(cfg.argv[1..4], ["-lic", "exec \"$@\"", "nido"]);
         }
         assert!(cfg.initial_input.is_none());
+    }
+
+    #[test]
+    fn claude_sessions_launch_with_the_nido_mcp_unless_it_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let flags = [
+            "--dangerously-load-development-channels",
+            "server:nido",
+            "--allowedTools",
+            "mcp__nido__*",
+        ];
+        let mut s = claude_session(false);
+        let cfg = holder_config(&p, &s, 80, 24);
+        let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
+        assert_eq!(cfg.argv[at + 1..at + 5], flags, "{:?}", cfg.argv);
+        assert_eq!(cfg.argv[at + 5], "--session-id");
+        assert!(cfg.channel);
+        // Al retomarla, una vez (aunque la orden guardada ya las tuviera).
+        s.argv = claude::with_nido_mcp(&s.argv, true);
+        s.argv.extend(["--model".to_owned(), "haiku".to_owned()]);
+        let proj = p.home.join(".claude/projects/-w");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("sid-1.jsonl"), "{}").unwrap();
+        let cfg = holder_config(&p, &s, 80, 24);
+        let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
+        let mut want = vec!["claude"];
+        want.extend(flags);
+        want.extend(["--resume", "sid-1", "--model", "haiku"]);
+        assert_eq!(cfg.argv[at..], want);
+        assert!(cfg.channel);
+
+        // Apagado: tal cual, y sin channel.
+        assert!(mcp_on(&p));
+        set_mcp(&p, false).unwrap();
+        assert!(!mcp_on(&p));
+        let cfg = holder_config(&p, &claude_session(false), 80, 24);
+        assert!(
+            cfg.argv
+                .ends_with(&["claude".to_string(), "--resume".into(), "sid-1".into()]),
+            "{:?}",
+            cfg.argv
+        );
+        assert!(!cfg.channel);
+        set_mcp(&p, true).unwrap();
+        assert!(mcp_on(&p));
+        // Dos veces seguidas, sin error.
+        set_mcp(&p, true).unwrap();
+
+        // Una shell no lleva channel: el Claude que se escriba en ella va sin las opciones.
+        let cfg = holder_config(&p, &claude_session(true), 80, 24);
+        assert!(!cfg.channel);
+        assert!(cfg.argv.ends_with(&["bash".to_string()]));
     }
 
     #[test]

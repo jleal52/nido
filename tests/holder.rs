@@ -109,6 +109,7 @@ fn config(dir: &Path) -> HolderConfig {
         cols: 80,
         rows: 24,
         initial_input: None,
+        channel: false,
     }
 }
 
@@ -217,18 +218,29 @@ async fn claude_code_session_marks_do_not_reach_the_session() {
         std::env::set_var("CLAUDECODE", "1");
         std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
         std::env::set_var("CLAUDE_CONFIG_DIR", "/perfil/de/prueba");
+        // Y el channel de nido solo lo tiene la sesión que se lanzó con él.
+        std::env::set_var("NIDO_CHANNEL", "1");
     }
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = config(dir.path());
-    let socket = cfg.socket.clone();
-    let holder = tokio::spawn(holder::run(cfg));
+    for channel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HolderConfig {
+            channel,
+            ..config(dir.path())
+        };
+        let socket = cfg.socket.clone();
+        let holder = tokio::spawn(holder::run(cfg));
 
-    let (mut a, _) = Client::connect(&socket, Role::Driver, 80, 24).await;
-    a.type_line(r#"echo "marcas=${CLAUDECODE-no},${CLAUDE_CODE_CHILD_SESSION-no} perfil=$CLAUDE_CONFIG_DIR""#)
+        let (mut a, _) = Client::connect(&socket, Role::Driver, 80, 24).await;
+        a.type_line(r#"echo "marcas=${CLAUDECODE-no},${CLAUDE_CODE_CHILD_SESSION-no} perfil=$CLAUDE_CONFIG_DIR canal=${NIDO_CHANNEL-no}""#)
+            .await;
+        let canal = if channel { "1" } else { "no" };
+        a.wait_for(&format!(
+            "marcas=no,no perfil=/perfil/de/prueba canal={canal}"
+        ))
         .await;
-    a.wait_for("marcas=no,no perfil=/perfil/de/prueba").await;
 
-    a.type_line("exit 0").await;
-    assert_eq!(a.wait_exit().await, Some(0));
-    assert_eq!(holder.await.unwrap().unwrap(), Some(0));
+        a.type_line("exit 0").await;
+        assert_eq!(a.wait_exit().await, Some(0));
+        assert_eq!(holder.await.unwrap().unwrap(), Some(0));
+    }
 }

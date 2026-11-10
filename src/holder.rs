@@ -30,6 +30,9 @@ pub struct HolderConfig {
     /// Lo que se escribe en el terminal nada más arrancar (p. ej. `claude --resume …` en una
     /// shell al restaurar).
     pub initial_input: Option<Vec<u8>>,
+    /// Es un Claude lanzado con el channel de nido: `NIDO_CHANNEL=1`, y su `nido mcp` recoge la
+    /// bandeja. Sin él, aunque el gestor lo tuviera, la sesión no lo hereda.
+    pub channel: bool,
 }
 
 /// Lo que se difunde a los clientes conectados.
@@ -188,6 +191,11 @@ pub async fn run(cfg: HolderConfig) -> io::Result<Option<i32>> {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("NIDO_SESSION", &cfg.id);
+    if cfg.channel {
+        cmd.env("NIDO_CHANNEL", "1");
+    } else {
+        cmd.env_remove("NIDO_CHANNEL");
+    }
     for (k, v) in &cfg.env {
         cmd.env(k, v);
     }

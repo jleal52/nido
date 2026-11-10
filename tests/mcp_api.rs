@@ -517,7 +517,19 @@ async fn mcp_api_end_to_end() {
         .collect();
     let from = args.iter().position(|a| a == "claude").expect("claude");
     let argv = &args[from..];
-    assert_eq!(&argv[..2], ["claude", "--session-id"]);
+    // Con el MCP de nido delante de las opciones: tras `mcp__nido__*` viene una opción y el
+    // mensaje no se toma por otra herramienta permitida.
+    assert_eq!(
+        &argv[..6],
+        [
+            "claude",
+            "--dangerously-load-development-channels",
+            "server:nido",
+            "--allowedTools",
+            "mcp__nido__*",
+            "--session-id"
+        ]
+    );
     assert!(argv.windows(2).any(|w| w == ["-n", "work"]), "{argv:?}");
     assert!(
         argv.windows(2).any(|w| w == ["--model", "haiku"]),

@@ -181,6 +181,7 @@ mod tests {
             cols: 80,
             rows: 24,
             initial_input: None,
+            channel: false,
         };
         let holder = tokio::spawn(holder::run(cfg));
         for _ in 0..100 {

@@ -2,9 +2,9 @@
 //!
 //! Claude Code lo lanza dentro de cada sesión de nido (que pone `NIDO_SESSION`). Se declara
 //! channel de Claude Code, para meter en la sesión los mensajes de otras, y da las herramientas,
-//! que pasa tal cual a la API local de `nido serve` (`POST /api/v1/mcp/<herramienta>`). Un hilo
-//! recoge la bandeja de la sesión (`GET /api/v1/mcp/inbox`) y mete cada mensaje como evento del
-//! channel.
+//! que pasa tal cual a la API local de `nido serve` (`POST /api/v1/mcp/<herramienta>`). Si nido
+//! lanzó Claude con el channel (`NIDO_CHANNEL=1`), un hilo recoge la bandeja de la sesión (`GET
+//! /api/v1/mcp/inbox`) y mete cada mensaje como evento del channel.
 //!
 //! JSON-RPC 2.0 por líneas. `handle` es pura (mensaje → lo que hay que escribir) y `run` la
 //! conecta con stdin y stdout.
@@ -43,6 +43,9 @@ pub trait Mailbox: Send + Sync {
 pub struct State {
     /// La sesión de nido en la que corre (`NIDO_SESSION`); sin ella, ni herramientas ni channel.
     pub session: Option<String>,
+    /// Claude se lanzó con el channel de nido (`NIDO_CHANNEL=1`): se recoge la bandeja. Si no,
+    /// solo las herramientas.
+    pub channel: bool,
     /// Compartida: las llamadas a herramientas van cada una en su hilo.
     pub api: Arc<dyn Api>,
 }
@@ -668,10 +671,19 @@ pub fn inbox_loop(
     }
 }
 
+/// ¿Lanzó nido este Claude con su channel? (`NIDO_CHANNEL=1`.) Registrado `nido mcp` en Claude,
+/// cualquier `claude` lo arranca, también sin el channel (apagado, sesiones de antes, el aviso
+/// sin aceptar): si ese recogiera la bandeja, la sesión parecería tener channel y Claude tiraría
+/// los mensajes.
+pub fn channel_from(v: Option<String>) -> bool {
+    v.as_deref() == Some("1")
+}
+
 /// ¿Hay que empezar a recoger la bandeja? Cuando Claude Code acaba de saludar
-/// (`notifications/initialized`), y solo dentro de nido.
+/// (`notifications/initialized`), solo dentro de nido y con el channel.
 pub fn starts_inbox(st: &State, msg: &Value) -> bool {
     st.session.is_some()
+        && st.channel
         && msg.get("id").is_none()
         && msg.get("method").and_then(Value::as_str) == Some("notifications/initialized")
 }
@@ -685,6 +697,7 @@ pub fn run(api: client::Api) -> ! {
     });
     let mut st = State {
         session,
+        channel: channel_from(std::env::var("NIDO_CHANNEL").ok()),
         api: local.clone(),
     };
     let calls = Calls::default();
@@ -751,6 +764,7 @@ mod tests {
         fn for_tests(session: Option<&str>) -> State {
             State {
                 session: session.map(str::to_owned),
+                channel: true,
                 api: fake(Ok(json!({}))),
             }
         }
@@ -760,6 +774,7 @@ mod tests {
         let f = fake(reply);
         let st = State {
             session: Some("abc12345".into()),
+            channel: true,
             api: f.clone(),
         };
         (st, f)
@@ -1198,6 +1213,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let st = State {
             session: Some("abc12345".into()),
+            channel: true,
             api: Arc::new(Blocked(Mutex::new(rx))),
         };
         (st, tx)
@@ -1490,6 +1506,22 @@ mod tests {
         let init = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
         assert!(starts_inbox(&inside, &init));
         assert!(!starts_inbox(&outside, &init));
+        // Un Claude lanzado sin el channel (sin `NIDO_CHANNEL=1`): herramientas sí, bandeja no.
+        // Si la recogiera, la sesión parecería tener channel y los mensajes se perderían.
+        let no_channel = State {
+            channel: false,
+            ..State::for_tests(Some("abc12345"))
+        };
+        assert!(!starts_inbox(&no_channel, &init));
+        assert!(channel_from(Some("1".into())));
+        for v in [
+            None,
+            Some(String::new()),
+            Some("0".into()),
+            Some("sí".into()),
+        ] {
+            assert!(!channel_from(v.clone()), "{v:?}");
+        }
         assert!(!starts_inbox(
             &inside,
             &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})

@@ -81,6 +81,10 @@ pub struct AppState {
     /// Cómo se llega a otro equipo del grupo: sin nada, por el hub (`peer_member`); en las
     /// pruebas, lo que se ponga con `set_peer_link`.
     peer_link: std::sync::OnceLock<PeerLink>,
+    /// Las sesiones que se acaban de arrancar, para mirar su pantalla de arranque (ver
+    /// `spawn_startup_watch`).
+    launched: tokio::sync::mpsc::UnboundedSender<String>,
+    launched_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
 }
 
 /// Otra forma de llegar a los demás equipos del grupo (en vez del hub), para las pruebas: recibe
@@ -319,6 +323,7 @@ impl AppState {
         let uploads = paths.state.join("uploads");
         let hub = hub::Hub::new(paths.config.join("hub.json"));
         let (alerts, alerts_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (launched, launched_rx) = tokio::sync::mpsc::unbounded_channel();
         let paths_config_pair = paths.config.join("pair-demo.json");
         let inbox = crate::inbox::Inbox::load(paths.state.join("inbox.json"));
         let identity = e2e::Identity::load_or_create(&paths.config.join("hub.key"))
@@ -367,6 +372,8 @@ impl AppState {
             mcp_parents: Default::default(),
             quiet: Default::default(),
             peer_link: Default::default(),
+            launched,
+            launched_rx: std::sync::Mutex::new(Some(launched_rx)),
         }))
     }
 
@@ -493,12 +500,166 @@ impl AppState {
         }
         let sessions: Vec<Session> = self.registry.lock().await.sessions().to_vec();
         for s in sessions.iter().filter(|s| s.autostart) {
-            if !launch::is_alive(&self.paths, &s.id)
-                && let Err(e) = launch::start(&self.paths, self.launcher, &s.id)
-            {
-                eprintln!("nido: no se pudo restaurar {}: {e}", s.name);
+            if !launch::is_alive(&self.paths, &s.id) {
+                match launch::start(&self.paths, self.launcher, &s.id) {
+                    Ok(()) => self.launched(&s.id),
+                    Err(e) => eprintln!("nido: no se pudo restaurar {}: {e}", s.name),
+                }
             }
         }
+    }
+
+    /// Se acaba de arrancar la sesión `id`: si es un Claude con el channel de nido, que se mire
+    /// su pantalla de arranque.
+    pub(crate) fn launched(&self, id: &str) {
+        let _ = self.launched.send(id.to_owned());
+    }
+}
+
+/// Al arrancar `nido serve`, con el MCP encendido: que Claude tenga `nido mcp` en su
+/// configuración de usuario, en `~/.claude` y en cada perfil (`CLAUDE_CONFIG_DIR`) que usen las
+/// sesiones (ver `claude::ensure_mcp_registered`). Sin `claude` en este equipo, nada. Los fallos
+/// se dicen una vez y no paran nada.
+pub async fn register_mcp(st: Arc<AppState>) {
+    if !launch::mcp_on(&st.paths) {
+        return;
+    }
+    let path = std::env::var_os("PATH");
+    let Some(program) = claude::find_program(path.as_deref(), &st.paths.home) else {
+        return;
+    };
+    let nido = match launch::nido_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("nido: no se pudo registrar el MCP en Claude: sin la ruta de nido ({e})");
+            return;
+        }
+    };
+    let dirs = {
+        let reg = st.registry.lock().await;
+        claude::config_dirs(
+            reg.sessions().iter().filter_map(|s| s.claude.as_ref()),
+            &st.paths.home,
+        )
+    };
+    let cli = claude::Program {
+        path: program,
+        home: None,
+    };
+    let done =
+        tokio::task::spawn_blocking(move || claude::ensure_mcp_registered(&cli, &nido, &dirs))
+            .await
+            .unwrap_or_default();
+    for (dir, r) in done {
+        let profile = dir.map_or_else(|| "~/.claude".to_owned(), |d| d.display().to_string());
+        match r {
+            claude::Registration::Already => {}
+            claude::Registration::Added => {
+                eprintln!("nido: MCP de nido registrado en Claude ({profile})")
+            }
+            claude::Registration::Replaced => {
+                eprintln!(
+                    "nido: MCP de nido registrado de nuevo en Claude ({profile}): apuntaba a otro nido"
+                )
+            }
+            claude::Registration::Failed(e) => {
+                eprintln!("nido: no se pudo registrar el MCP de nido en Claude ({profile}): {e}")
+            }
+        }
+    }
+}
+
+/// Cuánto se mira la pantalla de un Claude recién lanzado con el channel de nido.
+pub const STARTUP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Mira la pantalla de cada Claude que se lanza con el channel de nido (ver `watch_startup`).
+pub fn spawn_startup_watch(state: Arc<AppState>) {
+    let Some(mut rx) = state.launched_rx.lock().expect("arranques").take() else {
+        return;
+    };
+    tokio::spawn(async move {
+        while let Some(id) = rx.recv().await {
+            let Some(s) = state.registry.lock().await.get(&id).cloned() else {
+                continue;
+            };
+            if !launch::holder_config(&state.paths, &s, 80, 24).channel {
+                continue;
+            }
+            let st = state.clone();
+            tokio::spawn(async move { watch_startup(&st, &id, STARTUP_WINDOW).await });
+        }
+    });
+}
+
+/// La pantalla de arranque de un Claude lanzado con el channel de nido, como visor y durante
+/// `window`. El aviso de los channels de desarrollo se acepta (un Enter) solo si lista
+/// exactamente `server:nido`; con otra lista no se toca. Si Claude dice que no tiene el servidor
+/// `nido`, la sesión queda sin channel. Lo demás (la pregunta de confiar en la carpeta) es del
+/// usuario: se sigue mirando. Devuelve en qué quedó: `Accept` si se aceptó, `Nothing` si no
+/// salió nada (o se cerró la sesión).
+pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt::Startup {
+    use prompt::Startup;
+    let deadline = tokio::time::Instant::now() + window;
+    let name = st
+        .registry
+        .lock()
+        .await
+        .get(id)
+        .map_or_else(|| id.to_owned(), |s| s.name.clone());
+    let mut scr = None;
+    let mut accepted = false;
+    while tokio::time::Instant::now() < deadline {
+        if scr.is_none() {
+            let hello = Hello {
+                role: Role::Viewer,
+                cols: 80,
+                rows: 24,
+            };
+            match holder_connect(st, id, hello).await {
+                Ok(stream) => {
+                    let (rd, wr) = crate::ipc::split(stream);
+                    scr = Some(prompt::Screen::new(rd, wr));
+                }
+                // Aún no atiende (al restaurar no se espera a que arranque).
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            }
+        }
+        let Some(s) = scr.as_mut() else { break };
+        let Ok(text) = s.screen().await else {
+            break;
+        };
+        match prompt::startup(&text) {
+            Startup::Accept if !accepted => {
+                let _one = st.answering.lock().await;
+                if s.keys(b"\r").await.is_err() {
+                    break;
+                }
+                accepted = true;
+                eprintln!("nido: {name}: aceptado el aviso del channel de nido");
+            }
+            Startup::Foreign(list) => {
+                eprintln!(
+                    "nido: {name}: el aviso de channels lista otros ({}); no se toca",
+                    list.join(" ")
+                );
+                return Startup::Foreign(list);
+            }
+            Startup::NoServer => {
+                st.inbox.refuse(id);
+                eprintln!("nido: {name}: Claude no tiene el MCP de nido; queda sin channel");
+                return Startup::NoServer;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    if accepted {
+        Startup::Accept
+    } else {
+        Startup::Nothing
     }
 }
 
@@ -1053,6 +1214,7 @@ fn spawn_background(state: Arc<AppState>) {
 pub fn spawn_scanner(state: Arc<AppState>) {
     spawn_group(state.clone());
     spawn_background(state.clone());
+    spawn_startup_watch(state.clone());
     // Los avisos al móvil, según los cambios que vea `scan`.
     if let Some(mut rx) = state.alerts_rx.lock().expect("avisos").take() {
         let st = state.clone();
@@ -1575,6 +1737,7 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
             );
         }
         wait_alive(&st, &created.id).await;
+        st.launched(&created.id);
     }
     st.refresh.notify_one();
     (StatusCode::CREATED, Json(created)).into_response()
@@ -1791,6 +1954,7 @@ async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
             return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
         wait_alive(&st, &s.id).await;
+        st.launched(&s.id);
     }
     remember_running(&st, &s.id, true).await;
     st.refresh.notify_one();
@@ -1820,6 +1984,7 @@ async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) ->
         return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     wait_alive(&st, &s.id).await;
+    st.launched(&s.id);
     remember_running(&st, &s.id, true).await;
     st.refresh.notify_one();
     Json(serde_json::json!({ "ok": true })).into_response()

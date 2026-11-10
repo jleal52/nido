@@ -2013,6 +2013,7 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         ));
     }
     server::wait_alive(st, &created.id).await;
+    st.launched(&created.id);
     st.refresh.notify_one();
     let Some(v) = view(st, &created.id).await else {
         return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
@@ -3485,6 +3486,29 @@ mod tests {
         );
         // Al retomarla se queda el modelo, y el mensaje no se repite.
         assert_eq!(claude::extra_args(&argv), ["--model", "haiku"]);
+        // Con el MCP de nido: `--allowedTools` y la lista de channels se leen como en Claude
+        // (commander: los valores siguen hasta la próxima opción), y el mensaje sigue siendo el
+        // mensaje, con o sin modelo.
+        fn values<'a>(argv: &'a [String], opt: &str) -> Vec<&'a str> {
+            let at = argv.iter().position(|a| a == opt).expect("la opción");
+            argv[at + 1..]
+                .iter()
+                .take_while(|a| !a.starts_with('-'))
+                .map(String::as_str)
+                .collect()
+        }
+        for model in [Some("haiku"), None] {
+            let plain = open_argv("web", "sid-1", model, &msg);
+            let with = claude::with_nido_mcp(&plain, true);
+            assert_eq!(values(&with, "--allowedTools"), ["mcp__nido__*"]);
+            assert_eq!(
+                values(&with, "--dangerously-load-development-channels"),
+                ["server:nido"]
+            );
+            assert_eq!(with.last(), Some(&msg));
+            assert_eq!(with.len(), plain.len() + 4, "{with:?}");
+            assert_eq!(claude::extra_args(&with), claude::extra_args(&plain));
+        }
         assert_eq!(
             open_argv("web", "s", None, "m"),
             ["claude", "--session-id", "s", "-n", "web", "m"]
