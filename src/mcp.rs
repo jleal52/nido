@@ -13,7 +13,7 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
@@ -35,7 +35,8 @@ pub trait Mailbox: Send + Sync {
     /// Lo que espera, del más antiguo al más nuevo; si no hay nada, `nido serve` espera hasta
     /// 25 s a que llegue algo.
     fn fetch(&self) -> Result<Vec<Value>, String>;
-    /// Ya está en la sesión: que no vuelva a salir.
+    /// Ya se metió en la sesión (con su id en el evento): `nido serve` no lo vuelve a dar
+    /// mientras no vea que hace falta (no aparece en la transcripción).
     fn ack(&self, ids: &[String]) -> Result<(), String>;
     /// La última petición a la bandeja dijo que no es para este `nido mcp` (no lo lanzó el
     /// Claude de la sesión): se vuelve a pedir, pero de tarde en tarde (`REFUSED_WAIT`).
@@ -97,7 +98,7 @@ impl Mailbox for LocalApi {
     }
 
     fn ack(&self, ids: &[String]) -> Result<(), String> {
-        let body = json!({ "ids": ids });
+        let body = json!({ "ids": ids, "tracked": true });
         self.inbox_request("POST", "/api/v1/mcp/inbox/ack", Some(&body), ACK_TIMEOUT)
             .map(drop)
     }
@@ -628,13 +629,54 @@ pub fn next_backoff(d: Duration) -> Duration {
 }
 
 /// Un mensaje de la bandeja como evento del channel: lo ve el modelo como `<channel
-/// source="nido" from=… from_id=… machine=…>texto</channel>`.
+/// source="nido" from=… from_id=… machine=… msg_id=…>texto</channel>`. Con su id: así queda en
+/// la transcripción, y `nido serve` sabe que entró.
 pub fn channel_event(msg: &Value) -> Value {
     let s = |k: &str| msg.get(k).and_then(Value::as_str).unwrap_or_default();
     json!({"jsonrpc": "2.0", "method": "notifications/claude/channel", "params": {
         "content": s("text"),
-        "meta": {"from": s("from"), "from_id": s("from_id"), "machine": s("machine")},
+        "meta": {"from": s("from"), "from_id": s("from_id"), "machine": s("machine"),
+            "msg_id": s("id")},
     }})
+}
+
+/// Cuánto se espera, tras el saludo de Claude Code (`notifications/initialized`, y `tools/list`
+/// si llega después), antes de meter el primer evento: justo después, a veces lo tira.
+pub const HANDSHAKE_SETTLE: Duration = Duration::from_secs(2);
+
+/// Hasta cuándo no se mete nada en la sesión (ver `HANDSHAKE_SETTLE`).
+#[derive(Default)]
+pub struct Settle(Mutex<Option<Instant>>);
+
+impl Settle {
+    /// Ha llegado `msg` (en `now`): si es del saludo, hasta `HANDSHAKE_SETTLE` después nada.
+    pub fn saw(&self, msg: &Value, now: Instant) {
+        let method = msg.get("method").and_then(Value::as_str);
+        if matches!(method, Some("notifications/initialized" | "tools/list")) {
+            let mut until = self.0.lock().unwrap();
+            let t = now + HANDSHAKE_SETTLE;
+            *until = Some(until.map_or(t, |u| u.max(t)));
+        }
+    }
+
+    /// Lo que falta, en `now`, para poder meter un evento.
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.0
+            .lock()
+            .unwrap()
+            .map_or(Duration::ZERO, |u| u.saturating_duration_since(now))
+    }
+
+    /// Espera a poder meter un evento.
+    pub fn wait(&self) {
+        loop {
+            let left = self.remaining(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            std::thread::sleep(left);
+        }
+    }
 }
 
 /// Cuántos ids de mensajes ya metidos en la sesión se recuerdan.
@@ -668,9 +710,10 @@ impl Seen {
 }
 
 /// Una vuelta de la bandeja: trae lo que espera, lo mete en la sesión con `emit` (que dice si
-/// pudo) y confirma lo que entró. Si `emit` falla o se pide parar, lo demás no se confirma y
-/// vuelve a salir (al menos una vez). Lo que ya entró en otra vuelta (en `seen`) solo se
-/// confirma. Devuelve cuántos entraron en esta.
+/// pudo) y dice lo que metió. Si `emit` falla o se pide parar, lo demás no se dice y vuelve a
+/// salir (al menos una vez). Lo que ya entró en otra vuelta (en `seen`, por su id y su intento)
+/// solo se dice; si `nido serve` lo vuelve a dar en otro intento (no lo vio en la
+/// transcripción), se mete otra vez. Devuelve cuántos entraron en esta.
 pub fn inbox_round(
     mb: &dyn Mailbox,
     emit: &dyn Fn(&Value) -> bool,
@@ -688,11 +731,12 @@ pub fn inbox_round(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        if !seen.contains(id) {
+        let key = format!("{id}#{}", m.get("try").and_then(Value::as_u64).unwrap_or(0));
+        if !seen.contains(&key) {
             if !emit(&channel_event(m)) {
                 break;
             }
-            seen.insert(id);
+            seen.insert(&key);
             emitted += 1;
         }
         done.push(id.to_owned());
@@ -760,6 +804,7 @@ pub fn run(api: client::Api) -> ! {
         api: local.clone(),
     };
     let calls = Calls::default();
+    let settle = Arc::new(Settle::default());
     let mut inbox: Option<std::thread::JoinHandle<()>> = None;
     let mut stdin = io::stdin().lock();
     let mut line = Vec::new();
@@ -770,11 +815,14 @@ pub fn run(api: client::Api) -> ! {
             Ok(_) => {}
         }
         if let Ok(msg) = serde_json::from_slice::<Value>(&line) {
+            settle.saw(&msg, Instant::now());
             if inbox.is_none() && starts_inbox(&st, &msg) {
                 let local = local.clone();
+                let settle = settle.clone();
                 // Se acaba con el proceso: `emit` sale si Claude Code cerró la tubería.
                 inbox = Some(std::thread::spawn(move || {
                     let emit_ok = |v: &Value| {
+                        settle.wait();
                         emit(v);
                         true
                     };
@@ -1424,10 +1472,12 @@ mod tests {
             [
                 json!({"jsonrpc":"2.0","method":"notifications/claude/channel","params":{
                     "content":"hola",
-                    "meta":{"from":"padre","from_id":"k123/padre1","machine":"Portatil"}}}),
+                    "meta":{"from":"padre","from_id":"k123/padre1","machine":"Portatil",
+                        "msg_id":"m1"}}}),
                 json!({"jsonrpc":"2.0","method":"notifications/claude/channel","params":{
                     "content":"¿qué tal?",
-                    "meta":{"from":"padre","from_id":"k123/padre1","machine":"Portatil"}}}),
+                    "meta":{"from":"padre","from_id":"k123/padre1","machine":"Portatil",
+                        "msg_id":"m2"}}}),
             ]
         );
         assert_eq!(*mb.acked.lock().unwrap(), [vec!["m1", "m2"]]);
@@ -1511,6 +1561,67 @@ mod tests {
             [vec!["m1", "m2"], vec!["m1", "m2", "m3"]]
         );
         assert!(mb.queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn another_try_is_emitted_again_by_the_same_mcp() {
+        // `nido serve` no lo vio en la transcripción y lo vuelve a dar (otro intento): se mete
+        // otra vez. El mismo intento (falló su confirmación), no.
+        let with_try = |n: u64| {
+            let mut m = inbox_msg("m1", "uno");
+            m["try"] = n.into();
+            m
+        };
+        let (sent, emit) = sink();
+        let emit_ok = |v: &Value| {
+            emit(v);
+            true
+        };
+        let stop = AtomicBool::new(false);
+        let mut seen = Seen::default();
+        for (n, emitted) in [(1, 1), (1, 0), (2, 1), (2, 0), (3, 1)] {
+            let mb = boxed(&[with_try(n)]);
+            assert_eq!(
+                inbox_round(&mb, &emit_ok, &stop, &mut seen),
+                Ok(emitted),
+                "{n}"
+            );
+            assert_eq!(*mb.acked.lock().unwrap(), [vec!["m1"]]);
+        }
+        assert_eq!(sent.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn nothing_gets_in_right_after_the_handshake() {
+        let t0 = Instant::now();
+        let s = Settle::default();
+        assert_eq!(
+            s.remaining(t0),
+            Duration::ZERO,
+            "sin saludo aún, no se espera"
+        );
+        s.saw(&json!({"jsonrpc":"2.0","id":0,"method":"initialize"}), t0);
+        assert_eq!(s.remaining(t0), Duration::ZERO);
+        s.saw(
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            t0,
+        );
+        assert_eq!(s.remaining(t0), HANDSHAKE_SETTLE);
+        // `tools/list` después: desde él.
+        let t1 = t0 + Duration::from_millis(500);
+        s.saw(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}), t1);
+        assert_eq!(s.remaining(t1), HANDSHAKE_SETTLE);
+        assert_eq!(
+            s.remaining(t0 + HANDSHAKE_SETTLE),
+            Duration::from_millis(500)
+        );
+        // Otra cosa no lo alarga, y pasado el rato ya no se espera.
+        s.saw(
+            &json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+            t1 + HANDSHAKE_SETTLE,
+        );
+        assert_eq!(s.remaining(t1 + HANDSHAKE_SETTLE), Duration::ZERO);
+        assert!(HANDSHAKE_SETTLE >= Duration::from_secs(2));
     }
 
     #[test]
@@ -1629,7 +1740,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Value>(body).unwrap(),
-            json!({"ids":["m1"]})
+            json!({"ids":["m1"], "tracked": true})
         );
         // Una respuesta sin `messages`: error.
         let (addr, h) = one_shot(http_ok("{}"));

@@ -478,7 +478,7 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
         s,
         json!({"state": "stopped", "taken": false, "replied": false})
     );
-    assert_eq!(mac.inbox.ack(&otra, std::slice::from_ref(&msg)), 1);
+    assert_eq!(mac.inbox.ack(&otra, std::slice::from_ref(&msg), true), 1);
     append(&transcript, &[user("¿qué tal?")]);
     assert_eq!(
         status(&msg).await.1,

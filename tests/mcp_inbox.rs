@@ -253,13 +253,15 @@ async fn mcp_inbox_end_to_end() {
     let m = &msgs[0];
     assert_eq!(
         m.as_object().unwrap().keys().collect::<Vec<_>>(),
-        ["at", "from", "from_id", "id", "machine", "text"]
+        ["at", "from", "from_id", "id", "machine", "text", "try"]
     );
     assert_eq!(m["text"], "uno");
     assert_eq!(m["from"], "padre");
     assert_eq!(m["from_id"], format!("Prueba/{padre}"));
     assert_eq!(m["machine"], "Prueba");
     assert!(m["at"].as_u64().unwrap() > 0);
+    // El primer intento (si no se ve en su transcripción, se vuelve a dar en otro).
+    assert_eq!(m["try"], 1);
     let first = id_of(m).to_owned();
 
     // Ya tiene channel: entregado, sin nota (es suya).
@@ -284,10 +286,11 @@ async fn mcp_inbox_end_to_end() {
     assert_eq!(texts(&msgs), ["uno", "dos"]);
     assert_eq!(id_of(&msgs[0]), first);
     let second = id_of(&msgs[1]).to_owned();
-    // Se confirma lo suyo; lo de otra bandeja no se toca.
+    // Dice lo que metió de lo suyo; lo de otra bandeja no se toca. Ya no sale (sigue en la cola
+    // hasta verlo en su transcripción).
     let other = state.inbox.pending(&parada)[0].id.clone();
     let r = ack(addr, &hija, &[&first, &other]).await;
-    assert_eq!(r, json!({"ok": true, "removed": 1}));
+    assert_eq!(r, json!({"ok": true, "acked": 1}));
     assert_eq!(state.inbox.pending(&parada).len(), 1);
     let (msgs, _) = poll(addr, &hija).await;
     assert_eq!(texts(&msgs), ["dos"]);
@@ -350,11 +353,11 @@ async fn mcp_inbox_end_to_end() {
     assert_eq!(code, 409, "{e}");
     assert_eq!(e["error"], "the inbox of that session is full");
 
-    // Tras reiniciar nido, lo no confirmado sigue ahí.
+    // Tras reiniciar nido, lo no visto en su transcripción sigue ahí (también lo ya metido).
     let again = AppState::new(paths.clone(), Launcher::Detached, Some(TOKEN.into()), true).unwrap();
     assert_eq!(again.inbox.pending(&parada).len(), 100);
     assert_eq!(again.inbox.pending(&hija), state.inbox.pending(&hija));
-    assert_eq!(texts_of(&again, &hija), ["tres"]);
+    assert_eq!(texts_of(&again, &hija), ["uno", "dos", "tres"]);
     drop(again);
 
     // Al cerrarla, fuera su bandeja (también del fichero).

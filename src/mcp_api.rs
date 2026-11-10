@@ -452,6 +452,9 @@ pub struct ReadOut {
     /// Se quitaron turnos antiguos (o se cortó el único) para no pasar de `MAX_READ`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// Mensajes para ella que no llegaron (ver `delivery_error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
 }
 
 fn json_len<T: Serialize>(v: &T) -> usize {
@@ -964,6 +967,9 @@ struct SendArgs {
 #[serde(deny_unknown_fields)]
 struct AckArgs {
     ids: Vec<String>,
+    /// Los metió con su id en el evento (`msg_id`). Un `nido mcp` de antes no lo manda.
+    #[serde(default)]
+    tracked: bool,
 }
 
 #[derive(Deserialize)]
@@ -1036,6 +1042,21 @@ pub struct Entry {
     /// Por qué no tiene channel, si su pantalla lo dijo (ver `inbox::Refusal::code`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_error: Option<&'static str>,
+    /// Mensajes que no se ven en su conversación tras darlos `inbox::MAX_TRIES` veces (ver
+    /// `delivery_error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
+}
+
+/// Lo que se dice de los mensajes de la bandeja de `id` que no llegaron (siguen en ella).
+pub fn delivery_error(st: &AppState, id: &str) -> Option<String> {
+    match st.inbox.undelivered(id) {
+        0 => None,
+        n => Some(format!(
+            "{n} message(s) not delivered after {} tries; still queued",
+            inbox::MAX_TRIES
+        )),
+    }
 }
 
 fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: Status) -> Entry {
@@ -1051,6 +1072,7 @@ fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: S
         mine: caller.owns(me, v.opened_by.as_deref()),
         channel: st.inbox.channel(&v.id),
         channel_error: st.inbox.refusal(&v.id).map(inbox::Refusal::code),
+        delivery_error: delivery_error(st, &v.id),
     }
 }
 
@@ -1353,8 +1375,11 @@ fn with_session(mut args: Value, id: &str) -> Value {
 const WAIT_UNKNOWN: Duration = Duration::from_secs(2);
 
 /// `GET /api/v1/mcp/inbox`: lo que espera en la bandeja de la sesión que llama, del más antiguo
-/// al más nuevo (`{messages: [...]}`). Si no hay nada, espera a que llegue algo (25 s como mucho;
-/// luego, vacío). Lo no confirmado vuelve a salir en la siguiente.
+/// al más nuevo (`{messages: [...]}`, cada uno con su intento, `try`). Si no hay nada, espera a
+/// que llegue algo (25 s como mucho; luego, vacío). Lo que su `nido mcp` no dijo que metió
+/// vuelve a salir en la siguiente; lo metido, solo si no se ve en la transcripción (ver
+/// `check_delivery`). Antes de volver a dar algo se mira la transcripción: lo que ya está no se
+/// da otra vez.
 pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let caller = match authorize(&st, &headers).await {
         Ok(s) => s,
@@ -1380,7 +1405,25 @@ pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
         tokio::time::sleep(wait).await;
         return Json(json!({ "messages": [] })).into_response();
     }
-    let messages: Vec<Msg> = st.inbox.poll(&caller.id).await;
+    let path = transcript_now(&st, &caller.id).await;
+    if path.is_some() {
+        check_delivery(&st, &caller.id, None).await;
+    }
+    let from = path.and_then(|p| {
+        let offset = std::fs::metadata(&p).ok()?.len();
+        Some(inbox::Mark { path: p, offset })
+    });
+    let messages: Vec<Value> = st
+        .inbox
+        .poll_from(&caller.id, from)
+        .await
+        .into_iter()
+        .map(|(m, n)| {
+            let mut v = json!(m);
+            v["try"] = n.into();
+            v
+        })
+        .collect();
     Json(json!({ "messages": messages })).into_response()
 }
 
@@ -1401,11 +1444,57 @@ pub async fn api_inbox_ack(
     };
     match own_claude(&st, &caller.id, &headers).await {
         Ok(Claim::Yes) => {}
-        Ok(_) => return Json(json!({ "ok": true, "removed": 0 })).into_response(),
+        Ok(_) => return Json(json!({ "ok": true, "acked": 0 })).into_response(),
         Err(f) => return f.into_response(),
     }
-    let removed = st.inbox.ack(&caller.id, &a.ids);
-    Json(json!({ "ok": true, "removed": removed })).into_response()
+    let acked = st.inbox.ack(&caller.id, &a.ids, a.tracked);
+    Json(json!({ "ok": true, "acked": acked })).into_response()
+}
+
+/// Mira en la transcripción de `id` si ya entró lo dado a su `nido mcp` (desde donde se miró la
+/// otra vez: ver `Inbox::scan_from`), y lo quita de su bandeja. Con `tick` (el rato desde la
+/// vuelta anterior de `spawn_delivery_watch`), lo que sigue sin verse cuenta ese rato si Claude
+/// no trabajaba (no está `busy` ni ha escrito en su transcripción hace poco), y se vuelve a dar
+/// o se deja (ver `inbox::step`). Sin transcripción aún, se espera a que la tenga.
+pub async fn check_delivery(st: &AppState, id: &str, tick: Option<Duration>) {
+    let Some(path) = transcript_now(st, id).await else {
+        return;
+    };
+    let Some(from) = st.inbox.scan_from(id, &path) else {
+        return;
+    };
+    let scan = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let found = inbox::channel_deliveries(&path, from)?;
+            let written = std::fs::metadata(&path)?.modified()?;
+            Ok::<_, std::io::Error>((found, written))
+        })
+        .await
+    };
+    let Ok(Ok(((found, upto), written))) = scan else {
+        return;
+    };
+    st.inbox.confirm(id, &path, upto, &found);
+    let Some(elapsed) = tick else {
+        return;
+    };
+    let busy = st
+        .views
+        .borrow()
+        .sessions
+        .iter()
+        .find(|v| v.id == id)
+        .is_none_or(|v| {
+            !v.alive
+                || v.claude
+                    .as_ref()
+                    .is_some_and(|c| c.status.as_deref() == Some("busy"))
+        });
+    let writing = SystemTime::now()
+        .duration_since(written)
+        .is_ok_and(|age| age < st.inbox.transcript_quiet());
+    st.inbox.tick(id, !busy && !writing, elapsed);
 }
 
 /// La bandeja de la sesión `id` solo la recoge (y confirma) el `nido mcp` de su Claude. Su pid
@@ -1766,6 +1855,7 @@ async fn read_out(
         turns,
         question: menu.as_ref().map(Question::from),
         truncated: false,
+        delivery_error: delivery_error(st, &s.id),
     };
     fit(&mut out, MAX_READ);
     Ok(out)
@@ -1822,7 +1912,7 @@ async fn status_here(st: &AppState, id: &str, msg: Option<&str>) -> Result<Statu
     }
     let (state, menu) = poll_status(st, id).await;
     let (taken, replied) = match msg {
-        Some(m) => (Some(!st.inbox.has(id, m)), Some(replied(st, id, m).await)),
+        Some(m) => (Some(st.inbox.taken(id, m)), Some(replied(st, id, m).await)),
         None => (None, None),
     };
     Ok(StatusOut {
@@ -2778,6 +2868,7 @@ mod tests {
             turns,
             question: None,
             truncated: false,
+            delivery_error: None,
         }
     }
 
@@ -2900,6 +2991,7 @@ mod tests {
             mine: false,
             channel: true,
             channel_error: None,
+            delivery_error: None,
         }
     }
 

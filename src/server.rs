@@ -1617,11 +1617,34 @@ fn spawn_background(state: Arc<AppState>) {
     });
 }
 
+/// Cada cuánto se mira si lo dado a los `nido mcp` está ya en la transcripción de su sesión.
+const DELIVERY_TICK: Duration = Duration::from_secs(2);
+
+/// Cada `DELIVERY_TICK`, en las sesiones con mensajes dados que aún no se ven en su
+/// transcripción (y solo en ellas), mira lo nuevo de la transcripción y vuelve a dar lo que toque
+/// (ver `mcp_api::check_delivery`).
+pub fn spawn_delivery_watch(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(DELIVERY_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last = tokio::time::Instant::now();
+        loop {
+            tick.tick().await;
+            let elapsed = last.elapsed();
+            last = tokio::time::Instant::now();
+            for id in state.inbox.outstanding() {
+                crate::mcp_api::check_delivery(&state, &id, Some(elapsed)).await;
+            }
+        }
+    });
+}
+
 /// Cada 2 s (o al pedirlo) vuelve a mirar el estado.
 pub fn spawn_scanner(state: Arc<AppState>) {
     spawn_group(state.clone());
     spawn_background(state.clone());
     spawn_startup_watch(state.clone());
+    spawn_delivery_watch(state.clone());
     // Los avisos al móvil, según los cambios que vea `scan`.
     if let Some(mut rx) = state.alerts_rx.lock().expect("avisos").take() {
         let st = state.clone();

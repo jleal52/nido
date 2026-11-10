@@ -1,14 +1,17 @@
 //! La bandeja de mensajes entre sesiones (la herramienta `send` del MCP): una cola por sesión de
 //! destino, en el nido de su equipo. La recoge el `nido mcp` de esa sesión (`GET
-//! /api/v1/mcp/inbox`), que mete cada mensaje en Claude como evento del channel y luego lo
-//! confirma. Lo no confirmado se vuelve a entregar: al menos una vez.
+//! /api/v1/mcp/inbox`), que mete cada mensaje en Claude como evento del channel y luego dice que
+//! lo metió (`ack`). Eso no basta: Claude a veces tira un evento (justo tras saludar), así que el
+//! mensaje sigue en la cola hasta verlo en la transcripción de la sesión (`confirm`; el evento
+//! lleva su id, `msg_id`). Si no aparece en un rato sin que Claude trabaje, se vuelve a dar (ver
+//! `step`): al menos una vez, y nunca otra vez lo que ya se vio.
 //!
 //! Se guarda en `<estado>/inbox.json`: sobrevive a un reinicio de nido. Aquí también se sabe qué
 //! sesiones tienen channel (su `nido mcp` está recogiendo la bandeja), solo en memoria.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -131,6 +134,82 @@ pub struct Msg {
     pub at: u64,
 }
 
+/// Dónde acababa la transcripción de una sesión: desde ahí se busca lo que entró después.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mark {
+    pub path: PathBuf,
+    pub offset: u64,
+}
+
+/// Lo que se sabe de un mensaje ya dado a su `nido mcp` (con `Queued`; se guarda).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Out {
+    /// El intento: 1 la primera vez que se da, uno más cada vez que se vuelve a dar (`Step::Again`).
+    pub tries: u32,
+    /// Dónde acababa la transcripción la primera vez que se dio (si la había).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Mark>,
+    /// Su `nido mcp` dijo que lo metió en Claude, en este intento.
+    #[serde(default)]
+    pub emitted: bool,
+    /// Lo metió con su id (`msg_id`): un `nido mcp` de antes no lo pone, y entonces se reconoce
+    /// por quién lo manda y su texto.
+    #[serde(default)]
+    pub tracked: bool,
+    /// Tras `MAX_TRIES` intentos no apareció: no se da más (hasta volver a lanzar la sesión).
+    #[serde(default)]
+    pub failed: bool,
+}
+
+/// Un mensaje en la cola y, si ya se dio, cómo va (se guarda así, compatible con lo de antes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Queued {
+    #[serde(flatten)]
+    msg: Msg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    out: Option<Out>,
+}
+
+/// Lo que se ve de un evento del channel de nido en la transcripción.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivered {
+    /// Con su id (`msg_id`).
+    Id(String),
+    /// Sin él (lo metió un `nido mcp` de antes): quién lo manda y el texto.
+    Text { from_id: String, text: String },
+}
+
+/// Cuánto se espera a ver en la transcripción un mensaje ya metido, sin contar el rato en que
+/// Claude trabaja (puede no enseñar los eventos hasta acabar el turno).
+pub const CONFIRM_WAIT: Duration = Duration::from_secs(30);
+/// Sin escribir en su transcripción en este rato, Claude no está trabajando.
+pub const TRANSCRIPT_QUIET: Duration = Duration::from_secs(5);
+/// Las veces que se da un mensaje antes de dejarlo (sigue en la cola, con un error de entrega).
+pub const MAX_TRIES: u32 = 3;
+
+/// Qué hacer con un mensaje dado que aún no aparece en la transcripción.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Seguir esperando.
+    Wait,
+    /// Darlo otra vez.
+    Again,
+    /// Ya se dio `MAX_TRIES` veces: no más.
+    Failed,
+}
+
+/// Un mensaje dado (`out`) tras `waited` (sin contar lo que Claude trabajó) sin verse en la
+/// transcripción: solo cuenta lo que su `nido mcp` dijo que metió.
+pub fn step(out: &Out, waited: Duration, limit: Duration) -> Step {
+    if !out.emitted || out.failed || waited < limit {
+        Step::Wait
+    } else if out.tries >= MAX_TRIES {
+        Step::Failed
+    } else {
+        Step::Again
+    }
+}
+
 /// No se pudo encolar: ya hay `MAX_QUEUED` esperando.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Full;
@@ -168,7 +247,15 @@ pub fn live(polling: usize, last: Option<Instant>, refused: bool, now: Instant) 
 
 pub struct Inbox {
     path: PathBuf,
-    queues: Mutex<HashMap<String, Vec<Msg>>>,
+    queues: Mutex<HashMap<String, Vec<Queued>>>,
+    /// Cuánto lleva cada mensaje metido sin verse, sin contar lo que trabajó Claude (por su id;
+    /// solo en memoria: tras reiniciar `nido serve` se empieza a contar de nuevo).
+    waits: Mutex<HashMap<String, Duration>>,
+    /// Hasta dónde se ha mirado la transcripción de cada sesión.
+    cursors: Mutex<HashMap<String, Mark>>,
+    /// `CONFIRM_WAIT` y `TRANSCRIPT_QUIET` en ms (las pruebas los acortan).
+    confirm_ms: AtomicU64,
+    quiet_ms: AtomicU64,
     /// Compartido con los `Hold`, que lo sueltan al acabar.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
     /// Cambia con cada mensaje nuevo: despierta a las recogidas que esperan.
@@ -183,7 +270,7 @@ pub struct Inbox {
 impl Inbox {
     /// La de `path`; si no está o no se puede leer, vacía.
     pub fn load(path: PathBuf) -> Self {
-        let queues: BTreeMap<String, Vec<Msg>> = match std::fs::read(&path) {
+        let queues: BTreeMap<String, Vec<Queued>> = match std::fs::read(&path) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
                 // Rota: se aparta (para mirarla) y se empieza vacía; si no, se pisaría al guardar.
                 let bad = path.with_extension("json.bad");
@@ -202,6 +289,10 @@ impl Inbox {
         Self {
             path,
             queues: Mutex::new(queues.into_iter().collect()),
+            waits: Mutex::default(),
+            cursors: Mutex::default(),
+            confirm_ms: AtomicU64::new(CONFIRM_WAIT.as_millis() as u64),
+            quiet_ms: AtomicU64::new(TRANSCRIPT_QUIET.as_millis() as u64),
             channels: Arc::default(),
             arrived: Arc::new(watch::Sender::new(())),
             wait_ms: AtomicU64::new(POLL_WAIT.as_millis() as u64),
@@ -224,8 +315,8 @@ impl Inbox {
     }
 
     /// Escribe en un temporal y lo renombra (solo para el usuario: son conversaciones).
-    fn save(&self, queues: &HashMap<String, Vec<Msg>>) {
-        let sorted: BTreeMap<&String, &Vec<Msg>> =
+    fn save(&self, queues: &HashMap<String, Vec<Queued>>) {
+        let sorted: BTreeMap<&String, &Vec<Queued>> =
             queues.iter().filter(|(_, q)| !q.is_empty()).collect();
         let write = || -> std::io::Result<()> {
             if let Some(dir) = self.path.parent() {
@@ -259,40 +350,56 @@ impl Inbox {
             if q.len() >= MAX_QUEUED {
                 return Err(Full);
             }
-            q.push(msg);
+            q.push(Queued { msg, out: None });
             self.save(&queues);
         }
         self.arrived.send_replace(());
         Ok(())
     }
 
-    /// Lo que espera para `id`, del más antiguo al más nuevo.
+    /// Lo que hay en la cola de `id` (también lo ya dado que aún no se ha visto), del más antiguo
+    /// al más nuevo.
     pub fn pending(&self, id: &str) -> Vec<Msg> {
         self.queues
             .lock()
             .expect("bandeja")
             .get(id)
-            .cloned()
+            .map(|q| q.iter().map(|m| m.msg.clone()).collect())
             .unwrap_or_default()
     }
 
-    /// ¿Sigue en la cola de `id` el mensaje `msg`? (Si no, ya lo recogió.)
-    pub fn has(&self, id: &str, msg: &str) -> bool {
+    /// Cómo va el mensaje `msg` de la cola de `id`, si sigue en ella.
+    pub fn out(&self, id: &str, msg: &str) -> Option<Option<Out>> {
         self.queues
             .lock()
             .expect("bandeja")
-            .get(id)
-            .is_some_and(|q| q.iter().any(|m| m.id == msg))
+            .get(id)?
+            .iter()
+            .find(|m| m.msg.id == msg)
+            .map(|m| m.out.clone())
     }
 
-    /// Quita de la cola de `id` los mensajes `ids` (los de otras colas no se tocan). Devuelve
-    /// cuántos quitó.
+    /// ¿Sigue en la cola de `id` el mensaje `msg`?
+    pub fn has(&self, id: &str, msg: &str) -> bool {
+        self.out(id, msg).is_some()
+    }
+
+    /// ¿Lo recogió ya la sesión? Si ya no está en la cola, o su `nido mcp` dijo que lo metió (lo
+    /// que mira `send` con `wait`).
+    pub fn taken(&self, id: &str, msg: &str) -> bool {
+        match self.out(id, msg) {
+            None => true,
+            Some(out) => out.is_some_and(|o| o.emitted || o.failed),
+        }
+    }
+
+    /// Su `nido mcp` dice que metió en Claude los mensajes `ids` de la cola de `id` (los de otras
+    /// colas no se tocan), con su id en el evento (`tracked`) o, uno de antes, sin él. Siguen en la
+    /// cola hasta verlos en la transcripción (`confirm`). Devuelve cuántos eran de esta cola.
     ///
-    /// Retenida (`held`), no quita nada y devuelve 0, a propósito: mejor «al menos una vez» que
-    /// «perdido». Una confirmación que llega tarde, tras parar o volver a lanzar la sesión, deja
-    /// el mensaje en la cola y se entregará otra vez.
-    pub fn ack(&self, id: &str, ids: &[String]) -> usize {
-        // Retenida, no se le ha dado nada: lo que diga confirmar no es de este arranque.
+    /// Retenida (`held`), no apunta nada y devuelve 0, a propósito: mejor «al menos una vez» que
+    /// «perdido». Lo que diga tarde, tras parar o volver a lanzar la sesión, no cuenta.
+    pub fn ack(&self, id: &str, ids: &[String], tracked: bool) -> usize {
         if self.held(id) {
             return 0;
         }
@@ -300,8 +407,56 @@ impl Inbox {
         let Some(q) = queues.get_mut(id) else {
             return 0;
         };
+        let mut acked = 0;
+        let mut waits = self.waits.lock().expect("esperas");
+        for m in q.iter_mut().filter(|m| ids.contains(&m.msg.id)) {
+            let out = m.out.get_or_insert_with(Out::default);
+            out.tries = out.tries.max(1);
+            if !out.emitted {
+                waits.insert(m.msg.id.clone(), Duration::ZERO);
+            }
+            out.emitted = true;
+            out.tracked = tracked;
+            acked += 1;
+        }
+        drop(waits);
+        if acked > 0 {
+            self.save(&queues);
+        }
+        acked
+    }
+
+    /// Lo que se ha visto en la transcripción de `id` (en `path`, mirada hasta `upto`): fuera de
+    /// su cola. Un evento con id quita ese mensaje; uno sin él (de un `nido mcp` de antes), el más
+    /// antiguo ya dado sin id que lo mande el mismo y con el mismo texto (uno por evento).
+    /// Devuelve cuántos quitó.
+    pub fn confirm(&self, id: &str, path: &Path, upto: u64, seen: &[Delivered]) -> usize {
+        self.cursors.lock().expect("cursores").insert(
+            id.to_owned(),
+            Mark {
+                path: path.to_owned(),
+                offset: upto,
+            },
+        );
+        let mut queues = self.queues.lock().expect("bandeja");
+        let Some(q) = queues.get_mut(id) else {
+            return 0;
+        };
         let before = q.len();
-        q.retain(|m| !ids.contains(&m.id));
+        let mut gone: Vec<String> = Vec::new();
+        for d in seen {
+            let at = match d {
+                Delivered::Id(msg) => q.iter().position(|m| &m.msg.id == msg),
+                Delivered::Text { from_id, text } => q.iter().position(|m| {
+                    m.out.as_ref().is_some_and(|o| !o.tracked)
+                        && &m.msg.from_id == from_id
+                        && &m.msg.text == text
+                }),
+            };
+            if let Some(i) = at {
+                gone.push(q.remove(i).msg.id);
+            }
+        }
         let removed = before - q.len();
         if q.is_empty() {
             queues.remove(id);
@@ -309,15 +464,140 @@ impl Inbox {
         if removed > 0 {
             self.save(&queues);
         }
+        drop(queues);
+        let mut waits = self.waits.lock().expect("esperas");
+        for g in &gone {
+            waits.remove(g);
+        }
         removed
+    }
+
+    /// Las sesiones con mensajes ya dados que aún no se han visto en su transcripción.
+    pub fn outstanding(&self) -> Vec<String> {
+        self.queues
+            .lock()
+            .expect("bandeja")
+            .iter()
+            .filter(|(_, q)| q.iter().any(|m| m.out.as_ref().is_some_and(|o| !o.failed)))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Desde dónde mirar la transcripción de `id` (en `path`) para ver lo ya dado: hasta donde se
+    /// miró la otra vez o, si no, desde donde acababa al darlo (de cero si era otra o no la había).
+    /// `None`: no hay nada dado que buscar.
+    pub fn scan_from(&self, id: &str, path: &Path) -> Option<u64> {
+        let queues = self.queues.lock().expect("bandeja");
+        let outs: Vec<&Out> = queues
+            .get(id)?
+            .iter()
+            .filter_map(|m| m.out.as_ref())
+            .collect();
+        if outs.is_empty() {
+            return None;
+        }
+        let earliest = outs
+            .iter()
+            .map(|o| match &o.from {
+                Some(f) if f.path == path => f.offset,
+                _ => 0,
+            })
+            .min()
+            .unwrap_or(0);
+        let cursor = self
+            .cursors
+            .lock()
+            .expect("cursores")
+            .get(id)
+            .filter(|c| c.path == path)
+            .map(|c| c.offset);
+        Some(cursor.unwrap_or(earliest))
+    }
+
+    /// Ha pasado `elapsed` para los mensajes metidos en `id`, y contaba (`quiet`: Claude no
+    /// trabajaba). Los que toca se vuelven a dar (y despiertan a quien recoge) o se dejan (ver
+    /// `step`). Devuelve cuántos se vuelven a dar y cuántos se dejan.
+    pub fn tick(&self, id: &str, quiet: bool, elapsed: Duration) -> (usize, usize) {
+        let limit = Duration::from_millis(self.confirm_ms.load(Ordering::Relaxed));
+        let (mut again, mut failed) = (0, 0);
+        {
+            let mut queues = self.queues.lock().expect("bandeja");
+            let Some(q) = queues.get_mut(id) else {
+                return (0, 0);
+            };
+            let mut waits = self.waits.lock().expect("esperas");
+            for m in q.iter_mut() {
+                let Some(out) = m.out.as_mut() else { continue };
+                if !out.emitted || out.failed {
+                    continue;
+                }
+                let w = waits.entry(m.msg.id.clone()).or_default();
+                if quiet {
+                    *w += elapsed;
+                }
+                match step(out, *w, limit) {
+                    Step::Wait => {}
+                    Step::Again => {
+                        out.emitted = false;
+                        out.tries += 1;
+                        *w = Duration::ZERO;
+                        again += 1;
+                    }
+                    Step::Failed => {
+                        out.failed = true;
+                        failed += 1;
+                        eprintln!(
+                            "nido: el mensaje {} para la sesión {id} no aparece en su \
+                             conversación tras {MAX_TRIES} intentos; sigue en la cola",
+                            m.msg.id
+                        );
+                    }
+                }
+            }
+            drop(waits);
+            if again + failed > 0 {
+                self.save(&queues);
+            }
+        }
+        if again > 0 {
+            self.arrived.send_replace(());
+        }
+        (again, failed)
+    }
+
+    /// Cuántos mensajes de la cola de `id` se dejaron sin entregar (ver `Step::Failed`).
+    pub fn undelivered(&self, id: &str) -> usize {
+        self.queues.lock().expect("bandeja").get(id).map_or(0, |q| {
+            q.iter()
+                .filter(|m| m.out.as_ref().is_some_and(|o| o.failed))
+                .count()
+        })
+    }
+
+    /// Para las pruebas: cuánto se espera a ver un mensaje y cuánto sin escribir es no trabajar.
+    pub fn set_confirm_wait(&self, wait: Duration, quiet: Duration) {
+        self.confirm_ms
+            .store(wait.as_millis() as u64, Ordering::Relaxed);
+        self.quiet_ms
+            .store(quiet.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Sin escribir en su transcripción en este rato, Claude no está trabajando.
+    pub fn transcript_quiet(&self) -> Duration {
+        Duration::from_millis(self.quiet_ms.load(Ordering::Relaxed))
     }
 
     /// Una sesión que ya no está: fuera su cola y lo que se sabía de su channel.
     pub fn forget(&self, id: &str) {
         let mut queues = self.queues.lock().expect("bandeja");
-        if queues.remove(id).is_some() {
+        if let Some(q) = queues.remove(id) {
             self.save(&queues);
+            let mut waits = self.waits.lock().expect("esperas");
+            for m in q {
+                waits.remove(&m.msg.id);
+            }
         }
+        self.cursors.lock().expect("cursores").remove(id);
         drop(queues);
         self.channels.lock().expect("channels").remove(id);
     }
@@ -402,11 +682,31 @@ impl Inbox {
 
     /// La sesión `id` se acaba de lanzar otra vez: lo que se sabía de su channel era del
     /// arranque anterior.
+    ///
+    /// Lo dado al arranque de antes que no se ha visto en su transcripción se da otra vez al
+    /// nuevo, desde el primer intento (antes de darlo se mira la transcripción: ver `scan_from`).
     pub fn relaunched(&self, id: &str) {
         if let Some(c) = self.channels.lock().expect("channels").get_mut(id) {
             c.refused = None;
             c.stopped = false;
             c.unguarded = false;
+        }
+        let mut queues = self.queues.lock().expect("bandeja");
+        let mut changed = false;
+        if let Some(q) = queues.get_mut(id) {
+            let mut waits = self.waits.lock().expect("esperas");
+            for m in q.iter_mut() {
+                if let Some(o) = m.out.as_mut() {
+                    o.emitted = false;
+                    o.failed = false;
+                    o.tries = 0;
+                    waits.remove(&m.msg.id);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.save(&queues);
         }
     }
 
@@ -423,6 +723,17 @@ impl Inbox {
     /// La recogida del `nido mcp` de `id`: lo que espera, en cuanto haya algo, o nada si pasa
     /// `poll_wait`. Mientras dura (y un rato después), la sesión tiene channel.
     pub async fn poll(&self, id: &str) -> Vec<Msg> {
+        self.poll_from(id, None)
+            .await
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect()
+    }
+
+    /// `poll`, con dónde acaba ahora la transcripción de la sesión (`from`, si la tiene): lo que
+    /// se da por primera vez se buscará desde ahí. Da lo que no se ha metido aún (ni se dejó),
+    /// cada uno con su intento.
+    pub async fn poll_from(&self, id: &str, from: Option<Mark>) -> Vec<(Msg, u32)> {
         let _polling = Polling::start(self, id);
         // Antes de mirar la cola: así no se pierde un mensaje que llegue entre medias.
         let mut rx = self.arrived.subscribe();
@@ -432,7 +743,7 @@ impl Inbox {
             let msgs = if self.held(id) {
                 Vec::new()
             } else {
-                self.pending(id)
+                self.offer(id, from.as_ref())
             };
             if !msgs.is_empty() {
                 return msgs;
@@ -443,6 +754,146 @@ impl Inbox {
             }
         }
     }
+}
+
+impl Inbox {
+    /// Lo que se le puede dar ahora al `nido mcp` de `id`, apuntado como dado.
+    fn offer(&self, id: &str, from: Option<&Mark>) -> Vec<(Msg, u32)> {
+        let mut queues = self.queues.lock().expect("bandeja");
+        let Some(q) = queues.get_mut(id) else {
+            return Vec::new();
+        };
+        let mut changed = false;
+        let mut out = Vec::new();
+        for m in q.iter_mut() {
+            let o = m.out.get_or_insert_with(|| {
+                changed = true;
+                Out::default()
+            });
+            if o.emitted || o.failed {
+                continue;
+            }
+            if o.tries == 0 {
+                o.tries = 1;
+                changed = true;
+            }
+            if o.from.is_none() && from.is_some() {
+                o.from = from.cloned();
+                changed = true;
+            }
+            out.push((m.msg.clone(), o.tries));
+        }
+        if changed {
+            self.save(&queues);
+        }
+        out
+    }
+}
+
+/// Los eventos del channel de nido que hay en la transcripción `path` desde `from` (desde la
+/// primera línea entera; si el fichero es más corto, se rehízo: desde el principio), y hasta
+/// dónde se miró (la última línea entera). Solo se leen las líneas con `"channel"` (con comillas,
+/// el valor de `origin.kind`): un turno de
+/// Claude con el evento (`origin.kind == "channel"`), o el mismo metido mientras trabajaba (un
+/// `queued_command` con ese origen).
+pub fn channel_deliveries(path: &Path, from: u64) -> std::io::Result<(Vec<Delivered>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let from = if from > len { 0 } else { from };
+    let start = from.saturating_sub(1);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    // Lo de antes de `from` es media línea (o el salto de la anterior).
+    let skip = if from == 0 {
+        0
+    } else {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            None => return Ok((Vec::new(), from)),
+        }
+    };
+    let complete = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    if complete <= skip {
+        return Ok((Vec::new(), start + skip as u64));
+    }
+    let upto = start + complete as u64;
+    let found = buf[skip..complete]
+        .split(|&b| b == b'\n')
+        .filter(|line| line.windows(9).any(|w| w == b"\"channel\""))
+        .filter_map(|line| std::str::from_utf8(line).ok().and_then(delivered))
+        .collect();
+    Ok((found, upto))
+}
+
+/// Una línea de la transcripción, si es un evento del channel de nido entregado.
+fn delivered(line: &str) -> Option<Delivered> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let channel = |o: &serde_json::Value| {
+        o.pointer("/origin/kind").and_then(|k| k.as_str()) == Some("channel")
+    };
+    let text = match v.get("type").and_then(|t| t.as_str())? {
+        "user" if channel(&v) => match v.pointer("/message/content")? {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => return None,
+        },
+        "attachment" => {
+            let a = v.get("attachment")?;
+            if a.get("type").and_then(|t| t.as_str()) != Some("queued_command") || !channel(a) {
+                return None;
+            }
+            a.get("prompt")?.as_str()?.to_owned()
+        }
+        _ => return None,
+    };
+    channel_tag(&text)
+}
+
+/// `<channel source="nido" … msg_id="…">\ntexto\n</channel>`: su id o, sin él, quién lo manda y
+/// el texto. No se mira `source` (es el nombre con que Claude tiene el servidor): los ids son
+/// únicos, y sin id se compara con lo dado (quién y qué).
+fn channel_tag(text: &str) -> Option<Delivered> {
+    let rest = text.trim_start().strip_prefix("<channel")?;
+    let close = rest.find('>')?;
+    let attrs = attributes(&rest[..close]);
+    let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+    if let Some(id) = get("msg_id") {
+        return Some(Delivered::Id(id));
+    }
+    let body = &rest[close + 1..];
+    let body = body.strip_prefix('\n').unwrap_or(body);
+    let body = body.trim_end();
+    let body = body.strip_suffix("</channel>")?;
+    let body = body.strip_suffix('\n').unwrap_or(body);
+    Some(Delivered::Text {
+        from_id: get("from_id")?,
+        text: body.to_owned(),
+    })
+}
+
+/// `a="1" b="dos"` → [(a, 1), (b, dos)] (con `&quot;`, `&lt;`, `&gt;` y `&amp;` deshechos).
+fn attributes(s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(eq) = rest.find("=\"") {
+        let key = rest[..eq].trim().to_owned();
+        let after = &rest[eq + 2..];
+        let Some(end) = after.find('"') else { break };
+        let value = after[..end]
+            .replace("&quot;", "\"")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        out.push((key, value));
+        rest = &after[end + 1..];
+    }
+    out
 }
 
 /// Una recogida en marcha: la sesión tiene channel hasta un rato después de soltarla.
@@ -509,13 +960,20 @@ mod tests {
         assert_eq!(ids(&inbox.pending("hija")), ["m1", "m2"], "en orden");
         assert!(inbox.has("hija", "m1") && !inbox.has("hija", "m3"));
         // Los de otra cola no se tocan.
-        assert_eq!(inbox.ack("hija", &["m3".into()]), 0);
-        assert_eq!(ids(&inbox.pending("otra")), ["m3"]);
-        assert_eq!(inbox.ack("nadie", &["m3".into()]), 0);
-        // Sin confirmar, siguen ahí.
+        assert_eq!(inbox.ack("hija", &["m3".into()], true), 0);
+        assert_eq!(inbox.out("otra", "m3"), Some(None));
+        assert_eq!(inbox.ack("nadie", &["m3".into()], true), 0);
+        // Metido (dice su `nido mcp`), sigue en la cola hasta verlo en la transcripción.
+        assert_eq!(inbox.ack("hija", &["m1".into(), "zz".into()], true), 1);
         assert_eq!(ids(&inbox.pending("hija")), ["m1", "m2"]);
-        assert_eq!(inbox.ack("hija", &["m1".into(), "zz".into()]), 1);
+        assert!(inbox.taken("hija", "m1") && !inbox.taken("hija", "m2"));
+        let path = Path::new("/t.jsonl");
+        assert_eq!(
+            inbox.confirm("hija", path, 0, &[Delivered::Id("m1".into())]),
+            1
+        );
         assert_eq!(ids(&inbox.pending("hija")), ["m2"]);
+        assert!(inbox.taken("hija", "m1"), "ya no está");
         inbox.forget("otra");
         assert!(inbox.pending("otra").is_empty());
     }
@@ -528,7 +986,19 @@ mod tests {
         inbox.push("hija", msg("m1", "uno")).unwrap();
         inbox.push("hija", msg("m2", "dos")).unwrap();
         inbox.push("otra", msg("m3", "tres")).unwrap();
-        inbox.ack("hija", &["m1".into()]);
+        // Dado y metido, y luego visto: fuera. Dado y metido sin verse: sigue, y así se guarda.
+        let from = Mark {
+            path: "/t.jsonl".into(),
+            offset: 7,
+        };
+        assert_eq!(inbox.offer("hija", Some(&from)).len(), 2);
+        inbox.ack("hija", &["m1".into(), "m2".into()], true);
+        inbox.confirm(
+            "hija",
+            Path::new("/t.jsonl"),
+            9,
+            &[Delivered::Id("m1".into())],
+        );
         inbox.forget("otra");
         drop(inbox);
         assert!(!path.with_extension("json.tmp").exists());
@@ -538,10 +1008,30 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        // Tras el «reinicio»: lo no confirmado se vuelve a entregar.
+        // Tras el «reinicio»: lo no visto sigue, con dónde buscarlo.
         let again = Inbox::load(path.clone());
         assert_eq!(again.pending("hija"), vec![msg("m2", "dos")]);
+        assert_eq!(
+            again.out("hija", "m2"),
+            Some(Some(Out {
+                tries: 1,
+                from: Some(from),
+                emitted: true,
+                tracked: true,
+                failed: false,
+            }))
+        );
+        assert_eq!(again.scan_from("hija", Path::new("/t.jsonl")), Some(7));
         assert!(again.pending("otra").is_empty());
+        // Una bandeja de antes (sin cómo va cada uno) se lee igual.
+        std::fs::write(
+            &path,
+            r#"{"vieja":[{"id":"v1","from":"a","from_id":"k/a","machine":"M","text":"t","at":1}]}"#,
+        )
+        .unwrap();
+        let old = Inbox::load(path);
+        assert_eq!(ids(&old.pending("vieja")), ["v1"]);
+        assert_eq!(old.out("vieja", "v1"), Some(None));
     }
 
     #[test]
@@ -580,7 +1070,8 @@ mod tests {
         assert_eq!(inbox.pending("hija").len(), MAX_QUEUED);
         // Las demás sesiones, aparte.
         inbox.push("otra", msg("m", "x")).unwrap();
-        inbox.ack("hija", &["m0".into()]);
+        inbox.ack("hija", &["m0".into()], true);
+        inbox.confirm("hija", Path::new("/t"), 0, &[Delivered::Id("m0".into())]);
         inbox.push("hija", msg("otro", "x")).unwrap();
     }
 
@@ -618,7 +1109,7 @@ mod tests {
         assert!(inbox.channel("hija"), "acaba de recoger");
         // Con algo en la cola, vuelve enseguida; sin nada, al acabarse la espera.
         assert_eq!(ids(&inbox.poll("hija").await), ["m1"]);
-        inbox.ack("hija", &["m1".into()]);
+        inbox.ack("hija", &["m1".into()], true);
         inbox.set_poll_wait(Duration::from_millis(200));
         let start = Instant::now();
         assert!(inbox.poll("hija").await.is_empty());
@@ -665,7 +1156,7 @@ mod tests {
         inbox.push("s", msg("m1", "uno")).unwrap();
         assert!(a.await.unwrap().is_empty(), "se lo llevó retenida");
         // Ni confirmar.
-        assert_eq!(inbox.ack("s", &["m1".into()]), 0);
+        assert_eq!(inbox.ack("s", &["m1".into()], true), 0);
         assert_eq!(ids(&inbox.pending("s")), ["m1"]);
         // Al soltarla, la que espera lo recoge ya.
         let b = poll(&inbox);
@@ -674,7 +1165,7 @@ mod tests {
         drop(hold);
         assert_eq!(ids(&b.await.unwrap()), ["m1"]);
         assert!(start.elapsed() < Duration::from_millis(1000));
-        assert_eq!(inbox.ack("s", &["m1".into()]), 1);
+        assert_eq!(inbox.ack("s", &["m1".into()], true), 1);
         // Igual con un rechazo, que llega con una recogida en marcha.
         let c = poll(&inbox);
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -682,7 +1173,8 @@ mod tests {
         inbox.push("s", msg("m2", "dos")).unwrap();
         assert!(c.await.unwrap().is_empty());
         inbox.relaunched("s");
-        assert_eq!(inbox.ack("s", &["m2".into()]), 1);
+        // El arranque nuevo recibe también lo metido al de antes sin verse (m1).
+        assert_eq!(inbox.ack("s", &["m1".into(), "m2".into()], true), 2);
         // Parada a mano: hasta volver a lanzarla, nada (su `nido mcp` se está muriendo).
         let d = poll(&inbox);
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -691,7 +1183,182 @@ mod tests {
         assert!(d.await.unwrap().is_empty());
         assert!(!inbox.channel("s"));
         inbox.relaunched("s");
-        assert_eq!(ids(&inbox.poll("s").await), ["m3"]);
+        // Lo metido al arranque de antes sin verse en su transcripción, otra vez al nuevo.
+        assert_eq!(ids(&inbox.poll("s").await), ["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn what_to_do_with_a_message_not_seen_yet() {
+        let limit = CONFIRM_WAIT;
+        let out = |tries, emitted| Out {
+            tries,
+            emitted,
+            ..Out::default()
+        };
+        // Dado pero sin que su `nido mcp` diga que lo metió: no cuenta.
+        assert_eq!(step(&out(1, false), limit * 10, limit), Step::Wait);
+        assert_eq!(step(&out(1, true), limit / 2, limit), Step::Wait);
+        assert_eq!(step(&out(1, true), limit, limit), Step::Again);
+        assert_eq!(step(&out(MAX_TRIES - 1, true), limit, limit), Step::Again);
+        assert_eq!(step(&out(MAX_TRIES, true), limit, limit), Step::Failed);
+        let failed = Out {
+            failed: true,
+            ..out(MAX_TRIES, true)
+        };
+        assert_eq!(step(&failed, limit * 10, limit), Step::Wait);
+    }
+
+    #[tokio::test]
+    async fn a_message_is_given_again_until_seen_or_given_up() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Inbox::load(dir.path().join("inbox.json"));
+        inbox.set_poll_wait(Duration::from_millis(50));
+        let t = Path::new("/t.jsonl");
+        let mark = |offset| Mark {
+            path: t.to_owned(),
+            offset,
+        };
+        let tries = |v: Vec<(Msg, u32)>| -> Vec<(String, u32)> {
+            v.into_iter().map(|(m, n)| (m.id, n)).collect()
+        };
+        inbox.push("s", msg("m1", "uno")).unwrap();
+        assert_eq!(inbox.outstanding(), Vec::<String>::new());
+        assert_eq!(inbox.scan_from("s", t), None, "nada dado: nada que buscar");
+        // Dado: primer intento, buscado desde donde acababa la transcripción.
+        assert_eq!(
+            tries(inbox.poll_from("s", Some(mark(40))).await),
+            [("m1".into(), 1)]
+        );
+        assert_eq!(inbox.outstanding(), ["s"]);
+        assert_eq!(inbox.scan_from("s", t), Some(40));
+        assert_eq!(inbox.scan_from("s", Path::new("/otra.jsonl")), Some(0));
+        // Sin que diga que lo metió, sale igual en la siguiente (y no cuenta el tiempo).
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT * 2), (0, 0));
+        assert_eq!(
+            tries(inbox.poll_from("s", Some(mark(50))).await),
+            [("m1".into(), 1)]
+        );
+        assert_eq!(inbox.scan_from("s", t), Some(40), "desde la primera vez");
+        // Metido: ya no sale, ni con Claude trabajando cuenta el tiempo.
+        assert_eq!(inbox.ack("s", &["m1".into()], true), 1);
+        assert!(inbox.poll_from("s", None).await.is_empty());
+        assert_eq!(inbox.tick("s", false, CONFIRM_WAIT * 2), (0, 0));
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT / 2), (0, 0));
+        // Visto lo de otro (y hasta dónde se miró): sigue.
+        assert_eq!(
+            inbox.confirm("s", t, 60, &[Delivered::Id("otro".into())]),
+            0
+        );
+        assert_eq!(inbox.scan_from("s", t), Some(60));
+        // Sin verse tras el plazo: otra vez, segundo intento.
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT / 2), (1, 0));
+        assert!(!inbox.taken("s", "m1"));
+        assert_eq!(tries(inbox.poll_from("s", None).await), [("m1".into(), 2)]);
+        inbox.ack("s", &["m1".into()], true);
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT), (1, 0));
+        assert_eq!(tries(inbox.poll_from("s", None).await), [("m1".into(), 3)]);
+        inbox.ack("s", &["m1".into()], true);
+        assert_eq!(inbox.undelivered("s"), 0);
+        // El último: se deja, sigue en la cola y ya no se da ni se busca.
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT), (0, 1));
+        assert_eq!(inbox.undelivered("s"), 1);
+        assert_eq!(ids(&inbox.pending("s")), ["m1"]);
+        assert!(inbox.poll_from("s", None).await.is_empty());
+        assert_eq!(inbox.outstanding(), Vec::<String>::new());
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT * 9), (0, 0), "una vez");
+        // Al volver a lanzarla, otra vez desde el primero.
+        inbox.relaunched("s");
+        assert_eq!(inbox.undelivered("s"), 0);
+        assert_eq!(tries(inbox.poll_from("s", None).await), [("m1".into(), 1)]);
+        inbox.ack("s", &["m1".into()], true);
+        // Visto: fuera, y ya no se busca ni se vuelve a dar.
+        assert_eq!(inbox.confirm("s", t, 90, &[Delivered::Id("m1".into())]), 1);
+        assert!(inbox.pending("s").is_empty());
+        assert_eq!(inbox.outstanding(), Vec::<String>::new());
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT * 9), (0, 0));
+        assert!(inbox.poll_from("s", None).await.is_empty());
+    }
+
+    #[test]
+    fn without_an_id_it_is_recognised_by_sender_and_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Inbox::load(dir.path().join("inbox.json"));
+        let t = Path::new("/t.jsonl");
+        for (id, text) in [("a", "hola"), ("b", "hola"), ("c", "otro")] {
+            inbox.push("s", msg(id, text)).unwrap();
+        }
+        inbox.push("s", msg("d", "hola")).unwrap();
+        // Un `nido mcp` de antes (sin `msg_id`) metió a, b y c; d aún no se ha dado.
+        inbox.offer("s", None);
+        inbox.ack("s", &["a".into(), "b".into(), "c".into()], false);
+        inbox.ack("s", &["d".into()], true);
+        let text = |from_id: &str, text: &str| Delivered::Text {
+            from_id: from_id.into(),
+            text: text.into(),
+        };
+        // Un evento es un mensaje: el más antiguo de ese que lo manda y con ese texto.
+        assert_eq!(inbox.confirm("s", t, 0, &[text("k123/padre1", "hola")]), 1);
+        assert_eq!(ids(&inbox.pending("s")), ["b", "c", "d"]);
+        // De otro, o con otro texto: no.
+        assert_eq!(inbox.confirm("s", t, 0, &[text("k9/otra", "hola")]), 0);
+        assert_eq!(inbox.confirm("s", t, 0, &[text("k123/padre1", "hola!")]), 0);
+        // Dos eventos iguales, dos mensajes; el de id (d) no se toma por el texto.
+        let two = [text("k123/padre1", "hola"), text("k123/padre1", "hola")];
+        assert_eq!(inbox.confirm("s", t, 0, &two), 1);
+        assert_eq!(ids(&inbox.pending("s")), ["c", "d"]);
+    }
+
+    /// Dos líneas de verdad de una transcripción de Claude Code 2.1.322 (con la ruta cambiada):
+    /// un evento del channel con Claude esperando, y otro que llegó mientras trabajaba.
+    const DELIVERED_IDLE: &str = r#"{"parentUuid":"bd8fc7db-f0ee-42dc-b7c5-de6896853ea0","isSidechain":false,"promptId":"44fee0fa-00cb-4eda-871d-a84d3d354e70","type":"user","message":{"role":"user","content":"<channel source=\"nido\" from=\"padre\" from_id=\"k123/padre1\" machine=\"Portatil\" msg_id=\"5e5c4756-9e96-4225-9d4c-ee4453697737\">\nHola, ¿cuánto es 2+2?\n</channel>"},"isMeta":true,"uuid":"a7cfc6c0-6d8e-4e40-baf6-50b3d0ebd382","timestamp":"2026-11-10T09:58:06.693Z","permissionMode":"auto","origin":{"kind":"channel","server":"nido"},"promptSource":"system","queueSkipSlashCommands":true,"turnOrigin":"peer","turnPosition":{"promptIndex":0,"turnIndex":1},"queueSkipAttachments":true,"userType":"external","entrypoint":"cli","cwd":"/home/ana/proyecto","sessionId":"7a0ae70e-d2c0-4be6-9bbb-92c3be2eb706","version":"2.1.322","gitBranch":"HEAD"}"#;
+    const DELIVERED_BUSY: &str = r#"{"parentUuid":"fd471423-b95c-434b-9e53-91cab74e1a5e","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<channel source=\"nido\" from=\"padre\" from_id=\"k123/padre1\" machine=\"Portatil\">\nMensaje enviado mientras trabajas: di la palabra GIRASOL.\n</channel>","source_uuid":"e7446d97-604a-49b7-865c-3075ffd969bd","delivery_id":"5e5c4756-9e96-4225-9d4c-ee4453697737","commandMode":"prompt","origin":{"kind":"channel","server":"nido"},"timestamp":"2026-11-10T09:58:37.471Z","isMeta":true},"type":"attachment","uuid":"b9aa7fd6-dcd1-418d-bbea-3b523113a334","timestamp":"2026-11-10T09:58:37.471Z","rendered":[{"content":"<system-reminder>\nA message arrived from nido while you were working:\n<channel source=\"nido\" from=\"padre\">\nMensaje enviado mientras trabajas: di la palabra GIRASOL.\n</channel>\n</system-reminder>"}],"renderedRole":"system","session_id":"7a0ae70e-d2c0-4be6-9bbb-92c3be2eb706","userType":"external","entrypoint":"cli","cwd":"/home/ana/proyecto","sessionId":"7a0ae70e-d2c0-4be6-9bbb-92c3be2eb706","version":"2.1.322","gitBranch":"HEAD"}"#;
+
+    #[test]
+    fn deliveries_are_read_from_the_transcript_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        // Un turno tuyo que cita un evento (no es del channel) y uno de Claude.
+        let quoted = r#"{"type":"user","message":{"role":"user","content":"<channel source=\"nido\" msg_id=\"falso\">\nx\n</channel>"}}"#;
+        let reply =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"channel"}]}}"#;
+        let head = format!("{quoted}\n{reply}\n");
+        std::fs::write(&path, format!("{head}{DELIVERED_IDLE}\n{DELIVERED_BUSY}\n")).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        let (found, upto) = channel_deliveries(&path, 0).unwrap();
+        assert_eq!(
+            found,
+            [
+                Delivered::Id("5e5c4756-9e96-4225-9d4c-ee4453697737".into()),
+                Delivered::Text {
+                    from_id: "k123/padre1".into(),
+                    text: "Mensaje enviado mientras trabajas: di la palabra GIRASOL.".into()
+                },
+            ]
+        );
+        assert_eq!(upto, len);
+        // Desde lo ya mirado: nada; desde a media línea, solo lo de después.
+        assert_eq!(channel_deliveries(&path, len).unwrap(), (vec![], len));
+        let mid = head.len() as u64 + 10;
+        let (found, _) = channel_deliveries(&path, mid).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(matches!(found[0], Delivered::Text { .. }));
+        // Una línea a medio escribir no cuenta (ni se salta): hasta la última entera.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, &DELIVERED_IDLE.as_bytes()[..100]).unwrap();
+        assert_eq!(channel_deliveries(&path, len).unwrap(), (vec![], len));
+        std::io::Write::write_all(&mut f, &DELIVERED_IDLE.as_bytes()[100..]).unwrap();
+        std::io::Write::write_all(&mut f, b"\n").unwrap();
+        let (found, upto) = channel_deliveries(&path, len).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(upto > len);
+        // Más corto que lo mirado (se rehízo): desde el principio.
+        std::fs::write(&path, format!("{DELIVERED_IDLE}\n")).unwrap();
+        let (found, _) = channel_deliveries(&path, upto).unwrap();
+        assert_eq!(found.len(), 1);
     }
 
     #[test]
