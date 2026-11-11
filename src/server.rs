@@ -89,11 +89,11 @@ pub struct AppState {
     /// confíe en su carpeta (ver `trust_waiting`).
     trust_told: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Los secretos de este equipo (`secret`).
-    pub secrets: crate::secrets::Store,
+    pub secrets: Arc<crate::secrets::Store>,
     /// Las preguntas de secretos en curso.
     pub asks: crate::secrets::Asks,
     /// Lo que las sesiones mandan al usuario (`clipboard`, `send_file`).
-    pub outbox: crate::outbox::Outbox,
+    pub outbox: Arc<crate::outbox::Outbox>,
 }
 
 /// Una sesión recién arrancada y, si hay quien mire los arranques, su bandeja retenida.
@@ -462,8 +462,11 @@ impl AppState {
         }
         let accounts = accounts::Accounts::new(&paths.home, &paths.data);
         let secrets_dir = paths.state.join("secrets");
-        let outbox = crate::outbox::Outbox::new(paths.state.join("outbox"), secrets_dir.clone());
-        let secrets = crate::secrets::Store::new(secrets_dir);
+        let outbox = Arc::new(crate::outbox::Outbox::new(
+            paths.state.join("outbox"),
+            secrets_dir.clone(),
+        ));
+        let secrets = Arc::new(crate::secrets::Store::new(secrets_dir));
         Ok(Arc::new(Self {
             paths,
             launcher,
@@ -2789,13 +2792,22 @@ async fn api_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> 
 pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), RegistryError> {
     stop_and_wait(st, id).await;
     let res = st.registry.lock().await.remove(id);
-    let _ = std::fs::remove_dir_all(st.paths.session_state(id));
     st.mcp_cursors.forget(id);
     st.inbox.forget(id);
-    // Lo suyo de secretos y envíos: se cerró.
     st.asks.cancel_session(id);
-    st.secrets.forget_session(id);
-    st.outbox.forget(id);
+    // Sus ficheros, sus secretos y sus envíos: se cerró. Borrar puede tardar: fuera del hilo.
+    let (dir, secrets, outbox) = (
+        st.paths.session_state(id),
+        st.secrets.clone(),
+        st.outbox.clone(),
+    );
+    let id_ = id.to_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(dir);
+        secrets.forget_session(&id_);
+        outbox.forget(&id_);
+    })
+    .await;
     st.refresh.notify_one();
     res.map(|_| ())
 }

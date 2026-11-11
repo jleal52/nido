@@ -430,8 +430,9 @@ async fn save_answer(
         names.join(", ")
     };
     let (name, sessions, forced) = (taken.name.clone(), taken.sessions.clone(), taken.forced);
+    let store = st.secrets.clone();
     let saved = tokio::task::spawn_blocking(move || {
-        st.secrets.save_answer(
+        store.save_answer(
             &name,
             &sessions,
             value.as_bytes(),
@@ -462,7 +463,10 @@ async fn save_answer(
 
 /// `GET /api/v1/secrets`: los secretos recordados de este equipo, sin su valor.
 pub async fn api_secrets(State(st): State<Arc<AppState>>) -> Response {
-    Json(json!({ "secrets": st.secrets.list(now_ms()) })).into_response()
+    match tokio::task::spawn_blocking(move || st.secrets.list(now_ms())).await {
+        Ok(list) => Json(json!({ "secrets": list })).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 /// `DELETE /api/v1/secrets/{name}`: olvida uno (la próxima vez se pregunta).
@@ -478,12 +482,14 @@ pub async fn api_forget_secret(
             ),
         );
     }
-    match st.secrets.forget(&name) {
-        Ok(true) => Json(json!({ "ok": true })).into_response(),
-        Ok(false) => error(
+    let (store, n) = (st.secrets.clone(), name.clone());
+    match tokio::task::spawn_blocking(move || store.forget(&n)).await {
+        Ok(Ok(true)) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(false)) => error(
             StatusCode::NOT_FOUND,
             format!("no hay ningún secreto recordado {name:?}"),
         ),
+        Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
