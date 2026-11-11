@@ -200,8 +200,9 @@ To send you a text without writing it into the conversation, a session uses `cli
 file's `path`, or `nido clip`: `git diff | nido clip --title "the diff"` sends its standard input,
 and `nido clip ~/.ssh/id_ed25519.pub` a file. It goes to the clipboard of the session it runs in
 (`NIDO_SESSION`, so only inside a nido session), like `clipboard`: the web, the app and a
-notification. It only answers how much it sent (`enviado al portapapeles (1 KB)`), never the
-content. Only UTF-8 text, up to 64 KB: anything else is an error (for a binary file, use
+notification. It only answers how much it sent (`sent to the clipboard (1 KB)`), never the
+content, in the terminal's language (`LC_ALL`, `LC_MESSAGES` or `LANG`: Spanish if it is `es…`,
+English otherwise), unlike the rest of the command line, which is in Spanish. Only UTF-8 text, up to 64 KB: anything else is an error (for a binary file, use
 `send_file`), and so is an empty text. Like `send_file`, it doesn't take anything from nido's
 secrets folder.
 
