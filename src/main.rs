@@ -118,6 +118,16 @@ enum Cmd {
     Ls,
     /// Las alertas de las sesiones que aún no has visto.
     Alerts,
+    /// Manda un texto al portapapeles de esta sesión de nido, para copiarlo desde la web o la app,
+    /// sin enseñarlo: el fichero o, sin él, la entrada estándar (`orden | nido clip`). Solo texto
+    /// UTF-8, hasta 64 KB.
+    Clip {
+        /// El fichero de texto; sin él, lo que llegue por la entrada estándar.
+        file: Option<PathBuf>,
+        /// El título con el que se enseña.
+        #[arg(long)]
+        title: Option<String>,
+    },
     /// Los secretos que recuerda este equipo (sin su valor); `forget` olvida uno.
     Secrets {
         #[command(subcommand)]
@@ -1022,6 +1032,7 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             }
         }
         Cmd::Attach { name } => return attach_cmd(api, paths, name),
+        Cmd::Clip { file, title } => return clip_cmd(api, file, title),
         Cmd::Mcp { action: None } => nido::mcp::run(api.clone()),
         Cmd::Serve { .. }
         | Cmd::Holder { .. }
@@ -1032,6 +1043,74 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
         #[cfg(windows)]
         Cmd::Service { .. } => unreachable!(),
     }
+    Ok(())
+}
+
+/// `nido clip`: lo que hace la herramienta `clipboard` del MCP, desde una orden de la sesión (la
+/// de `NIDO_SESSION`). Con un fichero, lo lee el gestor con las comprobaciones de `send_file`
+/// (nada de la carpeta de secretos); sin él, la entrada estándar. El contenido no sale por la
+/// salida: solo cuánto se ha mandado.
+fn clip_cmd(api: &Api, file: Option<PathBuf>, title: Option<String>) -> io::Result<()> {
+    use nido::outbox::{self, MAX_TEXT};
+    use std::io::{IsTerminal, Read};
+    let Some(session) = nido::mcp::session_from(std::env::var("NIDO_SESSION").ok()) else {
+        return Err(io::Error::other(
+            "falta o no es válida NIDO_SESSION: `nido clip` es para las órdenes de una sesión de nido",
+        ));
+    };
+    let mut body = match file {
+        // Absoluto: el gestor no está en esta carpeta.
+        Some(f) => serde_json::json!({ "path": std::path::absolute(&f)? }),
+        None => {
+            let stdin = io::stdin();
+            // Sin nada que leer, no se queda esperando a que se escriba.
+            if stdin.is_terminal() {
+                use clap::CommandFactory;
+                let mut cli = Cli::command();
+                cli.build();
+                let clip = cli.find_subcommand_mut("clip").expect("la orden clip");
+                clip.error(
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "falta qué mandar: un fichero, o la salida de una orden (`orden | nido clip`)",
+                )
+                .exit();
+            }
+            let mut buf = Vec::new();
+            stdin
+                .lock()
+                .take(MAX_TEXT as u64 + 1)
+                .read_to_end(&mut buf)?;
+            if buf.len() > MAX_TEXT {
+                return Err(io::Error::other(format!(
+                    "el texto pasa de {} KB",
+                    MAX_TEXT / 1024
+                )));
+            }
+            let Some(text) = outbox::text_of(buf) else {
+                return Err(io::Error::other(
+                    "la entrada no es texto (UTF-8): para mandar un binario, usa send_file",
+                ));
+            };
+            if text.trim().is_empty() {
+                return Err(io::Error::other("el texto está vacío"));
+            }
+            serde_json::json!({ "text": text })
+        }
+    };
+    if let Some(t) = title {
+        body["title"] = t.into();
+    }
+    let r = api.call_with(
+        "POST",
+        "/api/v1/mcp/clipboard",
+        Some(&body),
+        &[("X-Nido-Session", &session)],
+    )?;
+    let size = r["size"].as_u64().unwrap_or(0);
+    println!(
+        "enviado al portapapeles ({} KB)",
+        size.div_ceil(1024).max(1)
+    );
     Ok(())
 }
 

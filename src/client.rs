@@ -19,7 +19,7 @@ impl Api {
         body: Option<&serde_json::Value>,
     ) -> io::Result<(u16, serde_json::Value)> {
         // La terminal habla español: los mensajes del gestor, también (la API, por defecto, en
-        // inglés para la app y la web).
+        // inglés para la app y la web). Lo mismo en `call_with`.
         self.request_with(
             method,
             path,
@@ -82,7 +82,21 @@ impl Api {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> io::Result<serde_json::Value> {
-        let (code, json) = self.request(method, path, body)?;
+        self.call_with(method, path, body, &[])
+    }
+
+    /// Como `call`, con cabeceras de más (`X-Nido-Session` para hablar como una sesión).
+    pub fn call_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> io::Result<serde_json::Value> {
+        let mut all = vec![("Accept-Language", "es")];
+        all.extend_from_slice(headers);
+        let (code, json) =
+            self.request_with(method, path, body, &all, Some(Duration::from_secs(30)))?;
         ok_or_message(code, json)
     }
 }
