@@ -122,15 +122,24 @@ lista. El nombre de cada equipo es el del sistema, o el de `NIDO_NAME`.
 
 Cada Claude que lanza nido tiene el servidor MCP de nido (`nido mcp`), con estas herramientas:
 
-- `sessions`: las sesiones de Claude de todos los equipos de tu grupo, con su estado.
+- `sessions`: las sesiones de Claude de todos los equipos de tu grupo, con su estado y `since`
+  (cuándo arrancó, si está en marcha, o cuándo se paró).
 - `send`: un mensaje a otra sesión. Le llega por un
   [channel](https://code.claude.com/docs/en/channels) de Claude Code, y la respuesta vuelve igual.
 - `read`: lo que ha dicho una sesión desde la última vez que se leyó, su estado y su pregunta
   pendiente.
 - `open`, `answer` y `close`: abrir una sesión de Claude nueva (una hija) en una carpeta de
   cualquier equipo del grupo, contestar sus preguntas y peticiones de permiso, y cerrarla.
+- `start` y `stop`: arrancar una sesión de Claude parada de cualquier equipo del grupo, retomando
+  su conversación, y parar una (su conversación se guarda). `stop` no para una sesión que está
+  trabajando o tiene una pregunta pendiente, salvo con `force`; una sesión no se para a sí misma.
 - `alert`: un aviso a tu móvil (y una 🔔 en `nido ls` y en las apps), para cuando pediste que te
   avisaran de algo.
+- `secret`: te pide un token o una contraseña sin que pase por la conversación (ver
+  [Secretos, textos y ficheros](#secretos-textos-y-ficheros)).
+- `clipboard`: un texto para que lo copies (un recuadro con un botón Copiar en la web y la app),
+  y un aviso.
+- `send_file`: una copia de un fichero para abrirla o guardarla desde la web o la app, y un aviso.
 
 Lo que nido cambia en tu configuración de Claude:
 
@@ -140,11 +149,19 @@ Lo que nido cambia en tu configuración de Claude:
   `nido`, lo cambia.
 - Las sesiones de Claude que lanza llevan `--dangerously-load-development-channels server:nido`
   (los channels están en vista previa, y el de nido es un channel de desarrollo) y
-  `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert`. Al
-  cargar un channel de desarrollo, Claude enseña un aviso al arrancar: nido lo acepta por ti,
-  pero solo si la lista es exactamente `server:nido`.
-- Solo esas cuatro herramientas van sin preguntar. `open`, `answer` y `close` pasan por el
-  permiso de siempre de Claude (en modo auto, decide su clasificador).
+  `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert
+  mcp__nido__secret mcp__nido__clipboard mcp__nido__send_file`. Al cargar un channel de
+  desarrollo, Claude enseña un aviso al arrancar: nido lo acepta por ti, pero solo si la lista es
+  exactamente `server:nido`.
+- Solo esas siete herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo a ti
+  (`secret` lo controla su propio diálogo). `open`, `answer`, `close`, `start` y `stop` actúan
+  sobre otras sesiones, así que pasan por el permiso de siempre de Claude (en modo auto, decide su
+  clasificador).
+- También llevan `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
+  con la ruta absoluta de la carpeta de secretos de nido (y también la de verdad, si hay un enlace
+  por medio). Claude aplica la regla de `Read` a su herramienta Read y a `cat`, `head`, `<`… en
+  Bash, y la de `Edit` a Edit y Write: así Claude no mete un secreto en la conversación por un
+  descuido.
 - Las opciones del channel solo se ponen si tu Claude Code las conoce. Con uno más antiguo, la
   sesión arranca sin ellas y `sessions` enseña un `channel_error`.
 
@@ -153,10 +170,61 @@ Lo que nido cambia en tu configuración de Claude:
 gestionados). Mientras tanto las herramientas funcionan pero los mensajes no llegan: nido lee el
 aviso de Claude y `sessions` enseña `channel_error: "blocked by org policy"` en esa sesión.
 
+### Secretos, textos y ficheros
+
+Cuando una sesión llama a `secret`, se abre un diálogo en la web y la app de nido con el nombre
+del secreto y el motivo de la sesión, y te llega un aviso al móvil. Lo que escribes va cifrado de
+extremo a extremo a ese equipo y se guarda en un fichero privado; la sesión recibe la ruta del
+fichero, nunca el valor. Puedes hacer que se recuerde 2 horas, 7 días o siempre, para todas las
+sesiones de ese equipo (nunca en otros equipos); si no, es solo para esa sesión. `secret` espera
+hasta 15 minutos a que contestes.
+
+La sesión usa el secreto de una de estas dos maneras:
+
+- Con su ruta, para los programas que lo leen de un fichero (`--password-file <ruta>`).
+- Con `nido secrets run <nombre> --env VAR -- <orden> [args…]`, para los que lo quieren en una
+  variable de entorno: ejecuta la orden con el secreto en `VAR` y sin enseñarlo, y sale con el
+  código de la orden. Usa el mismo que devolvió `secret`, así que solo funciona dentro de una
+  sesión de nido (`NIDO_SESSION`). Si `nido` no está en el `PATH` de la sesión, `secret` devuelve
+  también su ruta completa: va entre comillas dobles, como la ruta del secreto, porque pueden
+  tener espacios. En Windows, las órdenes `.cmd` y `.bat` (`npm`, `npx`…) van con `cmd /c`:
+  `nido secrets run npm-token --env NPM_TOKEN -- cmd /c npm publish`.
+
+Si un programa solo admite el secreto como argumento, Claude te lo dice en lugar de usarlo.
+
+Dónde se guardan y cuánto duran (`<state>` es `~/.local/state/nido`, `$XDG_STATE_HOME/nido` o
+`$NIDO_HOME/state`; en Windows, `%USERPROFILE%\.local\state\nido`):
+
+- Los secretos, en `<state>/secrets/`, que solo puede leer tu usuario. Uno recordado dura hasta
+  que caduca o lo olvidas; uno sin recordar se borra al cerrar su sesión, o a las 24 horas. Un
+  secreto puede tener hasta 16 KB.
+- Lo que mandan `clipboard` y `send_file`, en `<state>/outbox/`: dura 7 días o hasta que se
+  cierra la sesión, como mucho los 50 últimos de cada sesión y 256 MB por equipo (primero se van
+  los más antiguos). Un texto puede tener hasta 64 KB y un fichero hasta 64 MB.
+- En Windows nido no cambia permisos: los ficheros heredan los de tu perfil de usuario, que solo
+  son tuyos. Por eso la carpeta de estado tiene que seguir dentro de tu perfil (no la saques con
+  `XDG_STATE_HOME` ni con `NIDO_HOME`).
+
+```sh
+nido secrets                                      # los secretos recordados en este equipo (nunca su valor)
+nido secrets forget <nombre>                      # olvida uno: la próxima sesión que lo necesite lo vuelve a pedir
+nido secrets run <nombre> --env VAR -- <orden>    # ejecuta una orden con un secreto en VAR
+```
+
+Si pones `MCP_TOOL_TIMEOUT` de Claude Code por debajo de 15 minutos, `secret` falla antes de que
+te dé tiempo a contestar.
+
 Seguridad:
 
 - Las herramientas solo llegan a los equipos de tu grupo de nido, por el mismo canal cifrado de
-  extremo a extremo.
+  extremo a extremo. Otro equipo del grupo no puede pedir secretos ni mandar textos o ficheros en
+  nombre de una sesión: solo las sesiones de ese equipo.
+- Un secreto solo lo puede contestar un móvil o un navegador emparejado (una persona), no el token
+  de la consola, que tiene el `nido mcp` de cada sesión. Sin ningún dispositivo emparejado,
+  `secret` falla en el momento.
+- La conversación no ve un secreto mientras Claude no lo lea, y nido hace que Claude se niegue a
+  leerlo (ver arriba). Pero un programa que abra el fichero por su cuenta sí puede leerlo: esto
+  protege contra descuidos, no contra una sesión que quiera leer el secreto.
 - Una sesión solo puede contestar y cerrar las sesiones que abrió con `open`.
 - Cada equipo tiene en marcha como mucho 10 sesiones abiertas con `open` desde un mismo equipo
   (él incluido), y apuntadas como mucho 50.
@@ -209,8 +277,11 @@ sed "s/USUARIO/$(whoami)/g" contrib/nido.plist > ~/Library/LaunchAgents/io.githu
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.jleal52.nido.plist
 ```
 
-El ejecutable no está firmado por Apple. Bajado con `curl`, como arriba, macOS lo deja correr; si
-lo bajas con el navegador y no te deja abrirlo, quítale la marca de descarga con
+Los ejecutables de macOS van firmados con un Developer ID: macOS reconoce nido de una versión a
+otra y mantiene los permisos de privacidad que le diste (a Documentos o Descargas, por ejemplo),
+así que las sesiones no se quedan esperando otra vez ese diálogo tras cada actualización. No están
+notarizados. Bajado con `curl`, como arriba, macOS lo deja correr; si lo bajas con el navegador
+y no te deja abrirlo, quítale la marca de descarga con
 `xattr -d com.apple.quarantine ~/.local/bin/nido`.
 
 **Windows 10/11** (PowerShell), con una tarea programada que arranca nido al iniciar sesión, con

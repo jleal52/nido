@@ -123,14 +123,23 @@ Each computer's name is the system's, or `NIDO_NAME`.
 
 Each Claude that nido launches gets nido's MCP server (`nido mcp`), with these tools:
 
-- `sessions`: the Claude sessions on every computer in your group, with their state.
+- `sessions`: the Claude sessions on every computer in your group, with their state and `since`
+  (when it started, if it is running, or when it stopped).
 - `send`: a message to another session. It arrives through a Claude Code
   [channel](https://code.claude.com/docs/en/channels), and the answer comes back the same way.
 - `read`: what a session has said since it was last read, its state and its pending question.
 - `open`, `answer` and `close`: open a new Claude session (a child) in a folder on any computer
   in the group, answer its questions and permission requests, and close it.
+- `start` and `stop`: start a stopped Claude session on any computer in the group, picking up its
+  conversation, and stop one (its conversation is kept). `stop` refuses a session that is working
+  or has a pending question, unless asked with `force`; a session can't stop itself.
 - `alert`: a notification to your phone (and a 🔔 in `nido ls` and in the apps), for when you
   asked to be told about something.
+- `secret`: asks you for a token or a password without it going through the conversation (see
+  [Secrets, texts and files](#secrets-texts-and-files)).
+- `clipboard`: a text for you to copy (a box with a Copy button in the web and the app), and a
+  notification.
+- `send_file`: a copy of a file to open or save from the web or the app, and a notification.
 
 What nido changes in your Claude setup:
 
@@ -140,11 +149,19 @@ What nido changes in your Claude setup:
   it points to another `nido`, it is replaced.
 - The Claude sessions it launches get `--dangerously-load-development-channels server:nido`
   (channels are a research preview, and nido's is a development channel) and
-  `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert`. When it
-  loads a development channel, Claude shows a warning at startup: nido accepts it for you, but
-  only when the list is exactly `server:nido`.
-- Only those four tools run without asking. `open`, `answer` and `close` go through Claude's
-  usual permission prompt (in auto mode, its classifier decides).
+  `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert
+  mcp__nido__secret mcp__nido__clipboard mcp__nido__send_file`. When it loads a development
+  channel, Claude shows a warning at startup: nido accepts it for you, but only when the list is
+  exactly `server:nido`.
+- Only those seven tools run without asking: they look, talk, or ask and send things to you
+  (`secret` is controlled by its own dialog). `open`, `answer`, `close`, `start` and `stop` act
+  on other sessions, so they go through Claude's usual permission prompt (in auto mode, its
+  classifier decides).
+- They also get `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
+  with the absolute path of nido's secrets folder (and its real path too, if there is a link on
+  the way). Claude applies the `Read` rule to its Read tool and to `cat`, `head`, `<`… in Bash,
+  and the `Edit` rule to Edit and Write: that way Claude doesn't read a secret into the
+  conversation by mistake.
 - The channel flags are only added if your Claude Code knows them. With an older one, the
   session starts without them and `sessions` shows a `channel_error`.
 
@@ -153,10 +170,60 @@ What nido changes in your Claude setup:
 Until then the tools work but messages don't arrive: nido reads Claude's warning and `sessions`
 shows `channel_error: "blocked by org policy"` for that session.
 
+### Secrets, texts and files
+
+When a session calls `secret`, a dialog opens in the nido web and app with the secret's name and
+the session's reason, and your phone gets a notification. What you type goes end-to-end encrypted
+to that computer and is saved in a private file; the session gets the file's path, never the
+value. You can have it remembered 2 hours, 7 days or forever, for every session on that computer
+(never on other computers); otherwise it is only for that session. `secret` waits up to 15
+minutes for your answer.
+
+The session uses the secret in one of two ways:
+
+- With its path, for programs that read it from a file (`--password-file <path>`).
+- With `nido secrets run <name> --env VAR -- <command> [args…]`, for programs that want it in an
+  environment variable: it runs the command with the secret in `VAR` and without showing it, and
+  exits with the command's code. It takes the same one `secret` returned, so it only works inside
+  a nido session (`NIDO_SESSION`). If `nido` is not in the session's `PATH`, `secret` also returns
+  its full path: put it in double quotes, like the secret's path, because they may contain spaces.
+  On Windows, `.cmd` and `.bat` commands (`npm`, `npx`…) go through `cmd /c`:
+  `nido secrets run npm-token --env NPM_TOKEN -- cmd /c npm publish`.
+
+If a program only takes the secret as an argument, Claude tells you so instead of using it.
+
+Where they live and how long they last (`<state>` is `~/.local/state/nido`,
+`$XDG_STATE_HOME/nido` or `$NIDO_HOME/state`; on Windows, `%USERPROFILE%\.local\state\nido`):
+
+- Secrets, in `<state>/secrets/`, readable only by your user. A remembered one stays until it
+  expires or you forget it; one that isn't remembered is deleted when its session is closed, or
+  after 24 hours. A secret can be up to 16 KB.
+- What `clipboard` and `send_file` send, in `<state>/outbox/`: kept 7 days or until the session
+  is closed, at most the last 50 per session and 256 MB per computer (the oldest go first). A text
+  can be up to 64 KB and a file up to 64 MB.
+- On Windows nido doesn't change permissions: the files inherit those of your user profile, which
+  are only yours. So the state folder must stay inside your profile (don't move it out with
+  `XDG_STATE_HOME` or `NIDO_HOME`).
+
+```sh
+nido secrets                                      # the secrets remembered on this computer (never their value)
+nido secrets forget <name>                        # forget one: the next session that needs it asks again
+nido secrets run <name> --env VAR -- <command>    # run a command with a secret in VAR
+```
+
+If you set Claude Code's `MCP_TOOL_TIMEOUT` below 15 minutes, `secret` fails before you have time
+to answer.
+
 Security:
 
 - The tools only reach the computers in your nido group, over the same end-to-end encrypted
-  channel.
+  channel. Another computer in the group can't ask for secrets or send texts or files on behalf
+  of a session: only the sessions on that computer can.
+- Only a paired phone or browser (a person) can answer a secret, not the command line's token,
+  which every session's `nido mcp` has. With no device paired, `secret` fails at once.
+- The conversation doesn't see a secret as long as Claude doesn't read it, and nido makes Claude
+  refuse to read it (see above). But a program that opens the file on its own can read it: this
+  guards against accidents, not against a session that wants to read the secret.
 - A session can only answer and close the sessions it opened with `open`.
 - Each computer runs at most 10 sessions opened with `open` from the same computer (itself
   included), and keeps at most 50 of them registered.
@@ -209,9 +276,11 @@ sed "s/USUARIO/$(whoami)/g" contrib/nido.plist > ~/Library/LaunchAgents/io.githu
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.jleal52.nido.plist
 ```
 
-The binary is not signed by Apple. Downloaded with `curl`, as above, macOS lets it run; if you
-download it with a browser and macOS won't open it, remove the download flag with
-`xattr -d com.apple.quarantine ~/.local/bin/nido`.
+The macOS binaries are signed with a Developer ID: macOS recognizes nido across updates and keeps
+the privacy permissions you gave it (to Documents or Downloads, for instance), so sessions don't
+get stuck waiting on that dialog again after each update. They are not notarized. Downloaded with
+`curl`, as above, macOS lets it run; if you download it with a browser and macOS won't open it,
+remove the download flag with `xattr -d com.apple.quarantine ~/.local/bin/nido`.
 
 **Windows 10/11** (PowerShell), with a scheduled task that starts nido when you sign in, as your
 user and with no window (`nidow.exe` launches it without a console):
