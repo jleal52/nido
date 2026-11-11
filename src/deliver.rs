@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -307,14 +307,31 @@ fn read_answer(body: &[u8]) -> Result<SecretAnswer, &'static str> {
     Ok(req)
 }
 
+/// Lo más que se lee del cuerpo de una respuesta (el secreto va en JSON, con sus escapes): no
+/// los 2 MB de siempre.
+pub const MAX_ANSWER: usize = 128 * 1024;
+
 /// `POST /api/v1/sessions/{id}/secret` `{ask, value, remember}` o `{ask, reject: true}`: la
 /// respuesta del usuario a la pregunta `ask` que espera la sesión `id`. La primera vale; las
 /// demás, 404 (la web y la app cierran el diálogo).
+///
+/// Solo con el token de un dispositivo emparejado (un teléfono o una web, una persona): no con
+/// el principal, que tiene el `nido mcp` de cada sesión. Si no, una sesión engañada podría
+/// contestar la pregunta de otra o dejar un valor recordado para todo el equipo.
 pub async fn api_secret_answer(
     State(st): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let device = crate::auth::bearer(&headers)
+        .is_some_and(|t| st.phones.lock().expect("teléfonos").token_ok(t));
+    if !device {
+        return error(
+            StatusCode::FORBIDDEN,
+            "solo un teléfono o una web emparejados pueden contestar un secreto",
+        );
+    }
     let req = match read_answer(&body) {
         Ok(r) => r,
         Err(msg) => return error(StatusCode::BAD_REQUEST, msg),

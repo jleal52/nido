@@ -86,13 +86,24 @@ fn session(name: &str, cwd: &Path, claude: Option<ClaudeLink>) -> Session {
     }
 }
 
-/// Una petición de la web: con el token y en español.
+/// Una petición de la consola (con el token principal), en español.
 async fn web(addr: SocketAddr, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
-    let (method, path) = (method.to_owned(), path.to_owned());
+    web_as(addr, TOKEN, method, path, body).await
+}
+
+/// Una petición con `token` (el principal, o el de un dispositivo emparejado), en español.
+async fn web_as(
+    addr: SocketAddr,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let (method, path, token) = (method.to_owned(), path.to_owned(), token.to_owned());
     tokio::task::spawn_blocking(move || {
         let api = Api {
             addr,
-            token: Some(TOKEN.into()),
+            token: Some(token),
         };
         api.request_with(
             &method,
@@ -105,6 +116,32 @@ async fn web(addr: SocketAddr, method: &str, path: &str, body: Option<Value>) ->
     })
     .await
     .unwrap()
+}
+
+/// Un POST con un cuerpo de `len` bytes: el código con el que contesta (aunque corte antes de
+/// leerlo entero).
+async fn post_big(addr: SocketAddr, token: &str, path: &str, len: usize) -> u16 {
+    use std::io::{Read, Write};
+    let head = format!(
+        "POST {path} HTTP/1.0\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {len}\r\n\r\n"
+    );
+    let raw = tokio::task::spawn_blocking(move || {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.write_all(head.as_bytes()).unwrap();
+        // Puede cortar antes: lo que importa es lo que contesta.
+        let _ = s.write_all(&vec![b' '; len]);
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        out
+    })
+    .await
+    .unwrap();
+    String::from_utf8_lossy(&raw)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Lo que baja la web: el código, las cabeceras (en minúsculas) y el cuerpo.
@@ -217,7 +254,15 @@ async fn secrets_clipboard_and_files_end_to_end() {
         e["error"],
         "nowhere to ask: no phone or browser is paired with nido"
     );
+    // Un teléfono emparejado: en el grupo (hay dónde preguntar) y con su token (contesta).
     state.group.add_device(&[7u8; 32], "teléfono de prueba");
+    let device = state
+        .phones
+        .lock()
+        .unwrap()
+        .add(&[7u8; 32], "teléfono de prueba", None)
+        .unwrap()
+        .token;
     let (code, e) = tool(addr, me, "secret", json!({"name": "a/b", "reason": "x"})).await;
     assert_eq!(code, 400, "{e}");
     let (code, e) = tool(addr, me, "secret", json!({"name": "tok", "reason": "  "})).await;
@@ -247,8 +292,27 @@ async fn secrets_clipboard_and_files_end_to_end() {
         )
     );
     let answer = format!("/api/v1/sessions/{caller}/secret");
+    // Solo contesta un dispositivo emparejado: con el token principal (el que tiene el `nido mcp`
+    // de cada sesión), no.
     let (code, e) = web(
         addr,
+        "POST",
+        &answer,
+        Some(json!({"ask": ask["id"], "value": "puesto-por-otra-sesion"})),
+    )
+    .await;
+    assert_eq!(
+        (code, e["error"].as_str()),
+        (
+            403,
+            Some("solo un teléfono o una web emparejados pueden contestar un secreto")
+        )
+    );
+    // Un cuerpo enorme no se lee entero: su propio tope, no los 2 MB de siempre.
+    assert_eq!(post_big(addr, &device, &answer, 200 * 1024).await, 413);
+    let (code, e) = web_as(
+        addr,
+        &device,
         "POST",
         &answer,
         Some(json!({"ask": ask["id"], "value": ""})),
@@ -259,8 +323,9 @@ async fn secrets_clipboard_and_files_end_to_end() {
         (400, Some("el secreto está vacío"))
     );
     // Un error de la respuesta no cita el valor.
-    let (code, e) = web(
+    let (code, e) = web_as(
         addr,
+        &device,
         "POST",
         &answer,
         Some(json!({"ask": ask["id"], "value": "s3cr3t-de-prueba", "otro": 1})),
@@ -268,8 +333,9 @@ async fn secrets_clipboard_and_files_end_to_end() {
     .await;
     assert_eq!(code, 400);
     assert!(!e.to_string().contains("s3cr3t"), "{e}");
-    let (code, _) = web(
+    let (code, _) = web_as(
         addr,
+        &device,
         "POST",
         &answer,
         Some(json!({"ask": ask["id"], "value": "s3cr3t-de-prueba", "remember": "2h"})),
@@ -277,8 +343,9 @@ async fn secrets_clipboard_and_files_end_to_end() {
     .await;
     assert_eq!(code, 200);
     // La segunda respuesta (otro dispositivo) ya no vale.
-    let (code, _) = web(
+    let (code, _) = web_as(
         addr,
+        &device,
         "POST",
         &answer,
         Some(json!({"ask": ask["id"], "value": "otro"})),
@@ -317,8 +384,9 @@ async fn secrets_clipboard_and_files_end_to_end() {
     // `force`: pregunta otra vez; rechazado → error para la sesión.
     let asking = ask_in_bg(json!({"name": "tok", "reason": "caducó", "force": true}));
     let ask = asked(addr, &caller).await;
-    let (code, _) = web(
+    let (code, _) = web_as(
         addr,
+        &device,
         "POST",
         &answer,
         Some(json!({"ask": ask["id"], "reject": true})),
@@ -334,8 +402,9 @@ async fn secrets_clipboard_and_files_end_to_end() {
     // Sin recordar: solo para esta sesión, en su carpeta.
     let asking = ask_in_bg(json!({"name": "solo", "reason": "x"}));
     let ask = asked(addr, &caller).await;
-    let (code, _) = web(
+    let (code, _) = web_as(
         addr,
+        &device,
         "POST",
         &answer,
         Some(json!({"ask": ask["id"], "value": "v"})),

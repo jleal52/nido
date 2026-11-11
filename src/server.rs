@@ -2058,7 +2058,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/sessions/{id}/secret",
-            post(crate::deliver::api_secret_answer),
+            post(crate::deliver::api_secret_answer)
+                .layer(DefaultBodyLimit::max(crate::deliver::MAX_ANSWER)),
         )
         .route("/api/v1/secrets", get(crate::deliver::api_secrets))
         .route(

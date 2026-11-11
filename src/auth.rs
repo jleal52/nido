@@ -64,7 +64,7 @@ pub fn host_is_loopback(host: &str) -> bool {
     matches!(name, "localhost" | "127.0.0.1" | "::1")
 }
 
-fn bearer(h: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(h: &HeaderMap) -> Option<&str> {
     header(h, header::AUTHORIZATION)?.strip_prefix("Bearer ")
 }
 

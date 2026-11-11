@@ -816,6 +816,10 @@ const TABLE: &[(&str, &str)] = &[
         "that secret is no longer waiting for an answer",
     ),
     (
+        "solo un teléfono o una web emparejados pueden contestar un secreto",
+        "only a paired phone or browser can answer a secret",
+    ),
+    (
         "no hay ningún secreto recordado {}",
         "there is no remembered secret {0}",
     ),
