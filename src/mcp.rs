@@ -382,6 +382,70 @@ const TOOLS: &[Tool] = &[
                 about something.",
         args: &[req("text", "string", "What to tell the user.")],
     },
+    Tool {
+        any_of: &[],
+        name: "secret",
+        about: "Ask the user for a secret (a token, a password) without it going through this \
+                conversation. A dialog opens in the user's nido web and app with the name and \
+                your reason; what they type is saved in a private file on this machine, and this \
+                returns {path, nido}. Never print the secret, cat it or read it: nido blocks \
+                reading that folder with Read and in Bash (cat, head, < …). Use it in one of two \
+                ways: pass the path to an option that reads the secret from a file (like \
+                --password-file <path>); or, if the program wants it in an environment \
+                variable, run the command through nido: nido secrets run <name> --env VAR -- \
+                <command> [args…] (it sets VAR to the secret and runs the command without \
+                showing it; if `nido` is not found, use the full path in the nido field). If the \
+                program only takes the secret as an argument, tell the user instead. If the user \
+                chose to remember it, later calls with the same name on this machine return at \
+                once; use force when the stored one no longer works. Waits until the user \
+                answers, declines or 15 minutes pass (then it is an error).",
+        args: &[
+            req(
+                "name",
+                "string",
+                "Short name for the secret, like github-token: letters, digits, '.', '_' or \
+                 '-', up to 64.",
+            ),
+            req("reason", "string", "Why you need it: the user sees it."),
+            opt(
+                "force",
+                "boolean",
+                "Ask again even if one is remembered (the stored one no longer works); the \
+                 answer replaces it.",
+            ),
+        ],
+    },
+    Tool {
+        any_of: &[],
+        name: "clipboard",
+        about: "Send the user a text to copy (a command, a URL, a code), up to 64 KB: it shows \
+                up in this session in the user's nido web and app with a Copy button, and as a \
+                notification on their phone. Returns status sent.",
+        args: &[
+            req("text", "string", "The text to copy."),
+            opt(
+                "title",
+                "string",
+                "A short title (default: its first line).",
+            ),
+        ],
+    },
+    Tool {
+        any_of: &[],
+        name: "send_file",
+        about: "Send the user a copy of a file on this machine, up to 64 MB: it shows up in \
+                this session in the user's nido web and app, to open or save, and as a \
+                notification on their phone. The copy is kept 7 days or until this session is \
+                closed. Returns status sent, name and size.",
+        args: &[
+            req(
+                "path",
+                "string",
+                "The file: absolute, or relative to this session's folder.",
+            ),
+            opt("title", "string", "A short title (default: the file name)."),
+        ],
+    },
 ];
 
 const INSTRUCTIONS: &str = "nido manages the user's terminal sessions (mostly Claude Code) on \
@@ -402,7 +466,13 @@ answers Claude's question of whether to trust a folder: only the user can, and n
 `alert` notifies the user on their phone: use it when the user asked to be notified of something.
 
 `start` and `stop` work on any Claude session of the group: `stop` keeps its conversation and \
-`start` resumes it. Don't stop a session that is working unless the user asked to.";
+`start` resumes it. Don't stop a session that is working unless the user asked to.
+
+`secret` asks the user for a token or a password and returns the path of a file that holds it: \
+never print, cat or read it; pass the path to an option that reads from a file (e.g. \
+--password-file <path>), or run the command with `nido secrets run <name> --env VAR -- <command>` \
+(with the nido path it returns, if `nido` is not found). `clipboard` and `send_file` send the \
+user a text to copy or a file.";
 
 const OUTSIDE: &str = "This Claude session is not running inside nido: no nido tools here.";
 
@@ -1017,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_the_nine_tools() {
+    fn lists_the_twelve_tools() {
         let mut st = State::for_tests(Some("abc12345"));
         let out = handle(
             &mut st,
@@ -1031,7 +1101,18 @@ mod tests {
         assert_eq!(
             names,
             [
-                "sessions", "send", "read", "open", "answer", "close", "start", "stop", "alert"
+                "sessions",
+                "send",
+                "read",
+                "open",
+                "answer",
+                "close",
+                "start",
+                "stop",
+                "alert",
+                "secret",
+                "clipboard",
+                "send_file"
             ]
         );
         for t in tools {
@@ -1065,6 +1146,31 @@ mod tests {
             "boolean"
         );
         assert!(tools[0]["description"].as_str().unwrap().contains("since"));
+        let secret = &tools[9];
+        assert_eq!(secret["inputSchema"]["required"], json!(["name", "reason"]));
+        assert_eq!(
+            secret["inputSchema"]["properties"]["force"]["type"],
+            "boolean"
+        );
+        let about = secret["description"].as_str().unwrap();
+        for want in [
+            "--password-file",
+            "nido secrets run",
+            "nido field",
+            "Never print",
+        ] {
+            assert!(about.contains(want), "{want}: {about}");
+        }
+        assert_eq!(tools[10]["inputSchema"]["required"], json!(["text"]));
+        assert_eq!(tools[11]["inputSchema"]["required"], json!(["path"]));
+    }
+
+    #[test]
+    fn the_instructions_tell_to_use_the_secret_path_without_reading_it() {
+        assert!(INSTRUCTIONS.contains("`secret`"));
+        assert!(INSTRUCTIONS.contains("nido secrets run"));
+        assert!(INSTRUCTIONS.contains("--password-file"));
+        assert!(INSTRUCTIONS.contains("`clipboard`") && INSTRUCTIONS.contains("`send_file`"));
     }
 
     #[test]
