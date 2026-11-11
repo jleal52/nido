@@ -315,6 +315,19 @@ fn without_controls(s: &str) -> String {
     out
 }
 
+/// La hora de parada que se guarda tras un escaneo (ms; 0: no se sabe). Se apunta al ver parada
+/// una que estaba viva en el escaneo de antes (`was_alive`). En marcha se olvida: si luego se
+/// para sin que nido lo vea, no se sabe desde cuándo, y la de antes ya no vale.
+fn stop_time(stopped: u64, alive: bool, was_alive: bool, now: u64) -> u64 {
+    if alive {
+        0
+    } else if was_alive {
+        now
+    } else {
+        stopped
+    }
+}
+
 /// Las alertas que el usuario aún no ha visto.
 fn unread_alerts(alerts: &[AlertRec], seen: u64) -> Vec<AlertRec> {
     alerts.iter().filter(|a| a.at > seen).cloned().collect()
@@ -448,9 +461,8 @@ impl AppState {
             .collect();
         for s in sessions {
             let alive = launch::is_alive(&self.paths, &s.id);
-            let mut stopped = s.stopped;
-            if !alive && was_alive.contains(&s.id) {
-                stopped = now_ms();
+            let stopped = stop_time(s.stopped, alive, was_alive.contains(&s.id), now_ms());
+            if stopped != s.stopped {
                 let _ = reg.update(&s.id, |x| x.stopped = stopped);
             }
             let found = alive
@@ -3263,6 +3275,20 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+
+    #[test]
+    fn a_stop_time_from_before_the_last_run_is_forgotten() {
+        let since = crate::mcp_api::since;
+        // Parada mientras nido miraba: su hora.
+        assert_eq!(stop_time(0, false, true, 1_000), 1_000);
+        assert_eq!(stop_time(1_000, false, false, 2_000), 1_000);
+        // Vuelve a estar en marcha: esa hora ya no vale.
+        let t1 = stop_time(1_000, true, false, 3_000);
+        assert_eq!(t1, 0);
+        // Se para sin que nido lo vea (p. ej. mientras se reiniciaba): no se sabe, no la de antes.
+        let after = stop_time(t1, false, false, 4_000);
+        assert_eq!(since(false, None, after), None);
+    }
 
     fn view(id: &str) -> SessionView {
         SessionView {
