@@ -253,6 +253,32 @@ come in English, or in Spanish if the request asks for it with `Accept-Language:
 `DELETE /api/v1/phones/me`: the paired phone or browser that calls it signs itself out of every
 computer in the group (the web app's "Sign out").
 
+Each Claude session in `GET /api/v1/sessions` has, in `claude`, `model` (the display name of the
+model of Claude's last reply, e.g. `"Opus 5.5"`, or the one nido last set; `null` if unknown) and
+`models` (the models that can be chosen, as Claude's `/model` menu showed them the last time nido
+opened it, without `Default`; until then `["Opus", "Fable", "Sonnet", "Haiku"]`, which also work
+as requests). `GET /api/v1/info` has `models` too. Each `screen` message of
+`/api/v1/sessions/{id}/live` has `mode`, the permission mode Claude's footer shows: `"auto"`,
+`"manual"`, `"acceptEdits"`, `"plan"`, `"bypassPermissions"` or `null` (not shown or not
+understood, e.g. while a menu is open).
+
+`POST /api/v1/sessions/{id}/mode` `{"mode": "plan"}` changes Claude's permission mode by pressing
+shift+tab and reading the footer after each press, until it shows the mode asked for; it works
+while Claude is working too, and on the way it may briefly go through other modes. Returns
+`{"ok": true, "mode": "plan"}`; `400` for an unknown mode; `409` if it could not (the session is
+not running, a menu or a question is on screen, the footer is not understood, or the mode is not
+reachable with shift+tab).
+
+`POST /api/v1/sessions/{id}/model` `{"model": "Opus 5.5"}` changes Claude's model for this
+session only: with Claude idle, no menu on screen and nothing typed in its input box, it types
+`/model`, moves the menu's cursor to that model with the arrow keys (never `Default`) and presses
+`s` ("use this session only"); it never presses Enter in that menu, which would make it the
+default for new sessions. A model, a label (`"Sonnet"`) or its beginning (`"Opus"`: the first
+option that starts like that) can be asked for. Returns `{"ok": true, "model": "Opus 5.5"}`, with
+the model as the menu shows it; `400` without a model; `409` if it could not (Claude working, a
+menu or a draft on screen, the option not in the menu, no "session only" in the menu…), after
+closing the menu with Esc if it was open.
+
 ## Install
 
 There are binaries for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel) and Windows
