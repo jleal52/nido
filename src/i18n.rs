@@ -758,6 +758,59 @@ const TABLE: &[(&str, &str)] = &[
         "no se pudieron mandar las respuestas",
         "the answers could not be sent",
     ),
+    // prompt.rs y server.rs: el modo de permisos y el modelo
+    (
+        "hay un menú o una pregunta en pantalla",
+        "there is a menu or a question on screen",
+    ),
+    (
+        "no se entiende el modo en el pie de Claude",
+        "Claude's footer does not show a known mode",
+    ),
+    (
+        "Claude no ha cambiado de modo",
+        "Claude did not change mode",
+    ),
+    (
+        "no se llega al modo {} con shift+tab",
+        "shift+tab does not reach mode {0}",
+    ),
+    (
+        "Claude está trabajando: espera a que termine",
+        "Claude is working: wait until it finishes",
+    ),
+    (
+        "no se ve la caja de escribir de Claude",
+        "Claude's input box is not visible",
+    ),
+    ("Claude no ha cogido /model", "Claude did not take /model"),
+    (
+        "no se abre el menú de /model",
+        "the /model menu does not open",
+    ),
+    (
+        "el menú de /model no deja usar un modelo solo en esta sesión",
+        "the /model menu does not offer a model for this session only",
+    ),
+    (
+        "en el menú de /model no está «{}»",
+        "“{0}” is not in the /model menu",
+    ),
+    (
+        "el menú de /model ha desaparecido",
+        "the /model menu has disappeared",
+    ),
+    (
+        "el cursor del menú de /model no se mueve",
+        "the cursor in the /model menu does not move",
+    ),
+    (
+        "Claude no ha dicho que cambió el modelo",
+        "Claude did not confirm the model change",
+    ),
+    ("falta el modo", "the mode is missing"),
+    ("modo desconocido: «{}»", "unknown mode: “{0}”"),
+    ("falta el modelo", "the model is missing"),
     // transcript.rs (avisos dentro de la conversación)
     (
         "Claude resumió la conversación para seguir (se le acababa el contexto)",
@@ -913,6 +966,19 @@ mod tests {
             english("Tarea en segundo plano: failed"),
             "Background task: failed"
         );
+    }
+
+    #[test]
+    fn mode_and_model_messages() {
+        assert_eq!(
+            english("no se llega al modo plan con shift+tab"),
+            "shift+tab does not reach mode plan"
+        );
+        assert_eq!(
+            english("en el menú de /model no está «Gemini»"),
+            "“Gemini” is not in the /model menu"
+        );
+        assert_eq!(english("modo desconocido: «x»"), "unknown mode: “x”");
     }
 
     #[test]
