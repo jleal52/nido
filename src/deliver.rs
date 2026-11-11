@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use crate::mcp_api::{Fail, Reply, args_of, fail};
 use crate::outbox::{self, MAX_TEXT};
@@ -126,7 +127,12 @@ pub async fn api_items(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<Str
         Ok(s) => s,
         Err(r) => return r,
     };
-    Json(json!({ "items": st.outbox.list(&s.id) })).into_response()
+    // Lee el índice del disco: fuera del hilo de tokio.
+    let listed = tokio::task::spawn_blocking(move || st.outbox.list(&s.id)).await;
+    match listed {
+        Ok(items) => Json(json!({ "items": items })).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 /// `GET /api/v1/sessions/{id}/items/{item}`: el texto o el fichero, para copiarlo, abrirlo o
@@ -140,29 +146,63 @@ pub async fn api_item(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let Some((it, path)) = st.outbox.open(&s.id, &item) else {
-        let listed = st.outbox.list(&s.id).into_iter().any(|i| i.id == item);
-        return if listed {
-            error(StatusCode::GONE, "ese envío ha caducado")
-        } else {
-            error(StatusCode::NOT_FOUND, "no existe ese envío")
-        };
-    };
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
+    // El índice y la copia, en el disco: fuera del hilo de tokio. `Err(true)`: está en la
+    // lista, pero ya no.
+    let found = tokio::task::spawn_blocking(move || match st.outbox.open(&s.id, &item) {
+        Some(found) => Ok(found),
+        None => Err(st.outbox.list(&s.id).into_iter().any(|i| i.id == item)),
+    })
+    .await;
+    match found {
+        Ok(Ok((it, path))) => serve_item(&it, &path).await,
+        Ok(Err(true)) => error(StatusCode::GONE, "ese envío ha caducado"),
+        Ok(Err(false)) => error(StatusCode::NOT_FOUND, "no existe ese envío"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Lo que se lee de una vez al mandar una copia.
+const CHUNK: usize = 64 * 1024;
+
+/// Manda la copia `path` del envío `it` a trozos (puede tener 64 MB: no entera en memoria).
+async fn serve_item(it: &outbox::Item, path: &Path) -> Response {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        // Se borró entre mirar y abrir (caducó o pasó el tope).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error(StatusCode::GONE, "ese envío ha caducado");
+        }
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    let len = file.metadata().await.ok().map(|m| m.len());
+    // Hasta el final o el primer error (que corta la respuesta).
+    let chunks = futures_util::stream::unfold(Some(file), |file| async move {
+        let mut file = file?;
+        let mut buf = vec![0u8; CHUNK];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(Bytes::from(buf)), Some(file)))
+            }
+            Err(e) => Some((Err::<Bytes, _>(e), None)),
+        }
+    });
     let name = it.name.clone().unwrap_or_else(|| format!("{}.txt", it.id));
-    (
+    let mut r = (
         [
-            (header::CONTENT_TYPE, item_type(&it).to_owned()),
+            (header::CONTENT_TYPE, item_type(it).to_owned()),
             (header::CONTENT_DISPOSITION, outbox::disposition(&name)),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
             (header::CACHE_CONTROL, "no-store".to_owned()),
         ],
-        bytes,
+        Body::from_stream(chunks),
     )
-        .into_response()
+        .into_response();
+    if let Some(n) = len {
+        r.headers_mut().insert(header::CONTENT_LENGTH, n.into());
+    }
+    r
 }
 
 /// Con qué tipo se sirve un envío: un texto, como texto; un fichero, según su nombre.
@@ -647,6 +687,36 @@ mod tests {
             Path::new("/w/proyecto/informe.pdf")
         );
         assert_eq!(resolve(cwd, "/tmp/x.png"), Path::new("/tmp/x.png"));
+    }
+
+    /// La copia se manda tal cual, a trozos; si ya no está al ir a leerla (caducó entre mirar y
+    /// abrir), «caducado» y no un error de nido.
+    #[tokio::test]
+    async fn an_item_is_streamed_and_one_gone_meanwhile_is_expired() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let it = outbox::Item {
+            id: "it1".into(),
+            kind: NoteKind::File,
+            title: "t".into(),
+            name: Some("a.pdf".into()),
+            size: 0,
+            at: 1,
+            expired: false,
+        };
+        let path = tmp.path().join("it1");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let r = serve_item(&it, &path).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/pdf");
+        assert_eq!(r.headers()[header::CONTENT_LENGTH], "200000");
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), data.as_slice());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(serve_item(&it, &path).await.status(), StatusCode::GONE);
     }
 
     #[test]
