@@ -394,11 +394,12 @@ const TOOLS: &[Tool] = &[
                 --password-file <path>); or, if the program wants it in an environment \
                 variable, run the command through nido: nido secrets run <name> --env VAR -- \
                 <command> [args…] (it sets VAR to the secret and runs the command without \
-                showing it; if `nido` is not found, use the full path in the nido field). If the \
-                program only takes the secret as an argument, tell the user instead. If the user \
-                chose to remember it, later calls with the same name on this machine return at \
-                once; use force when the stored one no longer works. Waits until the user \
-                answers, declines or 15 minutes pass (then it is an error).",
+                showing it; if `nido` is not found, use the full path in the nido field). Put \
+                both paths in double quotes: they may contain spaces. If the program only \
+                takes the secret as an argument, tell the user instead. If the user chose to \
+                remember it, later calls with the same name on this machine return at once; use \
+                force when the stored one no longer works. Waits until the user answers, \
+                declines or 15 minutes pass (then it is an error).",
         args: &[
             req(
                 "name",
@@ -471,7 +472,8 @@ answers Claude's question of whether to trust a folder: only the user can, and n
 `secret` asks the user for a token or a password and returns the path of a file that holds it: \
 never print, cat or read it; pass the path to an option that reads from a file (e.g. \
 --password-file <path>), or run the command with `nido secrets run <name> --env VAR -- <command>` \
-(with the nido path it returns, if `nido` is not found). `clipboard` and `send_file` send the \
+(with the nido path it returns, if `nido` is not found). Put those paths in double quotes: they \
+may contain spaces. `clipboard` and `send_file` send the \
 user a text to copy or a file.";
 
 const OUTSIDE: &str = "This Claude session is not running inside nido: no nido tools here.";
@@ -1157,6 +1159,7 @@ mod tests {
             "--password-file",
             "nido secrets run",
             "nido field",
+            "in double quotes",
             "Never print",
         ] {
             assert!(about.contains(want), "{want}: {about}");
@@ -1170,6 +1173,7 @@ mod tests {
         assert!(INSTRUCTIONS.contains("`secret`"));
         assert!(INSTRUCTIONS.contains("nido secrets run"));
         assert!(INSTRUCTIONS.contains("--password-file"));
+        assert!(INSTRUCTIONS.contains("in double quotes"));
         assert!(INSTRUCTIONS.contains("`clipboard`") && INSTRUCTIONS.contains("`send_file`"));
     }
 
