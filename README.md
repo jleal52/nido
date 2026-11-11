@@ -139,7 +139,10 @@ Each Claude that nido launches gets nido's MCP server (`nido mcp`), with these t
 - `secret`: asks you for a token or a password without it going through the conversation (see
   [Secrets, texts and files](#secrets-texts-and-files)).
 - `clipboard`: a text for you to copy (a box with a Copy button in the web and the app), and a
-  notification.
+  notification. Instead of `text`, it takes the `path` of a text file (relative to the session's
+  folder, like `send_file`), so the content doesn't go through the conversation; for a command's
+  output, the session runs `<command> | nido clip` (see
+  [Secrets, texts and files](#secrets-texts-and-files)).
 - `send_file`: a copy of a file to open or save from the web or the app, and a notification.
 
 What nido changes in your Claude setup:
@@ -193,6 +196,15 @@ The session uses the secret in one of two ways:
 
 If a program only takes the secret as an argument, Claude tells you so instead of using it.
 
+To send you a text without writing it into the conversation, a session uses `clipboard` with a
+file's `path`, or `nido clip`: `git diff | nido clip --title "the diff"` sends its standard input,
+and `nido clip ~/.ssh/id_ed25519.pub` a file. It goes to the clipboard of the session it runs in
+(`NIDO_SESSION`, so only inside a nido session), like `clipboard`: the web, the app and a
+notification. It only answers how much it sent (`enviado al portapapeles (1 KB)`), never the
+content. Only UTF-8 text, up to 64 KB: anything else is an error (for a binary file, use
+`send_file`), and so is an empty text. Like `send_file`, it doesn't take anything from nido's
+secrets folder.
+
 Where they live and how long they last (`<state>` is `~/.local/state/nido`,
 `$XDG_STATE_HOME/nido` or `$NIDO_HOME/state`; on Windows, `%USERPROFILE%\.local\state\nido`):
 
@@ -210,6 +222,8 @@ Where they live and how long they last (`<state>` is `~/.local/state/nido`,
 nido secrets                                      # the secrets remembered on this computer (never their value)
 nido secrets forget <name>                        # forget one: the next session that needs it asks again
 nido secrets run <name> --env VAR -- <command>    # run a command with a secret in VAR
+<command> | nido clip [--title T]                 # send its output to the session's clipboard
+nido clip <file> [--title T]                      # send a text file to the session's clipboard
 ```
 
 If you set Claude Code's `MCP_TOOL_TIMEOUT` below 15 minutes, `secret` fails before you have time
