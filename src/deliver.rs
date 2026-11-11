@@ -223,20 +223,22 @@ struct SecretArgs {
     force: bool,
 }
 
+/// El motivo de `secret`, que el usuario ve en el diálogo: sin caracteres de control ni de
+/// formato (los que no se ven o dan la vuelta al texto), como los títulos, pero con sus saltos
+/// de línea. `None` si queda vacío.
+fn clean_reason(s: &str) -> Option<String> {
+    let s: String = s.chars().filter(|&c| !outbox::is_format(c)).collect();
+    server::alert_text(&s)
+}
+
 /// Lo que devuelve `secret` según cómo acabó la pregunta.
 fn outcome_reply(o: Outcome, session: &str, name: &str) -> Reply {
     match o {
-        Outcome::Saved(paths) => {
-            paths
-                .get(session)
-                .map(|p| json!({ "path": p }))
-                .ok_or_else(|| {
-                    fail(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "no se pudo guardar el secreto: sin ruta",
-                    )
-                })
-        }
+        // Sin ruta para ella: ya no la esperaba (como cerrada).
+        Outcome::Saved(paths) => paths
+            .get(session)
+            .map(|p| json!({ "path": p }))
+            .ok_or_else(|| fail(StatusCode::GONE, "la sesión se cerró mientras esperaba")),
         Outcome::Failed(e) => Err(fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("no se pudo guardar el secreto: {e}"),
@@ -270,7 +272,7 @@ pub(crate) async fn tool_secret(st: &Arc<AppState>, caller: &Session, args: Valu
             ),
         ));
     }
-    let Some(reason) = server::alert_text(&a.reason) else {
+    let Some(reason) = clean_reason(&a.reason) else {
         return Err(fail(StatusCode::BAD_REQUEST, "falta el motivo"));
     };
     let now = now_ms();
@@ -578,6 +580,14 @@ mod tests {
             StatusCode::REQUEST_TIMEOUT
         );
         assert_eq!(p(Outcome::Closed).unwrap_err().0, StatusCode::GONE);
+        // Guardado, pero sin ruta para ella (ya no la esperaba): como cerrada.
+        assert_eq!(
+            p(Outcome::Saved(Default::default())).unwrap_err(),
+            (
+                StatusCode::GONE,
+                "la sesión se cerró mientras esperaba".to_owned()
+            )
+        );
         assert_eq!(
             p(Outcome::Failed("disco lleno".into())).unwrap_err().1,
             "no se pudo guardar el secreto: disco lleno"
@@ -616,6 +626,18 @@ mod tests {
         ] {
             assert_eq!(crate::i18n::english(es), en);
         }
+    }
+
+    /// El motivo lo ve el usuario en el diálogo: sin caracteres invisibles ni que den la vuelta
+    /// al texto, como los títulos, pero con sus saltos de línea.
+    #[test]
+    fn the_reason_has_no_invisible_characters() {
+        assert_eq!(
+            clean_reason("subir\u{202E}txt.exe\n\u{2066}línea 2\u{2069}"),
+            Some("subirtxt.exe\nlínea 2".to_owned())
+        );
+        assert_eq!(clean_reason("  \u{200B}\u{FEFF} "), None);
+        assert_eq!(clean_reason("\u{1b}[31mrojo"), Some("rojo".to_owned()));
     }
 
     /// Lo que contesta el usuario: sus errores son textos fijos, nunca con nada del valor.

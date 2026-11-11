@@ -85,7 +85,7 @@ impl std::fmt::Display for SendError {
 
 /// Caracteres de formato de Unicode (categoría `Cf`): no se ven, pero cambian lo que se ve (el
 /// sentido del texto: `informe\u{202E}fdp.exe` se lee «informeexe.pdf») o lo esconden.
-fn is_format(c: char) -> bool {
+pub(crate) fn is_format(c: char) -> bool {
     matches!(
         c,
         '\u{AD}'
