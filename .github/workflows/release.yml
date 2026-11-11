@@ -86,9 +86,64 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
+  # Firma los ejecutables de macOS con un certificado «Developer ID Application». Sin una firma
+  # estable, macOS reconoce nido por su huella, que cambia en cada versión, y olvida los permisos
+  # (Descargas, Documentos…) que se le dieron: las sesiones se quedan esperando a que se vuelvan a
+  # dar. Este trabajo no compila nada ni usa acciones de terceros: solo baja lo ya compilado y lo
+  # firma. Los secretos están en el entorno «firma» (solo etiquetas v* y main). Si no están (en un
+  # fork, p. ej.), se publica sin firmar.
+  sign-macos:
+    name: Firmar (${{ matrix.target }})
+    needs: build
+    environment: firma
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist
+      - name: Firmar
+        env:
+          P12: ${{ secrets.MACOS_CERT_P12 }}
+          P12_PASS: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$P12" ]; then echo "Sin certificado: se publica sin firmar."; exit 0; fi
+          kc="$RUNNER_TEMP/firma.keychain-db"
+          kcpass=$(openssl rand -hex 24)
+          security create-keychain -p "$kcpass" "$kc"
+          security set-keychain-settings -lut 900 "$kc"
+          security unlock-keychain -p "$kcpass" "$kc"
+          umask 077
+          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/c.p12"
+          security import "$RUNNER_TEMP/c.p12" -k "$kc" -P "$P12_PASS" -T /usr/bin/codesign >/dev/null
+          rm -f "$RUNNER_TEMP/c.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpass" "$kc" >/dev/null
+          id=$(security find-identity -v -p codesigning "$kc" | awk '/Developer ID Application/ {print $2; exit}')
+          [ -n "$id" ] || { echo "El certificado no es «Developer ID Application»"; exit 1; }
+          name="nido-${{ matrix.target }}"
+          mkdir work
+          tar -xzf "dist/$name.tar.gz" -C work
+          # Sin hardened runtime: no se notariza, y con él macOS pediría permisos (entitlements)
+          # para lo que hacen las sesiones que nido lanza.
+          codesign --force --timestamp --identifier io.github.jleal52.nido --sign "$id" --keychain "$kc" "work/$name/nido"
+          codesign --verify --strict --verbose=2 "work/$name/nido"
+          codesign -d -r- "work/$name/nido"
+          tar -C work -czf "dist/$name.tar.gz" "$name"
+          security delete-keychain "$kc"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/nido-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          overwrite: true
+
   release:
     name: Versión en GitHub
-    needs: build
+    needs: [build, sign-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
