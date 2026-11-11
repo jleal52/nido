@@ -779,6 +779,42 @@ const TABLE: &[(&str, &str)] = &[
     ("sesión no válida", "invalid session"),
     ("ese envío ha caducado", "that item has expired"),
     ("no existe ese envío", "no such item"),
+    (
+        "nombre de secreto no válido: {} (letras, números, «.», «_» o «-»; hasta 64)",
+        "invalid secret name: {0} (letters, digits, “.”, “_” or “-”; up to 64)",
+    ),
+    ("falta el motivo", "the reason is missing"),
+    (
+        "no hay dónde preguntar: ni teléfono ni web emparejados con nido",
+        "nowhere to ask: no phone or browser is paired with nido",
+    ),
+    (
+        "esta sesión ya espera otro secreto",
+        "this session is already waiting for another secret",
+    ),
+    (
+        "el usuario no quiso dar «{}»",
+        "the user declined to give “{0}”",
+    ),
+    (
+        "nadie contestó en 15 minutos",
+        "no answer within 15 minutes",
+    ),
+    (
+        "la sesión se cerró mientras esperaba",
+        "the session was closed while waiting",
+    ),
+    (
+        "no se pudo guardar el secreto: {}",
+        "could not save the secret: {0}",
+    ),
+    ("petición no válida", "invalid request"),
+    ("el secreto está vacío", "the secret is empty"),
+    ("el secreto pasa de 16 KB", "the secret is over 16 KB"),
+    (
+        "ese secreto ya no espera respuesta",
+        "that secret is no longer waiting for an answer",
+    ),
 ];
 
 #[cfg(test)]

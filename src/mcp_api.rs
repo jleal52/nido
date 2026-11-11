@@ -1159,7 +1159,8 @@ pub async fn api_mcp(
     let me = Machine::of(&st);
     let reply = match tool.as_str() {
         "alert" => tool_alert(&st, &session, args).await,
-        // Lo que se manda al usuario: solo desde una sesión de aquí.
+        // Lo que se pide o se manda al usuario: solo desde una sesión de aquí.
+        "secret" => crate::deliver::tool_secret(&st, &session, args).await,
         "clipboard" => crate::deliver::tool_clipboard(&st, &session, args).await,
         "send_file" => crate::deliver::tool_send_file(&st, &session, args).await,
         _ => {
@@ -1173,8 +1174,8 @@ pub async fn api_mcp(
     }
 }
 
-/// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert`, `clipboard` y
-/// `send_file` (van siempre al nido de quien las usa), y, para su nido, `status` (lo que miran
+/// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert`, `secret`,
+/// `clipboard` y `send_file` (van siempre al nido de quien las usa), y, para su nido, `status` (lo que miran
 /// sus esperas) y `alerts` (las de aquí sin leer, para `nido alerts`).
 pub const PEER_TOOLS: [&str; 10] = [
     "sessions", "send", "read", "open", "answer", "close", "start", "stop", "status", "alerts",

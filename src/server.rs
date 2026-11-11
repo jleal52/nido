@@ -2025,6 +2025,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/sessions/{id}/items/{item}",
             get(crate::deliver::api_item),
         )
+        .route(
+            "/api/v1/sessions/{id}/secret",
+            post(crate::deliver::api_secret_answer),
+        )
         .route("/api/v1/sessions/{id}/answer", post(api_answer))
         .route("/api/v1/sessions/{id}/stop", post(api_stop))
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
