@@ -178,6 +178,19 @@ async fn start_and_stop_end_to_end() {
         (code, e["error"].as_str()),
         (400, Some("a session cannot stop itself"))
     );
+    // Tampoco escrita con su equipo.
+    let (code, e) = tool(
+        addr,
+        me,
+        "stop",
+        json!({"session": format!("Prueba/{me_id}")}),
+    )
+    .await;
+    assert_eq!(
+        (code, e["error"].as_str()),
+        (400, Some("a session cannot stop itself"))
+    );
+    assert!(nido::launch::is_alive(&paths, &me_id));
     // Sin Claude a la vista, la de la shell falsa está «arrancando»: cuenta como trabajando, así
     // que sin `force` no se para.
     assert_eq!(s["state"], "working");
@@ -202,7 +215,8 @@ async fn start_and_stop_end_to_end() {
     let (_, list) = tool(addr, me, "sessions", json!({})).await;
     let s = listed(&list, &other);
     assert_eq!(s["state"], "stopped");
-    assert!(s["since"].as_u64().unwrap() >= t0, "{s}");
+    let stopped_at = s["since"].as_u64().unwrap();
+    assert!(stopped_at >= t0, "{s}");
     let (code, r) = tool(addr, me, "stop", json!({"session": other})).await;
     assert_eq!(
         (code, r["note"].as_str()),
@@ -216,11 +230,37 @@ async fn start_and_stop_end_to_end() {
     assert!(r.get("note").is_none(), "{r}");
     assert!(nido::launch::is_alive(&paths, &other));
     assert!(state.registry.lock().await.get(&other).unwrap().autostart);
+    // En marcha otra vez: `since` es cuando volvió a arrancar, no la parada.
+    let (_, list) = tool(addr, me, "sessions", json!({})).await;
+    let s = listed(&list, &other);
+    assert_ne!(s["state"], "stopped");
+    let started_at = s["since"].as_u64().unwrap();
+    assert!(started_at >= stopped_at, "{s} (parada: {stopped_at})");
     let (code, r) = tool(addr, me, "start", json!({"session": other})).await;
     assert_eq!(
         (code, r["note"].as_str()),
         (200, Some("it was already running"))
     );
+
+    // Se para sola (sin nido): sigue con autoarranque. `stop` dice que ya estaba parada, pero
+    // apunta que se queda así: no vuelve a arrancar con el equipo.
+    nido::launch::stop(&paths, Launcher::Detached, &other).unwrap();
+    let mut gone = false;
+    for _ in 0..100 {
+        if !nido::launch::is_alive(&paths, &other) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone);
+    assert!(state.registry.lock().await.get(&other).unwrap().autostart);
+    let (code, r) = tool(addr, me, "stop", json!({"session": other})).await;
+    assert_eq!(
+        (code, r["note"].as_str()),
+        (200, Some("it was already stopped"))
+    );
+    assert!(!state.registry.lock().await.get(&other).unwrap().autostart);
 
     // Una que no existe, o que no es de Claude: no.
     let (code, _) = tool(addr, me, "start", json!({"session": "ffffffff"})).await;

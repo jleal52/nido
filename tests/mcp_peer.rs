@@ -416,8 +416,10 @@ async fn peer_calls_end_to_end() {
     )
     .await);
     assert_eq!(r["state"], "stopped");
+    assert!(!nido::launch::is_alive(&paths, &id));
     let r = ok(ask(&state, &mac, "start", p(json!({"session": id}))).await);
     assert_ne!(r["state"], "stopped");
+    assert!(nido::launch::is_alive(&paths, &id));
     for id in running.drain(..) {
         ok(ask(&state, &mac, "close", p(json!({"session": id}))).await);
     }
