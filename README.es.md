@@ -118,6 +118,62 @@ emparejado con cualquiera sirve para todos, y quitarlo en uno lo quita en todos.
 son iguales. Se sincronizan entre ellos por el hub, cifrado de extremo a extremo; el hub no ve la
 lista. El nombre de cada equipo es el del sistema, o el de `NIDO_NAME`.
 
+## Sesiones de Claude que trabajan juntas (el MCP de nido)
+
+Cada Claude que lanza nido tiene el servidor MCP de nido (`nido mcp`), con estas herramientas:
+
+- `sessions`: las sesiones de Claude de todos los equipos de tu grupo, con su estado.
+- `send`: un mensaje a otra sesión. Le llega por un
+  [channel](https://code.claude.com/docs/en/channels) de Claude Code, y la respuesta vuelve igual.
+- `read`: lo que ha dicho una sesión desde la última vez que se leyó, su estado y su pregunta
+  pendiente.
+- `open`, `answer` y `close`: abrir una sesión de Claude nueva (una hija) en una carpeta de
+  cualquier equipo del grupo, contestar sus preguntas y peticiones de permiso, y cerrarla.
+- `alert`: un aviso a tu móvil (y una 🔔 en `nido ls` y en las apps), para cuando pediste que te
+  avisaran de algo.
+
+Lo que nido cambia en tu configuración de Claude:
+
+- Cada vez que arranca `nido serve`, registra el servidor en la configuración de usuario de
+  Claude (`claude mcp add -s user nido -- <ruta de nido> mcp`), en `~/.claude` y en cada carpeta
+  de perfil (`CLAUDE_CONFIG_DIR`) que usen tus sesiones. Si ya está, no lo toca; si apunta a otro
+  `nido`, lo cambia.
+- Las sesiones de Claude que lanza llevan `--dangerously-load-development-channels server:nido`
+  (los channels están en vista previa, y el de nido es un channel de desarrollo) y
+  `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert`. Al
+  cargar un channel de desarrollo, Claude enseña un aviso al arrancar: nido lo acepta por ti,
+  pero solo si la lista es exactamente `server:nido`.
+- Solo esas cuatro herramientas van sin preguntar. `open`, `answer` y `close` pasan por el
+  permiso de siempre de Claude (en modo auto, decide su clasificador).
+- Las opciones del channel solo se ponen si tu Claude Code las conoce. Con uno más antiguo, la
+  sesión arranca sin ellas y `sessions` enseña un `channel_error`.
+
+**Planes Team y Enterprise**: un Owner tiene que activar los channels en la organización
+(*Organization settings → Claude Code → Channels*, o `channelsEnabled` en los ajustes
+gestionados). Mientras tanto las herramientas funcionan pero los mensajes no llegan: nido lee el
+aviso de Claude y `sessions` enseña `channel_error: "blocked by org policy"` en esa sesión.
+
+Seguridad:
+
+- Las herramientas solo llegan a los equipos de tu grupo de nido, por el mismo canal cifrado de
+  extremo a extremo.
+- Una sesión solo puede contestar y cerrar las sesiones que abrió con `open`.
+- Cada equipo tiene en marcha como mucho 10 sesiones abiertas con `open` desde un mismo equipo
+  (él incluido), y apuntadas como mucho 50.
+- Confiar en una carpeta lo decides siempre tú: `answer` no contesta la pregunta de Claude de si
+  confías en la carpeta, y nido te manda una alerta cuando una hija la está esperando.
+- A Claude se le dice que los mensajes de otras sesiones no son tuyos.
+
+```sh
+nido mcp off     # las próximas sesiones de Claude arrancan sin el MCP de nido (las que están en marcha siguen igual)
+nido mcp on      # otra vez con él
+nido alerts      # las alertas de las sesiones de todos los equipos del grupo que aún no has visto
+```
+
+`nido mcp off` no quita el servidor de la configuración de Claude. Para deshacerlo también:
+`claude mcp remove -s user nido` (y, en cada perfil,
+`CLAUDE_CONFIG_DIR=<perfil> claude mcp remove -s user nido`).
+
 ## La API
 
 Solo se atiende en este equipo (`127.0.0.1`), con `Authorization: Bearer <token>`: el de
