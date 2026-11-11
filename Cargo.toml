@@ -45,6 +45,8 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 libc = "0.2"
 tempfile = "3"
+# El reloj parado de las pruebas (`start_paused`).
+tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.28"
 
 [profile.release]

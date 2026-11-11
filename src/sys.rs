@@ -21,6 +21,21 @@ pub fn private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Crea `dir` y las carpetas que le falten, ya solo para el usuario (0700) desde el primer
+/// momento. Las que ya existían quedan como estaban (para eso, `private_dir`).
+pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
 /// Un fichero que ya existe, solo para el usuario (0600).
 pub fn private_file(file: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
