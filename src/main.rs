@@ -1352,6 +1352,22 @@ fn secrets_run(paths: &Paths, name: &str, var: &str, command: &[String]) -> Exit
         // Solo vuelve si no se pudo ejecutar.
         cmd.exec()
     };
+    // Sin `exec`: nido espera a la orden. Ctrl+C llega a las dos (comparten consola); que lo
+    // atienda ella y nido salga con su código. Con un manejador propio y no con
+    // `SetConsoleCtrlHandler(None, TRUE)`, que la orden heredaría y tampoco atendería Ctrl+C.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+        };
+        unsafe extern "system" fn ignore(event: u32) -> windows_sys::Win32::Foundation::BOOL {
+            (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT).into()
+        }
+        // SAFETY: `ignore` vale para todo el proceso y no toca nada.
+        unsafe {
+            SetConsoleCtrlHandler(Some(ignore), 1);
+        }
+    }
     #[cfg(not(unix))]
     let e = match cmd.status() {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
