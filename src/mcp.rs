@@ -297,7 +297,8 @@ const TOOLS: &[Tool] = &[
         name: "read",
         about: "Read a session's conversation: what is new since this session last read it (or \
                 its last turns), its state (working, idle, question or stopped) and its pending \
-                question or permission request, if any.",
+                question or permission request, if any. A note, if present, says the question is \
+                Claude's question of whether to trust the folder: only the user can answer it.",
         args: &[
             SESSION,
             WAIT,

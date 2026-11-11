@@ -161,7 +161,8 @@ Seguridad:
 - Cada equipo tiene en marcha como mucho 10 sesiones abiertas con `open` desde un mismo equipo
   (él incluido), y apuntadas como mucho 50.
 - Confiar en una carpeta lo decides siempre tú: `answer` no contesta la pregunta de Claude de si
-  confías en la carpeta, y nido te manda una alerta cuando una hija la está esperando.
+  confías en la carpeta, y nido te manda una alerta cuando una hija la está esperando (la sesión
+  que la abrió lo sabe por `read`).
 - A Claude se le dice que los mensajes de otras sesiones no son tuyos.
 
 ```sh

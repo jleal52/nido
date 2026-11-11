@@ -1416,16 +1416,17 @@ pub fn dev_channels(screen: &str) -> Option<Vec<String>> {
 pub fn trust_screen(screen: &str) -> bool {
     let screen = strip_sgr(screen);
     let all: Vec<&str> = screen.lines().collect();
-    startup_rows(&all).iter().any(|l| {
-        [
-            "trust this folder",
-            "Yes, I trust",
-            "Quick safety check",
-            "Accessing workspace",
-        ]
-        .iter()
-        .any(|t| l.contains(t))
-    })
+    let rows = startup_rows(&all);
+    let has = |words: &[&str]| rows.iter().any(|l| words.iter().any(|t| l.contains(t)));
+    has(&[
+        "trust this folder",
+        "Yes, I trust",
+        "Quick safety check",
+        "Accessing workspace",
+        // La de Claude Code de antes: «Do you trust the files in this folder?», con
+        // «Yes, proceed» (que solo, sin hablar de confiar, puede ser otra cosa).
+        "trust the files in this folder",
+    ]) || (has(&["Yes, proceed"]) && has(&["trust"]))
 }
 
 /// Dónde empieza la caja de Claude: una raya y, debajo, la fila de `❯`.
@@ -1939,6 +1940,37 @@ mod tests {
         assert_eq!(m.options[0].n, None);
         assert!(m.options[0].selected);
         assert_eq!(m.title.as_deref(), Some("Security guide"));
+    }
+
+    #[test]
+    fn trust_folder_in_older_claude() {
+        // Claude Code de antes preguntaba con otras palabras.
+        let s = "\
+╭──────────────────────────────────────────────────────────────╮
+│                                                              │
+│ Do you trust the files in this folder?                       │
+│                                                              │
+│ /home/ana/proyecto                                           │
+│                                                              │
+│ Claude Code may read files in this folder. Reading untrusted │
+│ files may lead Claude Code to behave in unexpected ways.     │
+│                                                              │
+│ ❯ 1. Yes, proceed                                            │
+│   2. No, exit                                                │
+│                                                              │
+╰──────────────────────────────────────────────────────────────╯
+";
+        assert!(trust_screen(s));
+        // Ya sin la pregunta a la vista (se fue hacia arriba), «Yes, proceed» con lo de confiar.
+        let cut: String = s.lines().skip(5).map(|l| format!("{l}\n")).collect();
+        assert!(trust_screen(&cut), "{cut}");
+        // «Yes, proceed» solo, en otro menú del arranque, no lo es.
+        let other = "╭────────────────────────╮\n│ Some other question?   │\n│                        │\n\
+                     │ ❯ 1. Yes, proceed      │\n│   2. No                │\n╰────────────────────────╯\n";
+        assert!(!trust_screen(other));
+        assert!(trust_screen(
+            &other.replace("Some other question?", "Do you trust it?    ")
+        ));
     }
 
     #[test]

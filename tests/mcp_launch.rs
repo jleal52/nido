@@ -563,8 +563,9 @@ async fn claude_launches_with_the_nido_channel() {
     };
     assert!(alerts(&s.id).await.is_empty());
 
-    // Una hija de `open` en esa pregunta: `open` se lo dice a la madre, `answer` no la contesta
-    // (es del usuario) y al usuario se le avisa con una alerta, aunque viva su madre (una vez).
+    // Una hija de `open` en esa pregunta: `open` no espera a que salga, `read` se lo dice a la
+    // madre, `answer` no la contesta (es del usuario) y al usuario se le avisa con una alerta,
+    // aunque viva su madre (una vez).
     let hija = tmp.path().join("confianza-hija");
     folder(&hija, &fixture("confianza"));
     let (code, o) = tool(
@@ -575,13 +576,26 @@ async fn claude_launches_with_the_nido_channel() {
     )
     .await;
     assert_eq!(code, 200, "{o}");
-    let note = o["note"].as_str().unwrap_or_default();
-    assert!(
-        note.contains("waiting for the user to trust the folder")
-            && note.contains("confianza-hija"),
-        "{o}"
-    );
+    assert!(o.get("note").is_none(), "{o}");
     let child = o["id"].as_str().unwrap().to_owned();
+    let mut r = json!(null);
+    for _ in 0..50 {
+        let (code, got) = tool(addr, &caller, "read", json!({"session": child})).await;
+        assert_eq!(code, 200, "{got}");
+        r = got;
+        if r.get("note").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(r["state"], "question", "{r}");
+    let note = r["note"].as_str().unwrap_or_default();
+    assert!(
+        note.starts_with("the session is waiting for the user to trust the folder")
+            && note.contains("confianza-hija")
+            && note.ends_with("(they have been told)"),
+        "{r}"
+    );
     let (code, e) = tool(
         addr,
         &caller,

@@ -456,6 +456,10 @@ pub struct ReadOut {
     /// Mensajes para ella que no llegaron (ver `delivery_error`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_error: Option<String>,
+    /// La pregunta es la de confiar en la carpeta: solo la contesta el usuario (ver
+    /// `trust_note`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 fn json_len<T: Serialize>(v: &T) -> usize {
@@ -1900,12 +1904,22 @@ async fn read_out(
         .or_else(|| s.claude.clone())
         .expect("sesión de Claude");
     let turns = unread_turns(st, reader, &s.id, &link, last).await?;
+    // Si la pregunta es la de confiar en la carpeta, se dice: `answer` no la contesta, y así lo
+    // sabe la madre en cuanto la lee (sale unos segundos después de `open`).
+    let note = match menu {
+        Some(_) => screen_of(st, &s.id)
+            .await
+            .filter(|scr| prompt::trust_screen(scr))
+            .map(|_| i18n::tr(&trust_note(&s.cwd, s.opened_by.is_some()))),
+        None => None,
+    };
     let mut out = ReadOut {
         state,
         turns,
         question: menu.as_ref().map(Question::from),
         truncated: false,
         delivery_error: delivery_error(st, &s.id),
+        note,
     };
     fit(&mut out, MAX_READ);
     Ok(out)
@@ -2251,54 +2265,32 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
     server::wait_alive(st, &created.id).await;
     st.launched(&created.id, hold);
     st.refresh.notify_one();
-    let trust = waits_for_trust(st, &created.id).await;
+    // La pregunta de confiar en la carpeta sale unos segundos después: no se espera aquí (a otro
+    // equipo se le contesta en 15 s como mucho). La dice `read` (ver `trust_note`).
     let Some(v) = view(st, &created.id).await else {
         return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
     };
     let (state, _) = status_of(st, &v).await;
-    let mut out = to_json(&entry(st, me, caller, &v, state))?;
-    if trust {
-        out["note"] = i18n::tr(&trust_note(&v.cwd)).into();
-    }
-    Ok(out)
+    to_json(&entry(st, me, caller, &v, state))
 }
 
-/// Cuánto se mira la pantalla de una sesión recién abierta con `open` por si sale la pregunta de
-/// confiar en la carpeta: hasta que se queda quieta (dos veces igual), o este rato. En blanco
-/// (aún no ha pintado nada), solo `OPEN_LOOK_BLANK`: si sale luego, `answer` también lo dice.
-const OPEN_LOOK: Duration = Duration::from_secs(4);
-const OPEN_LOOK_BLANK: Duration = Duration::from_millis(1500);
-
-/// ¿Se ha quedado la sesión `id`, recién abierta, en la pregunta de confiar en su carpeta? Se
-/// mira su pantalla (ver `OPEN_LOOK`).
-async fn waits_for_trust(st: &AppState, id: &str) -> bool {
-    let start = Instant::now();
-    let mut last: Option<String> = None;
-    loop {
-        let screen = screen_of(st, id).await.unwrap_or_default();
-        if prompt::trust_screen(&screen) {
-            return true;
-        }
-        let blank = screen.trim().is_empty();
-        if !blank && last.as_deref() == Some(screen.as_str()) {
-            return false;
-        }
-        let limit = if blank { OPEN_LOOK_BLANK } else { OPEN_LOOK };
-        if start.elapsed() >= limit || !launch::is_alive(&st.paths, id) {
-            return false;
-        }
-        last = (!blank).then_some(screen);
-        tokio::time::sleep(Duration::from_millis(250)).await;
+/// Lo que se dice de una sesión en la pregunta de confiar en su carpeta (en `read`, y el error
+/// de `answer`). Si la abrió otra con `open` (`opened`), al usuario ya se le ha avisado (ver
+/// `AppState::trust_waiting`); si no, la tiene delante.
+fn trust_note(cwd: &Path, opened: bool) -> String {
+    if opened {
+        format!(
+            "la sesión espera a que el usuario confíe en la carpeta {}; solo el usuario puede \
+             hacerlo (ya se le ha avisado)",
+            cwd.display()
+        )
+    } else {
+        format!(
+            "la sesión espera a que el usuario confíe en la carpeta {}; solo el usuario puede \
+             hacerlo",
+            cwd.display()
+        )
     }
-}
-
-/// Lo que se dice a la madre de una sesión en la pregunta de confiar en su carpeta.
-fn trust_note(cwd: &Path) -> String {
-    format!(
-        "la sesión espera a que el usuario confíe en la carpeta {}; solo el usuario puede \
-         hacerlo (ya se le ha avisado)",
-        cwd.display()
-    )
 }
 
 /// La sesión que apunta `open` en el registro (sin arrancarla): con el nombre pedido o uno libre
@@ -2367,7 +2359,10 @@ async fn tool_answer(st: &AppState, me: &Machine, caller: &Caller, args: Value) 
     // Confiar en la carpeta es siempre del usuario (a él se le avisa: ver
     // `AppState::trust_waiting`).
     if prompt::trust_screen(&screen) {
-        return Err(fail(StatusCode::FORBIDDEN, trust_note(&s.cwd)));
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            trust_note(&s.cwd, s.opened_by.is_some()),
+        ));
     }
     let Some(menu) = prompt::parse(&screen) else {
         return Err(fail(
@@ -2909,6 +2904,21 @@ mod tests {
     }
 
     #[test]
+    fn trust_note_says_who_was_told() {
+        let cwd = Path::new("/p/x");
+        assert_eq!(
+            i18n::english(&trust_note(cwd, true)),
+            "the session is waiting for the user to trust the folder /p/x; only the user can do \
+             that (they have been told)"
+        );
+        assert_eq!(
+            i18n::english(&trust_note(cwd, false)),
+            "the session is waiting for the user to trust the folder /p/x; only the user can do \
+             that"
+        );
+    }
+
+    #[test]
     fn open_limits_per_machine() {
         // (en marcha) de las abiertas desde ese equipo.
         let ok = |alive: &[bool]| open_allowed(alive.iter().copied());
@@ -3019,6 +3029,7 @@ mod tests {
             question: None,
             truncated: false,
             delivery_error: None,
+            note: None,
         }
     }
 

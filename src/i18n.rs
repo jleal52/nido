@@ -277,6 +277,10 @@ const TABLE: &[(&str, &str)] = &[
         "the session is waiting for the user to trust the folder {0}; only the user can do that (they have been told)",
     ),
     (
+        "la sesión espera a que el usuario confíe en la carpeta {}; solo el usuario puede hacerlo",
+        "the session is waiting for the user to trust the folder {0}; only the user can do that",
+    ),
+    (
         "falta la opción o el texto",
         "the option or the text is missing",
     ),

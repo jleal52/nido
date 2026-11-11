@@ -161,7 +161,8 @@ Security:
 - Each computer runs at most 10 sessions opened with `open` from the same computer (itself
   included), and keeps at most 50 of them registered.
 - Trusting a folder is always up to you: `answer` refuses Claude's "trust this folder" question,
-  and nido sends you an alert when a child is waiting on it.
+  and nido sends you an alert when a child is waiting on it (the session that opened it learns
+  it from `read`).
 - Claude is told that messages from other sessions don't come from you.
 
 ```sh

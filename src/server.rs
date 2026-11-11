@@ -710,10 +710,23 @@ pub fn spawn_startup_watch(state: Arc<AppState>) {
             let Some(s) = state.registry.lock().await.get(&id).cloned() else {
                 continue;
             };
-            if !launch::holder_config(&state.paths, &s, 80, 24).channel {
+            // Fuera del runtime: puede preguntarle a Claude su versión (`claude --version`, ver
+            // `claude::channels_supported`).
+            let (channel, old) = {
+                let (paths, s) = (state.paths.clone(), s.clone());
+                tokio::task::spawn_blocking(move || {
+                    let channel = launch::holder_config(&paths, &s, 80, 24).channel;
+                    let old = !channel
+                        && launch::channel_launch(&paths, &s.argv)
+                            == launch::ChannelLaunch::OldClaude;
+                    (channel, old)
+                })
+                .await
+                .unwrap_or((false, false))
+            };
+            if !channel {
                 // Con un Claude Code de antes de los channels: sin channel, y que se sepa.
-                if launch::channel_launch(&state.paths, &s.argv) == launch::ChannelLaunch::OldClaude
-                {
+                if old {
                     state.inbox.refuse(&id, crate::inbox::Refusal::OldClaude);
                 }
                 // Sin channel no hay arranque que mirar; pero una hija de `open` puede quedarse
