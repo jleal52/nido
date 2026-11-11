@@ -1938,16 +1938,14 @@ fn spawn_cleanup(state: Arc<AppState>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let ids: std::collections::HashSet<String> = state
-                .registry
-                .lock()
-                .await
-                .sessions()
-                .iter()
-                .map(|s| s.id.clone())
-                .collect();
             let st = state.clone();
             let _ = tokio::task::spawn_blocking(move || {
+                // Con el registro cogido mientras se limpia: una sesión que se cree a la vez no
+                // puede guardar nada antes de estar en él, así que no se le borra lo recién
+                // guardado por no estar en una lista vieja.
+                let reg = st.registry.blocking_lock();
+                let ids: std::collections::HashSet<&str> =
+                    reg.sessions().iter().map(|s| s.id.as_str()).collect();
                 let now = now_ms();
                 st.secrets.prune(now, |id| ids.contains(id));
                 st.outbox.prune(now, |id| ids.contains(id));
