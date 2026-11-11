@@ -179,17 +179,7 @@ fn starts_dim(s: &str) -> bool {
             break;
         };
         if &seq[end..end + 1] == "m" {
-            let ps: Vec<&str> = seq[..end].split(';').collect();
-            let mut i = 0;
-            while i < ps.len() {
-                match ps[i] {
-                    "38" | "48" | "58" => i += if ps.get(i + 1) == Some(&"2") { 5 } else { 2 },
-                    "" | "0" | "22" => dim = false,
-                    "2" => dim = true,
-                    _ => {}
-                }
-                i += 1;
-            }
+            dim = sgr_dim(&seq[..end], dim);
         }
         rest = &seq[end + 1..];
     }
@@ -204,6 +194,47 @@ fn starts_dim(s: &str) -> bool {
         return starts_dim(after);
     }
     false
+}
+
+/// Si sigue atenuado tras los parámetros `ps` de una secuencia SGR (`2;38;2;1;2;3`): el 2 de un
+/// color RGB (`38;2;r;g;b`) no es atenuado.
+fn sgr_dim(ps: &str, mut dim: bool) -> bool {
+    let ps: Vec<&str> = ps.split(';').collect();
+    let mut i = 0;
+    while i < ps.len() {
+        match ps[i] {
+            "38" | "48" | "58" => i += if ps.get(i + 1) == Some(&"2") { 5 } else { 2 },
+            "" | "0" | "22" => dim = false,
+            "2" => dim = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    dim
+}
+
+/// Solo el texto que no está atenuado (sin colores): lo escrito, sin las ayudas de Claude.
+fn undimmed(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut dim = false;
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if let Some(seq) = rest.strip_prefix("\x1b[") {
+            let Some(end) = seq.find(|c: char| c.is_ascii_alphabetic()) else {
+                break;
+            };
+            if &seq[end..end + 1] == "m" {
+                dim = sgr_dim(&seq[..end], dim);
+            }
+            rest = &seq[end + 1..];
+            continue;
+        }
+        if c != '\x1b' && !dim {
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 /// Columna (en caracteres) del primer carácter que no es espacio.
@@ -764,6 +795,8 @@ pub struct ModelMenu {
     /// La ayuda dice «s to use this session only» (con `s`, el modelo solo vale para esta sesión;
     /// con Enter se guardaría como el de todas las nuevas).
     pub session_only: bool,
+    /// Ya se ve su ayuda (la última línea: «… Esc to cancel»): no está a medio pintar.
+    pub complete: bool,
 }
 
 impl ModelMenu {
@@ -783,8 +816,8 @@ impl ModelMenu {
     }
 
     /// La opción del modelo que se pide (nunca `Default`): la de ese modelo («Opus 5.5»); si no,
-    /// la de esa etiqueta («Sonnet»); si no, la primera cuya etiqueta o modelo empiece así
-    /// («Opus», «fable 5»).
+    /// la de esa etiqueta («Sonnet»); si no, una cuya etiqueta o modelo empiece así («Opus»,
+    /// «fable 5»). Si casan varias, la de la versión más nueva («Fable» es Fable 5.2, no 5.1).
     pub fn find(&self, want: &str) -> Option<usize> {
         let w = norm(want);
         if w.is_empty() {
@@ -804,20 +837,67 @@ impl ModelMenu {
                     .next()
                     .is_none_or(|c| !c.is_alphanumeric())
         };
+        // De las que casan, la más nueva (a igual versión, la primera).
+        let newest = |found: Vec<(usize, &ModelOption)>| {
+            found
+                .into_iter()
+                .fold(None::<(usize, Vec<u32>)>, |best, (i, o)| {
+                    let v = version(&o.model);
+                    match best {
+                        Some((_, ref b)) if *b >= v => best,
+                        _ => Some((i, v)),
+                    }
+                })
+                .map(|(i, _)| i)
+        };
         choices()
             .find(|(_, o)| norm(&o.model) == w)
-            .or_else(|| choices().find(|(_, o)| norm(&o.label) == w))
-            .or_else(|| choices().find(|(_, o)| starts(&o.label) || starts(&o.model)))
             .map(|(i, _)| i)
+            .or_else(|| newest(choices().filter(|(_, o)| norm(&o.label) == w).collect()))
+            .or_else(|| {
+                newest(
+                    choices()
+                        .filter(|(_, o)| starts(&o.label) || starts(&o.model))
+                        .collect(),
+                )
+            })
     }
 }
 
-/// El menú de `/model` que haya en pantalla.
+/// La versión de un modelo («Fable 5.2» → `[5, 2]`), para comparar como números (5.10 > 5.9).
+fn version(model: &str) -> Vec<u32> {
+    model
+        .split_whitespace()
+        .rev()
+        .find_map(|w| {
+            let v: Option<Vec<u32>> = w.split('.').map(|n| n.parse().ok()).collect();
+            v
+        })
+        .unwrap_or_default()
+}
+
+/// La ayuda del menú de `/model` (o su primera línea, si viene partida).
+fn model_help(l: &str) -> bool {
+    let l = norm(l);
+    l.contains("enter to set as default") || l.contains("s to use this session only")
+}
+
+/// El menú de `/model` que haya en pantalla: por su título («Select model») o, si no se ve, por
+/// su ayuda («Enter to set as default · s to use this session only»).
 pub fn model_menu(screen: &str) -> Option<ModelMenu> {
     let plain = strip_sgr(screen);
     let lines: Vec<&str> = plain.lines().collect();
-    let title = lines.iter().rposition(|l| l.trim() == "Select model")?;
-    let below = lines[title..].join("\n");
+    let start = match lines.iter().rposition(|l| l.trim() == "Select model") {
+        Some(title) => title,
+        None => {
+            let help = lines.iter().rposition(|l| model_help(l))?;
+            lines[..help]
+                .iter()
+                .rposition(|l| is_rule(l))
+                .map_or(0, |i| i + 1)
+        }
+    };
+    let below = lines[start..].join("\n");
     let menu = parse(&below)?;
     let mut options = Vec::with_capacity(menu.options.len());
     for o in &menu.options {
@@ -853,24 +933,16 @@ pub fn model_menu(screen: &str) -> Option<ModelMenu> {
     Some(ModelMenu {
         options,
         session_only: hints.contains("s to use this session only"),
+        complete: hints.contains("esc to cancel"),
     })
 }
 
-/// Tras pulsar `s` en el menú de `/model`: Claude dice «Set model to … for this session only»
-/// debajo de la última vez que se escribió `/model` (si no, puede ser de un cambio de antes).
-fn model_set_for_session(screen: &str) -> bool {
-    let plain = strip_sgr(screen);
-    let lines: Vec<&str> = plain.lines().collect();
-    let from = lines
-        .iter()
-        .rposition(|l| {
-            let t = l.trim_start().trim_start_matches(['❯', '>']).trim();
-            t == "/model" || t.starts_with("/model ")
-        })
-        .map_or(0, |i| i + 1);
-    lines[from..]
-        .iter()
-        .any(|l| l.contains("Set model to") && l.contains("for this session only"))
+/// Cuántas veces dice la pantalla «Set model to `model` for this session only», lo que contesta
+/// Claude tras `s` en el menú de `/model` (aunque venga partido en varias líneas). Una nueva es
+/// que se cambió: se compara con la pantalla de antes de escribir `/model`.
+fn model_set_count(screen: &str, model: &str) -> usize {
+    let want = norm(&format!("Set model to {model} for this session only"));
+    norm(&strip_sgr(screen)).matches(&want).count()
 }
 
 // ---------- Formularios de un servidor MCP ----------
@@ -1239,7 +1311,7 @@ async fn form_go<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// Lo que se contesta: las preguntas de Claude (todas las que hizo a la vez, en orden) o una
 /// opción de cualquier otro menú.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Request {
     #[serde(default)]
     pub questions: Vec<QuestionAnswer>,
@@ -1481,6 +1553,40 @@ pub fn input_box(screen: &str) -> Option<String> {
     Some(text.join(" ").trim().to_owned())
 }
 
+/// Lo escrito en la caja de Claude sin nada de lo atenuado (las ayudas que Claude pinta detrás,
+/// como « [model]» tras `/model`), o `None` si no se ve la caja.
+fn typed_in_box(screen: &str) -> Option<String> {
+    input_box(screen)?;
+    let lines: Vec<&str> = screen.lines().collect();
+    let plain: Vec<String> = lines.iter().map(|l| strip_sgr(l)).collect();
+    let edge = |l: &str| l.trim_start().starts_with("──────");
+    let bottom = plain.iter().rposition(|l| edge(l))?;
+    let top = plain[..bottom].iter().rposition(|l| edge(l))?;
+    let mut text: Vec<String> = Vec::new();
+    for (k, l) in lines[top + 1..bottom].iter().enumerate() {
+        let u = undimmed(l);
+        let u = if k == 0 {
+            u.trim_start().trim_start_matches('❯').to_owned()
+        } else {
+            u
+        };
+        text.push(u.trim_matches([' ', '\u{a0}']).to_owned());
+    }
+    Some(text.join(" ").trim().to_owned())
+}
+
+/// Error si en pantalla está el menú de `/model` o su pregunta de si cambiar: ahí un número o
+/// Enter guardaría el modelo como el de todas las sesiones nuevas.
+fn not_in_model_dialog(screen: &str) -> Result<(), String> {
+    if model_dialog(screen) {
+        return Err(MODEL_DIALOG.into());
+    }
+    Ok(())
+}
+
+const MODEL_DIALOG: &str =
+    "en pantalla está el menú de /model: ciérralo desde la terminal (Esc), aquí no se contesta";
+
 /// Manda un mensaje a Claude: lo pega, espera a que la caja se quede quieta (con adjuntos,
 /// Claude tarda en cambiar las rutas por «[Image #1]»; un Enter que llega antes se pierde) y
 /// pulsa Enter; si la caja no se vacía, lo vuelve a pulsar.
@@ -1488,6 +1594,7 @@ pub async fn send_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     text: &str,
 ) -> Result<(), String> {
+    not_in_model_dialog(&scr.read().await?)?;
     let text = text.trim();
     if !text.is_empty() {
         let mut paste = b"\x1b[200~".to_vec();
@@ -1868,6 +1975,11 @@ pub async fn set_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if mode(&text) != Some(cur) {
             return Err(NO_MODE.into());
         }
+        // En plan, con Claude trabajando, en cualquier momento puede salir el menú de aprobar el
+        // plan, que acepta shift+tab: no se pulsa (aunque solo se pase por plan de camino).
+        if cur == Mode::Plan && working(&text) {
+            return Err(PLAN_WORKING.into());
+        }
         scr.keys(SHIFT_TAB).await?;
         // El pie nuevo (un instante puede no entenderse mientras Claude lo repinta).
         let deadline = tokio::time::Instant::now() + WAIT;
@@ -1897,27 +2009,30 @@ pub async fn set_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 const NO_MODE: &str = "no se entiende el modo en el pie de Claude";
+const PLAN_WORKING: &str =
+    "Claude está trabajando en modo plan: espera a que termine para cambiar de modo";
 
 /// Cambia el modelo de Claude solo para esta sesión: escribe `/model` en la caja vacía, Enter,
 /// lleva el cursor del menú a la opción de `want` (solo con ↑/↓: ←/→ cambian el esfuerzo) y pulsa
 /// `s` («s to use this session only»). Nunca Enter dentro del menú: lo guardaría como el modelo
-/// de todas las sesiones nuevas. Si algo no cuadra con el menú abierto, Esc y falla.
+/// de todas las sesiones nuevas. Si algo falla (también una lectura que no llega) después de
+/// escribir `/model`, se deja todo como estaba (`clean_model`).
 ///
-/// Las opciones del menú, si se llega a ver, quedan en `seen` (los modelos que se pueden
+/// Las opciones del menú, si se llega a ver entero, quedan en `seen` (los modelos que se pueden
 /// elegir). Devuelve el modelo elegido, como lo enseña Claude («Opus 5.5»).
 pub async fn set_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     want: &str,
     seen: &mut Option<Vec<String>>,
 ) -> Result<String, String> {
-    let text = scr.read().await?;
-    if something_open(&text) {
+    let before = scr.read().await?;
+    if something_open(&before) {
         return Err("hay un menú o una pregunta en pantalla".into());
     }
-    if working(&text) {
+    if working(&before) {
         return Err("Claude está trabajando: espera a que termine".into());
     }
-    match input_box(&text) {
+    match input_box(&before) {
         None => return Err("no se ve la caja de escribir de Claude".into()),
         Some(t) if !t.is_empty() => {
             return Err("en la caja de Claude ya hay algo escrito".into());
@@ -1925,10 +2040,28 @@ pub async fn set_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         Some(_) => {}
     }
     scr.keys(b"/model").await?;
-    let typed = |t: &str| {
-        input_box(t).is_some_and(|b| b == "/model" || b.starts_with("/model "))
-            && !something_open(t)
-    };
+    let mut entered = false;
+    match model_steps(scr, want, seen, &before, &mut entered).await {
+        Ok(model) => Ok(model),
+        Err(e) => {
+            clean_model(scr, entered).await;
+            Err(e)
+        }
+    }
+}
+
+/// Lo de `set_model` tras escribir `/model`; `entered`: si ya se pulsó Enter. Cualquier error
+/// deja la limpieza a quien llama.
+async fn model_steps<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    want: &str,
+    seen: &mut Option<Vec<String>>,
+    before: &str,
+    entered: &mut bool,
+) -> Result<String, String> {
+    // En la caja, exactamente `/model` (lo atenuado es una ayuda de Claude): con `/model sonnet`,
+    // Enter guardaría ese modelo por defecto.
+    let typed = |t: &str| typed_in_box(t).as_deref() == Some("/model") && !something_open(t);
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         tokio::time::sleep(STEP).await;
@@ -1936,48 +2069,48 @@ pub async fn set_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            undo_model(scr).await;
             return Err("Claude no ha cogido /model".into());
         }
     }
     // Justo antes de Enter, otra vez: `/model` en la caja y ningún menú abierto.
     if !typed(&scr.read().await?) {
-        undo_model(scr).await;
         return Err("Claude no ha cogido /model".into());
     }
     scr.keys(b"\r").await?;
+    *entered = true;
+    // El menú entero: con su ayuda (la última línea) o, si no, igual en dos lecturas seguidas.
     let deadline = tokio::time::Instant::now() + WAIT;
+    let mut last: Option<String> = None;
     let menu = loop {
         tokio::time::sleep(STEP).await;
-        if let Some(m) = model_menu(&scr.read().await?)
+        let text = scr.read().await?;
+        if let Some(m) = model_menu(&text)
             && !m.options.is_empty()
+            && (m.complete || last.as_deref() == Some(text.as_str()))
         {
             break m;
         }
         if tokio::time::Instant::now() >= deadline {
-            undo_model(scr).await;
             return Err("no se abre el menú de /model".into());
         }
+        last = Some(text);
     };
     let models = menu.models();
     if !models.is_empty() {
         *seen = Some(models);
     }
-    match pick_model(scr, menu, want).await {
-        Ok(model) => Ok(model),
-        Err(e) => {
-            escape_model_menu(scr).await;
-            Err(e)
-        }
-    }
+    pick_model(scr, menu, want, before).await
 }
 
-/// Con el menú de `/model` abierto: el cursor a la opción de `want` y `s`. Si falla, el menú
-/// sigue abierto (lo cierra quien llama, con Esc).
+/// Con el menú de `/model` abierto: el cursor a la opción de `want` y `s`. Vale cuando Claude
+/// dice que lo cambió con una línea nueva (que no estaba en `before`, la pantalla de antes de
+/// `/model`) y ya no hay nada abierto. Si falla, puede quedar algo abierto (lo cierra quien
+/// llama).
 async fn pick_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     mut menu: ModelMenu,
     want: &str,
+    before: &str,
 ) -> Result<String, String> {
     if !menu.session_only {
         return Err("el menú de /model no deja usar un modelo solo en esta sesión".into());
@@ -2012,19 +2145,22 @@ async fn pick_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     {
         return Err("no se pudo llevar el cursor a la opción".into());
     }
+    let said = model_set_count(before, &model);
     scr.keys(b"s").await?;
-    // Con conversación, Claude pregunta antes si cambiar («Switch model?»): sí, una vez.
+    // Con conversación, Claude pregunta antes si cambiar («Switch model?»): sí, una vez. La
+    // pregunta se mira antes que el éxito.
     let mut confirmed = false;
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         tokio::time::sleep(STEP).await;
         let text = scr.read().await?;
-        if model_menu(&text).is_none() && model_set_for_session(&text) {
+        if let Some(n) = switch_confirm(&text, &model) {
+            if !confirmed {
+                scr.keys(n.to_string().as_bytes()).await?;
+                confirmed = true;
+            }
+        } else if !something_open(&text) && model_set_count(&text, &model) > said {
             return Ok(model);
-        }
-        if !confirmed && let Some(n) = switch_confirm(&text, &model) {
-            scr.keys(n.to_string().as_bytes()).await?;
-            confirmed = true;
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("Claude no ha dicho que cambió el modelo".into());
@@ -2036,10 +2172,7 @@ async fn pick_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// … ❯ 1. Yes, switch to Sonnet 5.5 / 2. No, go back»): el número de la opción que cambia a
 /// `model`.
 fn switch_confirm(screen: &str, model: &str) -> Option<u32> {
-    if !strip_sgr(screen)
-        .lines()
-        .any(|l| l.trim() == "Switch model?")
-    {
+    if !switch_question(screen) {
         return None;
     }
     let want = norm(&format!("Yes, switch to {model}"));
@@ -2051,32 +2184,118 @@ fn switch_confirm(screen: &str, model: &str) -> Option<u32> {
         .filter(|n| *n <= 9)
 }
 
-/// El menú de `/model` o su pregunta de si cambiar («Switch model?»).
-fn model_dialog(screen: &str) -> bool {
-    model_menu(screen).is_some()
-        || (parse(screen).is_some()
-            && strip_sgr(screen)
-                .lines()
-                .any(|l| l.trim() == "Switch model?"))
+/// La pregunta de si cambiar de modelo («Switch model?»), con sus opciones.
+fn switch_question(screen: &str) -> bool {
+    parse(screen).is_some()
+        && strip_sgr(screen)
+            .lines()
+            .any(|l| l.trim() == "Switch model?")
 }
 
-/// Cierra el menú de `/model` (o su pregunta de si cambiar) con Esc, si sigue abierto, y espera
-/// a que se vaya.
-async fn escape_model_menu<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(scr: &mut Screen<R, W>) {
-    // Esc en la pregunta vuelve al menú: otro Esc. Solo se pulsa otra vez cuando la pantalla ha
-    // cambiado y sigue abierto (dos Esc seguidos en la caja vacía abrirían otra cosa).
+/// Qué hay abierto en pantalla, para saber cuándo ha hecho efecto un Esc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialog {
+    None,
+    /// El menú de `/model`.
+    Menu,
+    /// Su pregunta de si cambiar.
+    Switch,
+    /// Otro menú, pregunta o formulario.
+    Other,
+}
+
+fn dialog(screen: &str) -> Dialog {
+    if switch_question(screen) {
+        Dialog::Switch
+    } else if model_menu(screen).is_some() {
+        Dialog::Menu
+    } else if something_open(screen) {
+        Dialog::Other
+    } else {
+        Dialog::None
+    }
+}
+
+/// El menú de `/model` o su pregunta de si cambiar («Switch model?»).
+fn model_dialog(screen: &str) -> bool {
+    matches!(dialog(screen), Dialog::Menu | Dialog::Switch)
+}
+
+/// Lo que hay en pantalla (el diálogo y lo escrito en la caja) cuando dos lecturas seguidas
+/// dicen lo mismo: tras una lectura que no llegó a tiempo, la siguiente puede traer la pantalla
+/// de entonces. `None` si la sesión no contesta.
+async fn settled<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+) -> Option<(Dialog, Option<String>)> {
+    let read = |t: &str| (dialog(t), typed_in_box(t));
+    let mut last = read(&scr.read().await.ok()?);
+    for _ in 0..10 {
+        let now = read(&scr.read().await.ok()?);
+        if now == last {
+            return Some(now);
+        }
+        last = now;
+        tokio::time::sleep(STEP).await;
+    }
+    None
+}
+
+/// Tras un fallo en `set_model`, una sola limpieza: Esc si está el menú de `/model` o su
+/// pregunta (o, si ya se pulsó Enter, cualquier otro menú, que antes no estaba: lo ha abierto
+/// `/model`); si no hay nada abierto y la caja dice exactamente `/model`, se borra.
+async fn clean_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    entered: bool,
+) {
+    let Some((open, typed)) = settled(scr).await else {
+        return;
+    };
+    match open {
+        Dialog::Menu | Dialog::Switch => escape_model_menu(scr, false).await,
+        Dialog::Other if entered => escape_model_menu(scr, true).await,
+        Dialog::Other => {}
+        Dialog::None => {
+            if typed.as_deref() == Some("/model") {
+                if scr.keys(&b"\x7f".repeat("/model".len())).await.is_err() {
+                    return;
+                }
+                // Hasta que se vea borrado.
+                let deadline = tokio::time::Instant::now() + WAIT;
+                while tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(STEP).await;
+                    match scr.read().await {
+                        Ok(t) if typed_in_box(&t).as_deref() != Some("/model") => return,
+                        Err(_) => return,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Cierra con Esc el menú de `/model` o su pregunta de si cambiar (con `other`, también otro
+/// menú): de la pregunta se vuelve al menú, y del menú a nada. Tras cada Esc espera a que cambie
+/// lo que hay abierto (no cualquier cosa de la pantalla); si no cambia, no pulsa más. Nunca
+/// pulsa Esc sin nada abierto: dos seguidos con la caja vacía abrirían otra cosa.
+async fn escape_model_menu<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    other: bool,
+) {
     for _ in 0..3 {
-        let Ok(before) = scr.read().await else {
+        let Some((open, _)) = settled(scr).await else {
             return;
         };
-        if !model_dialog(&before) || scr.keys(b"\x1b").await.is_err() {
+        let ours =
+            matches!(open, Dialog::Menu | Dialog::Switch) || (other && open == Dialog::Other);
+        if !ours || scr.keys(b"\x1b").await.is_err() {
             return;
         }
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
             tokio::time::sleep(STEP).await;
             match scr.read().await {
-                Ok(t) if t != before => break,
+                Ok(t) if dialog(&t) != open => break,
                 Err(_) => return,
                 _ => {}
             }
@@ -2087,32 +2306,13 @@ async fn escape_model_menu<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(scr: &mu
     }
 }
 
-/// `/model` no llegó a abrir su menú: si se abrió otro, Esc; si `/model` sigue en la caja, se
-/// borra.
-async fn undo_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(scr: &mut Screen<R, W>) {
-    let Ok(text) = scr.read().await else {
-        return;
-    };
-    // Otro menú (uno que no es el nuestro, como un permiso) se deja: Esc lo contestaría.
-    if model_menu(&text).is_some() {
-        escape_model_menu(scr).await;
-        return;
-    }
-    if something_open(&text) {
-        return;
-    }
-    if let Some(b) = input_box(&text)
-        && (b == "/model" || b.starts_with("/model "))
-    {
-        let _ = scr.keys(&b"\x7f".repeat("/model".len())).await;
-    }
-}
-
 /// Contesta el menú que hay en pantalla.
 pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     req: &Request,
 ) -> Result<(), String> {
+    // Ni un número ni Enter en el menú de `/model`: lo guardaría por defecto.
+    not_in_model_dialog(&scr.read().await?)?;
     if !req.questions.is_empty() {
         return questions(scr, &req.questions).await;
     }
@@ -3245,9 +3445,9 @@ mod tests {
         // Lo que se pide: el modelo, la etiqueta o su principio; nunca Default.
         assert_eq!(m.find("Opus 5.5"), Some(1));
         assert_eq!(m.find("opus"), Some(1));
-        assert_eq!(m.find("Fable"), Some(2));
+        assert_eq!(m.find("Fable"), Some(3), "la más nueva");
         assert_eq!(m.find("Fable 5.2"), Some(3));
-        assert_eq!(m.find("fable 5"), Some(2));
+        assert_eq!(m.find("fable 5"), Some(3));
         assert_eq!(m.find("Sonnet"), Some(4));
         assert_eq!(m.find("Haiku 5.5"), Some(5));
         assert_eq!(m.find("Default"), None);
@@ -3306,12 +3506,13 @@ mod tests {
     }
 
     #[test]
-    fn the_new_model_must_be_said_after_the_last_model_command() {
+    fn the_confirmations_of_a_model() {
         let s = "❯ /model\n  ⎿  Set model to Opus 5.5 for this session only\n\n────\n❯ \n────\n  ⏵⏵ auto mode on";
-        assert!(model_set_for_session(s));
-        // Uno de antes, y luego otro `/model` sin respuesta: no.
-        let s = "❯ /model\n  ⎿  Set model to Opus 5.5 for this session only\n❯ /model\n  ⎿  Kept model as Fable\n────\n❯ \n────";
-        assert!(!model_set_for_session(s));
+        assert_eq!(model_set_count(s, "Opus 5.5"), 1);
+        assert_eq!(model_set_count(s, "Haiku 5.5"), 0);
+        // Partida en dos líneas, y con colores.
+        let s = "  ⎿  Set model to \x1b[1mOpus 5.5\x1b[22m for this\n     session only\n❯ /model\n  ⎿  Set model to Opus 5.5 for this session only";
+        assert_eq!(model_set_count(s, "Opus 5.5"), 2);
     }
 
     use std::sync::{Arc, Mutex};
@@ -3536,7 +3737,7 @@ mod tests {
     fn the_real_switch_question() {
         // Visto con un Claude de verdad tras `s`, con conversación ya empezada.
         let s = "\
-▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ Advisor Tool (experimental) is on and may use more tokens · /advisor ▔
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
    Switch model?
    Your next response will be slower and use more tokens
 
@@ -3588,6 +3789,240 @@ mod tests {
         never_enter_in_the_menu(&c);
         let c = c.lock().unwrap();
         assert_eq!((c.current, c.menu, c.switch), (3, None, None));
+    }
+
+    // ---------- Lo que encontró la revisión ----------
+
+    /// (1) Una lectura que no llega a tiempo a mitad de `/model` no deja nada abierto: ni
+    /// `/model` en la caja ni el menú.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_read_in_the_middle_of_model_cleans_up() {
+        // Tras escribir `/model`: se borra.
+        let c = claude(|c| c.stall_after = Some(b"/model"));
+        let mut scr = fake::screen_of(&c);
+        assert!(set_model(&mut scr, "Opus", &mut None).await.is_err());
+        {
+            let c = c.lock().unwrap();
+            assert_eq!((c.input.as_str(), c.menu), ("", None), "{:?}", c.keys);
+        }
+        never_enter_in_the_menu(&c);
+        // Tras el Enter, con el menú ya abierto: Esc.
+        let c = claude(|c| c.stall_after = Some(b"\r"));
+        let mut scr = fake::screen_of(&c);
+        assert!(set_model(&mut scr, "Opus", &mut None).await.is_err());
+        {
+            let c = c.lock().unwrap();
+            assert_eq!((c.menu, c.current), (None, 3), "{:?}", c.keys);
+            assert!(!c.esc_in_box, "{:?}", c.keys);
+        }
+        never_enter_in_the_menu(&c);
+    }
+
+    /// (1) Ni la web ni el MCP `answer` pueden pulsar nada en el menú de `/model` ni en su
+    /// pregunta de si cambiar (un número o Enter lo guardaría por defecto).
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_answered_in_the_model_menu() {
+        let reqs = [
+            Request {
+                option: Some("1".into()),
+                ..Default::default()
+            },
+            Request {
+                option: Some("Opus".into()),
+                ..Default::default()
+            },
+            Request {
+                message: Some(String::new()),
+                ..Default::default()
+            },
+            Request {
+                message: Some("hola".into()),
+                ..Default::default()
+            },
+        ];
+        for open in [
+            (|c: &mut fake::Claude| c.menu = Some(3)) as fn(&mut fake::Claude),
+            |c| c.switch = Some(4),
+        ] {
+            for req in &reqs {
+                let c = claude(open);
+                let mut scr = fake::screen_of(&c);
+                assert!(answer(&mut scr, req).await.is_err(), "{req:?}");
+                assert!(keys(&c).is_empty(), "{req:?}: {:?}", keys(&c));
+            }
+            let c = claude(open);
+            let mut scr = fake::screen_of(&c);
+            assert!(send_message(&mut scr, "").await.is_err());
+            assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+        }
+    }
+
+    /// (3) Tras `s`, solo vale una confirmación nueva y del modelo elegido: no una de antes
+    /// (aunque Claude no repita `/model` encima).
+    #[tokio::test(start_paused = true)]
+    async fn an_old_confirmation_is_not_success() {
+        let c = claude(|c| {
+            c.no_echo = true;
+            c.s_silent = true;
+            c.log
+                .push("  ⎿  Set model to Opus 5.5 for this session only".into());
+        });
+        let mut scr = fake::screen_of(&c);
+        assert!(set_model(&mut scr, "Opus", &mut None).await.is_err());
+        // De otro modelo, tampoco.
+        let c = claude(|c| {
+            c.no_echo = true;
+            c.s_silent = true;
+            c.log
+                .push("  ⎿  Set model to Haiku 5.5 for this session only".into());
+        });
+        let mut scr = fake::screen_of(&c);
+        assert!(set_model(&mut scr, "Opus", &mut None).await.is_err());
+        // Y la pregunta de si cambiar va antes: con una confirmación vieja en pantalla, se
+        // contesta igual.
+        let c = claude(|c| {
+            c.no_echo = true;
+            c.asks_switch = true;
+            c.log
+                .push("  ⎿  Set model to Sonnet 5.5 for this session only".into());
+        });
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            set_model(&mut scr, "Sonnet 5.5", &mut None).await,
+            Ok("Sonnet 5.5".to_owned())
+        );
+        assert_eq!(keys(&c).last().unwrap(), b"1");
+        assert_eq!(c.lock().unwrap().switch, None);
+    }
+
+    /// (4) En modo plan con Claude trabajando, shift+tab puede caer en el menú de aprobar el
+    /// plan: no se pulsa.
+    #[tokio::test(start_paused = true)]
+    async fn no_shift_tab_in_plan_mode_while_working() {
+        let c = claude(|c| {
+            c.mode = 3;
+            c.working = true;
+        });
+        let mut scr = fake::screen_of(&c);
+        assert!(set_mode(&mut scr, Mode::Auto).await.is_err());
+        assert!(keys(&c).is_empty());
+        // Ni pasando por él: de accept edits a auto se pasa por plan.
+        let c = claude(|c| {
+            c.mode = 2;
+            c.working = true;
+        });
+        let mut scr = fake::screen_of(&c);
+        assert!(set_mode(&mut scr, Mode::Auto).await.is_err());
+        assert_eq!(keys(&c).len(), 1);
+        // Sin trabajar, sí.
+        let c = claude(|c| c.mode = 3);
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(set_mode(&mut scr, Mode::Auto).await, Ok(Mode::Auto));
+    }
+
+    /// (5) La confirmación partida en dos líneas (pantalla estrecha) también vale.
+    #[tokio::test(start_paused = true)]
+    async fn a_narrow_confirmation() {
+        let c = claude(|c| c.narrow = true);
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            set_model(&mut scr, "Opus", &mut None).await,
+            Ok("Opus 5.5".to_owned())
+        );
+    }
+
+    /// (6) El menú de `/model` se reconoce también por su ayuda, sin el título.
+    #[test]
+    fn the_model_menu_without_its_title() {
+        let s = MODEL_MENU.replace("   Select model\n", "");
+        let m = model_menu(&s).unwrap();
+        assert_eq!(m.options.len(), 6);
+        assert!(m.session_only);
+        assert!(model_dialog(&s));
+    }
+
+    /// (6) Si `/model` abre otro menú, se cierra con Esc.
+    #[tokio::test(start_paused = true)]
+    async fn another_menu_after_model_is_escaped() {
+        let c = claude(|c| c.opens_other = true);
+        let mut scr = fake::screen_of(&c);
+        assert!(set_model(&mut scr, "Opus", &mut None).await.is_err());
+        let c = c.lock().unwrap();
+        assert!(!c.other, "{:?}", c.keys);
+        assert_eq!(c.keys.last().unwrap(), b"\x1b");
+        assert_eq!(c.keys.iter().filter(|k| k.contains(&b'\r')).count(), 1);
+    }
+
+    /// (7) Antes de Enter, la caja dice exactamente `/model` (lo atenuado no cuenta): con
+    /// `/model sonnet`, Enter lo guardaría por defecto.
+    #[tokio::test(start_paused = true)]
+    async fn only_exactly_model_is_entered() {
+        let c = claude(|c| c.typed_suffix = Some(" sonnet"));
+        let mut scr = fake::screen_of(&c);
+        assert!(set_model(&mut scr, "Opus", &mut None).await.is_err());
+        assert!(
+            !keys(&c).iter().any(|k| k.contains(&b'\r')),
+            "{:?}",
+            keys(&c)
+        );
+        // Una ayuda atenuada detrás: sí.
+        let c = claude(|c| c.dim_suffix = Some(" [model]"));
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            set_model(&mut scr, "Opus", &mut None).await,
+            Ok("Opus 5.5".to_owned())
+        );
+    }
+
+    /// (9) Esc espera a que cambie el diálogo, no cualquier cosa de la pantalla: nunca un Esc de
+    /// más con la caja vacía.
+    #[tokio::test(start_paused = true)]
+    async fn escape_waits_for_the_dialog_to_change() {
+        for switch in [false, true] {
+            let c = claude(|c| {
+                c.ticker = true;
+                c.esc_lag = 3;
+                c.asks_switch = switch;
+                c.switch_stuck = true;
+            });
+            let mut scr = fake::screen_of(&c);
+            let want = if switch { "Sonnet" } else { "Gemini" };
+            assert!(set_model(&mut scr, want, &mut None).await.is_err());
+            let c = c.lock().unwrap();
+            assert!(!c.esc_in_box, "{:?}", c.keys);
+            assert_eq!((c.menu, c.switch), (None, None), "{:?}", c.keys);
+            let escs = c.keys.iter().filter(|k| *k == b"\x1b").count();
+            assert_eq!(escs, if switch { 2 } else { 1 }, "{:?}", c.keys);
+        }
+    }
+
+    /// (10) Un menú pintado a medias no vale: ni sus opciones ni su ayuda.
+    #[tokio::test(start_paused = true)]
+    async fn a_half_painted_menu_is_waited_for() {
+        let c = claude(|c| c.slow_paint = true);
+        let mut scr = fake::screen_of(&c);
+        let mut seen = None;
+        assert_eq!(
+            set_model(&mut scr, "Haiku", &mut seen).await,
+            Ok("Haiku 5.5".to_owned())
+        );
+        assert_eq!(seen.unwrap().len(), 5);
+        never_enter_in_the_menu(&c);
+    }
+
+    /// (14) Un nombre corto elige la versión más nueva de esa familia.
+    #[test]
+    fn a_short_name_picks_the_newest_version() {
+        let m = model_menu(MODEL_MENU).unwrap();
+        assert_eq!(m.find("Fable"), Some(3));
+        assert_eq!(m.find("fable 5"), Some(3));
+        assert_eq!(m.find("Fable 5.1"), Some(2));
+        assert_eq!(m.find("Opus"), Some(1));
+        // Las versiones, como números: 5.10 es más nueva que 5.9.
+        let s = MODEL_MENU
+            .replace("Fable 5.1 ·", "Fable 5.10 ·")
+            .replace("Fable 5.2 ·", "Fable 5.9 ·");
+        assert_eq!(model_menu(&s).unwrap().find("Fable"), Some(2));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3653,6 +4088,36 @@ pub(crate) mod fake {
         pub switch_stuck: bool,
         /// Un número con el menú de `/model` abierto (lo elegiría como el de por defecto).
         pub digit_in_menu: bool,
+        /// Encima de la caja, una línea que cambia en cada lectura (como el reloj de Claude).
+        pub ticker: bool,
+        pub reads: u32,
+        /// Esc tarda en hacer efecto estas lecturas (Claude repinta más tarde).
+        pub esc_lag: u32,
+        pending_esc: Vec<u32>,
+        /// Esc sin ningún diálogo abierto (con la caja vacía, dos seguidos abren otra cosa).
+        pub esc_in_box: bool,
+        /// El menú de `/model` se pinta poco a poco: una línea más en cada lectura.
+        pub slow_paint: bool,
+        painted: Option<usize>,
+        /// Tras escribir `/model`, lo que añade Claude: atenuado (una ayuda) o como si se hubiera
+        /// escrito.
+        pub dim_suffix: Option<&'static str>,
+        pub typed_suffix: Option<&'static str>,
+        /// `/model` + Enter abre otro menú (no el de `/model`), que Esc cierra.
+        pub opens_other: bool,
+        pub other: bool,
+        /// Tras esa tecla, la lectura siguiente no llega a tiempo (llega tarde, con la pantalla
+        /// de entonces).
+        pub stall_after: Option<&'static [u8]>,
+        stall_next: bool,
+        /// Al escribir `/model`, Claude no lo repite encima de la caja.
+        pub no_echo: bool,
+        /// `s` cierra el menú pero Claude no dice nada.
+        pub s_silent: bool,
+        /// La confirmación sale partida en dos líneas (pantalla estrecha).
+        pub narrow: bool,
+        /// El menú de `/model` se pinta sin su título («Select model»).
+        pub no_title: bool,
     }
 
     impl Default for Claude {
@@ -3686,15 +4151,90 @@ pub(crate) mod fake {
                 switch: None,
                 switch_stuck: false,
                 digit_in_menu: false,
+                ticker: false,
+                reads: 0,
+                esc_lag: 0,
+                pending_esc: Vec::new(),
+                esc_in_box: false,
+                slow_paint: false,
+                painted: None,
+                dim_suffix: None,
+                typed_suffix: None,
+                opens_other: false,
+                other: false,
+                stall_after: None,
+                stall_next: false,
+                no_echo: false,
+                s_silent: false,
+                narrow: false,
+                no_title: false,
             }
         }
     }
 
     impl Claude {
+        /// Lo que ve nido al pedir la pantalla: pasa una lectura (los Esc con retraso, el
+        /// reloj, el menú que se pinta poco a poco).
+        pub fn read(&mut self) -> String {
+            self.reads += 1;
+            let mut fire = 0;
+            self.pending_esc.retain_mut(|n| {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    fire += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            for _ in 0..fire {
+                self.esc();
+            }
+            let text = self.screen();
+            if let Some(p) = self.painted.as_mut() {
+                *p += 1;
+            }
+            text
+        }
+
+        fn esc(&mut self) {
+            if let Some(at) = self.switch.take() {
+                self.menu = Some(at);
+            } else if self.menu.take().is_some() {
+                self.painted = None;
+                self.log.push("  ⎿  Kept model as it was".into());
+            } else if self.other {
+                self.other = false;
+            } else if !self.permission {
+                self.esc_in_box = true;
+            }
+        }
+
+        fn said_set(&mut self, at: usize) {
+            let model = self.options[at].1;
+            if self.narrow {
+                self.log.push(format!("  ⎿  Set model to {model} for this"));
+                self.log.push("     session only".into());
+            } else {
+                self.log
+                    .push(format!("  ⎿  Set model to {model} for this session only"));
+            }
+        }
+
         pub fn screen(&self) -> String {
             let mut out: Vec<String> = self.log.clone();
+            if self.ticker {
+                out.push(format!("  ✻ {}s", self.reads));
+            }
             out.push(String::new());
-            if self.permission {
+            if self.other {
+                out.push(RULE.into());
+                out.push("   Pick something".into());
+                out.push("   ❯ 1. One".into());
+                out.push("     2. Two".into());
+                out.push(String::new());
+                out.push("   Esc to cancel".into());
+            } else if self.permission {
                 out.push(RULE.into());
                 out.push(" Bash command".into());
                 out.push(" Do you want to proceed?".into());
@@ -3714,7 +4254,10 @@ pub(crate) mod fake {
                 out.push("     2. No, go back".into());
             } else if let Some(at) = self.menu {
                 out.push(RULE.into());
-                out.push("   Select model".into());
+                let top = out.len();
+                if !self.no_title {
+                    out.push("   Select model".into());
+                }
                 out.push("   Switch between Claude models. Your pick becomes the default for new sessions.".into());
                 for (i, (label, model)) in self.options.iter().enumerate() {
                     let cursor = if i == at { "❯" } else { " " };
@@ -3736,9 +4279,15 @@ pub(crate) mod fake {
                 } else {
                     "   Enter to confirm · Esc to cancel".into()
                 });
+                if let Some(p) = self.painted {
+                    out.truncate((top + p).min(out.len()));
+                }
             } else {
                 out.push(RULE.into());
-                out.push(format!("❯ {}", self.input));
+                match self.dim_suffix.filter(|_| self.input == "/model") {
+                    Some(d) => out.push(format!("❯ {}\x1b[2m{d}\x1b[22m", self.input)),
+                    None => out.push(format!("❯ {}", self.input)),
+                }
                 out.push(RULE.into());
                 let foot = if self.odd_footer {
                     "⏵⏵ algo nuevo".to_owned()
@@ -3764,6 +4313,9 @@ pub(crate) mod fake {
 
         fn key(&mut self, k: &[u8]) {
             self.keys.push(k.to_vec());
+            if self.stall_after == Some(k) {
+                self.stall_next = true;
+            }
             match k {
                 b"\x1b[Z" => {
                     if self.permission || self.menu.is_some() {
@@ -3783,20 +4335,28 @@ pub(crate) mod fake {
                 }
                 b"\x1b[C" | b"\x1b[D" => self.effort_changed |= self.menu.is_some(),
                 b"\x1b" => {
-                    if let Some(at) = self.switch.take() {
-                        self.menu = Some(at);
-                    } else if self.menu.take().is_some() {
-                        self.log.push("  ⎿  Kept model as it was".into());
+                    if self.esc_lag > 0 {
+                        self.pending_esc.push(self.esc_lag);
+                    } else {
+                        self.esc();
                     }
                 }
                 b"\r" => {
                     if self.menu.is_some() {
                         self.saved_default = true;
                         self.menu = None;
+                    } else if self.input == "/model" && self.opens_other {
+                        self.input.clear();
+                        self.other = true;
                     } else if self.input == "/model" && self.opens_menu {
-                        self.log.push("❯ /model".into());
+                        if !self.no_echo {
+                            self.log.push("❯ /model".into());
+                        }
                         self.input.clear();
                         self.menu = Some(self.current);
+                        if self.slow_paint {
+                            self.painted = Some(1);
+                        }
                     } else if !self.input.is_empty() {
                         self.log.push(format!("❯ {}", self.input));
                         self.input.clear();
@@ -3805,14 +4365,18 @@ pub(crate) mod fake {
                 _ => {
                     for c in String::from_utf8_lossy(k).chars() {
                         if let Some(at) = self.switch {
-                            if c == '1' && !self.switch_stuck {
-                                self.switch = None;
-                                self.current = at;
-                                self.log.push(format!(
-                                    "  ⎿  Set model to {} for this session only",
-                                    self.options[at].1
-                                ));
+                            if c == '1' {
+                                if !self.switch_stuck {
+                                    self.switch = None;
+                                    self.current = at;
+                                    self.said_set(at);
+                                }
+                            } else if c.is_ascii_digit() {
+                                self.digit_in_menu = true;
                             }
+                            continue;
+                        }
+                        if self.other {
                             continue;
                         }
                         match (c, self.menu) {
@@ -3823,10 +4387,9 @@ pub(crate) mod fake {
                             ('s', Some(at)) if self.hint_s => {
                                 self.current = at;
                                 self.menu = None;
-                                self.log.push(format!(
-                                    "  ⎿  Set model to {} for this session only",
-                                    self.options[at].1
-                                ));
+                                if !self.s_silent {
+                                    self.said_set(at);
+                                }
                             }
                             (c, Some(_)) if c.is_ascii_digit() => self.digit_in_menu = true,
                             (_, Some(_)) => {}
@@ -3835,6 +4398,11 @@ pub(crate) mod fake {
                             }
                             (c, None) => self.input.push(c),
                         }
+                    }
+                    if self.input == "/model"
+                        && let Some(t) = self.typed_suffix
+                    {
+                        self.input.push_str(t);
                     }
                 }
             }
@@ -3846,7 +4414,14 @@ pub(crate) mod fake {
         while let Ok(Some(f)) = proto::read_frame(&mut s).await {
             match f {
                 Frame::HistoryRequest(_) => {
-                    let text = claude.lock().unwrap().screen();
+                    let (text, stall) = {
+                        let mut c = claude.lock().unwrap();
+                        let stall = std::mem::take(&mut c.stall_next);
+                        (c.read(), stall)
+                    };
+                    if stall {
+                        tokio::time::sleep(WAIT + Duration::from_secs(1)).await;
+                    }
                     if proto::write_frame(&mut s, &Frame::History(text.into_bytes()))
                         .await
                         .is_err()

@@ -863,6 +863,19 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("{} pasa de 64 MB ({})", "{0} is over 64 MB ({1})"),
     ("{} pasa de 64 KB", "{0} is over 64 KB"),
+    // prompt.rs y server.rs: el modo y el modelo
+    (
+        "en pantalla está el menú de /model: ciérralo desde la terminal (Esc), aquí no se contesta",
+        "the /model menu is on screen: close it from the terminal (Esc), it can't be answered from here",
+    ),
+    (
+        "Claude está trabajando en modo plan: espera a que termine para cambiar de modo",
+        "Claude is working in plan mode: wait until it finishes to change the mode",
+    ),
+    (
+        "el cuerpo no es JSON válido: {}",
+        "the body is not valid JSON: {0}",
+    ),
     // nido clip
     (
         "no responde el gestor en {} ({}); ¿está `nido serve` en marcha?",
