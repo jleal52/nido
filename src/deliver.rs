@@ -234,12 +234,20 @@ pub(crate) async fn tool_secret(st: &Arc<AppState>, caller: &Session, args: Valu
         return Err(fail(StatusCode::BAD_REQUEST, "falta el motivo"));
     };
     let now = now_ms();
-    if !a.force
-        && let Some(path) = st.secrets.remembered(&a.name, now)
-    {
-        // Sin diálogo, pero se apunta quién lo pidió.
-        let _ = st.secrets.touch(&a.name, &caller.name, now);
-        return Ok(json!({ "path": path, "nido": nido_cmd() }));
+    if !a.force {
+        // Con el cerrojo de los secretos y escribiendo en el disco: fuera del hilo de tokio.
+        let (st, name, by) = (st.clone(), a.name.clone(), caller.name.clone());
+        let found = tokio::task::spawn_blocking(move || {
+            let path = st.secrets.remembered(&name, now)?;
+            // Sin diálogo, pero se apunta quién lo pidió.
+            let _ = st.secrets.touch(&name, &by, now);
+            Some(path)
+        })
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Some(path) = found {
+            return Ok(json!({ "path": path, "nido": nido_cmd() }));
+        }
     }
     if !st.has_devices() {
         return Err(fail(
