@@ -18,7 +18,7 @@ use crate::i18n::{self, tr};
 use crate::launch::{self, Launcher, Paths};
 use crate::proto::{self, Frame, Hello, HistoryRequest, Role, Size};
 use crate::registry::{
-    AlertRec, ClaudeLink, Registry, RegistryError, Session, new_id, now, now_ms,
+    AlertRec, ClaudeLink, NoteKind, Registry, RegistryError, Session, new_id, now, now_ms,
 };
 use crate::{accounts, auth, e2e, hub, prompt, upload};
 
@@ -201,20 +201,37 @@ enum Offer {
     Joined,
 }
 
-/// El freno de las alertas: cuándo salió el último push de cada sesión y las que se juntaron
-/// mientras tanto (cuántas y la última).
+/// Lo que se juntó de una sesión para el siguiente push: cuántas, la última y si todas eran
+/// alertas.
+#[derive(Debug, Clone, PartialEq)]
+struct Held {
+    count: usize,
+    /// El tipo de la última (`None`: una alerta).
+    kind: Option<NoteKind>,
+    text: String,
+    only_alerts: bool,
+}
+
+/// El freno de las notas que mandan las sesiones (alertas y envíos): cuándo salió el último push
+/// de cada sesión y las que se juntaron mientras tanto.
 #[derive(Debug, Default)]
 struct AlertThrottle {
     last: std::collections::HashMap<String, std::time::Instant>,
-    held: std::collections::HashMap<String, (usize, String)>,
+    held: std::collections::HashMap<String, Held>,
 }
 
 impl AlertThrottle {
-    /// Una alerta nueva: se apunta y dice si sale ya, si hay que poner el reloj o si se junta.
-    fn offer(&mut self, session: &str, text: &str, now: std::time::Instant) -> Offer {
+    /// Una nota nueva: se apunta y dice si sale ya, si hay que poner el reloj o si se junta.
+    fn offer(
+        &mut self,
+        session: &str,
+        kind: Option<NoteKind>,
+        text: &str,
+        now: std::time::Instant,
+    ) -> Offer {
         // Antes de mirar el freno: si sale ya, se lleva también las que esperaban, y si no,
         // `pending` dice si es la primera (la que pone el reloj).
-        self.hold(session, text);
+        self.hold(session, kind, text);
         if self.allow(session, now) {
             Offer::Now
         } else if self.pending(session) == 1 {
@@ -245,30 +262,60 @@ impl AlertThrottle {
     }
 
     /// Apunta una para el siguiente push.
-    fn hold(&mut self, session: &str, text: &str) {
-        let h = self.held.entry(session.to_owned()).or_default();
-        h.0 += 1;
-        h.1 = text.to_owned();
+    fn hold(&mut self, session: &str, kind: Option<NoteKind>, text: &str) {
+        let h = self.held.entry(session.to_owned()).or_insert(Held {
+            count: 0,
+            kind: None,
+            text: String::new(),
+            only_alerts: true,
+        });
+        h.count += 1;
+        h.only_alerts &= kind.is_none();
+        h.kind = kind;
+        h.text = text.to_owned();
     }
 
     /// Cuántas hay juntas esperando.
     fn pending(&self, session: &str) -> usize {
-        self.held.get(session).map_or(0, |h| h.0)
+        self.held.get(session).map_or(0, |h| h.count)
     }
 
-    /// Las que se juntaron (cuántas y la última), y queda vacío.
-    fn take(&mut self, session: &str) -> Option<(usize, String)> {
+    /// Las que se juntaron, y queda vacío.
+    fn take(&mut self, session: &str) -> Option<Held> {
         self.held.remove(session)
+    }
+
+    /// Salió un push de la sesión por otro lado (el de un secreto): cuenta para el freno.
+    fn stamp(&mut self, session: &str, now: std::time::Instant) {
+        self.last.insert(session.to_owned(), now);
+    }
+
+    /// Pasó el tiempo de las que esperaban: `None` si salen ya (o ya no queda ninguna); si
+    /// entre tanto salió otro push de la sesión (el de un secreto), lo que falta.
+    fn due(&mut self, session: &str, now: std::time::Instant) -> Option<Duration> {
+        if self.pending(session) == 0 || self.allow(session, now) {
+            None
+        } else {
+            Some(self.remaining(session, now))
+        }
     }
 }
 
-/// El cuerpo del push: el texto, o «N alertas: <la última>» si se juntaron varias.
-fn alert_body(count: usize, last: &str) -> String {
-    if count > 1 {
-        format!("{count} alertas: {last}")
-    } else {
-        last.to_owned()
-    }
+/// El título y el texto del push de lo que se juntó de una sesión: una alerta, «🔔 sesión
+/// (equipo)» y su texto; un texto para copiar o un fichero, con 📋 o 📎 y su título; varias,
+/// cuántas («N alertas: <la última>» o, si no todas eran alertas, «N envíos de <sesión>»).
+fn push_text(name: &str, host: &str, h: &Held) -> (String, String) {
+    let icon = match (h.count, h.kind) {
+        (1, Some(NoteKind::Clipboard)) => "📋",
+        (1, Some(NoteKind::File)) => "📎",
+        _ => "🔔",
+    };
+    let body = match h.count {
+        1 => h.text.clone(),
+        n if h.only_alerts => format!("{n} alertas: {}", h.text),
+        n => format!("{n} envíos de {name}"),
+    };
+    (format!("{icon} {name} ({host})"), body)
 }
 
 /// El texto de una alerta, sin caracteres de control (salvo saltos de línea y tabuladores: ni
@@ -1467,13 +1514,26 @@ impl AppState {
                 .any(|p| p.handle.is_some())
     }
 
-    /// Una sesión manda una alerta al usuario (`text` ya limpio, de `alert_text`): se apunta,
-    /// se redibuja la lista y sale un push a los teléfonos (como mucho uno cada 30 s por
-    /// sesión; las demás se juntan en el siguiente). No espera al push.
+    /// Una sesión manda una alerta al usuario (`text` ya limpio, de `alert_text`); ver
+    /// [`AppState::session_note`].
     pub async fn session_alert(
         self: &Arc<Self>,
         id: &str,
         text: &str,
+    ) -> Result<(), RegistryError> {
+        self.session_note(id, None, text, None).await
+    }
+
+    /// Una nota de la sesión para el usuario (`text` ya limpio): se apunta, se redibuja la lista
+    /// y sale un push a los teléfonos (como mucho uno cada 30 s por sesión; las demás se juntan
+    /// en el siguiente). «Sin contestar» (`NoteKind::Secret`) no lleva push: ya se avisó al
+    /// preguntar. No espera al push.
+    pub async fn session_note(
+        self: &Arc<Self>,
+        id: &str,
+        kind: Option<NoteKind>,
+        text: &str,
+        item: Option<&str>,
     ) -> Result<(), RegistryError> {
         let id = {
             let mut reg = self.registry.lock().await;
@@ -1481,30 +1541,36 @@ impl AppState {
                 .find(id)
                 .map(|s| s.id.clone())
                 .ok_or_else(|| RegistryError::NotFound(id.to_owned()))?;
-            reg.add_alert(&id, text, now_ms())?;
+            reg.add_note(&id, text, now_ms(), kind, item.map(str::to_owned))?;
             id
         };
         self.scan().await;
-        if !self.can_push() {
+        if kind == Some(NoteKind::Secret) || !self.can_push() {
             return Ok(());
         }
-        let offer =
-            self.alert_throttle
-                .lock()
-                .expect("freno")
-                .offer(&id, text, std::time::Instant::now());
+        let offer = self.alert_throttle.lock().expect("freno").offer(
+            &id,
+            kind,
+            text,
+            std::time::Instant::now(),
+        );
         let st = self.clone();
         match offer {
             Offer::Now => {
                 tokio::spawn(async move { st.flush_alerts(&id).await });
             }
-            Offer::Schedule(d) => {
+            Offer::Schedule(mut d) => {
                 tokio::spawn(async move {
-                    tokio::time::sleep(d).await;
-                    let now = std::time::Instant::now();
-                    if st.alert_throttle.lock().expect("freno").allow(&id, now) {
-                        st.flush_alerts(&id).await;
+                    // Si entre tanto salió el push de un secreto, otra espera.
+                    loop {
+                        tokio::time::sleep(d).await;
+                        let now = std::time::Instant::now();
+                        match st.alert_throttle.lock().expect("freno").due(&id, now) {
+                            Some(more) => d = more,
+                            None => break,
+                        }
                     }
+                    st.flush_alerts(&id).await;
                 });
             }
             Offer::Joined => {}
@@ -1512,9 +1578,9 @@ impl AppState {
         Ok(())
     }
 
-    /// Manda en un push las alertas apartadas de una sesión, si aún no se han leído.
+    /// Manda en un push las notas apartadas de una sesión, si aún no se han leído.
     async fn flush_alerts(&self, id: &str) {
-        let Some((count, last)) = self.alert_throttle.lock().expect("freno").take(id) else {
+        let Some(held) = self.alert_throttle.lock().expect("freno").take(id) else {
             return;
         };
         if !self.can_push() {
@@ -1525,13 +1591,38 @@ impl AppState {
             return;
         };
         let host = <Self as e2e::Host>::host_name(self);
-        self.push_all(
-            &format!("🔔 {} ({host})", v.name),
-            &alert_body(count, &last),
-            id,
-            badge,
-        )
-        .await;
+        let (title, body) = push_text(&v.name, &host, &held);
+        self.push_all(&title, &body, id, badge).await;
+    }
+
+    /// Una sesión pide un secreto nuevo: push al momento («🔑 sesión (equipo)» / «pide
+    /// «nombre»»), que cuenta para el freno de la sesión. No espera al push.
+    pub(crate) async fn secret_push(self: &Arc<Self>, id: &str, secret: &str) {
+        self.scan().await;
+        if !self.can_push() {
+            return;
+        }
+        self.alert_throttle
+            .lock()
+            .expect("freno")
+            .stamp(id, std::time::Instant::now());
+        let (view, badge) = self.view_and_badge(id);
+        let Some(v) = view else {
+            return;
+        };
+        let host = <Self as e2e::Host>::host_name(self);
+        let title = format!("🔑 {} ({host})", v.name);
+        let body = format!("pide «{secret}»");
+        let (st, id) = (self.clone(), id.to_owned());
+        tokio::spawn(async move {
+            st.push_all(&title, &body, &id, badge).await;
+        });
+    }
+
+    /// Si hay algún dispositivo (teléfono o navegador) que pueda contestar: emparejado aquí o
+    /// en otro equipo del grupo (entra por el grupo).
+    pub(crate) fn has_devices(&self) -> bool {
+        self.group.snapshot().devices.iter().any(|d| !d.removed)
     }
 }
 
@@ -3820,32 +3911,94 @@ mod tests {
         let mut t = AlertThrottle::default();
         let t0 = Instant::now();
         let at = |s| t0 + Duration::from_secs(s);
-        assert_eq!(t.offer("s", "una", t0), Offer::Now);
-        assert_eq!(t.take("s"), Some((1, "una".to_owned())));
+        let took = |t: &mut AlertThrottle| t.take("s").map(|h| (h.count, h.text));
+        assert_eq!(t.offer("s", None, "una", t0), Offer::Now);
+        assert_eq!(took(&mut t), Some((1, "una".to_owned())));
         assert_eq!(
-            t.offer("s", "dos", at(10)),
+            t.offer("s", None, "dos", at(10)),
             Offer::Schedule(Duration::from_secs(20))
         );
-        assert_eq!(t.offer("s", "tres", at(12)), Offer::Joined);
+        assert_eq!(t.offer("s", None, "tres", at(12)), Offer::Joined);
         assert_eq!(t.pending("s"), 2);
         // Otra sesión, por su cuenta.
-        assert_eq!(t.offer("otra", "x", at(12)), Offer::Now);
-        assert_eq!(t.take("s"), Some((2, "tres".to_owned())));
+        assert_eq!(t.offer("otra", None, "x", at(12)), Offer::Now);
+        assert_eq!(took(&mut t), Some((2, "tres".to_owned())));
         assert_eq!(t.pending("s"), 0);
-        assert_eq!(t.take("s"), None);
+        assert_eq!(took(&mut t), None);
         assert_eq!(
-            t.offer("s", "cuatro", at(20)),
+            t.offer("s", None, "cuatro", at(20)),
             Offer::Schedule(Duration::from_secs(10))
         );
         // Si sale ya, se lleva también las que esperaban.
-        assert_eq!(t.offer("s", "cinco", at(30)), Offer::Now);
-        assert_eq!(t.take("s"), Some((2, "cinco".to_owned())));
+        assert_eq!(t.offer("s", None, "cinco", at(30)), Offer::Now);
+        assert_eq!(took(&mut t), Some((2, "cinco".to_owned())));
     }
 
     #[test]
-    fn alert_body_joins_held_ones() {
-        assert_eq!(alert_body(1, "listo"), "listo");
-        assert_eq!(alert_body(3, "tres"), "3 alertas: tres");
+    fn mixed_kinds_are_not_only_alerts_and_a_secret_stamps_the_throttle() {
+        let mut t = AlertThrottle::default();
+        let t0 = Instant::now();
+        t.stamp("s", t0);
+        assert!(matches!(
+            t.offer("s", Some(NoteKind::Clipboard), "orden", t0),
+            Offer::Schedule(_)
+        ));
+        t.offer("s", None, "listo", t0);
+        let h = t.take("s").unwrap();
+        assert_eq!((h.count, h.only_alerts, h.kind), (2, false, None));
+    }
+
+    #[test]
+    fn a_secret_push_while_others_wait_puts_them_off() {
+        let mut t = AlertThrottle::default();
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        assert_eq!(t.offer("s", None, "una", t0), Offer::Now);
+        t.take("s");
+        assert_eq!(
+            t.offer("s", Some(NoteKind::File), "a.pdf", at(10)),
+            Offer::Schedule(Duration::from_secs(20))
+        );
+        // Sale el push de un secreto antes de que le toque: espera otros 30 s, no se pierde.
+        t.stamp("s", at(25));
+        assert_eq!(t.due("s", at(30)), Some(Duration::from_secs(25)));
+        assert_eq!(t.pending("s"), 1);
+        assert_eq!(t.due("s", at(55)), None);
+        assert_eq!(t.take("s").map(|h| h.count), Some(1));
+        // Sin ninguna esperando, nada (y no cuenta como push).
+        assert_eq!(t.due("s", at(90)), None);
+        assert_eq!(t.offer("s", None, "otra", at(90)), Offer::Now);
+    }
+
+    #[test]
+    fn push_text_by_kind_and_count() {
+        let h = |count, kind, text: &str, only_alerts| Held {
+            count,
+            kind,
+            text: text.into(),
+            only_alerts,
+        };
+        let p = |h: Held| push_text("api", "mac", &h);
+        assert_eq!(
+            p(h(1, None, "listo", true)),
+            ("🔔 api (mac)".into(), "listo".into())
+        );
+        assert_eq!(
+            p(h(3, None, "tres", true)),
+            ("🔔 api (mac)".into(), "3 alertas: tres".into())
+        );
+        assert_eq!(
+            p(h(1, Some(NoteKind::Clipboard), "la orden", false)),
+            ("📋 api (mac)".into(), "la orden".into())
+        );
+        assert_eq!(
+            p(h(1, Some(NoteKind::File), "informe.pdf", false)),
+            ("📎 api (mac)".into(), "informe.pdf".into())
+        );
+        assert_eq!(
+            p(h(3, Some(NoteKind::File), "x", false)),
+            ("🔔 api (mac)".into(), "3 envíos de api".into())
+        );
     }
 
     #[test]
