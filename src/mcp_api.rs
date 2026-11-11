@@ -2521,8 +2521,9 @@ async fn tool_stop(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
     };
     if state == Status::Stopped {
         // Se apunta que se queda parada: la que salió sola volvería a arrancar con el equipo.
-        // Sin señales: su pidfile puede ser viejo, y su número, ya de otro proceso.
-        server::remember_running(st, &s.id, false).await;
+        // Y se para igual, por si su guardián quedó a medio arrancar (`launch::stop` no manda
+        // nada a un pidfile viejo cuyo número es ya de otro proceso).
+        server::stop_session(st, &s.id).await;
         return Ok(json!({ "state": Status::Stopped, "note": i18n::tr("ya estaba parada") }));
     }
     may_stop(state, a.force)?;
