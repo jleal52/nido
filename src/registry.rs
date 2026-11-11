@@ -56,12 +56,18 @@ pub struct Session {
     pub alerts: Vec<AlertRec>,
 }
 
-/// Una alerta que mandó la sesión al usuario.
+/// Una nota que mandó la sesión al usuario: una alerta (`alert`) o, con `kind`, un envío o un
+/// secreto sin contestar. Los clientes de antes las enseñan todas como alertas.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlertRec {
     pub text: String,
     /// ms desde 1970.
     pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<NoteKind>,
+    /// El envío (`outbox`), si lo es.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
 }
 
 /// Qué es una nota de la sesión que no es una alerta (`alert`).
@@ -273,17 +279,31 @@ impl Registry {
         Ok(updated)
     }
 
-    /// Añade una alerta y deja solo las `MAX_ALERTS` últimas.
-    pub fn add_alert(&mut self, id: &str, text: &str, at: u64) -> Result<(), RegistryError> {
+    /// Añade una nota y deja solo las `MAX_ALERTS` últimas.
+    pub fn add_note(
+        &mut self,
+        id: &str,
+        text: &str,
+        at: u64,
+        kind: Option<NoteKind>,
+        item: Option<String>,
+    ) -> Result<(), RegistryError> {
         self.update(id, |s| {
             s.alerts.push(AlertRec {
                 text: text.to_owned(),
                 at,
+                kind,
+                item: item.clone(),
             });
             let extra = s.alerts.len().saturating_sub(MAX_ALERTS);
             s.alerts.drain(..extra);
         })?;
         Ok(())
+    }
+
+    /// Añade una alerta (una nota sin tipo).
+    pub fn add_alert(&mut self, id: &str, text: &str, at: u64) -> Result<(), RegistryError> {
+        self.add_note(id, text, at, None, None)
     }
 
     /// Orden de las carpetas tal como lo dejó el usuario.
@@ -510,12 +530,44 @@ mod tests {
         s.alerts.push(AlertRec {
             text: "listo".into(),
             at: 5,
+            kind: None,
+            item: None,
         });
         let back: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.opened_by.as_deref(), Some("m1/b2"));
         assert_eq!(back.alerts[0].text, "listo");
         let plain = serde_json::to_string(&session("a2")).unwrap();
         assert!(!plain.contains("alerts") && !plain.contains("opened_by"));
+    }
+
+    #[test]
+    fn notes_keep_their_kind_and_old_alerts_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Registry::load(&dir.path().join("s.json")).unwrap();
+        let s = r.add(session("api")).unwrap();
+        r.add_note(
+            &s.id,
+            "la orden",
+            5,
+            Some(NoteKind::Clipboard),
+            Some("it1".into()),
+        )
+        .unwrap();
+        r.add_alert(&s.id, "listo", 6).unwrap();
+        let back = Registry::load(&dir.path().join("s.json")).unwrap();
+        let a = &back.get(&s.id).unwrap().alerts;
+        assert_eq!(a[0].kind, Some(NoteKind::Clipboard));
+        assert_eq!(a[0].item.as_deref(), Some("it1"));
+        assert_eq!((a[1].kind, a[1].item.as_deref()), (None, None));
+        // Una alerta de antes (sin `kind`) se lee, y una de ahora se escribe sin él.
+        let old: AlertRec = serde_json::from_str(r#"{"text":"x","at":1}"#).unwrap();
+        assert_eq!(old.kind, None);
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"text":"x","at":1}"#
+        );
+        let json = serde_json::to_string(&a[0]).unwrap();
+        assert!(json.contains(r#""kind":"clipboard""#), "{json}");
     }
 
     #[test]

@@ -2689,6 +2689,7 @@ mod tests {
             unread: false,
             opened_by: None,
             alerts: vec![],
+            secret: None,
         };
         let secs = Duration::from_secs;
         let quiet = (secs(5), secs(90));

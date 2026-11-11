@@ -1282,6 +1282,8 @@ fn alert_lines(
             let rec = AlertRec {
                 text: a["text"].as_str().unwrap_or("").to_owned(),
                 at: a["at"].as_u64().unwrap_or(0),
+                kind: None,
+                item: None,
             };
             let name = a["name"].as_str().unwrap_or("");
             alert_line(machine, name, &rec, local_time(rec.at), now)
@@ -1344,6 +1346,8 @@ mod tests {
         let a = AlertRec {
             text: "acabé los tests".into(),
             at: 0,
+            kind: None,
+            item: None,
         };
         let at = t(2026, 11, 10, 9, 5);
         let now = t(2026, 11, 10, 18, 30);

@@ -88,6 +88,12 @@ pub struct AppState {
     /// Las sesiones de las que ya se avisó, en este arranque, que esperan a que el usuario
     /// confíe en su carpeta (ver `trust_waiting`).
     trust_told: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Los secretos de este equipo (`secret`).
+    pub secrets: crate::secrets::Store,
+    /// Las preguntas de secretos en curso.
+    pub asks: crate::secrets::Asks,
+    /// Lo que las sesiones mandan al usuario (`clipboard`, `send_file`).
+    pub outbox: crate::outbox::Outbox,
 }
 
 /// Una sesión recién arrancada y, si hay quien mire los arranques, su bandeja retenida.
@@ -362,6 +368,9 @@ pub struct SessionView {
     pub opened_by: Option<String>,
     /// Las alertas que mandó y el usuario aún no ha visto.
     pub alerts: Vec<AlertRec>,
+    /// El secreto que espera que le den (ver `secrets::Asks`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<crate::secrets::AskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -405,6 +414,9 @@ impl AppState {
             }
         }
         let accounts = accounts::Accounts::new(&paths.home, &paths.data);
+        let secrets_dir = paths.state.join("secrets");
+        let outbox = crate::outbox::Outbox::new(paths.state.join("outbox"), secrets_dir.clone());
+        let secrets = crate::secrets::Store::new(secrets_dir);
         Ok(Arc::new(Self {
             paths,
             launcher,
@@ -440,6 +452,9 @@ impl AppState {
             launched,
             launched_rx: std::sync::Mutex::new(Some(launched_rx)),
             trust_told: Default::default(),
+            secrets,
+            asks: Default::default(),
+            outbox,
         }))
     }
 
@@ -518,6 +533,11 @@ impl AppState {
                     kind: AlertKind::Waiting,
                 });
             }
+            // La pregunta de una sesión que ya no vive se cierra: su Claude no puede recibir la
+            // ruta.
+            if !alive {
+                self.asks.cancel_session(&s.id);
+            }
             views.push(SessionView {
                 id: s.id.clone(),
                 name: s.name.clone(),
@@ -530,6 +550,7 @@ impl AppState {
                 unread: finished > s.seen,
                 opened_by: s.opened_by.clone(),
                 alerts: unread_alerts(&s.alerts, s.seen),
+                secret: self.asks.view_for(&s.id),
                 alive,
                 claude: link.map(|l| ClaudeView {
                     background: found.as_ref().and_then(|_| {
@@ -1277,6 +1298,7 @@ fn attention(sessions: &[SessionView]) -> usize {
             still_alerting(v, AlertKind::Waiting)
                 || still_alerting(v, AlertKind::Finished)
                 || still_alerting(v, AlertKind::Requested)
+                || v.secret.is_some()
         })
         .count()
 }
@@ -3307,6 +3329,7 @@ mod tests {
             unread: false,
             opened_by: None,
             alerts: vec![],
+            secret: None,
         }
     }
 
@@ -3518,11 +3541,37 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_secret_counts_for_the_badge() {
+        let mut v = view("a1");
+        assert_eq!(attention(&[v.clone()]), 0);
+        v.secret = Some(crate::secrets::AskView {
+            id: "q1".into(),
+            name: "tok".into(),
+            reason: "x".into(),
+            since: 1,
+            until: 2,
+        });
+        assert_eq!(attention(&[v]), 1);
+    }
+
+    #[test]
+    fn the_session_view_carries_its_pending_secret() {
+        let v = view("a1");
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(
+            json.get("secret").is_none(),
+            "sin pregunta, sin la clave: {json}"
+        );
+    }
+
+    #[test]
     fn attention_counts_unread_alerts() {
         let mut a = view("a");
         a.alerts.push(AlertRec {
             text: "listo".into(),
             at: 5,
+            kind: None,
+            item: None,
         });
         let b = view("b");
         assert!(still_alerting(&a, AlertKind::Requested));
@@ -3536,10 +3585,14 @@ mod tests {
             AlertRec {
                 text: "vieja".into(),
                 at: 10,
+                kind: None,
+                item: None,
             },
             AlertRec {
                 text: "nueva".into(),
                 at: 30,
+                kind: None,
+                item: None,
             },
         ];
         let unread = unread_alerts(&alerts, 20);
