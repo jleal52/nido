@@ -708,6 +708,25 @@ mod tests {
         let secret = st.secrets.save_session(&id, "tok", b"secreto").unwrap();
         let e = clip(json!({ "path": secret })).await.unwrap_err();
         assert!(e.1.contains("carpeta de secretos"), "{e:?}");
+        // Ni por un enlace, ni dando la vuelta con `..` (también con `send_file`).
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, tmp.path().join("atajo")).unwrap();
+            std::os::unix::fs::symlink(secret.parent().unwrap(), tmp.path().join("carpeta"))
+                .unwrap();
+            for p in ["atajo", "carpeta/tok", "docs/../carpeta/tok"] {
+                let e = clip(json!({ "path": p })).await.unwrap_err();
+                assert!(e.1.contains("carpeta de secretos"), "{p}: {e:?}");
+                let Err(e) = tool_send_file(&st, &caller, json!({ "path": p })).await else {
+                    panic!("{p}: mandado");
+                };
+                assert!(e.1.contains("carpeta de secretos"), "{p}: {}", e.1);
+            }
+        }
+        let rel = secret.strip_prefix(tmp.path()).unwrap();
+        let around = format!("docs/../{}", rel.display());
+        let e = clip(json!({ "path": around })).await.unwrap_err();
+        assert!(e.1.contains("carpeta de secretos"), "{e:?}");
         // Lo que no se mandó no dejó nada: los tres de antes y el de 64 KB.
         assert_eq!(st.outbox.list(&id).len(), 4);
     }

@@ -253,6 +253,12 @@ fn sends_stdin_or_a_file_to_the_session_clipboard() {
     let o = nido.clip(me, &work, &[secret.to_str().unwrap()], b"");
     assert!(!stderr(&o).contains("secreto\n") && !stdout(&o).contains("secreto"));
     fails(o, "carpeta de secretos");
+    // Ni por un enlace, ni dando la vuelta con `..`.
+    std::os::unix::fs::symlink(&secret, work.join("atajo")).unwrap();
+    fails(nido.clip(me, &work, &["atajo"], b""), "carpeta de secretos");
+    let rel = secret.strip_prefix(tmp.path()).unwrap();
+    let around = format!("../trabajo/../{}", rel.display());
+    fails(nido.clip(me, &work, &[&around], b""), "carpeta de secretos");
     // Fuera de una sesión de nido (o con una que no es de este nido).
     fails(
         nido.clip(None, &work, &[], b"hola"),

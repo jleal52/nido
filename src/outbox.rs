@@ -208,6 +208,75 @@ fn open_read(path: &Path) -> io::Result<std::fs::File> {
     opts.open(path)
 }
 
+/// La ruta de lo que tiene abierto `f`, según el sistema (sin enlaces): en Linux,
+/// `/proc/self/fd/N`; en macOS, `F_GETPATH`; en Windows, `GetFinalPathNameByHandleW`. `None` en
+/// otros sistemas (se queda la comprobación de antes de abrir). Si no se puede saber, o el
+/// fichero ya no está, error: mejor no mandarlo.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn opened_path(f: &std::fs::File) -> io::Result<Option<PathBuf>> {
+    use std::os::fd::AsRawFd;
+    let p = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))?;
+    if p.to_string_lossy().ends_with(" (deleted)") {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "ya no existe"));
+    }
+    Ok(Some(p))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn opened_path(f: &std::fs::File) -> io::Result<Option<PathBuf>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `buf` tiene `PATH_MAX` bytes, lo que pide `F_GETPATH`.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..n]))))
+}
+
+#[cfg(windows)]
+pub(crate) fn opened_path(f: &std::fs::File) -> io::Result<Option<PathBuf>> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+    let mut buf: Vec<u16> = vec![0; 1024];
+    loop {
+        // SAFETY: el asa es de `f`, abierta; `buf` tiene la longitud que se dice.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                f.as_raw_handle() as _,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Si no cabe, dice cuánto hace falta.
+        if n >= buf.len() {
+            buf.resize(n + 1, 0);
+            continue;
+        }
+        return Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(
+            &buf[..n],
+        ))));
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
+pub(crate) fn opened_path(_: &std::fs::File) -> io::Result<Option<PathBuf>> {
+    Ok(None)
+}
+
 fn valid_session(id: &str) -> bool {
     crate::mcp::session_from(Some(id.to_owned())).is_some()
 }
@@ -399,6 +468,15 @@ impl Outbox {
             Err(_) if real.is_dir() => return Err(SendError::IsDir(path.to_owned())),
             Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
         };
+        // Y lo que se ha abierto de verdad: entre `canonicalize` y abrir, un enlace del camino
+        // puede haber cambiado para apuntar a la carpeta de secretos.
+        match opened_path(&src) {
+            Ok(Some(opened)) if self.in_secrets(&opened) => {
+                return Err(SendError::Secret(path.to_owned()));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
+        }
         let meta = src
             .metadata()
             .map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
@@ -514,6 +592,28 @@ impl Outbox {
 
 #[cfg(test)]
 mod tests {
+    /// (15) La ruta de lo abierto es la del fichero de verdad, aunque se abriera por un enlace
+    /// que luego apunta a otro sitio.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_path_of_what_was_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        std::os::unix::fs::symlink(dir.join("a.txt"), dir.join("enlace")).unwrap();
+        let f = std::fs::File::open(dir.join("enlace")).unwrap();
+        std::fs::remove_file(dir.join("enlace")).unwrap();
+        std::os::unix::fs::symlink(dir.join("b.txt"), dir.join("enlace")).unwrap();
+        assert_eq!(opened_path(&f).unwrap(), Some(dir.join("a.txt")));
+        // Borrado después de abrir: no se sabe dónde está.
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::remove_file(dir.join("a.txt")).unwrap();
+            assert!(opened_path(&f).is_err());
+        }
+    }
+
     use super::*;
     use std::time::Duration;
 
