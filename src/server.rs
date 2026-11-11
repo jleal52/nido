@@ -551,7 +551,8 @@ impl AppState {
             sessions: views,
             folders: reg.folders().to_vec(),
         };
-        drop(reg);
+        // Publicada antes de soltar el registro: el siguiente escaneo lee de ella qué estaba vivo
+        // (`was_alive`), y con la de antes apuntaría otra vez la misma parada.
         self.views.send_if_modified(|cur| {
             let changed = *cur != listing;
             if changed {
@@ -559,6 +560,7 @@ impl AppState {
             }
             changed
         });
+        drop(reg);
     }
 
     /// Al arrancar el equipo: vuelve a abrir las sesiones con autoarranque que no estén vivas.
