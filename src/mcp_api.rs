@@ -1175,8 +1175,8 @@ pub async fn api_mcp(
 }
 
 /// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert`, `secret`,
-/// `clipboard` y `send_file` (van siempre al nido de quien las usa), y, para su nido, `status` (lo que miran
-/// sus esperas) y `alerts` (las de aquí sin leer, para `nido alerts`).
+/// `clipboard` y `send_file` (van siempre al nido de quien las usa), y, para su nido, `status`
+/// (lo que miran sus esperas) y `alerts` (las de aquí sin leer, para `nido alerts`).
 pub const PEER_TOOLS: [&str; 10] = [
     "sessions", "send", "read", "open", "answer", "close", "start", "stop", "status", "alerts",
 ];
@@ -2910,6 +2910,41 @@ mod tests {
             at: 0,
             removed: false,
         }
+    }
+
+    /// Otro equipo no puede pedir secretos aquí ni mandar nada en nombre de una sesión.
+    #[tokio::test]
+    async fn other_machines_cannot_ask_for_secrets_or_send_things() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let paths = crate::launch::Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, crate::launch::Launcher::Detached, None, true).unwrap();
+        let caller = json!({"id": "aaaa1111", "name": "padre"});
+        for (tool, args) in [
+            (
+                "secret",
+                json!({"name": "tok", "reason": "x", "caller": caller}),
+            ),
+            ("clipboard", json!({"text": "x", "caller": caller})),
+            ("send_file", json!({"path": "/etc/hosts", "caller": caller})),
+            ("alert", json!({"text": "x", "caller": caller})),
+        ] {
+            assert_eq!(
+                peer_call(&st, &mac(), tool, args).await,
+                Err((400, format!("«{tool}» no se puede pedir desde otro equipo"))),
+                "{tool}"
+            );
+        }
+        assert!(st.outbox.list("aaaa1111").is_empty());
+        assert!(st.asks.view_for("aaaa1111").is_none());
     }
 
     fn remote(id: &str) -> Caller {

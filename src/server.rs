@@ -3739,12 +3739,25 @@ mod tests {
 
     #[test]
     fn the_session_view_carries_its_pending_secret() {
-        let v = view("a1");
+        let mut v = view("a1");
         let json = serde_json::to_value(&v).unwrap();
         assert!(
             json.get("secret").is_none(),
             "sin pregunta, sin la clave: {json}"
         );
+        v.secret = Some(crate::secrets::AskView {
+            id: "q1".into(),
+            name: "tok".into(),
+            reason: "subir".into(),
+            since: 1,
+            until: 2,
+        });
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["secret"]["name"], "tok");
+        assert_eq!(json["secret"]["reason"], "subir");
+        let keys: Vec<&String> = json["secret"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["id", "name", "reason", "since", "until"], "{json}");
+        assert!(json["secret"].get("value").is_none());
     }
 
     #[test]
