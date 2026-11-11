@@ -50,6 +50,10 @@ pub enum SendError {
     NotFound(PathBuf),
     Unreadable(PathBuf, io::Error),
     IsDir(PathBuf),
+    /// Una tubería, un dispositivo…: solo ficheros normales.
+    NotAFile(PathBuf),
+    /// Está en la carpeta de secretos de nido.
+    Secret(PathBuf),
     TooBig(PathBuf, u64),
     Io(io::Error),
 }
@@ -60,6 +64,12 @@ impl std::fmt::Display for SendError {
             SendError::NotFound(p) => write!(f, "no existe el fichero {}", p.display()),
             SendError::Unreadable(p, e) => write!(f, "no se puede leer {}: {e}", p.display()),
             SendError::IsDir(p) => write!(f, "{} es una carpeta", p.display()),
+            SendError::NotAFile(p) => write!(f, "{} no es un fichero normal", p.display()),
+            SendError::Secret(p) => write!(
+                f,
+                "{} está en la carpeta de secretos de nido: no se manda",
+                p.display()
+            ),
             SendError::TooBig(p, n) => {
                 write!(
                     f,
@@ -73,9 +83,44 @@ impl std::fmt::Display for SendError {
     }
 }
 
-/// Un título: una línea sin caracteres de control, hasta 80 caracteres.
+/// Caracteres de formato de Unicode (categoría `Cf`): no se ven, pero cambian lo que se ve (el
+/// sentido del texto: `informe\u{202E}fdp.exe` se lee «informeexe.pdf») o lo esconden.
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{AD}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61C}'
+            | '\u{6DD}'
+            | '\u{70F}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Un título: una línea sin caracteres de control ni de formato (los tabuladores, espacios),
+/// hasta 80 caracteres.
 fn clean_title(s: &str) -> Option<String> {
-    let t = crate::server::alert_text(s)?;
+    let s: String = s
+        .chars()
+        .filter(|&c| !is_format(c))
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .collect();
+    let t = crate::server::alert_text(&s)?;
     let first = t.lines().map(str::trim).find(|l| !l.is_empty())?;
     Some(
         first
@@ -130,10 +175,22 @@ pub fn disposition(name: &str) -> String {
 /// La bandeja de salida de este equipo, en `<state>/outbox`.
 pub struct Outbox {
     dir: PathBuf,
+    /// La carpeta de los secretos (`secrets.rs`): de ahí no se manda nada.
+    secrets: PathBuf,
     /// El tope (las pruebas lo bajan).
     cap: std::sync::atomic::AtomicU64,
     /// Una escritura del índice a la vez.
     lock: std::sync::Mutex<()>,
+}
+
+/// Abre `path` para leerlo. En Unix sin esperar: una tubería sin nadie al otro lado no deja a
+/// nido colgado (y luego se rechaza: no es un fichero normal).
+fn open_read(path: &Path) -> io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+    opts.open(path)
 }
 
 fn valid_session(id: &str) -> bool {
@@ -141,9 +198,10 @@ fn valid_session(id: &str) -> bool {
 }
 
 impl Outbox {
-    pub fn new(dir: PathBuf) -> Self {
+    pub fn new(dir: PathBuf, secrets: PathBuf) -> Self {
         Self {
             dir,
+            secrets,
             cap: CAP.into(),
             lock: std::sync::Mutex::new(()),
         }
@@ -163,13 +221,19 @@ impl Outbox {
     }
 
     pub fn list(&self, session: &str) -> Vec<Item> {
+        self.try_list(session).unwrap_or_default()
+    }
+
+    /// El índice de la sesión; `None` si está pero no se puede leer.
+    fn try_list(&self, session: &str) -> Option<Vec<Item>> {
         if !valid_session(session) {
-            return Vec::new();
+            return Some(Vec::new());
         }
-        std::fs::read(self.index(session))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        match std::fs::read(self.index(session)) {
+            Ok(b) => serde_json::from_slice(&b).ok(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Some(Vec::new()),
+            Err(_) => None,
+        }
     }
 
     fn save_list(&self, session: &str, list: &[Item]) -> io::Result<()> {
@@ -186,7 +250,7 @@ impl Outbox {
             ));
         }
         let dir = self.session_dir(session);
-        std::fs::create_dir_all(&dir)?;
+        crate::sys::create_private_dir_all(&dir)?;
         crate::sys::private_dir(&self.dir)?;
         crate::sys::private_dir(&dir)?;
         Ok(dir)
@@ -240,21 +304,37 @@ impl Outbox {
         title: Option<&str>,
         now: u64,
     ) -> Result<Item, SendError> {
-        let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
+        // Dónde está de verdad (sin enlaces ni `..`): de la carpeta de secretos, nada.
+        let real = match std::fs::canonicalize(path) {
+            Ok(p) => p,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(SendError::NotFound(path.to_owned()));
             }
             Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
         };
+        if self.in_secrets(&real) {
+            return Err(SendError::Secret(path.to_owned()));
+        }
+        // Primero se abre y luego se mira qué es lo abierto: entre mirar y abrir no puede
+        // cambiar.
+        let src = match open_read(&real) {
+            Ok(f) => f,
+            // En Windows una carpeta no se abre como un fichero.
+            Err(_) if real.is_dir() => return Err(SendError::IsDir(path.to_owned())),
+            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
+        };
+        let meta = src
+            .metadata()
+            .map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
         if meta.is_dir() {
             return Err(SendError::IsDir(path.to_owned()));
+        }
+        if !meta.is_file() {
+            return Err(SendError::NotAFile(path.to_owned()));
         }
         if meta.len() > MAX_FILE {
             return Err(SendError::TooBig(path.to_owned(), meta.len()));
         }
-        let src =
-            std::fs::File::open(path).map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
         let dir = self.ready(session).map_err(SendError::Io)?;
         let id = crate::registry::new_id();
         let dst = dir.join(&id);
@@ -293,6 +373,12 @@ impl Outbox {
         .map_err(SendError::Io)
     }
 
+    /// `real` (ya sin enlaces) está en la carpeta de secretos.
+    fn in_secrets(&self, real: &Path) -> bool {
+        real.starts_with(&self.secrets)
+            || std::fs::canonicalize(&self.secrets).is_ok_and(|s| real.starts_with(s))
+    }
+
     /// Un envío que aún está, con la ruta de su contenido.
     pub fn open(&self, session: &str, id: &str) -> Option<(Item, PathBuf)> {
         let item = self
@@ -306,11 +392,14 @@ impl Outbox {
     /// La sesión se cerró: fuera todo lo suyo.
     pub fn forget(&self, session: &str) {
         if valid_session(session) {
+            let _one = self.lock.lock().expect("bandeja de salida");
             let _ = std::fs::remove_dir_all(self.session_dir(session));
         }
     }
 
     /// Fuera lo de las sesiones que ya no existen (`live`) y lo de más de 7 días; luego el tope.
+    /// Y lo que dejó una caída: copias que no llegaron al índice y temporales, de más de una hora
+    /// (las de menos pueden ser una copia en curso).
     pub fn prune(&self, now: u64, live: impl Fn(&str) -> bool) {
         let Ok(dirs) = std::fs::read_dir(&self.dir) else {
             return;
@@ -322,7 +411,10 @@ impl Outbox {
                 let _ = std::fs::remove_dir_all(d.path());
                 continue;
             }
-            let mut list = self.list(&id);
+            // Si el índice está pero no se puede leer, no se borra nada por él.
+            let Some(mut list) = self.try_list(&id) else {
+                continue;
+            };
             let mut changed = false;
             for it in list
                 .iter_mut()
@@ -334,6 +426,14 @@ impl Outbox {
             }
             if changed {
                 let _ = self.save_list(&id, &list);
+            }
+            for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+                let name = f.file_name().to_string_lossy().into_owned();
+                let known = name == "items.json" || list.iter().any(|i| i.id == name && !i.expired);
+                if !known && crate::secrets::older_than(&f.path(), now, crate::secrets::TMP_KEEP_MS)
+                {
+                    let _ = std::fs::remove_file(f.path());
+                }
             }
         }
         // `enforce_cap` coge el cerrojo: no anidar.
@@ -377,10 +477,11 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn outbox() -> (tempfile::TempDir, Outbox) {
         let tmp = tempfile::tempdir().unwrap();
-        let o = Outbox::new(tmp.path().join("outbox"));
+        let o = Outbox::new(tmp.path().join("outbox"), tmp.path().join("secrets"));
         (tmp, o)
     }
 
@@ -521,5 +622,119 @@ mod tests {
             disposition("informe año.pdf"),
             "attachment; filename=\"informe_a_o.pdf\"; filename*=UTF-8''informe%20a%C3%B1o.pdf"
         );
+        // Ni comillas ni saltos de línea: no se puede meter otra cabecera.
+        assert_eq!(
+            disposition("a\"\r\nX: y.pdf"),
+            "attachment; filename=\"a___X__y.pdf\"; filename*=UTF-8''a%22%0D%0AX%3A%20y.pdf"
+        );
+    }
+
+    #[test]
+    fn titles_have_no_invisible_or_reversing_characters() {
+        let (_tmp, o) = outbox();
+        let t = |s: &str| o.add_text("aaaa1111", "x", Some(s), 1).unwrap().title;
+        assert_eq!(t("informe\u{202E}fdp.exe"), "informefdp.exe");
+        assert_eq!(t("\u{2066}a\u{2069}\u{200B}b\u{FEFF}c\u{00AD}"), "abc");
+        assert_eq!(t("uno\tdos"), "uno dos");
+        // Sin título: lo mismo con el nombre del fichero.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("foto\u{202E}gnp.exe");
+        std::fs::write(&src, b"x").unwrap();
+        let it = o.add_file("aaaa1111", &src, None, 1).unwrap();
+        assert_eq!(it.title, "fotognp.exe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_regular_files_are_sent_and_a_fifo_does_not_block() {
+        let (tmp, o) = outbox();
+        let fifo = tmp.path().join("tubo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // Sin nadie al otro lado: abrirla sin `O_NONBLOCK` se quedaría esperando.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let o2 = std::sync::Arc::new(o);
+        let o3 = o2.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(o3.add_file("aaaa1111", &fifo, None, 1));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("se quedó esperando a la tubería");
+        match got {
+            Err(e @ SendError::NotAFile(_)) => assert!(e.to_string().contains("no es un fichero")),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            o2.add_file("aaaa1111", Path::new("/dev/null"), None, 1),
+            Err(SendError::NotAFile(_))
+        ));
+        assert!(o2.list("aaaa1111").is_empty());
+    }
+
+    #[test]
+    fn nothing_from_the_secrets_folder() {
+        let (tmp, o) = outbox();
+        let secrets = crate::secrets::Store::new(tmp.path().join("secrets"));
+        let p = secrets
+            .save_team("gh", b"v", crate::secrets::Remember::Always, "api", 1)
+            .unwrap();
+        assert!(matches!(
+            o.add_file("aaaa1111", &p, None, 1),
+            Err(SendError::Secret(_))
+        ));
+        // Tampoco por otro camino: `..` o un enlace.
+        let around = tmp.path().join("otra/../secrets/equipo/gh");
+        std::fs::create_dir_all(tmp.path().join("otra")).unwrap();
+        assert!(matches!(
+            o.add_file("aaaa1111", &around, None, 1),
+            Err(SendError::Secret(_))
+        ));
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("enlace");
+            std::os::unix::fs::symlink(&p, &link).unwrap();
+            match o.add_file("aaaa1111", &link, None, 1) {
+                Err(e @ SendError::Secret(_)) => {
+                    assert!(e.to_string().contains("secretos"), "{e}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(o.list("aaaa1111").is_empty());
+    }
+
+    #[test]
+    fn prune_drops_copies_a_crash_left_behind() {
+        let (tmp, o) = outbox();
+        let src = tmp.path().join("a.txt");
+        std::fs::write(&src, b"hola").unwrap();
+        let now = std::time::SystemTime::now();
+        let now_ms = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let it = o.add_file("aaaa1111", &src, None, now_ms).unwrap();
+        let dir = tmp.path().join("outbox/aaaa1111");
+        // Una copia a medias (no llegó al índice) y un temporal del índice, viejos; y una copia
+        // que se está haciendo ahora.
+        let half = dir.join("0a1b2c3d");
+        let tmp_index = dir.join(".items.json.0a1b2c3d~tmp");
+        let now_copying = dir.join("4e5f6a7b");
+        for p in [&half, &tmp_index, &now_copying] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        for p in [&half, &tmp_index, &dir.join(&it.id)] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(2 * 3600))
+                .unwrap();
+        }
+        o.prune(now_ms, |_| true);
+        assert!(!half.exists() && !tmp_index.exists());
+        assert!(now_copying.exists());
+        assert!(o.open("aaaa1111", &it.id).is_some());
     }
 }
