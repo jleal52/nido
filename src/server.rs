@@ -2017,6 +2017,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sessions/{id}/start", post(api_start))
         .route("/api/v1/sessions/{id}/seen", post(api_seen))
         .route("/api/v1/sessions/{id}/alert", post(api_alert))
+        .route(
+            "/api/v1/sessions/{id}/items",
+            get(crate::deliver::api_items),
+        )
+        .route(
+            "/api/v1/sessions/{id}/items/{item}",
+            get(crate::deliver::api_item),
+        )
         .route("/api/v1/sessions/{id}/answer", post(api_answer))
         .route("/api/v1/sessions/{id}/stop", post(api_stop))
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
@@ -2470,7 +2478,7 @@ pub(crate) async fn wait_alive(st: &AppState, id: &str) -> bool {
     false
 }
 
-async fn find_session(st: &AppState, key: &str) -> Result<Session, Response> {
+pub(crate) async fn find_session(st: &AppState, key: &str) -> Result<Session, Response> {
     st.registry.lock().await.find(key).cloned().ok_or_else(|| {
         error(
             StatusCode::NOT_FOUND,

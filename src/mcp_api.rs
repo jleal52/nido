@@ -1109,14 +1109,14 @@ fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: S
     }
 }
 
-type Reply = Result<Value, Fail>;
+pub(crate) type Reply = Result<Value, Fail>;
 
 /// Un error de una herramienta: el código y el mensaje, en español (sale como `server::error`,
 /// en el idioma de la petición).
 #[derive(Debug)]
 pub struct Fail(pub StatusCode, pub String);
 
-fn fail(status: StatusCode, msg: impl Into<String>) -> Fail {
+pub(crate) fn fail(status: StatusCode, msg: impl Into<String>) -> Fail {
     Fail(status, msg.into())
 }
 
@@ -1159,6 +1159,9 @@ pub async fn api_mcp(
     let me = Machine::of(&st);
     let reply = match tool.as_str() {
         "alert" => tool_alert(&st, &session, args).await,
+        // Lo que se manda al usuario: solo desde una sesión de aquí.
+        "clipboard" => crate::deliver::tool_clipboard(&st, &session, args).await,
+        "send_file" => crate::deliver::tool_send_file(&st, &session, args).await,
         _ => {
             let caller = Caller::local(&me, &session.id, &session.name);
             run_tool(&st, &me, &caller, &tool, args).await
@@ -1170,9 +1173,9 @@ pub async fn api_mcp(
     }
 }
 
-/// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert` (una alerta va
-/// siempre al nido de quien la manda), y, para su nido, `status` (lo que miran sus esperas) y
-/// `alerts` (las de aquí sin leer, para `nido alerts`).
+/// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert`, `clipboard` y
+/// `send_file` (van siempre al nido de quien las usa), y, para su nido, `status` (lo que miran
+/// sus esperas) y `alerts` (las de aquí sin leer, para `nido alerts`).
 pub const PEER_TOOLS: [&str; 10] = [
     "sessions", "send", "read", "open", "answer", "close", "start", "stop", "status", "alerts",
 ];
@@ -1645,7 +1648,7 @@ fn not_from_session() -> Fail {
     )
 }
 
-fn args_of<T: DeserializeOwned>(args: Value) -> Result<T, Fail> {
+pub(crate) fn args_of<T: DeserializeOwned>(args: Value) -> Result<T, Fail> {
     serde_json::from_value(args).map_err(|e| {
         fail(
             StatusCode::BAD_REQUEST,

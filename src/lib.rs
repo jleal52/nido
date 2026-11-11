@@ -8,6 +8,7 @@ pub mod browse;
 pub mod claude;
 pub mod claude_store;
 pub mod client;
+pub mod deliver;
 pub mod e2e;
 pub mod emu;
 pub mod group;

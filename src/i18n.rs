@@ -761,6 +761,24 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("Tarea en segundo plano: {}", "Background task: {0}"),
     ("Tarea en segundo plano: aviso", "Background task: notice"),
+    // deliver.rs y outbox.rs
+    ("el texto está vacío", "the text is empty"),
+    (
+        "no se pudo guardar la copia: {}",
+        "could not save the copy: {0}",
+    ),
+    ("no existe el fichero {}", "file {0} does not exist"),
+    ("no se puede leer {}: {}", "cannot read {0}: {1}"),
+    ("{} es una carpeta", "{0} is a folder"),
+    ("{} no es un fichero normal", "{0} is not a regular file"),
+    (
+        "{} está en la carpeta de secretos de nido: no se manda",
+        "{0} is in nido's secrets folder: not sent",
+    ),
+    ("{} pasa de 64 MB ({})", "{0} is over 64 MB ({1})"),
+    ("sesión no válida", "invalid session"),
+    ("ese envío ha caducado", "that item has expired"),
+    ("no existe ese envío", "no such item"),
 ];
 
 #[cfg(test)]
