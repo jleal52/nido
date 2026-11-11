@@ -206,7 +206,7 @@ pub async fn exchange(
 }
 
 pub enum RefreshError {
-    /// La sesión ya no vale (`invalid_grant`): hay que volver a entrar.
+    /// La sesión ya no vale (Claude rechaza el token de renovación): hay que volver a entrar.
     Dead,
     /// Red, servidor… se puede reintentar.
     Transient(String),
@@ -228,14 +228,28 @@ pub async fn refresh(http: &reqwest::Client, refresh_token: &str) -> Result<Toke
     let status = resp.status();
     if !status.is_success() {
         let err = oauth_error(&resp.text().await.unwrap_or_default());
-        return Err(match (status.as_u16(), err.as_deref()) {
-            (400 | 401 | 403, Some("invalid_grant")) => RefreshError::Dead,
-            _ => RefreshError::Transient(format!("{status}")),
+        return Err(match refresh_failure(status.as_u16(), err.as_deref()) {
+            RefreshError::Transient(_) => RefreshError::Transient(format!("{status}")),
+            dead => dead,
         });
     }
     resp.json()
         .await
         .map_err(|_| RefreshError::Transient("respuesta que no se entiende".into()))
+}
+
+/// Qué hacer cuando Claude no renueva la sesión. Un 400/401/403 es que no acepta ese token de
+/// renovación (con `invalid_grant` o sin decir por qué, p. ej. un «400 Bad Request» a secas):
+/// reintentar no lo arregla, hay que volver a entrar. Salvo que el fallo sea de nido y no de la
+/// cuenta (`invalid_client`, `unsupported_grant_type`). Lo demás (límites, servidor) se reintenta.
+fn refresh_failure(status: u16, err: Option<&str>) -> RefreshError {
+    match (status, err) {
+        (400 | 401 | 403, Some("invalid_client" | "unsupported_grant_type")) => {
+            RefreshError::Transient(String::new())
+        }
+        (400 | 401 | 403, _) => RefreshError::Dead,
+        _ => RefreshError::Transient(String::new()),
+    }
 }
 
 /// El perfil de la cuenta (`account`, `organization`), tal cual.
@@ -522,6 +536,25 @@ pub fn parse_usage(v: &Value, at: f64) -> Option<Usage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_refresh_asks_to_log_in_again() {
+        let dead = |s, e| matches!(refresh_failure(s, e), RefreshError::Dead);
+        // Lo de siempre: el token de renovación ya no vale.
+        assert!(dead(400, Some("invalid_grant")));
+        // Un 400/401/403 sin `invalid_grant` (p. ej. un «400 Bad Request» a secas) tampoco se
+        // arregla reintentando: hay que volver a entrar.
+        assert!(dead(400, None));
+        assert!(dead(400, Some("invalid_request")));
+        assert!(dead(401, None));
+        assert!(dead(403, Some("access_denied")));
+        // Lo que no es culpa de la cuenta sí se reintenta.
+        assert!(!dead(400, Some("invalid_client")));
+        assert!(!dead(400, Some("unsupported_grant_type")));
+        assert!(!dead(429, None));
+        assert!(!dead(500, None));
+        assert!(!dead(503, Some("invalid_grant")));
+    }
 
     #[test]
     fn authorize_url_has_pkce_and_hint() {
