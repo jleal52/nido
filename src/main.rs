@@ -205,6 +205,17 @@ enum Cmd {
 enum SecretsCmd {
     /// Olvida un secreto recordado: la próxima vez que una sesión lo pida, se pregunta.
     Forget { name: String },
+    /// Ejecuta una orden con un secreto en una variable de entorno, sin enseñarlo: el de esta
+    /// sesión (`NIDO_SESSION`) o el recordado de este equipo. Sale con el código de la orden.
+    Run {
+        name: String,
+        /// La variable de entorno en la que va el secreto.
+        #[arg(long = "env", value_name = "VAR")]
+        var: String,
+        /// La orden y sus argumentos, tras `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -272,6 +283,10 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(e),
         },
+        // Sin token ni gestor: lee el secreto del disco.
+        Cmd::Secrets {
+            action: Some(SecretsCmd::Run { name, var, command }),
+        } => secrets_run(&paths, &name, &var, &command),
         cmd => {
             // Órdenes de consola: con la salida cortada (`nido ls | head`), terminar sin más,
             // como cualquier herramienta de terminal. El gestor y el guardián siguen ignorándolo.
@@ -1008,7 +1023,12 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
         }
         Cmd::Attach { name } => return attach_cmd(api, paths, name),
         Cmd::Mcp { action: None } => nido::mcp::run(api.clone()),
-        Cmd::Serve { .. } | Cmd::Holder { .. } | Cmd::Mcp { .. } => unreachable!(),
+        Cmd::Serve { .. }
+        | Cmd::Holder { .. }
+        | Cmd::Mcp { .. }
+        | Cmd::Secrets {
+            action: Some(SecretsCmd::Run { .. }),
+        } => unreachable!(),
         #[cfg(windows)]
         Cmd::Service { .. } => unreachable!(),
     }
@@ -1283,6 +1303,63 @@ fn clock(at: LocalTime, now: LocalTime) -> String {
     }
 }
 
+/// Un nombre de variable de entorno que vale en todos los sistemas: `[A-Za-z_][A-Za-z0-9_]*`.
+fn valid_env_name(v: &str) -> bool {
+    let mut b = v.bytes();
+    b.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && b.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+/// `nido secrets run`: la orden, con el secreto en `var`. En Unix nido se sustituye por ella
+/// (`exec`); en Windows la lanza, espera y sale con su código. El valor no se escribe en ningún
+/// sitio: solo va en el entorno de la orden.
+fn secrets_run(paths: &Paths, name: &str, var: &str, command: &[String]) -> ExitCode {
+    if !valid_env_name(var) {
+        return fail(format!(
+            "nombre de variable no válido: {var:?} (letras, números y «_»; no empieza por número)"
+        ));
+    }
+    let Some((program, args)) = command.split_first() else {
+        return fail("falta la orden, tras `--`");
+    };
+    let store = nido::secrets::Store::new(paths.state.join("secrets"));
+    let session = std::env::var("NIDO_SESSION").ok();
+    let path = match store.usable(session.as_deref(), name, registry::now_ms()) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    // Sin el error de `from_utf8`: no cita bytes, pero no hace falta nada de él.
+    let value = match std::fs::read(&path).map(String::from_utf8) {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => {
+            return fail(format!(
+                "el secreto «{name}» no es texto: no va en una variable"
+            ));
+        }
+        Err(e) => return fail(format!("no se pudo leer el secreto «{name}»: {e}")),
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).env(var, value);
+    // La salida cortada (`… | head`) termina la orden como a cualquier otra.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    #[cfg(unix)]
+    let e = {
+        use std::os::unix::process::CommandExt;
+        // Solo vuelve si no se pudo ejecutar.
+        cmd.exec()
+    };
+    #[cfg(not(unix))]
+    let e = match cmd.status() {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => e,
+    };
+    fail(format!("no se pudo ejecutar «{program}»: {e}"))
+}
+
 /// Lo que enseña `nido secrets` de `GET /api/v1/secrets`: «nombre · hasta cuándo · quién lo
 /// pidió y cuándo».
 fn secret_lines(
@@ -1449,6 +1526,16 @@ mod tests {
         );
         let (lines, warnings) = alert_lines(&serde_json::json!({"alerts": []}), now, |_| now);
         assert!(lines.is_empty() && warnings.is_empty());
+    }
+
+    #[test]
+    fn env_var_names() {
+        for ok in ["T", "GH_TOKEN", "_x1"] {
+            assert!(valid_env_name(ok), "{ok}");
+        }
+        for bad in ["", "1X", "A-B", "A=B", "Ñ", "A B"] {
+            assert!(!valid_env_name(bad), "{bad}");
+        }
     }
 
     #[test]

@@ -239,7 +239,7 @@ pub(crate) async fn tool_secret(st: &Arc<AppState>, caller: &Session, args: Valu
     {
         // Sin diálogo, pero se apunta quién lo pidió.
         let _ = st.secrets.touch(&a.name, &caller.name, now);
-        return Ok(json!({ "path": path }));
+        return Ok(json!({ "path": path, "nido": nido_cmd() }));
     }
     if !st.has_devices() {
         return Err(fail(
@@ -265,7 +265,15 @@ pub(crate) async fn tool_secret(st: &Arc<AppState>, caller: &Session, args: Valu
             .session_note(id, Some(NoteKind::Secret), &text, None)
             .await;
     }
-    outcome_reply(outcome, &caller.id, &a.name)
+    let mut reply = outcome_reply(outcome, &caller.id, &a.name)?;
+    reply["nido"] = nido_cmd().into();
+    Ok(reply)
+}
+
+/// Cómo llamar a nido desde la sesión (para `nido secrets run`): su ruta completa, por si no
+/// está en el `PATH` de la sesión.
+fn nido_cmd() -> String {
+    crate::launch::nido_exe().map_or_else(|_| "nido".to_owned(), |p| p.display().to_string())
 }
 
 /// Lo que manda la web o la app al contestar. Sin `Debug`: lleva el secreto.
