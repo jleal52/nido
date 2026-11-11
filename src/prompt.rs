@@ -834,14 +834,15 @@ pub fn model_menu(screen: &str) -> Option<ModelMenu> {
             Some(l) => (l.trim_end().to_owned(), true),
             None => (name.to_owned(), false),
         };
+        // Dos formas: «Opus   Opus 5.5 · Lo que hace» (el modelo, antes de « · ») u «Opus 5.5
+        // Lo que hace» (la etiqueta es el modelo).
         let rest = rest.split_whitespace().collect::<Vec<_>>().join(" ");
-        let model = rest.split(" · ").next().unwrap_or("").trim();
+        let model = match rest.split_once(" · ") {
+            Some((m, _)) if !m.trim().is_empty() => m.trim().to_owned(),
+            _ => label.clone(),
+        };
         options.push(ModelOption {
-            model: if model.is_empty() {
-                label.clone()
-            } else {
-                model.to_owned()
-            },
+            model,
             label,
             selected: o.selected,
             current,
@@ -2012,6 +2013,8 @@ async fn pick_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         return Err("no se pudo llevar el cursor a la opción".into());
     }
     scr.keys(b"s").await?;
+    // Con conversación, Claude pregunta antes si cambiar («Switch model?»): sí, una vez.
+    let mut confirmed = false;
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         tokio::time::sleep(STEP).await;
@@ -2019,25 +2022,67 @@ async fn pick_model<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if model_menu(&text).is_none() && model_set_for_session(&text) {
             return Ok(model);
         }
+        if !confirmed && let Some(n) = switch_confirm(&text, &model) {
+            scr.keys(n.to_string().as_bytes()).await?;
+            confirmed = true;
+        }
         if tokio::time::Instant::now() >= deadline {
             return Err("Claude no ha dicho que cambió el modelo".into());
         }
     }
 }
 
-/// Cierra el menú de `/model` con Esc (si sigue abierto) y espera a que se vaya.
+/// La pregunta de Claude tras elegir otro modelo con conversación ya empezada («Switch model?
+/// … ❯ 1. Yes, switch to Sonnet 5.5 / 2. No, go back»): el número de la opción que cambia a
+/// `model`.
+fn switch_confirm(screen: &str, model: &str) -> Option<u32> {
+    if !strip_sgr(screen)
+        .lines()
+        .any(|l| l.trim() == "Switch model?")
+    {
+        return None;
+    }
+    let want = norm(&format!("Yes, switch to {model}"));
+    parse(screen)?
+        .options
+        .iter()
+        .find(|o| norm(&o.label) == want)
+        .and_then(|o| o.n)
+        .filter(|n| *n <= 9)
+}
+
+/// El menú de `/model` o su pregunta de si cambiar («Switch model?»).
+fn model_dialog(screen: &str) -> bool {
+    model_menu(screen).is_some()
+        || (parse(screen).is_some()
+            && strip_sgr(screen)
+                .lines()
+                .any(|l| l.trim() == "Switch model?"))
+}
+
+/// Cierra el menú de `/model` (o su pregunta de si cambiar) con Esc, si sigue abierto, y espera
+/// a que se vaya.
 async fn escape_model_menu<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(scr: &mut Screen<R, W>) {
-    if !scr.read().await.is_ok_and(|t| model_menu(&t).is_some()) {
-        return;
-    }
-    if scr.keys(b"\x1b").await.is_err() {
-        return;
-    }
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(STEP).await;
-        if !scr.read().await.is_ok_and(|t| model_menu(&t).is_some()) {
+    // Esc en la pregunta vuelve al menú: otro Esc. Solo se pulsa otra vez cuando la pantalla ha
+    // cambiado y sigue abierto (dos Esc seguidos en la caja vacía abrirían otra cosa).
+    for _ in 0..3 {
+        let Ok(before) = scr.read().await else {
             return;
+        };
+        if !model_dialog(&before) || scr.keys(b"\x1b").await.is_err() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            tokio::time::sleep(STEP).await;
+            match scr.read().await {
+                Ok(t) if t != before => break,
+                Err(_) => return,
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
         }
     }
 }
@@ -3241,7 +3286,7 @@ mod tests {
      3. Fable
                                Fable 5.2 · Most
                                capable
-     4. Haiku                  Haiku 5.5
+     4. Haiku                  Haiku 5.5 · Fast
 
    ◐ Medium effort (default) ←/→ to adjust
 
@@ -3289,11 +3334,7 @@ mod tests {
         assert!(!c.effort_changed, "←/→ en el menú: {:?}", c.keys);
         let enters = c.keys.iter().filter(|k| k.contains(&b'\r')).count();
         assert!(enters <= 1, "{:?}", c.keys);
-        assert!(
-            !c.keys.iter().any(|k| k.len() == 1 && k[0].is_ascii_digit()),
-            "{:?}",
-            c.keys
-        );
+        assert!(!c.digit_in_menu, "un número en el menú: {:?}", c.keys);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3436,6 +3477,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_model_menu_with_the_models_as_labels() {
+        // Otra forma del menú de Claude Code 2.1.322 (visto en una sesión de prueba).
+        let s = "\
+   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names,
+   specify with --model.
+
+     1.  Default (recommended)  Opus 5.5 · Best for everyday, complex tasks
+     2.  Opus 5.5               For complex work and everyday tasks
+     3.  Fable 5.2              For your toughest challenges
+     4.  Sonnet 5.5             Most efficient for simpler tasks
+   ❯ 5.  Haiku 5.5 ✔            Fastest for quick answers
+     ▸   More models
+
+   ◐ Medium effort (default) ←/→ to adjust
+
+   Enter to set as default · s to use this session only · Esc to cancel";
+        let m = model_menu(s).unwrap();
+        assert_eq!(
+            options(&m),
+            [
+                ("Default (recommended)", "Opus 5.5", false, false),
+                ("Opus 5.5", "Opus 5.5", false, false),
+                ("Fable 5.2", "Fable 5.2", false, false),
+                ("Sonnet 5.5", "Sonnet 5.5", false, false),
+                ("Haiku 5.5", "Haiku 5.5", true, true),
+            ]
+        );
+        assert!(m.session_only);
+        assert_eq!(
+            m.models(),
+            ["Opus 5.5", "Fable 5.2", "Sonnet 5.5", "Haiku 5.5"]
+        );
+        assert_eq!(m.find("Opus"), Some(1));
+        assert_eq!(m.find("sonnet"), Some(3));
+        assert_eq!(m.find("Fable 5.1"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_with_the_models_as_labels() {
+        let c = claude(|c| {
+            c.models_as_labels = true;
+            c.current = 5;
+        });
+        let mut scr = fake::screen_of(&c);
+        let mut seen = None;
+        assert_eq!(
+            set_model(&mut scr, "Sonnet", &mut seen).await,
+            Ok("Sonnet 5.5".to_owned())
+        );
+        assert_eq!(c.lock().unwrap().current, 4);
+        never_enter_in_the_menu(&c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_asks_whether_to_switch() {
+        // Con conversación, Claude pregunta si cambiar: «1. Yes, switch to …», con su número.
+        let c = claude(|c| c.asks_switch = true);
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            set_model(&mut scr, "Sonnet 5.5", &mut None).await,
+            Ok("Sonnet 5.5".to_owned())
+        );
+        assert_eq!(
+            keys(&c),
+            [
+                b"/model".to_vec(),
+                b"\r".to_vec(),
+                DOWN.to_vec(),
+                b"s".to_vec(),
+                b"1".to_vec()
+            ]
+        );
+        never_enter_in_the_menu(&c);
+        let c = c.lock().unwrap();
+        assert_eq!((c.current, c.menu, c.switch), (4, None, None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_switch_question_is_escaped_with_its_menu() {
+        // Esc en la pregunta vuelve al menú, y otro Esc lo cierra.
+        let c = claude(|c| {
+            c.asks_switch = true;
+            c.switch_stuck = true;
+        });
+        let mut scr = fake::screen_of(&c);
+        assert!(set_model(&mut scr, "Sonnet", &mut None).await.is_err());
+        let k = keys(&c);
+        assert_eq!(k[k.len() - 2..], [b"\x1b".to_vec(), b"\x1b".to_vec()]);
+        never_enter_in_the_menu(&c);
+        let c = c.lock().unwrap();
+        assert_eq!((c.current, c.menu, c.switch), (3, None, None));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn model_when_the_menu_does_not_open() {
         // Claude toma `/model` por un mensaje: un solo Enter y nada más.
@@ -3489,6 +3625,16 @@ pub(crate) mod fake {
         pub effort_changed: bool,
         /// shift+tab con un menú en pantalla.
         pub shift_tab_in_menu: bool,
+        /// Las opciones con el modelo por etiqueta («2.  Opus 5.5   Lo que hace»), como lo pinta
+        /// a veces Claude Code, con «▸ More models» debajo.
+        pub models_as_labels: bool,
+        /// Tras `s`, pregunta si cambiar («Switch model?»): dónde está, si está abierta.
+        pub asks_switch: bool,
+        pub switch: Option<usize>,
+        /// En esa pregunta, «1» no hace nada.
+        pub switch_stuck: bool,
+        /// Un número con el menú de `/model` abierto (lo elegiría como el de por defecto).
+        pub digit_in_menu: bool,
     }
 
     impl Default for Claude {
@@ -3517,6 +3663,11 @@ pub(crate) mod fake {
                 saved_default: false,
                 effort_changed: false,
                 shift_tab_in_menu: false,
+                models_as_labels: false,
+                asks_switch: false,
+                switch: None,
+                switch_stuck: false,
+                digit_in_menu: false,
             }
         }
     }
@@ -3533,6 +3684,16 @@ pub(crate) mod fake {
                 out.push("   2. No".into());
                 out.push(String::new());
                 out.push(" Esc to cancel · Tab to amend".into());
+            } else if let Some(at) = self.switch {
+                let model = self.options[at].1;
+                out.push(RULE.into());
+                out.push("   Switch model?".into());
+                out.push("   Your next response will be slower and use more tokens".into());
+                out.push(String::new());
+                out.push(format!("   This conversation is cached for the current model. Switching to {model} means the full history gets re-read."));
+                out.push(String::new());
+                out.push(format!("   ❯ 1. Yes, switch to {model}"));
+                out.push("     2. No, go back".into());
             } else if let Some(at) = self.menu {
                 out.push(RULE.into());
                 out.push("   Select model".into());
@@ -3540,8 +3701,16 @@ pub(crate) mod fake {
                 for (i, (label, model)) in self.options.iter().enumerate() {
                     let cursor = if i == at { "❯" } else { " " };
                     let mark = if i == self.current { " ✔" } else { "" };
-                    let name = format!("{}. {label}{mark}", i + 1);
-                    out.push(format!("   {cursor} {name:<26} {model} · Lo que hace"));
+                    if self.models_as_labels && i > 0 {
+                        let name = format!("{}.  {model}{mark}", i + 1);
+                        out.push(format!("   {cursor} {name:<26} Lo que hace"));
+                    } else {
+                        let name = format!("{}. {label}{mark}", i + 1);
+                        out.push(format!("   {cursor} {name:<26} {model} · Lo que hace"));
+                    }
+                }
+                if self.models_as_labels {
+                    out.push("     ▸   More models".into());
                 }
                 out.push("   ◐ Medium effort (default) ←/→ to adjust".into());
                 out.push(if self.hint_s {
@@ -3596,7 +3765,9 @@ pub(crate) mod fake {
                 }
                 b"\x1b[C" | b"\x1b[D" => self.effort_changed |= self.menu.is_some(),
                 b"\x1b" => {
-                    if self.menu.take().is_some() {
+                    if let Some(at) = self.switch.take() {
+                        self.menu = Some(at);
+                    } else if self.menu.take().is_some() {
                         self.log.push("  ⎿  Kept model as it was".into());
                     }
                 }
@@ -3615,7 +3786,22 @@ pub(crate) mod fake {
                 }
                 _ => {
                     for c in String::from_utf8_lossy(k).chars() {
+                        if let Some(at) = self.switch {
+                            if c == '1' && !self.switch_stuck {
+                                self.switch = None;
+                                self.current = at;
+                                self.log.push(format!(
+                                    "  ⎿  Set model to {} for this session only",
+                                    self.options[at].1
+                                ));
+                            }
+                            continue;
+                        }
                         match (c, self.menu) {
+                            ('s', Some(at)) if self.hint_s && self.asks_switch => {
+                                self.menu = None;
+                                self.switch = Some(at);
+                            }
                             ('s', Some(at)) if self.hint_s => {
                                 self.current = at;
                                 self.menu = None;
@@ -3624,6 +3810,7 @@ pub(crate) mod fake {
                                     self.options[at].1
                                 ));
                             }
+                            (c, Some(_)) if c.is_ascii_digit() => self.digit_in_menu = true,
                             (_, Some(_)) => {}
                             ('\x7f', None) => {
                                 self.input.pop();
