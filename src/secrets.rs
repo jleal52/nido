@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 /// Cuánto espera una pregunta a que el usuario conteste.
 pub const ASK_WAIT: Duration = Duration::from_secs(15 * 60);
@@ -333,6 +334,242 @@ impl Store {
     }
 }
 
+/// Cómo acabó una pregunta.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Contestada y guardada: la ruta de cada sesión que esperaba.
+    Saved(HashMap<String, PathBuf>),
+    /// Contestada, pero no se pudo guardar.
+    Failed(String),
+    /// El usuario no quiso.
+    Rejected,
+    /// Nadie contestó a tiempo.
+    Expired,
+    /// Ya no espera nadie (las sesiones se fueron).
+    Closed,
+}
+
+/// Lo que ven la web y la app de una pregunta en curso (en la `SessionView` de cada sesión que
+/// espera). Sin nada del valor.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AskView {
+    pub id: String,
+    pub name: String,
+    pub reason: String,
+    /// Cuándo se preguntó y hasta cuándo se espera (ms).
+    pub since: u64,
+    pub until: u64,
+}
+
+struct Ask {
+    view: AskView,
+    deadline: tokio::time::Instant,
+    sessions: Vec<String>,
+    /// Alguna de las sesiones lo pidió con `force` (el recordado ya no vale).
+    forced: bool,
+    done: watch::Sender<Option<Outcome>>,
+}
+
+/// Esa sesión ya espera otro secreto.
+#[derive(Debug, PartialEq)]
+pub struct Busy;
+
+/// Las preguntas en curso de este equipo, por nombre.
+#[derive(Default)]
+pub struct Asks {
+    map: std::sync::Mutex<HashMap<String, Ask>>,
+    /// Cuánto se espera; `None`: `ASK_WAIT` (las pruebas lo acortan).
+    wait: std::sync::Mutex<Option<Duration>>,
+}
+
+/// Lo que se lleva quien contesta: el nombre, a qué sesiones dar la ruta y cómo avisarlas.
+pub struct Taken {
+    pub name: String,
+    pub sessions: Vec<String>,
+    pub forced: bool,
+    done: watch::Sender<Option<Outcome>>,
+}
+
+impl Taken {
+    /// Avisa a las que esperan.
+    pub fn finish(self, outcome: Outcome) {
+        let _ = self.done.send(Some(outcome));
+    }
+}
+
+/// Una sesión que espera la respuesta. Al soltarlo (también si su petición se cae), deja de
+/// esperar.
+pub struct Waiter<'a> {
+    asks: &'a Asks,
+    name: String,
+    id: String,
+    session: String,
+    deadline: tokio::time::Instant,
+    rx: watch::Receiver<Option<Outcome>>,
+}
+
+impl Asks {
+    /// Para las pruebas: cuánto esperan las preguntas que se hagan desde ahora.
+    pub fn set_wait(&self, d: Duration) {
+        *self.wait.lock().expect("espera") = Some(d);
+    }
+
+    fn wait_for(&self) -> Duration {
+        self.wait.lock().expect("espera").unwrap_or(ASK_WAIT)
+    }
+
+    /// La sesión `session` pide `name`: se une a la pregunta que haya con ese nombre o se crea
+    /// una (`true`: es nueva, hay que avisar al usuario).
+    pub fn join(
+        &self,
+        name: &str,
+        reason: &str,
+        session: &str,
+        now: u64,
+    ) -> Result<(Waiter<'_>, bool), Busy> {
+        self.join_forced(name, reason, session, now, false)
+    }
+
+    /// Como [`Asks::join`]; con `forced`, el recordado que haya ya no vale.
+    pub fn join_forced(
+        &self,
+        name: &str,
+        reason: &str,
+        session: &str,
+        now: u64,
+        forced: bool,
+    ) -> Result<(Waiter<'_>, bool), Busy> {
+        let wait = self.wait_for();
+        let mut map = self.map.lock().expect("preguntas");
+        if map
+            .values()
+            .any(|a| a.sessions.iter().any(|s| s == session))
+        {
+            return Err(Busy);
+        }
+        let new = !map.contains_key(name);
+        let ask = map.entry(name.to_owned()).or_insert_with(|| Ask {
+            view: AskView {
+                id: crate::registry::new_id(),
+                name: name.to_owned(),
+                reason: reason.to_owned(),
+                since: now,
+                until: now + wait.as_millis() as u64,
+            },
+            deadline: tokio::time::Instant::now() + wait,
+            sessions: Vec::new(),
+            forced: false,
+            done: watch::channel(None).0,
+        });
+        ask.sessions.push(session.to_owned());
+        ask.forced |= forced;
+        let waiter = Waiter {
+            asks: self,
+            name: name.to_owned(),
+            id: ask.view.id.clone(),
+            session: session.to_owned(),
+            deadline: ask.deadline,
+            rx: ask.done.subscribe(),
+        };
+        Ok((waiter, new))
+    }
+
+    /// La pregunta que espera la sesión, si alguna.
+    pub fn view_for(&self, session: &str) -> Option<AskView> {
+        let map = self.map.lock().expect("preguntas");
+        map.values()
+            .find(|a| a.sessions.iter().any(|s| s == session))
+            .map(|a| a.view.clone())
+    }
+
+    /// Para contestarla: la pregunta `id`, si sigue en curso y la espera `session`. Sale de la
+    /// lista: la primera respuesta es la que vale.
+    pub fn take(&self, id: &str, session: &str) -> Option<Taken> {
+        let mut map = self.map.lock().expect("preguntas");
+        let name = map
+            .iter()
+            .find(|(_, a)| a.view.id == id && a.sessions.iter().any(|s| s == session))
+            .map(|(n, _)| n.clone())?;
+        let a = map.remove(&name)?;
+        Some(Taken {
+            name,
+            sessions: a.sessions,
+            forced: a.forced,
+            done: a.done,
+        })
+    }
+
+    /// Se acabó el tiempo de la pregunta `id`: fuera, y quien llama se lleva las sesiones que
+    /// esperaban (para apuntar «sin contestar»). `None` si ya no estaba.
+    fn expire(&self, name: &str, id: &str) -> Option<Vec<String>> {
+        let mut map = self.map.lock().expect("preguntas");
+        if map.get(name).is_none_or(|a| a.view.id != id) {
+            return None;
+        }
+        let a = map.remove(name)?;
+        let _ = a.done.send(Some(Outcome::Expired));
+        Some(a.sessions)
+    }
+
+    /// La sesión deja de esperar; si era la última, la pregunta se cierra.
+    fn leave(&self, name: &str, id: &str, session: &str) -> bool {
+        let mut map = self.map.lock().expect("preguntas");
+        let Some(a) = map.get_mut(name).filter(|a| a.view.id == id) else {
+            return false;
+        };
+        let before = a.sessions.len();
+        a.sessions.retain(|s| s != session);
+        let left = a.sessions.len() != before;
+        if a.sessions.is_empty()
+            && let Some(a) = map.remove(name)
+        {
+            let _ = a.done.send(Some(Outcome::Closed));
+        }
+        left
+    }
+
+    /// La sesión se cerró o ya no está viva: deja de esperar lo que esperase.
+    pub fn cancel_session(&self, session: &str) -> bool {
+        let found = {
+            let map = self.map.lock().expect("preguntas");
+            map.iter()
+                .find(|(_, a)| a.sessions.iter().any(|s| s == session))
+                .map(|(n, a)| (n.clone(), a.view.id.clone()))
+        };
+        found.is_some_and(|(name, id)| self.leave(&name, &id, session))
+    }
+}
+
+impl Waiter<'_> {
+    /// Espera a que acabe. Si se acaba el tiempo y es este quien la quita, también devuelve las
+    /// sesiones que esperaban (las demás esperas devuelven una lista vacía).
+    pub async fn wait(&mut self) -> (Outcome, Vec<String>) {
+        let rx = &mut self.rx;
+        let got = tokio::time::timeout_at(self.deadline, async {
+            rx.wait_for(Option::is_some).await.map(|o| o.clone())
+        })
+        .await;
+        match got {
+            Ok(Ok(Some(o))) => (o, Vec::new()),
+            // Quien contestaba se fue sin decir nada.
+            Ok(_) => (Outcome::Closed, Vec::new()),
+            Err(_) => match self.asks.expire(&self.name, &self.id) {
+                Some(sessions) => (Outcome::Expired, sessions),
+                None => (
+                    self.rx.borrow().clone().unwrap_or(Outcome::Expired),
+                    Vec::new(),
+                ),
+            },
+        }
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        self.asks.leave(&self.name, &self.id, &self.session);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +731,81 @@ mod tests {
         s.save_answer("tok", &sessions[..1], b"w", Remember::No, true, "api", 2)
             .unwrap();
         assert_eq!(s.remembered("tok", 2), None);
+    }
+
+    #[tokio::test]
+    async fn two_sessions_share_one_ask_and_get_their_paths() {
+        let asks = Asks::default();
+        let (mut a, new_a) = asks.join("tok", "para subir", "aaaa1111", 5).unwrap();
+        let (mut b, new_b) = asks.join("tok", "otro motivo", "bbbb2222", 6).unwrap();
+        assert!(new_a && !new_b);
+        let va = asks.view_for("aaaa1111").unwrap();
+        assert_eq!(va, asks.view_for("bbbb2222").unwrap());
+        assert_eq!(
+            (va.name.as_str(), va.reason.as_str(), va.since),
+            ("tok", "para subir", 5)
+        );
+        assert_eq!(va.until, 5 + ASK_WAIT.as_millis() as u64);
+        // Una sesión, una pregunta.
+        assert!(matches!(asks.join("otro", "x", "aaaa1111", 7), Err(Busy)));
+        // Contesta quien la ve en una de sus sesiones.
+        assert!(asks.take(&va.id, "cccc3333").is_none());
+        let taken = asks.take(&va.id, "bbbb2222").unwrap();
+        assert_eq!(taken.name, "tok");
+        assert_eq!(taken.sessions, ["aaaa1111", "bbbb2222"]);
+        assert!(asks.view_for("aaaa1111").is_none());
+        let paths: HashMap<String, PathBuf> = [
+            ("aaaa1111".to_owned(), PathBuf::from("/s/a")),
+            ("bbbb2222".to_owned(), PathBuf::from("/s/b")),
+        ]
+        .into();
+        taken.finish(Outcome::Saved(paths.clone()));
+        assert_eq!(a.wait().await, (Outcome::Saved(paths.clone()), vec![]));
+        assert_eq!(b.wait().await, (Outcome::Saved(paths), vec![]));
+        // Ya contestada: otra vez, nada.
+        assert!(asks.take(&va.id, "aaaa1111").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_ask_expires_once_for_all() {
+        let asks = Asks::default();
+        asks.set_wait(Duration::from_millis(200));
+        let (mut a, _) = asks.join("tok", "x", "aaaa1111", 0).unwrap();
+        let (mut b, _) = asks.join("tok", "x", "bbbb2222", 0).unwrap();
+        let (ra, rb) = tokio::join!(a.wait(), b.wait());
+        assert_eq!(ra.0, Outcome::Expired);
+        assert_eq!(rb.0, Outcome::Expired);
+        // Solo uno de los dos se lleva las sesiones (para apuntar «sin contestar» una vez).
+        let mut noted = [ra.1, rb.1].concat();
+        noted.sort();
+        assert_eq!(noted, ["aaaa1111", "bbbb2222"]);
+        assert!(asks.view_for("aaaa1111").is_none());
+    }
+
+    #[tokio::test]
+    async fn leaving_closes_it_when_nobody_waits() {
+        let asks = Asks::default();
+        let (a, _) = asks.join("tok", "x", "aaaa1111", 0).unwrap();
+        let (mut b, _) = asks.join("tok", "x", "bbbb2222", 0).unwrap();
+        drop(a); // su petición se cayó
+        assert!(asks.view_for("aaaa1111").is_none());
+        assert!(asks.view_for("bbbb2222").is_some());
+        assert!(asks.cancel_session("bbbb2222"));
+        assert_eq!(b.wait().await.0, Outcome::Closed);
+        assert!(!asks.cancel_session("bbbb2222"));
+        // Ya libre: puede preguntar otra cosa.
+        assert!(asks.join("otro", "x", "bbbb2222", 0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_and_forced() {
+        let asks = Asks::default();
+        let (mut a, _) = asks.join_forced("tok", "x", "aaaa1111", 0, false).unwrap();
+        let (_b, _) = asks.join_forced("tok", "x", "bbbb2222", 0, true).unwrap();
+        let id = asks.view_for("aaaa1111").unwrap().id;
+        let taken = asks.take(&id, "aaaa1111").unwrap();
+        assert!(taken.forced);
+        taken.finish(Outcome::Rejected);
+        assert_eq!(a.wait().await.0, Outcome::Rejected);
     }
 }
