@@ -203,7 +203,7 @@ async fn secrets_clipboard_and_files_end_to_end() {
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shell = bin.join("shell");
-    std::fs::write(&shell, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::write(&shell, "#!/bin/sh\nexec sleep 600\n").unwrap();
     std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     // Esta prueba es su propio proceso (un fichero de tests/): cambiar el entorno no toca a otras.
     unsafe {
