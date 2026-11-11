@@ -1924,12 +1924,43 @@ pub fn spawn_delivery_watch(state: Arc<AppState>) {
     });
 }
 
+/// Cada cuánto se borra lo caducado de secretos y envíos.
+const CLEANUP_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Al arrancar y cada `CLEANUP_EVERY`: secretos recordados vencidos, sin recordar de más de
+/// 24 h, envíos de más de 7 días o por encima del tope, y lo de sesiones que ya no existen.
+fn spawn_cleanup(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(CLEANUP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let ids: std::collections::HashSet<String> = state
+                .registry
+                .lock()
+                .await
+                .sessions()
+                .iter()
+                .map(|s| s.id.clone())
+                .collect();
+            let st = state.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let now = now_ms();
+                st.secrets.prune(now, |id| ids.contains(id));
+                st.outbox.prune(now, |id| ids.contains(id));
+            })
+            .await;
+        }
+    });
+}
+
 /// Cada 2 s (o al pedirlo) vuelve a mirar el estado.
 pub fn spawn_scanner(state: Arc<AppState>) {
     spawn_group(state.clone());
     spawn_background(state.clone());
     spawn_startup_watch(state.clone());
     spawn_delivery_watch(state.clone());
+    spawn_cleanup(state.clone());
     // Los avisos al móvil, según los cambios que vea `scan`.
     if let Some(mut rx) = state.alerts_rx.lock().expect("avisos").take() {
         let st = state.clone();
@@ -2755,6 +2786,10 @@ pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), Regist
     let _ = std::fs::remove_dir_all(st.paths.session_state(id));
     st.mcp_cursors.forget(id);
     st.inbox.forget(id);
+    // Lo suyo de secretos y envíos: se cerró.
+    st.asks.cancel_session(id);
+    st.secrets.forget_session(id);
+    st.outbox.forget(id);
     st.refresh.notify_one();
     res.map(|_| ())
 }
@@ -3641,6 +3676,45 @@ mod tests {
         assert!(AppState::quiet_while_parent(AlertKind::Waiting));
         assert!(AppState::quiet_while_parent(AlertKind::Finished));
         assert!(!AppState::quiet_while_parent(AlertKind::Requested));
+    }
+
+    /// Al borrar una sesión se van su pregunta, sus secretos sin recordar y sus envíos; los
+    /// recordados del equipo se quedan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_session_drops_its_secrets_items_and_ask() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _, _) = with_mac(tmp.path());
+        let session = Session {
+            id: new_id(),
+            name: "api".into(),
+            cwd: tmp.path().to_owned(),
+            argv: vec!["true".into()],
+            env: vec![],
+            autostart: false,
+            created: 0,
+            claude: None,
+            folder: None,
+            finished: 0,
+            stopped: 0,
+            seen: 0,
+            opened_by: None,
+            alerts: vec![],
+        };
+        let id = st.registry.lock().await.add(session).unwrap().id;
+        let own = st.secrets.save_session(&id, "tok", b"v").unwrap();
+        let team = st
+            .secrets
+            .save_team("gh", b"v", crate::secrets::Remember::Always, "api", 1)
+            .unwrap();
+        st.outbox.add_text(&id, "hola", None, 1).unwrap();
+        let (mut waiter, _) = st.asks.join("npm", "x", &id, 1).unwrap();
+        delete_session(&st, &id).await.unwrap();
+        assert_eq!(waiter.wait().await.0, crate::secrets::Outcome::Closed);
+        assert!(!own.exists() && !own.parent().unwrap().exists());
+        assert!(team.exists());
+        assert!(st.outbox.list(&id).is_empty());
+        assert!(!st.paths.state.join("outbox").join(&id).exists());
     }
 
     #[test]
