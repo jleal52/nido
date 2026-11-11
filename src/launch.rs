@@ -274,22 +274,37 @@ pub fn holder_id(paths: &Paths, id: &str) -> Option<HolderId> {
 pub fn holder_running(paths: &Paths, id: &str) -> bool {
     holder_pid(paths, id)
         .and_then(|p| u32::try_from(p).ok())
-        .is_some_and(|p| crate::sys::pid_alive(p) && is_nido(p))
+        .is_some_and(|p| crate::sys::pid_alive(p) && is_holder_of(p, id))
 }
 
-/// ¿Es `pid` un proceso de nido? El pidfile puede ser viejo (un guardián que murió sin
-/// borrarlo) y su número, de otro proceso que lo heredó: se mira el nombre (`nido`, o el del
-/// ejecutable con el que se lanzan los guardianes).
-fn is_nido(pid: u32) -> bool {
-    let Some(comm) = crate::claude::Procfs::default().comm(pid) else {
+/// ¿Es `pid` el guardián de la sesión `id`? El pidfile puede ser viejo (un guardián que murió
+/// sin borrarlo) y su número, de otro proceso que lo heredó, incluso otro de nido (el guardián
+/// de otra sesión, un `nido mcp`, el gestor). Se mira el nombre (`nido`, o el del ejecutable
+/// con el que se lanzan los guardianes) y los argumentos (`holder <id>`). En Windows los
+/// argumentos no se leen: solo el nombre.
+fn is_holder_of(pid: u32, id: &str) -> bool {
+    let procfs = crate::claude::Procfs::default();
+    let Some(comm) = procfs.comm(pid) else {
         return false;
     };
     let exe = nido_exe()
         .ok()
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
-    std::iter::once("nido".to_owned())
+    let named = std::iter::once("nido".to_owned())
         .chain(exe)
-        .any(|n| same_name(&comm, &n))
+        .any(|n| same_name(&comm, &n));
+    if !named {
+        return false;
+    }
+    match procfs.args(pid) {
+        Some(args) => holder_args(&args, id),
+        None => cfg!(windows),
+    }
+}
+
+/// Los argumentos son los de un guardián de la sesión `id` (`nido holder <id>`).
+fn holder_args(args: &[String], id: &str) -> bool {
+    args.windows(2).any(|w| w[0] == "holder" && w[1] == id)
 }
 
 /// El nombre de un proceso (`comm`) es `name`. Linux lo corta a 15 caracteres.
@@ -311,9 +326,9 @@ pub fn stop(paths: &Paths, launcher: Launcher, id: &str) -> io::Result<()> {
         return Ok(());
     }
     if let Some(pid) = holder_pid(paths, id).and_then(|p| u32::try_from(p).ok()) {
-        // Que el pid (de un fichero que puede ser viejo) sea de verdad un nido y no otro proceso
-        // que heredó el número. En Windows, además, se termina el árbol entero.
-        if !is_nido(pid) {
+        // Que el pid (de un fichero que puede ser viejo) sea de verdad el guardián de esta sesión
+        // y no otro proceso que heredó el número. En Windows, además, se termina el árbol entero.
+        if !is_holder_of(pid, id) {
             return Ok(());
         }
         crate::sys::terminate(pid);
@@ -642,6 +657,50 @@ mod tests {
         let _ = stranger.kill();
         let _ = stranger.wait();
         assert!(untouched, "stop mató a un proceso que no era de nido");
+    }
+
+    #[test]
+    fn a_holder_is_told_by_its_arguments() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(holder_args(
+            &args(&["/usr/bin/nido", "holder", "abcd1234"]),
+            "abcd1234"
+        ));
+        assert!(!holder_args(
+            &args(&["nido", "holder", "ffff0000"]),
+            "abcd1234"
+        ));
+        assert!(!holder_args(&args(&["nido", "mcp"]), "abcd1234"));
+        assert!(!holder_args(&args(&["nido", "serve"]), "abcd1234"));
+        assert!(!holder_args(&args(&["nido", "holder"]), "abcd1234"));
+        assert!(!holder_args(
+            &args(&["nido", "abcd1234", "holder"]),
+            "abcd1234"
+        ));
+    }
+
+    /// Los argumentos de un proceso, como los ve el sistema (en Windows no se leen).
+    #[cfg(unix)]
+    #[test]
+    fn the_arguments_of_a_process() {
+        let mut child = std::process::Command::new("sleep")
+            .args(["60"])
+            .spawn()
+            .unwrap();
+        let mut got = None;
+        for _ in 0..50 {
+            got = crate::claude::Procfs::default().args(child.id());
+            if got.as_ref().is_some_and(|a| a.len() == 2) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let got = got.unwrap();
+        assert!(got[0].ends_with("sleep"), "{got:?}");
+        assert_eq!(got[1], "60");
+        assert_eq!(crate::claude::Procfs::default().args(u32::MAX - 1), None);
     }
 
     #[test]

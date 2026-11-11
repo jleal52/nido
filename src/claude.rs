@@ -131,6 +131,31 @@ impl Procfs {
         Some(s.trim_end().to_owned())
     }
 
+    /// Los argumentos con los que se lanzó (`argv`, con el programa). `None` si no se pueden
+    /// leer; en Windows, siempre (leerlos de otro proceso no es sencillo).
+    pub fn args(&self, pid: u32) -> Option<Vec<String>> {
+        #[cfg(target_os = "macos")]
+        if self.native() {
+            return mac::args(pid);
+        }
+        #[cfg(windows)]
+        if self.native() {
+            let _ = pid;
+            return None;
+        }
+        let raw = std::fs::read(self.root.join(pid.to_string()).join("cmdline")).ok()?;
+        // Cada argumento acaba en un cero. Vacío: un zombi o un hilo del núcleo.
+        let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+        if raw.is_empty() {
+            return None;
+        }
+        Some(
+            raw.split(|&b| b == 0)
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect(),
+        )
+    }
+
     pub fn env_var(&self, pid: u32, key: &str) -> Option<String> {
         #[cfg(target_os = "macos")]
         if self.native() {
@@ -262,6 +287,24 @@ mod mac {
         }
         buf.truncate(size);
         Some(buf)
+    }
+
+    /// Los argumentos (`argv`): tras `argc`, la ruta del ejecutable, ceros de relleno y los
+    /// `argc` argumentos.
+    pub fn args(pid: u32) -> Option<Vec<String>> {
+        let raw = procargs(pid)?;
+        let argc = i32::from_ne_bytes(raw.get(..4)?.try_into().ok()?) as usize;
+        let rest = raw.get(4..)?;
+        let mut at = rest.iter().position(|&b| b == 0)?;
+        while rest.get(at) == Some(&0) {
+            at += 1;
+        }
+        let args: Vec<String> = rest[at..]
+            .split(|&b| b == 0)
+            .take(argc)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        (args.len() == argc).then_some(args)
     }
 
     pub fn env_var(pid: u32, key: &str) -> Option<String> {

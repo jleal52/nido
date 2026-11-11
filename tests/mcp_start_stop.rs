@@ -273,6 +273,22 @@ async fn start_and_stop_end_to_end() {
     let _ = stranger.wait();
     let _ = std::fs::remove_file(paths.pidfile(&other));
     assert!(untouched, "stop mató a un proceso que no era de nido");
+    // Ni aunque sea de nido: el guardián de otra sesión que heredó el número.
+    let theirs = nido::launch::holder_pid(&paths, &me_id).unwrap();
+    assert!(
+        nido::launch::holder_running(&paths, &me_id),
+        "es su guardián"
+    );
+    std::fs::write(paths.pidfile(&other), theirs.to_string()).unwrap();
+    assert!(!nido::launch::holder_running(&paths, &other));
+    let (code, _) = tool(addr, me, "stop", json!({"session": other})).await;
+    assert_eq!(code, 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = std::fs::remove_file(paths.pidfile(&other));
+    assert!(
+        nido::launch::is_alive(&paths, &me_id),
+        "stop paró el guardián de otra sesión"
+    );
 
     // Una que no existe, o que no es de Claude: no.
     let (code, _) = tool(addr, me, "start", json!({"session": "ffffffff"})).await;
