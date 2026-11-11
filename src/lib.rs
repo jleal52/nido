@@ -25,6 +25,7 @@ pub mod oauth;
 pub mod prompt;
 pub mod proto;
 pub mod registry;
+pub mod secrets;
 pub mod server;
 pub mod sys;
 pub mod transcript;
