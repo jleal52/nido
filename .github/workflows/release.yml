@@ -119,11 +119,17 @@ jobs:
           security unlock-keychain -p "$kcpass" "$kc"
           umask 077
           printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/c.p12"
-          security import "$RUNNER_TEMP/c.p12" -k "$kc" -P "$P12_PASS" -T /usr/bin/codesign >/dev/null
+          echo "p12: $(wc -c < "$RUNNER_TEMP/c.p12" | tr -d ' ') bytes"
+          security import "$RUNNER_TEMP/c.p12" -k "$kc" -P "$P12_PASS" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/c.p12"
+          # Solo números: el registro es público.
+          certs=$(security find-certificate -a "$kc" | grep -c '"labl"' || true)
+          keys=$(security dump-keychain "$kc" | grep -c 'class: 0x00000010' || true)
+          echo "certificados: $certs, claves privadas: $keys"
+          [ "$keys" -gt 0 ] || { echo "El .p12 no lleva la clave privada: expórtalo desde «Mis certificados» en Acceso a Llaveros."; exit 1; }
           security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpass" "$kc" >/dev/null
           id=$(security find-identity -v -p codesigning "$kc" | awk '/Developer ID Application/ {print $2; exit}')
-          [ -n "$id" ] || { echo "El certificado no es «Developer ID Application»"; exit 1; }
+          [ -n "$id" ] || { echo "No hay una identidad «Developer ID Application» válida en el .p12"; security find-identity -p codesigning "$kc" | sed -E 's/"[^"]*"/"…"/'; exit 1; }
           name="nido-${{ matrix.target }}"
           mkdir work
           tar -xzf "dist/$name.tar.gz" -C work
