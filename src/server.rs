@@ -2554,14 +2554,19 @@ async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
+/// Para la sesión y apunta que se queda parada (no vuelve a arrancar con el equipo).
+pub(crate) async fn stop_session(st: &AppState, id: &str) {
+    stop_and_wait(st, id).await;
+    remember_running(st, id, false).await;
+    st.refresh.notify_one();
+}
+
 async fn api_stop(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let s = match find_session(&st, &id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    stop_and_wait(&st, &s.id).await;
-    remember_running(&st, &s.id, false).await;
-    st.refresh.notify_one();
+    stop_session(&st, &s.id).await;
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 

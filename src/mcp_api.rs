@@ -955,6 +955,14 @@ struct SessionArg {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StopArgs {
+    session: String,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadArgs {
     session: String,
     #[serde(default)]
@@ -1165,8 +1173,8 @@ pub async fn api_mcp(
 /// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert` (una alerta va
 /// siempre al nido de quien la manda), y, para su nido, `status` (lo que miran sus esperas) y
 /// `alerts` (las de aquí sin leer, para `nido alerts`).
-pub const PEER_TOOLS: [&str; 8] = [
-    "sessions", "send", "read", "open", "answer", "close", "status", "alerts",
+pub const PEER_TOOLS: [&str; 9] = [
+    "sessions", "send", "read", "open", "answer", "close", "stop", "status", "alerts",
 ];
 
 /// Una herramienta (menos `alert`), para quien llame: de aquí o de otro equipo.
@@ -1178,6 +1186,7 @@ async fn run_tool(st: &AppState, me: &Machine, caller: &Caller, tool: &str, args
         "open" => tool_open(st, me, caller, args).await,
         "answer" => tool_answer(st, me, caller, args).await,
         "close" => tool_close(st, me, caller, args).await,
+        "stop" => tool_stop(st, me, caller, args).await,
         "status" => tool_status(st, me, caller, args).await,
         _ => Err(fail(
             StatusCode::NOT_FOUND,
@@ -2433,6 +2442,48 @@ async fn tool_close(st: &AppState, me: &Machine, caller: &Caller, args: Value) -
     Ok(json!({ "ok": true }))
 }
 
+/// Si se puede parar una sesión en este estado: trabajando o con una pregunta pendiente, solo con
+/// `force`.
+fn may_stop(state: Status, force: bool) -> Result<(), Fail> {
+    if !force && matches!(state, Status::Working | Status::Question) {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "está trabajando (o tiene una pregunta pendiente): para pararla igualmente, force: true",
+        ));
+    }
+    Ok(())
+}
+
+/// `stop`: para una sesión de Claude de cualquier equipo del grupo (la conversación se conserva;
+/// se retoma con `start`). Pasa por el permiso de Claude: no va en `--allowedTools`.
+async fn tool_stop(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
+    let raw = args.clone();
+    let a: StopArgs = args_of(args)?;
+    let id = match place(me, caller, &a.session)? {
+        Where::Here(id) => id,
+        Where::There { machine, id } => {
+            return forward(st, me, caller, &machine, "stop", with_session(raw, id)).await;
+        }
+    };
+    if caller.local && id == caller.id {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "una sesión no puede pararse a sí misma",
+        ));
+    }
+    let s = session_here(st, id).await?;
+    let state = match view(st, &s.id).await {
+        Some(v) => status_of(st, &v).await.0,
+        None => Status::Stopped,
+    };
+    if state == Status::Stopped {
+        return Ok(json!({ "state": Status::Stopped, "note": i18n::tr("ya estaba parada") }));
+    }
+    may_stop(state, a.force)?;
+    server::stop_session(st, &s.id).await;
+    Ok(json!({ "state": Status::Stopped }))
+}
+
 /// Solo desde una sesión de aquí: no está entre las de `PEER_TOOLS`.
 async fn tool_alert(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply {
     let a: AlertArgs = args_of(args)?;
@@ -2554,6 +2605,18 @@ mod tests {
         // Parada: cuando nido la vio pararse; si no se sabe, nada.
         assert_eq!(since(false, Some(t), 9_000), Some(9_000));
         assert_eq!(since(false, Some(t), 0), None);
+    }
+
+    #[test]
+    fn stop_refuses_a_busy_session_unless_forced() {
+        for busy in [Status::Working, Status::Question] {
+            let e = may_stop(busy, false).unwrap_err();
+            assert_eq!(e.0, StatusCode::CONFLICT);
+            assert!(e.1.starts_with("está trabajando"), "{}", e.1);
+            assert!(may_stop(busy, true).is_ok());
+        }
+        assert!(may_stop(Status::Idle, false).is_ok());
+        assert!(may_stop(Status::Stopped, false).is_ok());
     }
 
     #[test]

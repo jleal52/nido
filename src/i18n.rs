@@ -331,6 +331,16 @@ const TABLE: &[(&str, &str)] = &[
         "demasiadas sesiones abiertas con open en este equipo; cierra alguna",
         "too many sessions opened with open on this machine; close some",
     ),
+    // start y stop
+    (
+        "está trabajando (o tiene una pregunta pendiente): para pararla igualmente, force: true",
+        "it is working (or has a pending question): to stop it anyway, force: true",
+    ),
+    (
+        "una sesión no puede pararse a sí misma",
+        "a session cannot stop itself",
+    ),
+    ("ya estaba parada", "it was already stopped"),
     // server.rs (canal «peer»)
     (
         "«{}» no es ningún equipo del grupo",
