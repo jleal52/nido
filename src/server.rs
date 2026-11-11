@@ -2536,21 +2536,29 @@ async fn remember_running(st: &AppState, id: &str, running: bool) {
     }
 }
 
+/// Arranca la sesión si no está viva (retoma su conversación) y espera a que lo esté (como
+/// mucho lo de `wait_alive`). `Ok(true)`: ya está en marcha.
+pub(crate) async fn start_session(st: &AppState, id: &str) -> std::io::Result<bool> {
+    let mut alive = launch::is_alive(&st.paths, id);
+    if !alive {
+        let hold = st.launching(id);
+        launch::start(&st.paths, st.launcher, id)?;
+        alive = wait_alive(st, id).await;
+        st.launched(id, hold);
+    }
+    remember_running(st, id, true).await;
+    st.refresh.notify_one();
+    Ok(alive)
+}
+
 async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let s = match find_session(&st, &id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    if !launch::is_alive(&st.paths, &s.id) {
-        let hold = st.launching(&s.id);
-        if let Err(e) = launch::start(&st.paths, st.launcher, &s.id) {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-        }
-        wait_alive(&st, &s.id).await;
-        st.launched(&s.id, hold);
+    if let Err(e) = start_session(&st, &s.id).await {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
-    remember_running(&st, &s.id, true).await;
-    st.refresh.notify_one();
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 

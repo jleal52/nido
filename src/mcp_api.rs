@@ -1173,8 +1173,8 @@ pub async fn api_mcp(
 /// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert` (una alerta va
 /// siempre al nido de quien la manda), y, para su nido, `status` (lo que miran sus esperas) y
 /// `alerts` (las de aquí sin leer, para `nido alerts`).
-pub const PEER_TOOLS: [&str; 9] = [
-    "sessions", "send", "read", "open", "answer", "close", "stop", "status", "alerts",
+pub const PEER_TOOLS: [&str; 10] = [
+    "sessions", "send", "read", "open", "answer", "close", "start", "stop", "status", "alerts",
 ];
 
 /// Una herramienta (menos `alert`), para quien llame: de aquí o de otro equipo.
@@ -1186,6 +1186,7 @@ async fn run_tool(st: &AppState, me: &Machine, caller: &Caller, tool: &str, args
         "open" => tool_open(st, me, caller, args).await,
         "answer" => tool_answer(st, me, caller, args).await,
         "close" => tool_close(st, me, caller, args).await,
+        "start" => tool_start(st, me, caller, args).await,
         "stop" => tool_stop(st, me, caller, args).await,
         "status" => tool_status(st, me, caller, args).await,
         _ => Err(fail(
@@ -2440,6 +2441,48 @@ async fn tool_close(st: &AppState, me: &Machine, caller: &Caller, args: Value) -
         .await
         .map_err(Fail::from)?;
     Ok(json!({ "ok": true }))
+}
+
+/// `start`: arranca una sesión de Claude parada de cualquier equipo del grupo, retomando su
+/// conversación (como «Arrancar» en la web; recibe los mensajes que tuviera en cola). Espera a
+/// que esté en marcha y devuelve su estado. Pasa por el permiso de Claude.
+async fn tool_start(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
+    let raw = args.clone();
+    let a: SessionArg = args_of(args)?;
+    let id = match place(me, caller, &a.session)? {
+        Where::Here(id) => id,
+        Where::There { machine, id } => {
+            return forward(st, me, caller, &machine, "start", with_session(raw, id)).await;
+        }
+    };
+    let s = session_here(st, id).await?;
+    let was_alive = launch::is_alive(&st.paths, &s.id);
+    if !was_alive {
+        match server::start_session(st, &s.id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(fail(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "arrancó pero no llegó a estar en marcha",
+                ));
+            }
+            Err(e) => {
+                return Err(fail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("no se pudo arrancar: {e}"),
+                ));
+            }
+        }
+    }
+    let state = match view(st, &s.id).await {
+        Some(v) => status_of(st, &v).await.0,
+        None => Status::Stopped,
+    };
+    let mut out = json!({ "state": state });
+    if was_alive {
+        out["note"] = i18n::tr("ya estaba en marcha").into();
+    }
+    Ok(out)
 }
 
 /// Si se puede parar una sesión en este estado: trabajando o con una pregunta pendiente, solo con

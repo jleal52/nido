@@ -341,6 +341,11 @@ const TABLE: &[(&str, &str)] = &[
         "a session cannot stop itself",
     ),
     ("ya estaba parada", "it was already stopped"),
+    ("ya estaba en marcha", "it was already running"),
+    (
+        "arrancó pero no llegó a estar en marcha",
+        "it was started but did not come up",
+    ),
     // server.rs (canal «peer»)
     (
         "«{}» no es ningún equipo del grupo",
