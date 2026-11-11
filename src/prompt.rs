@@ -3532,6 +3532,24 @@ mod tests {
         never_enter_in_the_menu(&c);
     }
 
+    #[test]
+    fn the_real_switch_question() {
+        // Visto con un Claude de verdad tras `s`, con conversación ya empezada.
+        let s = "\
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ Advisor Tool (experimental) is on and may use more tokens · /advisor ▔
+   Switch model?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Sonnet 5.5 means the full history gets re-read.
+
+   ❯ 1. Yes, switch to Sonnet 5.5
+     2. No, go back";
+        assert_eq!(switch_confirm(s, "Sonnet 5.5"), Some(1));
+        assert_eq!(switch_confirm(s, "Opus 5.5"), None);
+        assert!(model_dialog(s));
+        assert_eq!(model_menu(s), None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn model_asks_whether_to_switch() {
         // Con conversación, Claude pregunta si cambiar: «1. Yes, switch to …», con su número.
