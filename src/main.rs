@@ -1329,7 +1329,7 @@ fn secrets_run(paths: &Paths, name: &str, var: &str, command: &[String]) -> Exit
         Ok(p) => p,
         Err(e) => return fail(e),
     };
-    // Sin el error de `from_utf8`: no cita bytes, pero no hace falta nada de él.
+    // Del error de `from_utf8`, nada: lleva dentro los bytes del secreto.
     let value = match std::fs::read(&path).map(String::from_utf8) {
         Ok(Ok(v)) => v,
         Ok(Err(_)) => {
