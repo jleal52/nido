@@ -4030,7 +4030,7 @@ mod tests {
                 ["server:nido"]
             );
             assert_eq!(with.last(), Some(&msg));
-            assert_eq!(with.len(), plain.len() + 7, "{with:?}");
+            assert_eq!(with.len(), plain.len() + 10, "{with:?}");
             assert_eq!(claude::extra_args(&with), claude::extra_args(&plain));
         }
         assert_eq!(

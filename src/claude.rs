@@ -408,16 +408,22 @@ pub fn is_claude(argv: &[String]) -> bool {
 const CHANNELS_OPT: &str = "--dangerously-load-development-channels";
 const NIDO_CHANNEL: &str = "server:nido";
 const ALLOWED_OPTS: [&str; 2] = ["--allowedTools", "--allowed-tools"];
-/// Las herramientas de nido que no piden permiso: las que miran y hablan. Las que actúan sobre
-/// otras sesiones (`open`, `answer`, `close`) pasan por el permiso de Claude como cualquier otra
-/// (en modo auto, lo decide su clasificador): una sesión engañada (un mensaje con instrucciones
-/// metidas) no puede abrir sesiones ni aprobar sus preguntas sin que nadie lo vea.
-pub const NIDO_TOOLS: [&str; 4] = [
+/// Las herramientas de nido que no piden permiso: las que miran y hablan, y las que piden y
+/// mandan cosas al usuario (`secret` lo controla su diálogo; `clipboard` y `send_file` solo le
+/// mandan algo a él). Las que actúan sobre otras sesiones (`open`, `answer`, `close`, `start`,
+/// `stop`) pasan por el permiso de Claude como cualquier otra (en modo auto, lo decide su
+/// clasificador): una sesión engañada (un mensaje con instrucciones metidas) no puede abrir,
+/// parar o arrancar sesiones ni aprobar sus preguntas sin que nadie lo vea.
+pub const NIDO_TOOLS: [&str; 7] = [
     "mcp__nido__sessions",
     "mcp__nido__read",
     "mcp__nido__send",
     "mcp__nido__alert",
+    "mcp__nido__secret",
+    "mcp__nido__clipboard",
+    "mcp__nido__send_file",
 ];
+const DENIED_OPTS: [&str; 2] = ["--disallowedTools", "--disallowed-tools"];
 /// Lo que ponía nido antes: todas sus herramientas sin permiso. Si viene en una orden (de una
 /// sesión de entonces), sale.
 const OLD_NIDO_TOOLS: &str = "mcp__nido__*";
@@ -476,6 +482,12 @@ pub fn with_nido_mcp(argv: &[String], on: bool) -> Vec<String> {
     if add.is_empty() {
         return argv.to_vec();
     }
+    insert_opts(argv, add)
+}
+
+/// `argv` con `add` (opciones de nido) delante de la primera opción; si no hay ninguna y detrás
+/// del programa solo hay textos sueltos (el mensaje inicial), tras un `--`.
+fn insert_opts(argv: &[String], mut add: Vec<String>) -> Vec<String> {
     let at = argv
         .iter()
         .skip(1)
@@ -494,6 +506,35 @@ pub fn with_nido_mcp(argv: &[String], on: bool) -> Vec<String> {
         }
     }
     out
+}
+
+/// La regla que no deja a Claude leer la carpeta de secretos de nido (`dir`, ver `secrets.rs`)
+/// con Read; Claude la aplica también a `cat`, `head`, `<`… en Bash. Ruta absoluta: `//` delante.
+/// En Windows, como la normaliza Claude: `C:\Users\u` es `/c/Users/u`.
+pub fn secrets_rule(dir: &str) -> String {
+    let d = dir.replace('\\', "/");
+    let d = match d.as_bytes() {
+        [l, b':', rest @ ..] if l.is_ascii_alphabetic() => format!(
+            "/{}{}",
+            (*l as char).to_ascii_lowercase(),
+            String::from_utf8_lossy(rest)
+        ),
+        _ => d,
+    };
+    format!("Read(/{}/**)", d.trim_end_matches('/'))
+}
+
+/// Una regla de secretos de nido (la de `secrets_rule`, con la carpeta que sea).
+fn is_secrets_rule(v: &str) -> bool {
+    v.starts_with("Read(//") && v.ends_with("/secrets/**)")
+}
+
+/// `argv` (de `with_nido_mcp`) con `--disallowedTools <rule>`, si no la lleva ya.
+pub fn with_secrets_guard(argv: &[String], rule: &str) -> Vec<String> {
+    if !is_claude(argv) || option_values(argv, &DENIED_OPTS).contains(&rule) {
+        return argv.to_vec();
+    }
+    insert_opts(argv, vec![DENIED_OPTS[0].to_owned(), rule.to_owned()])
 }
 
 /// La primera versión de Claude Code con channels (`--channels` y
@@ -603,6 +644,7 @@ pub fn extra_args(argv: &[String]) -> Vec<String> {
         (opt == CHANNELS_OPT && value == NIDO_CHANNEL)
             || (ALLOWED_OPTS.contains(&opt)
                 && (NIDO_TOOLS.contains(&value) || value == OLD_NIDO_TOOLS))
+            || (DENIED_OPTS.contains(&opt) && is_secrets_rule(value))
     };
     let mut out = Vec::new();
     let mut i = 1;
@@ -1114,8 +1156,9 @@ mod tests {
     }
 
     /// Las de nido, como van en la orden: el channel y las herramientas que no piden permiso
-    /// (las que miran y hablan; `open`, `answer` y `close` no).
-    const FLAGS: [&str; 7] = [
+    /// (las que miran y hablan, y las que mandan cosas al usuario; `open`, `answer`, `close`,
+    /// `start` y `stop` no).
+    const FLAGS: [&str; 10] = [
         "--dangerously-load-development-channels",
         "server:nido",
         "--allowedTools",
@@ -1123,6 +1166,9 @@ mod tests {
         "mcp__nido__read",
         "mcp__nido__send",
         "mcp__nido__alert",
+        "mcp__nido__secret",
+        "mcp__nido__clipboard",
+        "mcp__nido__send_file",
     ];
 
     fn flagged(program: &str, rest: &[&str]) -> Vec<String> {
@@ -1187,6 +1233,9 @@ mod tests {
                 "mcp__nido__sessions",
                 "mcp__nido__send",
                 "mcp__nido__alert",
+                "mcp__nido__secret",
+                "mcp__nido__clipboard",
+                "mcp__nido__send_file",
                 "--allowedTools=mcp__nido__read",
                 "-c"
             ])
@@ -1202,6 +1251,9 @@ mod tests {
             "mcp__nido__read",
             "mcp__nido__send",
             "mcp__nido__alert",
+            "mcp__nido__secret",
+            "mcp__nido__clipboard",
+            "mcp__nido__send_file",
         ]);
         assert_eq!(with_nido_mcp(&theirs, true), theirs);
         // Las de una orden de antes (todas sin permiso), fuera: con `=`, sola o con otras.
@@ -1234,6 +1286,41 @@ mod tests {
         assert_eq!(with_nido_mcp(&v(&["npm", "run"]), true), v(&["npm", "run"]));
         assert_eq!(with_nido_mcp(&v(&["claudette"]), true), v(&["claudette"]));
         assert_eq!(with_nido_mcp(&[], true), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_secrets_rule_is_absolute_as_claude_writes_it() {
+        assert_eq!(
+            secrets_rule("/home/u/.local/state/nido/secrets"),
+            "Read(//home/u/.local/state/nido/secrets/**)"
+        );
+        assert_eq!(
+            secrets_rule("/r/state/secrets/"),
+            "Read(//r/state/secrets/**)"
+        );
+        assert_eq!(
+            secrets_rule(r"C:\Users\u\.local\state\nido\secrets"),
+            "Read(//c/Users/u/.local/state/nido/secrets/**)"
+        );
+    }
+
+    #[test]
+    fn claude_gets_the_secrets_rule_once_and_in_front() {
+        let rule = "Read(//r/state/secrets/**)";
+        let launched = with_secrets_guard(&with_nido_mcp(&new_argv("p", "u-1"), true), rule);
+        assert_eq!(&launched[..3], ["claude", "--disallowedTools", rule]);
+        assert_eq!(launched[3], "--dangerously-load-development-channels");
+        assert_eq!(with_secrets_guard(&launched, rule), launched);
+        // Un mensaje sin opciones: delante y con `--`.
+        assert_eq!(
+            with_secrets_guard(&v(&["claude", "hola"]), rule),
+            v(&["claude", "--disallowedTools", rule, "--", "hola"])
+        );
+        assert_eq!(with_secrets_guard(&v(&["npm"]), rule), v(&["npm"]));
+        // Al retomar no se arrastra: la vuelve a poner nido.
+        let mut saved = launched.clone();
+        saved.extend(v(&["--model", "haiku"]));
+        assert_eq!(extra_args(&saved), v(&["--model", "haiku"]));
     }
 
     #[test]

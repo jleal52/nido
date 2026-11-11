@@ -138,8 +138,9 @@ fn claude_args(dir: &Path) -> Vec<String> {
     args[from..].to_vec()
 }
 
-/// Las de nido: el channel y solo las herramientas que miran y hablan sin pedir permiso.
-const FLAGS: [&str; 7] = [
+/// Las de nido: el channel y solo las herramientas que miran y hablan, o mandan cosas al
+/// usuario, sin pedir permiso.
+const FLAGS: [&str; 10] = [
     "--dangerously-load-development-channels",
     "server:nido",
     "--allowedTools",
@@ -147,6 +148,9 @@ const FLAGS: [&str; 7] = [
     "mcp__nido__read",
     "mcp__nido__send",
     "mcp__nido__alert",
+    "mcp__nido__secret",
+    "mcp__nido__clipboard",
+    "mcp__nido__send_file",
 ];
 
 fn nido_mcp(home: &Path, on: bool) -> String {
@@ -255,8 +259,14 @@ async fn claude_launches_with_the_nido_channel() {
     assert_eq!(code, 200, "{o}");
     assert!(wait_file(&aviso.join("args"), 100).await, "no arrancó");
     let argv = claude_args(&aviso);
-    assert_eq!(argv[1..8], FLAGS, "{argv:?}");
-    assert_eq!(argv[8], "--session-id");
+    // Delante, la regla que no deja leer los secretos.
+    assert_eq!(argv[1], "--disallowedTools", "{argv:?}");
+    assert!(
+        argv[2].starts_with("Read(//") && argv[2].ends_with("/secrets/**)"),
+        "{argv:?}"
+    );
+    assert_eq!(argv[3..13], FLAGS, "{argv:?}");
+    assert_eq!(argv[13], "--session-id");
     assert!(
         argv.windows(2).any(|w| w == ["--model", "haiku"]),
         "{argv:?}"

@@ -421,6 +421,9 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
     let channel = channel_launch(paths, &argv) == ChannelLaunch::Yes;
     if channel {
         argv = claude::with_nido_mcp(&argv, true);
+        // Y sin leer los secretos (ver `secrets.rs`).
+        let secrets = paths.state.join("secrets");
+        argv = claude::with_secrets_guard(&argv, &claude::secrets_rule(&secrets.to_string_lossy()));
     }
     HolderConfig {
         id: session.id.clone(),
@@ -515,9 +518,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
         let s = claude_session(false);
+        // Con el MCP de nido y sin leer los secretos.
+        let rule = claude::secrets_rule(&p.state.join("secrets").to_string_lossy());
+        let launched =
+            |argv: &[String]| claude::with_secrets_guard(&claude::with_nido_mcp(argv, true), &rule);
         let cfg = holder_config(&p, &s, 80, 24);
         assert!(
-            cfg.argv.ends_with(&claude::with_nido_mcp(&s.argv, true)),
+            cfg.argv.ends_with(&launched(&s.argv)),
             "sin transcripción: se lanza nuevo: {:?}",
             cfg.argv
         );
@@ -527,11 +534,7 @@ mod tests {
         std::fs::write(proj.join("sid-1.jsonl"), "{}").unwrap();
         let cfg = holder_config(&p, &s, 80, 24);
         let resume = ["claude".to_string(), "--resume".into(), "sid-1".into()];
-        assert!(
-            cfg.argv.ends_with(&claude::with_nido_mcp(&resume, true)),
-            "{:?}",
-            cfg.argv
-        );
+        assert!(cfg.argv.ends_with(&launched(&resume)), "{:?}", cfg.argv);
         // En Windows no hay shell de login: la orden va tal cual.
         if cfg!(unix) {
             assert_eq!(cfg.argv[1..4], ["-lic", "exec \"$@\"", "nido"]);
@@ -543,7 +546,11 @@ mod tests {
     fn claude_sessions_launch_with_the_nido_mcp_unless_it_is_off() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
+        // Sin leer los secretos, y luego las del MCP de nido.
+        let rule = claude::secrets_rule(&p.state.join("secrets").to_string_lossy());
         let mut flags = vec![
+            "--disallowedTools",
+            &rule,
             "--dangerously-load-development-channels",
             "server:nido",
             "--allowedTools",
@@ -552,8 +559,8 @@ mod tests {
         let mut s = claude_session(false);
         let cfg = holder_config(&p, &s, 80, 24);
         let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
-        assert_eq!(cfg.argv[at + 1..at + 8], flags, "{:?}", cfg.argv);
-        assert_eq!(cfg.argv[at + 8], "--session-id");
+        assert_eq!(cfg.argv[at + 1..at + 13], flags, "{:?}", cfg.argv);
+        assert_eq!(cfg.argv[at + 13], "--session-id");
         assert!(cfg.channel);
         // Al retomarla, una vez (aunque la orden guardada ya las tuviera).
         s.argv = claude::with_nido_mcp(&s.argv, true);
