@@ -92,6 +92,7 @@ fn session(name: &str, cwd: &Path, claude: Option<ClaudeLink>) -> Session {
         claude,
         folder: None,
         finished: 0,
+        stopped: 0,
         seen: 0,
         opened_by: None,
         alerts: vec![],

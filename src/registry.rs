@@ -41,6 +41,10 @@ pub struct Session {
     /// Cuándo terminó de trabajar por última vez (ms desde 1970; 0: nunca).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub finished: u64,
+    /// Cuándo se paró por última vez (ms desde 1970; 0: no se sabe, p. ej. parada antes de que
+    /// nido lo apuntara).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stopped: u64,
     /// Cuándo la vio el usuario por última vez (ms). Terminó después: «sin leer».
     #[serde(default, skip_serializing_if = "is_zero")]
     pub seen: u64,
@@ -63,7 +67,7 @@ pub struct AlertRec {
 /// Alertas que se guardan por sesión.
 const MAX_ALERTS: usize = 10;
 
-fn is_zero(v: &u64) -> bool {
+pub(crate) fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 
@@ -353,6 +357,7 @@ mod tests {
             claude: None,
             folder: None,
             finished: 0,
+            stopped: 0,
             seen: 0,
             opened_by: None,
             alerts: vec![],
@@ -385,6 +390,20 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn stop_time_is_kept_and_old_sessions_have_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Registry::load(&dir.path().join("s.json")).unwrap();
+        let s = r.add(session("api")).unwrap();
+        assert_eq!(s.stopped, 0);
+        r.update(&s.id, |x| x.stopped = 1234).unwrap();
+        let back = Registry::load(&dir.path().join("s.json")).unwrap();
+        assert_eq!(back.get(&s.id).unwrap().stopped, 1234);
+        // Sin hora no se escribe, y las de antes (sin el campo) se leen con 0.
+        let json = serde_json::to_string(&session("x")).unwrap();
+        assert!(!json.contains("stopped"), "{json}");
     }
 
     #[test]

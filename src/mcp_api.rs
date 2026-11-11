@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -1042,6 +1042,9 @@ pub struct Entry {
     pub name: String,
     pub cwd: PathBuf,
     pub state: Status,
+    /// Desde cuándo (ms desde 1970) está en marcha o parada; sin él, no se sabe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
     /// Quién la abrió con `open` (`<equipo>/<id>`); `null`: el usuario.
     pub opened_by: Option<String>,
     /// La abrió quien llama: puede contestarla y cerrarla.
@@ -1068,6 +1071,18 @@ pub fn delivery_error(st: &AppState, id: &str) -> Option<String> {
     }
 }
 
+/// Desde cuándo (ms) está como está: en marcha, desde que arrancó su guardián
+/// (`launch::holder_started`); parada, desde que nido la vio pararse (`stopped`; 0: no se sabe).
+pub fn since(alive: bool, holder: Option<SystemTime>, stopped: u64) -> Option<u64> {
+    if alive {
+        holder
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    } else {
+        (stopped > 0).then_some(stopped)
+    }
+}
+
 fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: Status) -> Entry {
     Entry {
         session: me.shown(&v.id),
@@ -1077,6 +1092,7 @@ fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: S
         name: v.name.clone(),
         cwd: v.cwd.clone(),
         state,
+        since: since(v.alive, launch::holder_started(&st.paths, &v.id), v.stopped),
         opened_by: v.opened_by.clone(),
         mine: caller.owns(me, v.opened_by.as_deref()),
         channel: st.inbox.channel(&v.id),
@@ -2321,6 +2337,7 @@ fn opened_session(
         }),
         folder: None,
         finished: 0,
+        stopped: 0,
         seen: 0,
         opened_by: Some(opened_by),
         alerts: vec![],
@@ -2529,6 +2546,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn since_is_when_it_started_or_when_it_stopped() {
+        let t = UNIX_EPOCH + Duration::from_millis(5_000);
+        // En marcha: cuando arrancó su guardián (lo que haya en `stopped` es de antes).
+        assert_eq!(since(true, Some(t), 9_000), Some(5_000));
+        assert_eq!(since(true, None, 9_000), None);
+        // Parada: cuando nido la vio pararse; si no se sabe, nada.
+        assert_eq!(since(false, Some(t), 9_000), Some(9_000));
+        assert_eq!(since(false, Some(t), 0), None);
+    }
+
+    #[test]
     fn the_delivery_clock_runs_only_with_claude_idle() {
         let view = |alive: bool, status: Option<&str>| SessionView {
             id: "s".into(),
@@ -2537,6 +2565,7 @@ mod tests {
             argv: vec!["claude".into()],
             autostart: false,
             created: 0,
+            stopped: 0,
             alive,
             claude: Some(crate::server::ClaudeView {
                 background: None,
@@ -3148,6 +3177,7 @@ mod tests {
             name: format!("sesion-{i}"),
             cwd: PathBuf::from(format!("/home/ana/proyectos/{}", "carpeta".repeat(20))),
             state: Status::Idle,
+            since: None,
             opened_by: Some("mac-id/padre".into()),
             mine: false,
             channel: true,

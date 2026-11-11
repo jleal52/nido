@@ -497,6 +497,7 @@ mod tests {
             created: now(),
             folder: None,
             finished: 0,
+            stopped: 0,
             seen: 0,
             opened_by: None,
             alerts: vec![],

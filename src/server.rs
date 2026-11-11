@@ -337,6 +337,9 @@ pub struct SessionView {
     pub argv: Vec<String>,
     pub autostart: bool,
     pub created: u64,
+    /// Cuándo se paró (ms; 0: no se sabe). Solo vale si no está viva.
+    #[serde(skip_serializing_if = "crate::registry::is_zero")]
+    pub stopped: u64,
     pub alive: bool,
     pub claude: Option<ClaudeView>,
     pub folder: Option<String>,
@@ -434,8 +437,22 @@ impl AppState {
         let mut reg = self.registry.lock().await;
         let mut views = Vec::with_capacity(reg.sessions().len());
         let sessions: Vec<Session> = reg.sessions().to_vec();
+        // Las que estaban vivas en el escaneo de antes: si ya no, se acaban de parar.
+        let was_alive: std::collections::HashSet<String> = self
+            .views
+            .borrow()
+            .sessions
+            .iter()
+            .filter(|v| v.alive)
+            .map(|v| v.id.clone())
+            .collect();
         for s in sessions {
             let alive = launch::is_alive(&self.paths, &s.id);
+            let mut stopped = s.stopped;
+            if !alive && was_alive.contains(&s.id) {
+                stopped = now_ms();
+                let _ = reg.update(&s.id, |x| x.stopped = stopped);
+            }
             let found = alive
                 .then(|| launch::holder_pid(&self.paths, &s.id))
                 .flatten()
@@ -496,6 +513,7 @@ impl AppState {
                 argv: s.argv.clone(),
                 autostart: s.autostart,
                 created: s.created,
+                stopped,
                 folder: s.folder.clone(),
                 unread: finished > s.seen,
                 opened_by: s.opened_by.clone(),
@@ -2291,6 +2309,7 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
             .map(|f| f.trim().to_owned())
             .filter(|f| !f.is_empty()),
         finished: 0,
+        stopped: 0,
         seen: 0,
         opened_by: None,
         alerts: vec![],
@@ -3240,6 +3259,7 @@ mod tests {
             argv: vec!["claude".into()],
             autostart: false,
             created: 0,
+            stopped: 0,
             alive: true,
             claude: None,
             folder: None,
