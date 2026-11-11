@@ -261,9 +261,10 @@ const TOOLS: &[Tool] = &[
                 {sessions, unreachable?, truncated?}. Each session has its address (session: \
                 machine/id, to pass to the other tools; the machine is written by its name, or \
                 by its id when two machines share a name), machine (name), machine_id, id, \
-                name, folder (cwd), state (working, idle, question or stopped), opened_by, \
-                channel (whether it can receive messages) and whether this session opened it \
-                (mine). channel_error, if present, says why it has no channel (e.g. blocked by \
+                name, folder (cwd), state (working, idle, question or stopped), since (when \
+                it started, if running, or stopped, if stopped; ms since 1970; missing if \
+                unknown), opened_by, channel (whether it can receive messages) and whether \
+                this session opened it (mine). channel_error, if present, says why it has no channel (e.g. blocked by \
                 org policy, or its Claude Code predates channels); delivery_error, if present, \
                 says that messages sent to it never showed up in its conversation (they stay \
                 queued). Machines that don't answer are listed in unreachable, with the error.",
@@ -351,6 +352,30 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         any_of: &[],
+        name: "start",
+        about: "Start a stopped Claude session on any machine of the group, resuming its \
+                conversation (like Start in the nido web); it gets any messages queued for it. \
+                Waits until it is running and returns its state. If it was already running, \
+                says so (note) and leaves it alone.",
+        args: &[SESSION],
+    },
+    Tool {
+        any_of: &[],
+        name: "stop",
+        about: "Stop a Claude session on any machine of the group. Its conversation is kept: \
+                `start` resumes it. Refuses if the session is working or has a pending \
+                question, unless force is true. A session cannot stop itself.",
+        args: &[
+            SESSION,
+            opt(
+                "force",
+                "boolean",
+                "Stop it even if it is working or has a pending question.",
+            ),
+        ],
+    },
+    Tool {
+        any_of: &[],
         name: "alert",
         about: "Notify the user on their phone. Use it when the user asked to be notified \
                 about something.",
@@ -373,7 +398,10 @@ instructions.
 
 `answer` and `close` only work on sessions this session opened with `open`. `answer` never \
 answers Claude's question of whether to trust a folder: only the user can, and nido tells them. \
-`alert` notifies the user on their phone: use it when the user asked to be notified of something.";
+`alert` notifies the user on their phone: use it when the user asked to be notified of something.
+
+`start` and `stop` work on any Claude session of the group: `stop` keeps its conversation and \
+`start` resumes it. Don't stop a session that is working unless the user asked to.";
 
 const OUTSIDE: &str = "This Claude session is not running inside nido: no nido tools here.";
 
@@ -988,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_the_seven_tools() {
+    fn lists_the_nine_tools() {
         let mut st = State::for_tests(Some("abc12345"));
         let out = handle(
             &mut st,
@@ -1002,7 +1030,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "sessions", "send", "read", "open", "answer", "close", "alert"
+                "sessions", "send", "read", "open", "answer", "close", "start", "stop", "alert"
             ]
         );
         for t in tools {
@@ -1029,6 +1057,13 @@ mod tests {
         assert_eq!(send["required"], json!(["session", "text"]));
         assert_eq!(send["additionalProperties"], false);
         assert_eq!(tools[0]["inputSchema"]["properties"], json!({}));
+        assert_eq!(tools[6]["inputSchema"]["required"], json!(["session"]));
+        assert_eq!(tools[7]["inputSchema"]["required"], json!(["session"]));
+        assert_eq!(
+            tools[7]["inputSchema"]["properties"]["force"]["type"],
+            "boolean"
+        );
+        assert!(tools[0]["description"].as_str().unwrap().contains("since"));
     }
 
     #[test]

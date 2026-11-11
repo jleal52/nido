@@ -405,6 +405,19 @@ async fn peer_calls_end_to_end() {
     ok(ask(&state, &mac, "close", p(json!({"session": gone}))).await);
     let o = ok(ask(&state, &mac, "open", open_one.clone()).await);
     running.push(o["id"].as_str().unwrap().to_owned());
+    // `stop` y `start` también desde otro equipo (con `force`: con la shell falsa, sin Claude a la
+    // vista, cuenta como trabajando).
+    let id = running.last().unwrap().clone();
+    let r = ok(ask(
+        &state,
+        &mac,
+        "stop",
+        p(json!({"session": id, "force": true})),
+    )
+    .await);
+    assert_eq!(r["state"], "stopped");
+    let r = ok(ask(&state, &mac, "start", p(json!({"session": id}))).await);
+    assert_ne!(r["state"], "stopped");
     for id in running.drain(..) {
         ok(ask(&state, &mac, "close", p(json!({"session": id}))).await);
     }
