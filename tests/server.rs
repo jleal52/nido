@@ -198,9 +198,12 @@ async fn sessions_end_to_end() {
     req.headers_mut()
         .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
     let (mut live, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-    ws.send(Message::Binary("echo en-vivo-$((6*7))\r".into()))
-        .await
-        .unwrap();
+    // Con un pie como el de Claude debajo: el modo de permisos va en la pantalla.
+    ws.send(Message::Binary(
+        "echo en-vivo-$((6*7)); printf '──────\\n❯\\n──────\\n  ⏸ plan mode on\\n'\r".into(),
+    ))
+    .await
+    .unwrap();
     let (mut chat_ok, mut screen_ok) = (false, false);
     let got = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(Ok(msg)) = live.next().await {
@@ -209,7 +212,9 @@ async fn sessions_end_to_end() {
                 match v["type"].as_str() {
                     Some("chat") => chat_ok = v["session_id"].is_null(),
                     Some("screen") => {
+                        assert!(v.get("mode").is_some(), "{v}");
                         screen_ok |= v["text"].as_str().unwrap_or("").contains("en-vivo-42")
+                            && v["mode"] == "plan"
                     }
                     _ => {}
                 }

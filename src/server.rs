@@ -94,6 +94,43 @@ pub struct AppState {
     pub asks: crate::secrets::Asks,
     /// Lo que las sesiones mandan al usuario (`clipboard`, `send_file`).
     pub outbox: Arc<crate::outbox::Outbox>,
+    /// Los modelos que se pueden elegir, como los enseñó el menú de `/model` la última vez que
+    /// nido lo abrió (`<state>/models.json`); si nunca, `DEFAULT_MODELS`.
+    models: std::sync::Mutex<Vec<String>>,
+    /// El modelo de cada sesión según su transcripción (para no leerla en cada escaneo).
+    model_seen: std::sync::Mutex<std::collections::HashMap<String, ModelSeen>>,
+    /// El modelo que nido le puso a cada sesión con `/model`, hasta que Claude conteste.
+    model_chosen: std::sync::Mutex<std::collections::HashMap<String, ModelChosen>>,
+}
+
+/// Los modelos que se ofrecen si nido aún no ha visto el menú de `/model` (también valen como
+/// petición: casan con la primera opción que empiece así).
+pub const DEFAULT_MODELS: [&str; 4] = ["Opus", "Fable", "Sonnet", "Haiku"];
+
+/// Lo último leído del modelo en la transcripción de una sesión.
+#[derive(Default)]
+struct ModelSeen {
+    session_id: String,
+    path: Option<PathBuf>,
+    len: u64,
+    /// El modelo de la última respuesta (tal cual) y dónde empieza esa línea.
+    last: Option<(String, u64)>,
+}
+
+/// Un modelo puesto por nido: vale mientras Claude no conteste después (`at`: lo que medía la
+/// transcripción al cambiarlo) en esa conversación y siga corriendo (es solo para esta sesión).
+struct ModelChosen {
+    session_id: String,
+    model: String,
+    at: u64,
+}
+
+fn load_models(path: &std::path::Path) -> Vec<String> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODELS.map(str::to_owned).to_vec())
 }
 
 /// Una sesión recién arrancada y, si hay quien mire los arranques, su bandeja retenida.
@@ -431,6 +468,10 @@ pub struct ClaudeView {
     pub status: Option<String>,
     pub title: Option<String>,
     pub account: Option<String>,
+    /// El modelo, para enseñarlo («Opus 5.5»): el de su última respuesta o el que le puso nido.
+    pub model: Option<String>,
+    /// Los modelos que se pueden elegir (`POST /api/v1/sessions/{id}/model`).
+    pub models: Vec<String>,
 }
 
 impl AppState {
@@ -467,6 +508,7 @@ impl AppState {
             secrets_dir.clone(),
         ));
         let secrets = Arc::new(crate::secrets::Store::new(secrets_dir));
+        let models = load_models(&paths.state.join("models.json"));
         Ok(Arc::new(Self {
             paths,
             launcher,
@@ -505,6 +547,9 @@ impl AppState {
             secrets,
             asks: Default::default(),
             outbox,
+            models: std::sync::Mutex::new(models),
+            model_seen: Default::default(),
+            model_chosen: Default::default(),
         }))
     }
 
@@ -524,6 +569,7 @@ impl AppState {
             .filter(|v| v.alive)
             .map(|v| v.id.clone())
             .collect();
+        let models = self.models();
         for s in sessions {
             let alive = launch::is_alive(&self.paths, &s.id);
             let stopped = stop_time(s.stopped, alive, was_alive.contains(&s.id), now_ms());
@@ -603,6 +649,8 @@ impl AppState {
                 secret: self.asks.view_for(&s.id),
                 alive,
                 claude: link.map(|l| ClaudeView {
+                    model: self.model_of(&s.id, &l, found.is_some()),
+                    models: models.clone(),
                     background: found.as_ref().and_then(|_| {
                         self.background
                             .lock()
@@ -685,6 +733,67 @@ impl AppState {
 /// configuración de usuario, en `~/.claude` y en cada perfil (`CLAUDE_CONFIG_DIR`) que usen las
 /// sesiones (ver `claude::ensure_mcp_registered`). Sin `claude` en este equipo, nada. Los fallos
 /// se dicen una vez y no paran nada.
+impl AppState {
+    /// Los modelos que se pueden elegir (ver `models`).
+    pub fn models(&self) -> Vec<String> {
+        self.models.lock().expect("modelos").clone()
+    }
+
+    /// Lo que enseñó el menú de `/model`: se guarda si cambió.
+    fn remember_models(&self, models: Vec<String>) {
+        let mut cur = self.models.lock().expect("modelos");
+        if *cur == models || models.is_empty() {
+            return;
+        }
+        *cur = models;
+        let path = self.paths.state.join("models.json");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&path, serde_json::to_vec(&*cur).unwrap_or_default()) {
+            eprintln!("nido: no se pudieron guardar los modelos: {e}");
+        }
+    }
+
+    /// El modelo de la sesión `id` para enseñarlo: el que le puso nido, si Claude no ha
+    /// contestado después; si no, el de su última respuesta (de la transcripción, que solo se
+    /// vuelve a leer si ha cambiado).
+    fn model_of(&self, id: &str, link: &ClaudeLink, running: bool) -> Option<String> {
+        let last = {
+            let mut seen = self.model_seen.lock().expect("modelo visto");
+            let e = seen.entry(id.to_owned()).or_default();
+            if e.session_id != link.session_id {
+                *e = ModelSeen {
+                    session_id: link.session_id.clone(),
+                    ..Default::default()
+                };
+            }
+            if e.path.as_ref().is_none_or(|p| !p.is_file()) {
+                e.path = transcript_of(self, link);
+            }
+            let len = e
+                .path
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map_or(0, |m| m.len());
+            if len != e.len {
+                e.len = len;
+                e.last = e.path.as_deref().and_then(crate::transcript::last_model);
+            }
+            e.last.clone()
+        };
+        let mut chosen = self.model_chosen.lock().expect("modelo elegido");
+        if let Some(c) = chosen.get(id) {
+            let answered = last.as_ref().is_some_and(|(_, at)| *at >= c.at);
+            if running && c.session_id == link.session_id && !answered {
+                return Some(c.model.clone());
+            }
+            chosen.remove(id);
+        }
+        last.map(|(m, _)| crate::transcript::model_name(&m))
+    }
+}
+
 pub async fn register_mcp(st: Arc<AppState>) {
     if !launch::mcp_on(&st.paths) {
         return;
@@ -2069,6 +2178,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(crate::deliver::api_forget_secret),
         )
         .route("/api/v1/sessions/{id}/answer", post(api_answer))
+        .route("/api/v1/sessions/{id}/mode", post(api_mode))
+        .route("/api/v1/sessions/{id}/model", post(api_model))
         .route("/api/v1/sessions/{id}/stop", post(api_stop))
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
         .route("/api/v1/sessions/{id}/history", get(api_history))
@@ -2133,6 +2244,8 @@ async fn api_info(State(st): State<Arc<AppState>>) -> Response {
         "sep": std::path::MAIN_SEPARATOR.to_string(),
         "roots": crate::browse::roots(),
         "commands": crate::browse::commands(),
+        // Los modelos que se pueden elegir con `POST /api/v1/sessions/{id}/model`.
+        "models": st.models(),
     }))
     .into_response()
 }
@@ -2663,6 +2776,116 @@ async fn api_answer(
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => error(StatusCode::CONFLICT, e),
     }
+}
+
+/// Cambia el modo de permisos de Claude (`{"mode": "plan"}`) con shift+tab; ver
+/// [`prompt::set_mode`].
+async fn api_mode(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(want) = body.get("mode").and_then(serde_json::Value::as_str) else {
+        return error(StatusCode::BAD_REQUEST, "falta el modo");
+    };
+    let Some(mode) = prompt::Mode::from_name(want) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("modo desconocido: «{want}»"),
+        );
+    };
+    let s = match find_session(&st, &id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let _one = st.answering.lock().await;
+    let Some(mut scr) = session_screen(&st, &s.id).await else {
+        return error(StatusCode::CONFLICT, "la sesión no está en marcha");
+    };
+    match prompt::set_mode(&mut scr, mode).await {
+        Ok(m) => Json(serde_json::json!({ "ok": true, "mode": m.name() })).into_response(),
+        Err(e) => error(StatusCode::CONFLICT, e),
+    }
+}
+
+/// Cambia el modelo de Claude solo para esta sesión (`{"model": "Opus 5.5"}`) con su menú de
+/// `/model`; ver [`prompt::set_model`].
+async fn api_model(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(want) = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    else {
+        return error(StatusCode::BAD_REQUEST, "falta el modelo");
+    };
+    let s = match find_session(&st, &id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Some(link) = s.claude.clone() else {
+        return error(StatusCode::CONFLICT, "en esta sesión no hay ningún Claude");
+    };
+    let busy = st.views.borrow().sessions.iter().any(|v| {
+        v.id == s.id
+            && v.claude
+                .as_ref()
+                .is_some_and(|c| c.status.as_deref() == Some("busy"))
+    });
+    if busy {
+        return error(
+            StatusCode::CONFLICT,
+            "Claude está trabajando: espera a que termine",
+        );
+    }
+    let _one = st.answering.lock().await;
+    let Some(mut scr) = session_screen(&st, &s.id).await else {
+        return error(StatusCode::CONFLICT, "la sesión no está en marcha");
+    };
+    // Lo que mide la transcripción ahora: lo que Claude conteste después dirá su modelo.
+    let at = transcript_of(&st, &link)
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len());
+    let mut seen = None;
+    let result = prompt::set_model(&mut scr, want, &mut seen).await;
+    if let Some(models) = seen {
+        st.remember_models(models);
+    }
+    match result {
+        Ok(model) => {
+            st.model_chosen.lock().expect("modelo elegido").insert(
+                s.id.clone(),
+                ModelChosen {
+                    session_id: link.session_id,
+                    model: model.clone(),
+                    at,
+                },
+            );
+            st.refresh.notify_one();
+            Json(serde_json::json!({ "ok": true, "model": model })).into_response()
+        }
+        Err(e) => error(StatusCode::CONFLICT, e),
+    }
+}
+
+/// La pantalla de la sesión, como visor de su guardián (para leerla y teclear); `None` si no
+/// está en marcha.
+async fn session_screen(st: &AppState, id: &str) -> Option<HolderScreen> {
+    if !launch::is_alive(&st.paths, id) {
+        return None;
+    }
+    let hello = Hello {
+        role: Role::Viewer,
+        cols: 80,
+        rows: 24,
+    };
+    let stream = holder_connect(st, id, hello).await.ok()?;
+    let (rd, wr) = crate::ipc::split(stream);
+    Some(prompt::Screen::new(rd, wr))
 }
 
 /// El usuario ha visto la sesión: deja de estar «sin leer».
@@ -3446,7 +3669,9 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                         let form = prompt::form(&text);
                         // Subagentes y órdenes en segundo plano.
                         let background = prompt::background(&text).map(|b| background_json(&b));
-                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v, "suggestion": suggestion, "form": form, "background": background });
+                        // El modo de permisos, según el pie.
+                        let mode = prompt::mode(&text);
+                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v, "suggestion": suggestion, "form": form, "background": background, "mode": mode });
                         if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                             return;
                         }
@@ -3456,7 +3681,7 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                 Ok(Some(Frame::Exit(_))) | Ok(None) | Err(_) => {
                     holder = None;
                     screen_pending = false;
-                    let msg = serde_json::json!({ "type": "screen", "text": null });
+                    let msg = serde_json::json!({ "type": "screen", "text": null, "mode": null });
                     let _ = socket.send(Message::Text(msg.to_string().into())).await;
                     last_screen = None;
                 }
@@ -3540,6 +3765,273 @@ mod tests {
         (st, answer, asked)
     }
 
+    // ---------- El modo y el modelo ----------
+
+    /// Un nido en `dir`, con su API en un puerto propio y una sesión cuyo guardián es un Claude
+    /// de mentira (`prompt::fake`). Devuelve también cómo parar ese guardián.
+    #[cfg(unix)]
+    async fn with_fake_claude(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<AppState>,
+        std::net::SocketAddr,
+        String,
+        Arc<std::sync::Mutex<prompt::fake::Claude>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, None, true).unwrap();
+        let session = Session {
+            id: new_id(),
+            name: "c".into(),
+            cwd: dir.to_owned(),
+            argv: vec!["claude".into()],
+            env: vec![],
+            autostart: false,
+            created: now(),
+            claude: Some(ClaudeLink {
+                session_id: "conv".into(),
+                config_dir: Some(dir.join("claude")),
+                account: None,
+                inside_shell: false,
+            }),
+            folder: None,
+            finished: 0,
+            stopped: 0,
+            seen: 0,
+            opened_by: None,
+            alerts: vec![],
+        };
+        let id = st.registry.lock().await.add(session).unwrap().id;
+        let claude = Arc::new(std::sync::Mutex::new(prompt::fake::Claude::default()));
+        let mut holder = crate::ipc::Listener::bind(&st.paths.socket(&id))
+            .await
+            .unwrap();
+        let c = claude.clone();
+        let guard = tokio::spawn(async move {
+            while let Ok(stream) = holder.accept().await {
+                tokio::spawn(prompt::fake::serve(stream, c.clone()));
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(st.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (st, addr, id, claude, guard)
+    }
+
+    #[cfg(unix)]
+    async fn post(
+        addr: std::net::SocketAddr,
+        path: String,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        tokio::task::spawn_blocking(move || {
+            crate::client::Api { addr, token: None }
+                .request_with("POST", &path, Some(&body), &[], None)
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mode_route() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, id, claude, guard) = with_fake_claude(tmp.path()).await;
+        let url = format!("/api/v1/sessions/{id}/mode");
+        // Lo que no es un modo: 400, sin tocar nada.
+        for body in [json!({}), json!({"mode": "turbo"}), json!({"mode": 3})] {
+            let (code, r) = post(addr, url.clone(), body).await;
+            assert_eq!(code, 400, "{r}");
+        }
+        let (code, r) = post(addr, url.clone(), json!({"mode": "turbo"})).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (400, Some("unknown mode: “turbo”"))
+        );
+        let (code, _) = post(
+            addr,
+            "/api/v1/sessions/nadie/mode".into(),
+            json!({"mode": "plan"}),
+        )
+        .await;
+        assert_eq!(code, 404);
+        assert!(claude.lock().unwrap().keys.is_empty());
+        // Al modo pedido.
+        let (code, r) = post(addr, url.clone(), json!({"mode": "plan"})).await;
+        assert_eq!(
+            (code, r.clone()),
+            (200, json!({"ok": true, "mode": "plan"})),
+            "{r}"
+        );
+        assert_eq!(
+            prompt::mode(&claude.lock().unwrap().screen()),
+            Some(prompt::Mode::Plan)
+        );
+        // Inalcanzable, o con un menú en pantalla: 409.
+        let (code, r) = post(addr, url.clone(), json!({"mode": "bypassPermissions"})).await;
+        assert_eq!(code, 409, "{r}");
+        claude.lock().unwrap().permission = true;
+        let (code, r) = post(addr, url.clone(), json!({"mode": "auto"})).await;
+        assert_eq!(code, 409, "{r}");
+        // Parada: 409.
+        guard.abort();
+        let _ = guard.await;
+        std::fs::remove_file(st.paths.socket(&id)).unwrap();
+        let (code, r) = post(addr, url, json!({"mode": "auto"})).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (409, Some("the session is not running"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_model_route() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, id, claude, _guard) = with_fake_claude(tmp.path()).await;
+        let url = format!("/api/v1/sessions/{id}/model");
+        // Antes de ver el menú, los de siempre.
+        assert_eq!(st.models(), DEFAULT_MODELS);
+        for body in [json!({}), json!({"model": "  "}), json!({"model": 1})] {
+            let (code, r) = post(addr, url.clone(), body).await;
+            assert_eq!(code, 400, "{r}");
+        }
+        // Con un borrador en la caja: 409, sin tocar nada.
+        claude.lock().unwrap().input = "a medio".into();
+        let (code, r) = post(addr, url.clone(), json!({"model": "Opus"})).await;
+        assert_eq!(code, 409, "{r}");
+        assert!(claude.lock().unwrap().keys.is_empty());
+        claude.lock().unwrap().input.clear();
+        // Claude trabajando (según su estado): 409.
+        st.views.send_replace(Listing {
+            sessions: vec![SessionView {
+                claude: Some(ClaudeView {
+                    background: None,
+                    session_id: "conv".into(),
+                    running: true,
+                    status: Some("busy".into()),
+                    title: None,
+                    account: None,
+                    model: None,
+                    models: vec![],
+                }),
+                ..view(&id)
+            }],
+            folders: vec![],
+        });
+        let (code, r) = post(addr, url.clone(), json!({"model": "Opus"})).await;
+        assert_eq!(code, 409, "{r}");
+        assert!(claude.lock().unwrap().keys.is_empty());
+        st.views.send_replace(Listing::default());
+        // Bien: solo para esta sesión, y nido apunta los modelos del menú.
+        let (code, r) = post(addr, url.clone(), json!({"model": "Opus"})).await;
+        assert_eq!(
+            (code, r.clone()),
+            (200, json!({"ok": true, "model": "Opus 5.5"})),
+            "{r}"
+        );
+        {
+            let c = claude.lock().unwrap();
+            assert_eq!(c.current, 1);
+            assert!(!c.saved_default && !c.effort_changed);
+        }
+        let menu = [
+            "Opus 5.5",
+            "Fable 5.1",
+            "Fable 5.2",
+            "Sonnet 5.5",
+            "Haiku 5.5",
+        ];
+        assert_eq!(st.models(), menu);
+        assert_eq!(load_models(&st.paths.state.join("models.json")), menu);
+        let info = tokio::task::spawn_blocking(move || {
+            crate::client::Api { addr, token: None }
+                .request("GET", "/api/v1/info", None)
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(info.1["models"], json!(menu));
+        let link = st
+            .registry
+            .lock()
+            .await
+            .get(&id)
+            .unwrap()
+            .claude
+            .clone()
+            .unwrap();
+        assert_eq!(st.model_of(&id, &link, true).as_deref(), Some("Opus 5.5"));
+        // Una opción que no está: 409 (y el menú, cerrado).
+        let (code, r) = post(addr, url.clone(), json!({"model": "Gemini"})).await;
+        assert_eq!(code, 409, "{r}");
+        assert_eq!(claude.lock().unwrap().menu, None);
+    }
+
+    #[test]
+    fn the_model_of_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _, _) = with_mac(tmp.path());
+        let config = tmp.path().join("claude");
+        let dir = config.join("projects").join("-w");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("conv.jsonl");
+        let reply = |model: &str| {
+            format!(
+                "{}\n",
+                json!({"type": "assistant", "message": {"model": model, "content": []}})
+            )
+        };
+        let link = ClaudeLink {
+            session_id: "conv".into(),
+            config_dir: Some(config),
+            account: None,
+            inside_shell: false,
+        };
+        // Sin transcripción aún: no se sabe.
+        assert_eq!(st.model_of("s", &link, true), None);
+        std::fs::write(&file, reply("claude-fable-5-2")).unwrap();
+        assert_eq!(st.model_of("s", &link, true).as_deref(), Some("Fable 5.2"));
+        // Puesto por nido: ese, hasta que Claude conteste.
+        let at = std::fs::metadata(&file).unwrap().len();
+        let chosen = |model: &str| ModelChosen {
+            session_id: "conv".into(),
+            model: model.into(),
+            at,
+        };
+        st.model_chosen
+            .lock()
+            .unwrap()
+            .insert("s".into(), chosen("Haiku 5.5"));
+        assert_eq!(st.model_of("s", &link, true).as_deref(), Some("Haiku 5.5"));
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text += &reply("claude-haiku-5-5");
+        std::fs::write(&file, &text).unwrap();
+        assert_eq!(st.model_of("s", &link, true).as_deref(), Some("Haiku 5.5"));
+        assert!(st.model_chosen.lock().unwrap().is_empty());
+        // Si se para, lo puesto por nido ya no vale (era solo para esa vez).
+        st.model_chosen.lock().unwrap().insert(
+            "s".into(),
+            ModelChosen {
+                at: u64::MAX,
+                ..chosen("Opus 5.5")
+            },
+        );
+        assert_eq!(st.model_of("s", &link, false).as_deref(), Some("Haiku 5.5"));
+    }
+
     /// Una hija abierta desde el Mac que pregunta (`Waiting`) o que terminó y no se ha visto.
     fn child(kind: AlertKind, opened_by: Option<&str>) -> SessionView {
         let mut v = view("hija");
@@ -3557,6 +4049,8 @@ mod tests {
             status: Some(status.into()),
             title: None,
             account: None,
+            model: None,
+            models: vec![],
         });
         v
     }

@@ -2724,6 +2724,8 @@ mod tests {
                 status: status.map(str::to_owned),
                 title: None,
                 account: None,
+                model: None,
+                models: vec![],
             }),
             folder: None,
             unread: false,
