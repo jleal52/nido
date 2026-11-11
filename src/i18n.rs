@@ -833,6 +833,15 @@ const TABLE: &[(&str, &str)] = &[
         "{0} is in nido's secrets folder: not sent",
     ),
     ("{} pasa de 64 MB ({})", "{0} is over 64 MB ({1})"),
+    ("{} pasa de 64 KB", "{0} is over 64 KB"),
+    (
+        "{} no es texto (UTF-8): para mandarlo, usa send_file",
+        "{0} is not text (UTF-8): to send it, use send_file",
+    ),
+    (
+        "hace falta text o path (uno de los dos)",
+        "text or path is required (exactly one of them)",
+    ),
     ("sesión no válida", "invalid session"),
     ("ese envío ha caducado", "that item has expired"),
     ("no existe ese envío", "no such item"),

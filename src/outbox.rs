@@ -55,6 +55,10 @@ pub enum SendError {
     /// Está en la carpeta de secretos de nido.
     Secret(PathBuf),
     TooBig(PathBuf, u64),
+    /// Para copiar: pasa de `MAX_TEXT`.
+    TextTooBig(PathBuf),
+    /// Para copiar: no es texto (UTF-8, sin bytes nulos).
+    NotText(PathBuf),
     Io(io::Error),
 }
 
@@ -78,9 +82,20 @@ impl std::fmt::Display for SendError {
                     *n as f64 / 1048576.0
                 )
             }
+            SendError::TextTooBig(p) => write!(f, "{} pasa de 64 KB", p.display()),
+            SendError::NotText(p) => write!(
+                f,
+                "{} no es texto (UTF-8): para mandarlo, usa send_file",
+                p.display()
+            ),
             SendError::Io(e) => write!(f, "no se pudo guardar la copia: {e}"),
         }
     }
+}
+
+/// Lo que se puede copiar como texto: UTF-8 y sin bytes nulos (si no, es un binario).
+pub fn text_of(bytes: Vec<u8>) -> Option<String> {
+    String::from_utf8(bytes).ok().filter(|t| !t.contains('\0'))
 }
 
 /// Caracteres de formato de Unicode (categoría `Cf`): no se ven, pero cambian lo que se ve (el
@@ -304,34 +319,7 @@ impl Outbox {
         title: Option<&str>,
         now: u64,
     ) -> Result<Item, SendError> {
-        // Dónde está de verdad (sin enlaces ni `..`): de la carpeta de secretos, nada.
-        let real = match std::fs::canonicalize(path) {
-            Ok(p) => p,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(SendError::NotFound(path.to_owned()));
-            }
-            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
-        };
-        if self.in_secrets(&real) {
-            return Err(SendError::Secret(path.to_owned()));
-        }
-        // Primero se abre y luego se mira qué es lo abierto: entre mirar y abrir no puede
-        // cambiar.
-        let src = match open_read(&real) {
-            Ok(f) => f,
-            // En Windows una carpeta no se abre como un fichero.
-            Err(_) if real.is_dir() => return Err(SendError::IsDir(path.to_owned())),
-            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
-        };
-        let meta = src
-            .metadata()
-            .map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
-        if meta.is_dir() {
-            return Err(SendError::IsDir(path.to_owned()));
-        }
-        if !meta.is_file() {
-            return Err(SendError::NotAFile(path.to_owned()));
-        }
+        let (src, meta) = self.open_checked(path)?;
         if meta.len() > MAX_FILE {
             return Err(SendError::TooBig(path.to_owned(), meta.len()));
         }
@@ -371,6 +359,56 @@ impl Outbox {
             },
         )
         .map_err(SendError::Io)
+    }
+
+    /// El contenido de un fichero para copiarlo (`clipboard` con `path`, `nido clip FICHERO`),
+    /// con las comprobaciones de `add_file` (nada de la carpeta de secretos, solo ficheros
+    /// normales): texto UTF-8 sin bytes nulos, hasta `MAX_TEXT`.
+    pub fn read_text(&self, path: &Path) -> Result<String, SendError> {
+        let (src, meta) = self.open_checked(path)?;
+        if meta.len() > MAX_TEXT as u64 {
+            return Err(SendError::TextTooBig(path.to_owned()));
+        }
+        let mut buf = Vec::new();
+        src.take(MAX_TEXT as u64 + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
+        if buf.len() > MAX_TEXT {
+            return Err(SendError::TextTooBig(path.to_owned()));
+        }
+        text_of(buf).ok_or_else(|| SendError::NotText(path.to_owned()))
+    }
+
+    /// Abre `path` para mandarlo: dónde está de verdad (sin enlaces ni `..`), que no sea de la
+    /// carpeta de secretos y que sea un fichero normal. Primero se abre y luego se mira qué es lo
+    /// abierto: entre mirar y abrir no puede cambiar.
+    fn open_checked(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), SendError> {
+        let real = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(SendError::NotFound(path.to_owned()));
+            }
+            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
+        };
+        if self.in_secrets(&real) {
+            return Err(SendError::Secret(path.to_owned()));
+        }
+        let src = match open_read(&real) {
+            Ok(f) => f,
+            // En Windows una carpeta no se abre como un fichero.
+            Err(_) if real.is_dir() => return Err(SendError::IsDir(path.to_owned())),
+            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
+        };
+        let meta = src
+            .metadata()
+            .map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
+        if meta.is_dir() {
+            return Err(SendError::IsDir(path.to_owned()));
+        }
+        if !meta.is_file() {
+            return Err(SendError::NotAFile(path.to_owned()));
+        }
+        Ok((src, meta))
     }
 
     /// `real` (ya sin enlaces) está en la carpeta de secretos.
