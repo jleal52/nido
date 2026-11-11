@@ -138,6 +138,14 @@ fn claude_args(dir: &Path) -> Vec<String> {
     args[from..].to_vec()
 }
 
+/// `--disallowedTools` y las reglas de los secretos de este nido (`claude::secrets_rules`): van
+/// delante en todo Claude que lanza nido.
+fn guard(paths: &Paths) -> Vec<String> {
+    let mut g = vec!["--disallowedTools".to_owned()];
+    g.extend(nido::claude::secrets_rules(&paths.state.join("secrets")));
+    g
+}
+
 /// Las de nido: el channel y solo las herramientas que miran y hablan, o mandan cosas al
 /// usuario, sin pedir permiso.
 const FLAGS: [&str; 10] = [
@@ -259,14 +267,12 @@ async fn claude_launches_with_the_nido_channel() {
     assert_eq!(code, 200, "{o}");
     assert!(wait_file(&aviso.join("args"), 100).await, "no arrancó");
     let argv = claude_args(&aviso);
-    // Delante, la regla que no deja leer los secretos.
-    assert_eq!(argv[1], "--disallowedTools", "{argv:?}");
-    assert!(
-        argv[2].starts_with("Read(//") && argv[2].ends_with("/secrets/**)"),
-        "{argv:?}"
-    );
-    assert_eq!(argv[3..13], FLAGS, "{argv:?}");
-    assert_eq!(argv[13], "--session-id");
+    // Delante, las reglas que no dejan leer ni tocar los secretos.
+    let g = guard(&paths);
+    let n = g.len();
+    assert_eq!(argv[1..1 + n], g, "{argv:?}");
+    assert_eq!(argv[1 + n..11 + n], FLAGS, "{argv:?}");
+    assert_eq!(argv[11 + n], "--session-id");
     assert!(
         argv.windows(2).any(|w| w == ["--model", "haiku"]),
         "{argv:?}"
@@ -1021,7 +1027,10 @@ done
     assert_eq!(code, 200, "{o}");
     assert!(wait_file(&viejo.join("args"), 100).await, "no arrancó");
     let argv = claude_args(&viejo);
-    assert_eq!(argv[1], "--session-id", "{argv:?}");
+    // Sin el MCP, pero tampoco lee los secretos.
+    let n = guard(&paths).len();
+    assert_eq!(argv[1..1 + n], guard(&paths), "{argv:?}");
+    assert_eq!(argv[1 + n], "--session-id", "{argv:?}");
     assert!(
         !argv.iter().any(|a| FLAGS.contains(&a.as_str())),
         "{argv:?}"
@@ -1070,7 +1079,9 @@ done
     assert_eq!(code, 200, "{o}");
     assert!(wait_file(&off.join("args"), 100).await, "no arrancó");
     let argv = claude_args(&off);
-    assert_eq!(argv[1], "--session-id", "{argv:?}");
+    let n = guard(&paths).len();
+    assert_eq!(argv[1..1 + n], guard(&paths), "{argv:?}");
+    assert_eq!(argv[1 + n], "--session-id", "{argv:?}");
     assert!(!argv.iter().any(|a| a == FLAGS[0]), "{argv:?}");
     assert!(wait_file(&off.join("channel"), 50).await);
     assert_eq!(std::fs::read_to_string(off.join("channel")).unwrap(), "no");

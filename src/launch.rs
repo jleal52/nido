@@ -399,6 +399,9 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
     let mut argv = session.argv.clone();
     let mut env = session.env.clone();
     let mut initial_input = None;
+    // Ningún Claude que lance nido lee ni toca los secretos (ver `secrets.rs`), lleve o no el
+    // MCP de nido.
+    let rules = claude::secrets_rules(&paths.state.join("secrets"));
     if let Some(link) = &session.claude {
         let config_dir = link
             .config_dir
@@ -406,7 +409,8 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
             .unwrap_or_else(|| claude::default_config_dir(&paths.home));
         if transcript_exists(&config_dir, &link.session_id) {
             if link.inside_shell {
-                initial_input = Some(format!("{}\r", claude::resume_line(link)).into_bytes());
+                initial_input =
+                    Some(format!("{}\r", claude::resume_line(link, &rules)).into_bytes());
             } else {
                 let (mut resume, resume_env) = claude::resume_argv(link);
                 // Las opciones propias con las que se lanzó (`--model`, `--mcp-config`…), también.
@@ -421,10 +425,8 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
     let channel = channel_launch(paths, &argv) == ChannelLaunch::Yes;
     if channel {
         argv = claude::with_nido_mcp(&argv, true);
-        // Y sin leer los secretos (ver `secrets.rs`).
-        let secrets = paths.state.join("secrets");
-        argv = claude::with_secrets_guard(&argv, &claude::secrets_rule(&secrets.to_string_lossy()));
     }
+    argv = claude::with_secrets_guard(&argv, &rules);
     HolderConfig {
         id: session.id.clone(),
         cwd: session.cwd.clone(),
@@ -519,9 +521,10 @@ mod tests {
         let p = paths(tmp.path());
         let s = claude_session(false);
         // Con el MCP de nido y sin leer los secretos.
-        let rule = claude::secrets_rule(&p.state.join("secrets").to_string_lossy());
-        let launched =
-            |argv: &[String]| claude::with_secrets_guard(&claude::with_nido_mcp(argv, true), &rule);
+        let rules = claude::secrets_rules(&p.state.join("secrets"));
+        let launched = |argv: &[String]| {
+            claude::with_secrets_guard(&claude::with_nido_mcp(argv, true), &rules)
+        };
         let cfg = holder_config(&p, &s, 80, 24);
         assert!(
             cfg.argv.ends_with(&launched(&s.argv)),
@@ -547,20 +550,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
         // Sin leer los secretos, y luego las del MCP de nido.
-        let rule = claude::secrets_rule(&p.state.join("secrets").to_string_lossy());
-        let mut flags = vec![
-            "--disallowedTools",
-            &rule,
+        let rules = claude::secrets_rules(&p.state.join("secrets"));
+        let mut guard = vec!["--disallowedTools"];
+        guard.extend(rules.iter().map(String::as_str));
+        let mut flags = guard.clone();
+        flags.extend([
             "--dangerously-load-development-channels",
             "server:nido",
             "--allowedTools",
-        ];
+        ]);
         flags.extend(claude::NIDO_TOOLS);
+        let n = flags.len();
         let mut s = claude_session(false);
         let cfg = holder_config(&p, &s, 80, 24);
         let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
-        assert_eq!(cfg.argv[at + 1..at + 13], flags, "{:?}", cfg.argv);
-        assert_eq!(cfg.argv[at + 13], "--session-id");
+        assert_eq!(cfg.argv[at + 1..at + 1 + n], flags, "{:?}", cfg.argv);
+        assert_eq!(cfg.argv[at + 1 + n], "--session-id");
         assert!(cfg.channel);
         // Al retomarla, una vez (aunque la orden guardada ya las tuviera).
         s.argv = claude::with_nido_mcp(&s.argv, true);
@@ -576,17 +581,16 @@ mod tests {
         assert_eq!(cfg.argv[at..], want);
         assert!(cfg.channel);
 
-        // Apagado: tal cual, y sin channel.
+        // Apagado: sin channel, pero tampoco lee los secretos.
         assert!(mcp_on(&p));
         set_mcp(&p, false).unwrap();
         assert!(!mcp_on(&p));
         let cfg = holder_config(&p, &claude_session(false), 80, 24);
-        assert!(
-            cfg.argv
-                .ends_with(&["claude".to_string(), "--resume".into(), "sid-1".into()]),
-            "{:?}",
-            cfg.argv
-        );
+        let mut want = vec!["claude"];
+        want.extend(&guard);
+        want.extend(["--resume", "sid-1"]);
+        let want: Vec<String> = want.into_iter().map(str::to_owned).collect();
+        assert!(cfg.argv.ends_with(&want), "{:?}", cfg.argv);
         assert!(!cfg.channel);
         set_mcp(&p, true).unwrap();
         assert!(mcp_on(&p));
@@ -609,9 +613,15 @@ mod tests {
         let s = claude_session(true);
         let cfg = holder_config(&p, &s, 80, 24);
         assert!(cfg.argv.ends_with(&["bash".to_string()]));
-        assert_eq!(
-            cfg.initial_input.as_deref(),
-            Some(&b"claude --resume sid-1\r"[..])
+        // Sin leer los secretos tampoco.
+        let rules: Vec<String> = claude::secrets_rules(&p.state.join("secrets"))
+            .iter()
+            .map(|r| format!("'{r}'"))
+            .collect();
+        let line = format!(
+            "claude --disallowedTools {} --resume sid-1\r",
+            rules.join(" ")
         );
+        assert_eq!(String::from_utf8(cfg.initial_input.unwrap()).unwrap(), line);
     }
 }

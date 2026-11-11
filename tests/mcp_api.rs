@@ -520,14 +520,13 @@ async fn mcp_api_end_to_end() {
     let argv = &args[from..];
     // Con el MCP de nido delante de las opciones: tras las herramientas permitidas viene una
     // opción y el mensaje no se toma por otra. `open`, `answer` y `close` no van: piden permiso.
-    // Delante de todo, la regla que no deja leer los secretos.
-    assert_eq!(argv[..2], ["claude", "--disallowedTools"], "{argv:?}");
-    assert!(
-        argv[2].starts_with("Read(//") && argv[2].ends_with("/secrets/**)"),
-        "{argv:?}"
-    );
+    // Delante de todo, las reglas que no dejan leer ni tocar los secretos.
+    let mut guard = vec!["--disallowedTools".to_owned()];
+    guard.extend(nido::claude::secrets_rules(&paths.state.join("secrets")));
+    let n = guard.len();
+    assert_eq!(argv[1..1 + n], guard, "{argv:?}");
     assert_eq!(
-        &argv[3..14],
+        &argv[1 + n..12 + n],
         [
             "--dangerously-load-development-channels",
             "server:nido",

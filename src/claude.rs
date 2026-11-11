@@ -508,10 +508,12 @@ fn insert_opts(argv: &[String], mut add: Vec<String>) -> Vec<String> {
     out
 }
 
-/// La regla que no deja a Claude leer la carpeta de secretos de nido (`dir`, ver `secrets.rs`)
-/// con Read; Claude la aplica también a `cat`, `head`, `<`… en Bash. Ruta absoluta: `//` delante.
-/// En Windows, como la normaliza Claude: `C:\Users\u` es `/c/Users/u`.
-pub fn secrets_rule(dir: &str) -> String {
+/// Una regla de `tool` (`Read` o `Edit`) para la carpeta de secretos de nido (`dir`, ver
+/// `secrets.rs`). Ruta absoluta: `//` delante. En Windows, como la normaliza Claude:
+/// `C:\Users\u` es `/c/Users/u`.
+pub fn secrets_rule(tool: &str, dir: &str) -> String {
+    // Lo que añade `canonicalize` en Windows.
+    let dir = dir.strip_prefix(r"\\?\").unwrap_or(dir);
     let d = dir.replace('\\', "/");
     let d = match d.as_bytes() {
         [l, b':', rest @ ..] if l.is_ascii_alphabetic() => format!(
@@ -521,20 +523,59 @@ pub fn secrets_rule(dir: &str) -> String {
         ),
         _ => d,
     };
-    format!("Read(/{}/**)", d.trim_end_matches('/'))
+    format!("{tool}(/{}/**)", d.trim_end_matches('/'))
 }
 
-/// Una regla de secretos de nido (la de `secrets_rule`, con la carpeta que sea).
-fn is_secrets_rule(v: &str) -> bool {
-    v.starts_with("Read(//") && v.ends_with("/secrets/**)")
+/// Las reglas que no dejan a Claude leer ni tocar la carpeta de secretos de nido: `Read`
+/// (Claude la aplica también a `cat`, `head`, `<`… en Bash) y `Edit` (también Write). Con la
+/// ruta absoluta y, si hay un enlace por medio, también con la de verdad: Claude compara la
+/// ruta tal como le llega.
+pub fn secrets_rules(dir: &Path) -> Vec<String> {
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+    let mut dirs = vec![abs.clone()];
+    if let Some(real) = real_path(&abs)
+        && real != abs
+    {
+        dirs.push(real);
+    }
+    dirs.iter()
+        .flat_map(|d| {
+            let d = d.to_string_lossy();
+            ["Read", "Edit"].map(|t| secrets_rule(t, &d))
+        })
+        .collect()
 }
 
-/// `argv` (de `with_nido_mcp`) con `--disallowedTools <rule>`, si no la lleva ya.
-pub fn with_secrets_guard(argv: &[String], rule: &str) -> Vec<String> {
-    if !is_claude(argv) || option_values(argv, &DENIED_OPTS).contains(&rule) {
+/// `p` sin enlaces, aunque aún no exista: la parte que existe, resuelta, y el resto tal cual.
+fn real_path(p: &Path) -> Option<PathBuf> {
+    let mut base = p;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            return Some(rest.iter().rev().fold(real, |acc, c| acc.join(c)));
+        }
+        rest.push(base.file_name()?);
+        base = base.parent()?;
+    }
+}
+
+/// `argv` (de `with_nido_mcp`) con `--disallowedTools` y las reglas de `rules` que no lleve ya.
+pub fn with_secrets_guard(argv: &[String], rules: &[String]) -> Vec<String> {
+    if !is_claude(argv) {
         return argv.to_vec();
     }
-    insert_opts(argv, vec![DENIED_OPTS[0].to_owned(), rule.to_owned()])
+    let has = option_values(argv, &DENIED_OPTS);
+    let missing: Vec<String> = rules
+        .iter()
+        .filter(|r| !has.contains(&r.as_str()))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return argv.to_vec();
+    }
+    let mut add = vec![DENIED_OPTS[0].to_owned()];
+    add.extend(missing);
+    insert_opts(argv, add)
 }
 
 /// La primera versión de Claude Code con channels (`--channels` y
@@ -644,7 +685,6 @@ pub fn extra_args(argv: &[String]) -> Vec<String> {
         (opt == CHANNELS_OPT && value == NIDO_CHANNEL)
             || (ALLOWED_OPTS.contains(&opt)
                 && (NIDO_TOOLS.contains(&value) || value == OLD_NIDO_TOOLS))
-            || (DENIED_OPTS.contains(&opt) && is_secrets_rule(value))
     };
     let mut out = Vec::new();
     let mut i = 1;
@@ -997,9 +1037,11 @@ fn sh_quote(s: &str) -> String {
     }
 }
 
-/// La línea que se escribe en la shell para retomar el Claude que corría dentro.
-pub fn resume_line(link: &ClaudeLink) -> String {
+/// La línea que se escribe en la shell para retomar el Claude que corría dentro, sin leer los
+/// secretos (`rules`, de `secrets_rules`).
+pub fn resume_line(link: &ClaudeLink, rules: &[String]) -> String {
     let (argv, env) = resume_argv(link);
+    let argv = with_secrets_guard(&argv, rules);
     let mut parts: Vec<String> = env
         .iter()
         .map(|(k, v)| format!("{k}={}", sh_quote(v)))
@@ -1289,38 +1331,97 @@ mod tests {
     }
 
     #[test]
-    fn the_secrets_rule_is_absolute_as_claude_writes_it() {
+    fn the_secrets_rules_are_absolute_as_claude_writes_them() {
         assert_eq!(
-            secrets_rule("/home/u/.local/state/nido/secrets"),
+            secrets_rule("Read", "/home/u/.local/state/nido/secrets"),
             "Read(//home/u/.local/state/nido/secrets/**)"
         );
         assert_eq!(
-            secrets_rule("/r/state/secrets/"),
-            "Read(//r/state/secrets/**)"
+            secrets_rule("Edit", "/r/state/secrets/"),
+            "Edit(//r/state/secrets/**)"
         );
         assert_eq!(
-            secrets_rule(r"C:\Users\u\.local\state\nido\secrets"),
+            secrets_rule("Read", r"C:\Users\u\.local\state\nido\secrets"),
             "Read(//c/Users/u/.local/state/nido/secrets/**)"
+        );
+        // Lo que devuelve `canonicalize` en Windows.
+        assert_eq!(
+            secrets_rule("Read", r"\\?\C:\Users\u\secrets"),
+            "Read(//c/Users/u/secrets/**)"
+        );
+        // Una ruta relativa sale absoluta.
+        for r in secrets_rules(Path::new("estado/secrets")) {
+            assert!(
+                (r.starts_with("Read(//") || r.starts_with("Edit(//"))
+                    && r.ends_with("/estado/secrets/**)"),
+                "{r}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secrets_rules_cover_the_real_path_and_editing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("state")).unwrap();
+        let link = tmp.path().join("enlace");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let rule = |t: &str, p: &Path| secrets_rule(t, &p.to_string_lossy());
+        // La carpeta de secretos aún no existe: la ruta de verdad, por la parte que sí.
+        let by_link = link.join("state/secrets");
+        let by_real = std::fs::canonicalize(&real).unwrap().join("state/secrets");
+        assert_eq!(
+            secrets_rules(&by_link),
+            [
+                rule("Read", &by_link),
+                rule("Edit", &by_link),
+                rule("Read", &by_real),
+                rule("Edit", &by_real),
+            ]
+        );
+        // Sin enlaces por medio, dos.
+        assert_eq!(
+            secrets_rules(&by_real),
+            [rule("Read", &by_real), rule("Edit", &by_real)]
         );
     }
 
     #[test]
-    fn claude_gets_the_secrets_rule_once_and_in_front() {
-        let rule = "Read(//r/state/secrets/**)";
-        let launched = with_secrets_guard(&with_nido_mcp(&new_argv("p", "u-1"), true), rule);
-        assert_eq!(&launched[..3], ["claude", "--disallowedTools", rule]);
-        assert_eq!(launched[3], "--dangerously-load-development-channels");
-        assert_eq!(with_secrets_guard(&launched, rule), launched);
+    fn claude_gets_the_secrets_rules_once_and_in_front() {
+        let rules = vec![
+            "Read(//r/state/secrets/**)".to_owned(),
+            "Edit(//r/state/secrets/**)".to_owned(),
+        ];
+        let (r0, r1) = (rules[0].as_str(), rules[1].as_str());
+        let launched = with_secrets_guard(&with_nido_mcp(&new_argv("p", "u-1"), true), &rules);
+        assert_eq!(&launched[..4], ["claude", "--disallowedTools", r0, r1]);
+        assert_eq!(launched[4], "--dangerously-load-development-channels");
+        assert_eq!(with_secrets_guard(&launched, &rules), launched);
+        // Si ya lleva una (también con `=`), solo la otra.
+        let one = format!("--disallowedTools={r0}");
+        assert_eq!(
+            with_secrets_guard(&v(&["claude", &one, "-c"]), &rules),
+            v(&["claude", "--disallowedTools", r1, &one, "-c"])
+        );
         // Un mensaje sin opciones: delante y con `--`.
         assert_eq!(
-            with_secrets_guard(&v(&["claude", "hola"]), rule),
-            v(&["claude", "--disallowedTools", rule, "--", "hola"])
+            with_secrets_guard(&v(&["claude", "hola"]), &rules),
+            v(&["claude", "--disallowedTools", r0, r1, "--", "hola"])
         );
-        assert_eq!(with_secrets_guard(&v(&["npm"]), rule), v(&["npm"]));
-        // Al retomar no se arrastra: la vuelve a poner nido.
+        assert_eq!(with_secrets_guard(&v(&["npm"]), &rules), v(&["npm"]));
+        // Las reglas que lleve la orden se quedan al retomar, aunque se parezcan a las de nido:
+        // pueden ser del usuario. Nido no las repite.
+        let own = v(&["claude", "--disallowedTools", "Read(//home/u/secrets/**)"]);
+        assert_eq!(extra_args(&own), own[1..]);
         let mut saved = launched.clone();
         saved.extend(v(&["--model", "haiku"]));
-        assert_eq!(extra_args(&saved), v(&["--model", "haiku"]));
+        let kept = extra_args(&saved);
+        assert_eq!(kept, v(&["--disallowedTools", r0, r1, "--model", "haiku"]));
+        let mut again = v(&["claude", "--resume", "u-1"]);
+        again.extend(kept);
+        let again = with_secrets_guard(&again, &rules);
+        assert_eq!(again.iter().filter(|a| *a == r0).count(), 1, "{again:?}");
     }
 
     #[test]
@@ -1799,7 +1900,7 @@ mod tests {
             )]
         );
         assert_eq!(
-            resume_line(&link),
+            resume_line(&link, &[]),
             "CLAUDE_CONFIG_DIR='/perfil con espacio' claude --resume u-1"
         );
         let with_acct = ClaudeLink {
@@ -1807,6 +1908,11 @@ mod tests {
             ..link
         };
         assert_eq!(resume_argv(&with_acct).1, []);
-        assert_eq!(resume_line(&with_acct), "claude --resume u-1");
+        assert_eq!(resume_line(&with_acct, &[]), "claude --resume u-1");
+        // Sin leer los secretos.
+        assert_eq!(
+            resume_line(&with_acct, &["Read(//r/secrets/**)".to_owned()]),
+            "claude --disallowedTools 'Read(//r/secrets/**)' --resume u-1"
+        );
     }
 }
