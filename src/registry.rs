@@ -64,6 +64,18 @@ pub struct AlertRec {
     pub at: u64,
 }
 
+/// Qué es una nota de la sesión que no es una alerta (`alert`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteKind {
+    /// Un texto para copiar (`clipboard`).
+    Clipboard,
+    /// Un fichero (`send_file`).
+    File,
+    /// Un secreto que nadie contestó (`secret`).
+    Secret,
+}
+
 /// Alertas que se guardan por sesión.
 const MAX_ALERTS: usize = 10;
 
