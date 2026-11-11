@@ -264,10 +264,11 @@ const TOOLS: &[Tool] = &[
                 name, folder (cwd), state (working, idle, question or stopped), since (when \
                 it started, if running, or stopped, if stopped; ms since 1970; missing if \
                 unknown), opened_by, channel (whether it can receive messages) and whether \
-                this session opened it (mine). channel_error, if present, says why it has no channel (e.g. blocked by \
-                org policy, or its Claude Code predates channels); delivery_error, if present, \
-                says that messages sent to it never showed up in its conversation (they stay \
-                queued). Machines that don't answer are listed in unreachable, with the error.",
+                this session opened it (mine). channel_error, if present, says why it has no \
+                channel (e.g. blocked by org policy, or its Claude Code predates channels); \
+                delivery_error, if present, says that messages sent to it never showed up in \
+                its conversation (they stay queued). Machines that don't answer are listed in \
+                unreachable, with the error.",
         args: &[],
     },
     Tool {
