@@ -356,6 +356,28 @@ pub async fn api_secret_answer(
         taken.finish(Outcome::Rejected);
         return Json(json!({ "ok": true })).into_response();
     }
+    let value = req.value.unwrap_or_default();
+    let remember = req.remember.unwrap_or(Remember::No);
+    // Se guarda y se avisa en una tarea aparte: si se corta esta petición (el dispositivo se va),
+    // se guarda igual y la sesión que espera recibe su ruta.
+    let saving = tokio::spawn(save_answer(st.clone(), taken, value, remember));
+    match saving.await {
+        Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
+        Ok(Err(e)) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("no se pudo guardar el secreto: {e}"),
+        ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Guarda lo que contestó el usuario y avisa a las sesiones que esperan (`taken`).
+async fn save_answer(
+    st: Arc<AppState>,
+    taken: secrets::Taken,
+    value: String,
+    remember: Remember,
+) -> Result<(), String> {
     let by = {
         let reg = st.registry.lock().await;
         let names: Vec<String> = taken
@@ -365,12 +387,9 @@ pub async fn api_secret_answer(
             .collect();
         names.join(", ")
     };
-    let value = req.value.unwrap_or_default();
-    let remember = req.remember.unwrap_or(Remember::No);
     let (name, sessions, forced) = (taken.name.clone(), taken.sessions.clone(), taken.forced);
-    let store_st = st.clone();
     let saved = tokio::task::spawn_blocking(move || {
-        store_st.secrets.save_answer(
+        st.secrets.save_answer(
             &name,
             &sessions,
             value.as_bytes(),
@@ -384,18 +403,17 @@ pub async fn api_secret_answer(
     match saved {
         Ok(Ok(paths)) => {
             taken.finish(Outcome::Saved(paths));
-            Json(json!({ "ok": true })).into_response()
+            Ok(())
         }
         Ok(Err(e)) => {
-            taken.finish(Outcome::Failed(e.to_string()));
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("no se pudo guardar el secreto: {e}"),
-            )
+            let e = e.to_string();
+            taken.finish(Outcome::Failed(e.clone()));
+            Err(e)
         }
         Err(e) => {
-            taken.finish(Outcome::Failed(e.to_string()));
-            error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            let e = e.to_string();
+            taken.finish(Outcome::Failed(e.clone()));
+            Err(e)
         }
     }
 }
@@ -431,6 +449,75 @@ pub async fn api_forget_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un nido en `dir`, sin HTTP, con una sesión y un teléfono emparejado (su token).
+    async fn nido_in(dir: &Path) -> (Arc<AppState>, String, String) {
+        let paths = crate::launch::Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, crate::launch::Launcher::Detached, None, true).unwrap();
+        let session = Session {
+            id: crate::registry::new_id(),
+            name: "api".into(),
+            cwd: dir.to_owned(),
+            argv: vec!["true".into()],
+            env: vec![],
+            autostart: false,
+            created: 0,
+            claude: None,
+            folder: None,
+            finished: 0,
+            stopped: 0,
+            seen: 0,
+            opened_by: None,
+            alerts: vec![],
+        };
+        let id = st.registry.lock().await.add(session).unwrap().id;
+        let token = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[7u8; 32], "teléfono de prueba", None)
+            .unwrap()
+            .token;
+        (st, id, token)
+    }
+
+    /// Si se corta la petición de quien contesta mientras se guarda, se guarda igual y la sesión
+    /// que espera recibe su ruta (no «se cerró»).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_is_saved_and_told_even_if_its_request_goes() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, id, token) = nido_in(tmp.path()).await;
+        let (mut waiter, _) = st.asks.join("tok", "x", &id, 1).unwrap();
+        let ask = st.asks.view_for(&id).unwrap().id;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let body = json!({"ask": ask, "value": "v"}).to_string();
+        let answering = api_secret_answer(
+            State(st.clone()),
+            UrlPath(id.clone()),
+            headers,
+            Bytes::from(body),
+        );
+        // Una vuelta y fuera, como si el dispositivo se fuera mientras se guarda.
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, answering).await;
+        match waiter.wait().await.0 {
+            Outcome::Saved(paths) => {
+                assert_eq!(std::fs::read_to_string(&paths[&id]).unwrap(), "v")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn each_outcome_is_a_path_or_an_error() {
