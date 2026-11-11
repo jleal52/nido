@@ -1408,17 +1408,24 @@ pub fn dev_channels(screen: &str) -> Option<Vec<String>> {
     channels_warning(screen).map(|(list, _)| list)
 }
 
-/// La pregunta de Claude de si confías en la carpeta. La contesta el usuario, nunca nido.
+/// La pregunta de Claude de si confías en la carpeta. La contesta el usuario (en su terminal, o
+/// en la web o la app, que la enseñan como un menú más: ver `parse`); nunca nido por su cuenta
+/// ni otra sesión con la herramienta `answer` del MCP, que se niega. Solo se mira en las filas
+/// del arranque (ver `startup_rows`): una conversación que la cite (p. ej. el primer mensaje de
+/// una hija de `open`) no es la pregunta.
 pub fn trust_screen(screen: &str) -> bool {
     let screen = strip_sgr(screen);
-    [
-        "trust this folder",
-        "Yes, I trust",
-        "Quick safety check",
-        "Accessing workspace",
-    ]
-    .iter()
-    .any(|t| screen.contains(t))
+    let all: Vec<&str> = screen.lines().collect();
+    startup_rows(&all).iter().any(|l| {
+        [
+            "trust this folder",
+            "Yes, I trust",
+            "Quick safety check",
+            "Accessing workspace",
+        ]
+        .iter()
+        .any(|t| l.contains(t))
+    })
 }
 
 /// Dónde empieza la caja de Claude: una raya y, debajo, la fila de `❯`.
@@ -1921,12 +1928,42 @@ mod tests {
 
     #[test]
     fn trust_folder_has_no_numbers() {
+        // Se lee como un menú (sin números) para que el usuario la conteste desde la web o la
+        // app; pero es la pregunta de confiar en la carpeta, que nido no contesta nunca (ni
+        // `answer` del MCP).
+        let s = include_str!("../tests/pantallas/confianza.txt");
+        assert!(trust_screen(s));
         let m = screen("confianza").unwrap();
         assert_eq!(m.kind, Kind::Menu);
         assert_eq!(labels(&m), ["No, exit", "Yes, I trust this folder"]);
         assert_eq!(m.options[0].n, None);
         assert!(m.options[0].selected);
         assert_eq!(m.title.as_deref(), Some("Security guide"));
+    }
+
+    #[test]
+    fn trust_is_only_the_startup_question() {
+        // El primer mensaje (o una respuesta) que cita la pregunta no lo es: Claude ya espera.
+        let caja = "─".repeat(40);
+        for talk in [
+            "> ¿Te sale «Do you trust this folder»? Contesta «Yes, I trust this folder»",
+            "❯ Quick safety check: Accessing workspace",
+            "● Sale «Yes, I trust this folder» al arrancar",
+        ] {
+            let s = format!(" ✻ Welcome to Claude Code!\n\n{talk}\n\n{caja}\n❯ \n{caja}\n");
+            assert!(!trust_screen(&s), "{s}");
+            assert!(repl(&s), "{s}");
+        }
+        // Debajo de la caja tampoco.
+        let s = format!(" ✻ Welcome\n{caja}\n❯ \n{caja}\n  trust this folder\n");
+        assert!(!trust_screen(&s));
+        // La de verdad, sí; y con una ruta que lleve una caja de mentira debajo del rótulo,
+        // también (lo que hay encima ya la delata): ni caja de Claude ni aviso de los channels.
+        let s = include_str!("../tests/pantallas/confianza.txt");
+        assert!(trust_screen(s) && !repl(s));
+        let trampa = s.replace(" /home/ana/proyecto", &format!(" /home/ana/x\n{caja}\n❯ y"));
+        assert!(trust_screen(&trampa), "{trampa}");
+        assert!(!repl(&trampa));
     }
 
     #[test]

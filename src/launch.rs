@@ -349,6 +349,35 @@ pub fn mcp_on(paths: &Paths) -> bool {
     !mcp_off_file(paths).exists()
 }
 
+/// Si una orden se lanza con el channel de nido, o por qué no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelLaunch {
+    Yes,
+    /// No es `claude`, o el MCP está apagado (`nido mcp off`).
+    No,
+    /// Su Claude Code no conoce las opciones del channel (ver `claude::channels_supported`).
+    OldClaude,
+}
+
+/// ¿Va `argv` con el channel de nido? Si es `claude`, con el MCP encendido y un Claude Code que
+/// lo conozca: el de la orden si lleva ruta y, si no, el que se encuentra en el `PATH`.
+pub fn channel_launch(paths: &Paths, argv: &[String]) -> ChannelLaunch {
+    if !claude::is_claude(argv) || !mcp_on(paths) {
+        return ChannelLaunch::No;
+    }
+    let named = Path::new(&argv[0]);
+    let program = if named.components().count() > 1 {
+        Some(named.to_owned())
+    } else {
+        let path = std::env::var_os("PATH");
+        claude::find_program(path.as_deref(), &paths.home)
+    };
+    match program.map(|p| claude::channels_supported(&p)) {
+        Some(Some(false)) => ChannelLaunch::OldClaude,
+        _ => ChannelLaunch::Yes,
+    }
+}
+
 /// `nido mcp on|off`: para las sesiones que arranquen a partir de ahora.
 pub fn set_mcp(paths: &Paths, on: bool) -> io::Result<()> {
     let file = mcp_off_file(paths);
@@ -389,7 +418,7 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
     }
     // Un Claude escrito en una shell va sin él: `NIDO_CHANNEL` se quedaría en la shell, y otro
     // `claude` lanzado luego en ella recogería la bandeja sin channel.
-    let channel = claude::is_claude(&argv) && mcp_on(paths);
+    let channel = channel_launch(paths, &argv) == ChannelLaunch::Yes;
     if channel {
         argv = claude::with_nido_mcp(&argv, true);
     }
@@ -513,17 +542,17 @@ mod tests {
     fn claude_sessions_launch_with_the_nido_mcp_unless_it_is_off() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
-        let flags = [
+        let mut flags = vec![
             "--dangerously-load-development-channels",
             "server:nido",
             "--allowedTools",
-            "mcp__nido__*",
         ];
+        flags.extend(claude::NIDO_TOOLS);
         let mut s = claude_session(false);
         let cfg = holder_config(&p, &s, 80, 24);
         let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
-        assert_eq!(cfg.argv[at + 1..at + 5], flags, "{:?}", cfg.argv);
-        assert_eq!(cfg.argv[at + 5], "--session-id");
+        assert_eq!(cfg.argv[at + 1..at + 8], flags, "{:?}", cfg.argv);
+        assert_eq!(cfg.argv[at + 8], "--session-id");
         assert!(cfg.channel);
         // Al retomarla, una vez (aunque la orden guardada ya las tuviera).
         s.argv = claude::with_nido_mcp(&s.argv, true);
@@ -534,7 +563,7 @@ mod tests {
         let cfg = holder_config(&p, &s, 80, 24);
         let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
         let mut want = vec!["claude"];
-        want.extend(flags);
+        want.extend(&flags);
         want.extend(["--resume", "sid-1", "--model", "haiku"]);
         assert_eq!(cfg.argv[at..], want);
         assert!(cfg.channel);

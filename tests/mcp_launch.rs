@@ -137,11 +137,15 @@ fn claude_args(dir: &Path) -> Vec<String> {
     args[from..].to_vec()
 }
 
-const FLAGS: [&str; 4] = [
+/// Las de nido: el channel y solo las herramientas que miran y hablan sin pedir permiso.
+const FLAGS: [&str; 7] = [
     "--dangerously-load-development-channels",
     "server:nido",
     "--allowedTools",
-    "mcp__nido__*",
+    "mcp__nido__sessions",
+    "mcp__nido__read",
+    "mcp__nido__send",
+    "mcp__nido__alert",
 ];
 
 fn nido_mcp(home: &Path, on: bool) -> String {
@@ -173,8 +177,35 @@ async fn claude_launches_with_the_nido_channel() {
     )
     .unwrap();
     std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    // El `claude` que mira nido para saber si conoce los channels (`claude --version`): uno de
+    // mentira, el primero del `PATH` (ver «Un Claude Code de antes de los channels»).
+    let fake_claude = bin.join("claude");
+    let claude_version = |v: &str, at: std::time::SystemTime| {
+        std::fs::write(
+            &fake_claude,
+            format!("#!/bin/sh\necho '{v} (Claude Code)'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &fake_claude,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        // Otra fecha: nido se la vuelve a preguntar.
+        std::fs::File::options()
+            .write(true)
+            .open(&fake_claude)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    claude_version("2.1.322", std::time::SystemTime::now());
     // Esta prueba es su propio proceso (un fichero de tests/): cambiar el entorno no toca a otras.
     unsafe {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![bin.clone()];
+        dirs.extend(std::env::split_paths(&path));
+        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
         std::env::set_var("NIDO_HOME", tmp.path().join("nido"));
         // Ni el `HOME` de verdad: nada de lo que se mire o escriba sale del temporal.
         std::env::set_var("HOME", tmp.path().join("home"));
@@ -223,8 +254,8 @@ async fn claude_launches_with_the_nido_channel() {
     assert_eq!(code, 200, "{o}");
     assert!(wait_file(&aviso.join("args"), 100).await, "no arrancó");
     let argv = claude_args(&aviso);
-    assert_eq!(argv[1..5], FLAGS, "{argv:?}");
-    assert_eq!(argv[5], "--session-id");
+    assert_eq!(argv[1..8], FLAGS, "{argv:?}");
+    assert_eq!(argv[8], "--session-id");
     assert!(
         argv.windows(2).any(|w| w == ["--model", "haiku"]),
         "{argv:?}"
@@ -524,6 +555,63 @@ async fn claude_launches_with_the_nido_channel() {
     );
     nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
     assert!(released(&state, &s.id).await, "no se soltó al pararla");
+    // No la abrió nadie con `open`: no hay alerta (el usuario la tiene delante).
+    let alerts = |id: &str| {
+        let id = id.to_owned();
+        let state = state.clone();
+        async move { state.registry.lock().await.get(&id).unwrap().alerts.clone() }
+    };
+    assert!(alerts(&s.id).await.is_empty());
+
+    // Una hija de `open` en esa pregunta: `open` se lo dice a la madre, `answer` no la contesta
+    // (es del usuario) y al usuario se le avisa con una alerta, aunque viva su madre (una vez).
+    let hija = tmp.path().join("confianza-hija");
+    folder(&hija, &fixture("confianza"));
+    let (code, o) = tool(
+        addr,
+        &caller,
+        "open",
+        json!({"machine": "Prueba", "folder": hija, "prompt": "haz algo"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{o}");
+    let note = o["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("waiting for the user to trust the folder")
+            && note.contains("confianza-hija"),
+        "{o}"
+    );
+    let child = o["id"].as_str().unwrap().to_owned();
+    let (code, e) = tool(
+        addr,
+        &caller,
+        "answer",
+        json!({"session": child, "option": "Yes, I trust this folder"}),
+    )
+    .await;
+    assert_eq!(code, 403, "{e}");
+    assert!(
+        e["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the session is waiting for the user to trust the folder"),
+        "{e}"
+    );
+    assert!(!hija.join("picked").exists(), "contestada");
+    let mut told = vec![];
+    for _ in 0..50 {
+        told = alerts(&child).await;
+        if !told.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].text.contains("confíes en la carpeta"), "{told:?}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(alerts(&child).await.len(), 1, "una vez");
+    let (code, r) = tool(addr, &caller, "close", json!({"session": child})).await;
+    assert_eq!(code, 200, "{r}");
 
     // Claude en otra pantalla todo el plazo (iniciar sesión, aprobar un MCP, una novedad…): no
     // se sabe si tira el channel. Retenida, hasta que se vea su caja o se cierre.
@@ -889,6 +977,58 @@ done
         let stop = format!("/api/v1/sessions/{}/stop", s.id);
         assert_eq!(rest(addr, &stop).await, 200);
     }
+
+    // Un Claude Code de antes de los channels no conoce sus opciones (no arrancaría): sin ellas,
+    // sin `NIDO_CHANNEL`, y `sessions` dice por qué no tiene channel.
+    claude_version(
+        "2.0.14",
+        std::time::SystemTime::now() + Duration::from_secs(60),
+    );
+    let viejo = tmp.path().join("viejo");
+    folder(&viejo, &fixture("normal"));
+    let (code, o) = tool(
+        addr,
+        &caller,
+        "open",
+        json!({"machine": "Prueba", "folder": viejo, "prompt": "di hola"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{o}");
+    assert!(wait_file(&viejo.join("args"), 100).await, "no arrancó");
+    let argv = claude_args(&viejo);
+    assert_eq!(argv[1], "--session-id", "{argv:?}");
+    assert!(
+        !argv.iter().any(|a| FLAGS.contains(&a.as_str())),
+        "{argv:?}"
+    );
+    assert!(wait_file(&viejo.join("channel"), 50).await);
+    assert_eq!(
+        std::fs::read_to_string(viejo.join("channel")).unwrap(),
+        "no"
+    );
+    let child = o["id"].as_str().unwrap().to_owned();
+    let mut error = Value::Null;
+    for _ in 0..50 {
+        let (_, list) = tool(addr, &caller, "sessions", json!({})).await;
+        error = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == child.as_str())
+            .unwrap()["channel_error"]
+            .clone();
+        if !error.is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(error, "claude too old for channels");
+    let (code, r) = tool(addr, &caller, "close", json!({"session": child})).await;
+    assert_eq!(code, 200, "{r}");
+    claude_version(
+        "2.1.322",
+        std::time::SystemTime::now() + Duration::from_secs(120),
+    );
 
     // Apagado: la sesión siguiente va sin opciones, sin `NIDO_CHANNEL` y sin que nadie teclee.
     assert!(nido_mcp(tmp.path(), false).contains("apagado"));

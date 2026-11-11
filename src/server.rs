@@ -85,6 +85,9 @@ pub struct AppState {
     /// `spawn_startup_watch`), con su bandeja ya retenida mientras tanto.
     launched: tokio::sync::mpsc::UnboundedSender<Launched>,
     launched_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Launched>>>,
+    /// Las sesiones de las que ya se avisó, en este arranque, que esperan a que el usuario
+    /// confíe en su carpeta (ver `trust_waiting`).
+    trust_told: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Una sesión recién arrancada y, si hay quien mire los arranques, su bandeja retenida.
@@ -262,11 +265,54 @@ fn alert_body(count: usize, last: &str) -> String {
     }
 }
 
-/// El texto de una alerta, sin espacios alrededor y recortado. `None` si queda vacío.
+/// El texto de una alerta, sin caracteres de control (salvo saltos de línea y tabuladores: ni
+/// secuencias de escape, que pintarían en la terminal de `nido alerts`), sin espacios alrededor y
+/// recortado. `None` si queda vacío.
 pub(crate) fn alert_text(text: &str) -> Option<String> {
-    let t: String = text.trim().chars().take(ALERT_MAX_CHARS).collect();
+    let t = without_controls(text);
+    let t: String = t.trim().chars().take(ALERT_MAX_CHARS).collect();
     let t = t.trim_end();
     (!t.is_empty()).then(|| t.to_owned())
+}
+
+/// `s` sin caracteres de control (C0, DEL y C1) menos `\n` y `\t`. Las secuencias de escape van
+/// enteras: CSI (`ESC [ … final`), OSC (`ESC ] … BEL` o `ESC \`) y las de un carácter.
+fn without_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\u{1b}' => match chars.next() {
+                // CSI: parámetros e intermedios hasta el final (@ a ~).
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC, DCS, SOS, PM, APC: hasta BEL o ST (`ESC \`).
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Las alertas que el usuario aún no ha visto.
@@ -377,6 +423,7 @@ impl AppState {
             peer_link: Default::default(),
             launched,
             launched_rx: std::sync::Mutex::new(Some(launched_rx)),
+            trust_told: Default::default(),
         }))
     }
 
@@ -526,6 +573,7 @@ impl AppState {
     pub(crate) fn launched(&self, id: &str, hold: Option<crate::inbox::Hold>) {
         // Lo que se sabía de su channel (rechazo, su Claude, parada) era del arranque anterior.
         self.inbox.relaunched(id);
+        self.trust_told.lock().expect("confianza").remove(id);
         let _ = self.launched.send((id.to_owned(), hold));
     }
 }
@@ -663,6 +711,17 @@ pub fn spawn_startup_watch(state: Arc<AppState>) {
                 continue;
             };
             if !launch::holder_config(&state.paths, &s, 80, 24).channel {
+                // Con un Claude Code de antes de los channels: sin channel, y que se sepa.
+                if launch::channel_launch(&state.paths, &s.argv) == launch::ChannelLaunch::OldClaude
+                {
+                    state.inbox.refuse(&id, crate::inbox::Refusal::OldClaude);
+                }
+                // Sin channel no hay arranque que mirar; pero una hija de `open` puede quedarse
+                // en la pregunta de confiar en la carpeta, y eso es del usuario.
+                if s.opened_by.is_some() && claude::is_claude(&s.argv) {
+                    let st = state.clone();
+                    tokio::spawn(async move { watch_trust(&st, &id).await });
+                }
                 continue;
             }
             let st = state.clone();
@@ -680,13 +739,53 @@ pub fn spawn_startup_watch(state: Arc<AppState>) {
 /// usuario: se sigue mirando, y cuando se va el plazo vuelve a empezar (como mucho
 /// `STARTUP_CAP` plazos en total). Devuelve en qué quedó: `Accept` si se aceptó, `Nothing` si no salió
 /// nada (o se cerró la sesión).
-pub async fn watch_startup(st: &AppState, id: &str, window: Duration) -> prompt::Startup {
+pub async fn watch_startup(st: &Arc<AppState>, id: &str, window: Duration) -> prompt::Startup {
     watch_held(st, id, window, st.inbox.hold(id)).await
+}
+
+/// La pantalla de arranque de un Claude sin channel abierto con `open`, como visor: si sale la
+/// pregunta de confiar en la carpeta, se avisa al usuario (`AppState::trust_waiting`). Hasta ver
+/// a Claude esperando peticiones, que se cierre, o `STARTUP_WINDOW` por `STARTUP_CAP`.
+async fn watch_trust(st: &Arc<AppState>, id: &str) {
+    let until = tokio::time::Instant::now() + STARTUP_WINDOW * STARTUP_CAP;
+    let mut scr: Option<HolderScreen> = None;
+    while tokio::time::Instant::now() < until {
+        if scr.is_none() {
+            let hello = Hello {
+                role: Role::Viewer,
+                cols: 80,
+                rows: 24,
+            };
+            match holder_connect(st, id, hello).await {
+                Ok(stream) => {
+                    let (rd, wr) = crate::ipc::split(stream);
+                    scr = Some(prompt::Screen::new(rd, wr));
+                }
+                Err(_) if !launch::is_alive(&st.paths, id) => return,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            }
+        }
+        let Some(s) = scr.as_mut() else { return };
+        match s.look().await {
+            Ok(text) if prompt::trust_screen(&text) => {
+                st.trust_waiting(id).await;
+                return;
+            }
+            Ok(text) if prompt::repl(&text) => return,
+            Ok(_) => {}
+            Err(prompt::Unread::Slow) => scr = None,
+            Err(prompt::Unread::Closed) => return,
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// `watch_startup`, con la bandeja ya retenida (`hold`, ver `AppState::launching`).
 async fn watch_held(
-    st: &AppState,
+    st: &Arc<AppState>,
     id: &str,
     window: Duration,
     hold: crate::inbox::Hold,
@@ -748,6 +847,9 @@ async fn watch_held(
         };
         // Mientras está, y al irse, el plazo empieza de nuevo.
         let trust = prompt::trust_screen(&text);
+        if trust && !trusting {
+            st.trust_waiting(id).await;
+        }
         if trust || trusting {
             deadline = (tokio::time::Instant::now() + window)
                 .min(cap)
@@ -974,6 +1076,8 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
         crate::inbox::Refusal::NoServer => {
             eprintln!("nido: {name}: Claude no tiene el MCP de nido; queda sin channel")
         }
+        // Ya lo dijo `claude::channels_supported`, una vez por programa.
+        crate::inbox::Refusal::OldClaude => {}
         crate::inbox::Refusal::NoClaude => eprintln!(
             "nido: {name} ({id}): su Claude ya no está en marcha; queda sin channel hasta que se \
              vuelva a lanzar"
@@ -1251,6 +1355,29 @@ impl AppState {
             AlertKind::Requested => return None,
         };
         Some((v.name.clone(), body, badge))
+    }
+
+    /// La sesión `id` espera a que el usuario confíe en su carpeta (la pregunta de Claude al
+    /// arrancar). Si la abrió otra sesión con `open`, eso solo lo puede hacer el usuario (ni nido
+    /// ni su madre: `answer` se niega): se le avisa con una alerta (la 🔔 y un push), aunque viva su
+    /// madre, una vez por arranque.
+    pub(crate) async fn trust_waiting(self: &Arc<Self>, id: &str) {
+        let Some(s) = self.registry.lock().await.get(id).cloned() else {
+            return;
+        };
+        if s.opened_by.is_none()
+            || !self
+                .trust_told
+                .lock()
+                .expect("confianza")
+                .insert(id.to_owned())
+        {
+            return;
+        }
+        let text = format!("Espera a que confíes en la carpeta {}", s.cwd.display());
+        if let Some(text) = alert_text(&text) {
+            let _ = self.session_alert(id, &text).await;
+        }
     }
 
     /// Quiere decir algo al usuario que, de una sesión abierta con `open`, es para su madre
@@ -3603,5 +3730,34 @@ mod tests {
         // El corte puede dejar un espacio al final: fuera también.
         let cut = format!("{} {}", "a".repeat(499), "b".repeat(10));
         assert_eq!(alert_text(&cut), Some("a".repeat(499)));
+    }
+
+    #[test]
+    fn alert_text_has_no_control_characters() {
+        // Saltos de línea y tabuladores, sí.
+        assert_eq!(alert_text("uno\n\tdos"), Some("uno\n\tdos".to_owned()));
+        // Colores, títulos de ventana (OSC con BEL o con ST), cursor, borrar pantalla: fuera
+        // enteros, sin dejar restos.
+        assert_eq!(
+            alert_text("\u{1b}[1;31mrojo\u{1b}[0m y \u{1b}]0;título\u{7}nada"),
+            Some("rojo y nada".to_owned())
+        );
+        assert_eq!(
+            alert_text("a\u{1b}]8;;https://x\u{1b}\\enlace\u{1b}]8;;\u{1b}\\b"),
+            Some("aenlaceb".to_owned())
+        );
+        assert_eq!(
+            alert_text("\u{1b}[2J\u{1b}[H\u{1b}7hola\u{1b}8"),
+            Some("hola".to_owned())
+        );
+        // Otros C0, DEL y C1 (también el CSI de un byte).
+        assert_eq!(
+            alert_text("a\u{0}b\u{7}c\rd\u{7f}e\u{85}f\u{9b}31mg"),
+            Some("abcdef31mg".to_owned())
+        );
+        // Solo control: vacía.
+        assert_eq!(alert_text("\u{1b}[0m\u{7}"), None);
+        // Un ESC suelto al final no rompe nada.
+        assert_eq!(alert_text("fin\u{1b}"), Some("fin".to_owned()));
     }
 }

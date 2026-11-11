@@ -71,6 +71,9 @@ pub enum Refusal {
     /// Su Claude se fue sin haber enseñado su caja y la sesión sigue (p. ej. una shell de login
     /// que no le hace `exec`): nadie recogerá su bandeja.
     NoClaude,
+    /// Su Claude Code es anterior a los channels (ver `claude::channels_supported`): se lanzó sin
+    /// el MCP de nido.
+    OldClaude,
 }
 
 impl Refusal {
@@ -80,6 +83,7 @@ impl Refusal {
             Refusal::NoServer => "no nido MCP server",
             Refusal::Blocked => "blocked by org policy",
             Refusal::NoClaude => "claude not running",
+            Refusal::OldClaude => "claude too old for channels",
         }
     }
 }

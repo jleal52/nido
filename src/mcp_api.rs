@@ -53,9 +53,10 @@ pub const WAIT_MAX_S: u64 = 1800;
 pub const MAX_PROMPT: usize = 24 * 1024;
 /// Lo más largo que puede ser el modelo de `open` (en caracteres).
 pub const MAX_MODEL: usize = 128;
-/// Cuántas sesiones abiertas con `open` desde un mismo equipo puede haber aquí en marcha a la vez,
-/// y apuntadas (en marcha o no): un equipo del grupo no llena este de Claudes. Las paradas cuentan
-/// solo para el segundo tope, más holgado: las huérfanas no dejan fuera al equipo.
+/// Cuántas sesiones abiertas con `open` desde un mismo equipo (este también) puede haber aquí en
+/// marcha a la vez, y apuntadas (en marcha o no): un equipo del grupo no llena este de Claudes.
+/// Las paradas cuentan solo para el segundo tope, más holgado: las huérfanas no dejan fuera al
+/// equipo.
 pub const MAX_REMOTE_OPEN: usize = 10;
 pub const MAX_REMOTE_REGISTERED: usize = 50;
 
@@ -758,6 +759,10 @@ pub fn decide(d: &Dest) -> Result<Decision, Fail> {
             }
             inbox::Refusal::NoClaude => {
                 "esa sesión no admite mensajes (no tiene channel): su Claude no está en marcha"
+            }
+            inbox::Refusal::OldClaude => {
+                "esa sesión no admite mensajes (no tiene channel): su Claude Code es anterior a \
+                 los channels"
             }
         };
         return Err(fail(StatusCode::CONFLICT, msg));
@@ -2209,22 +2214,27 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
     }
     let opener = caller.address();
     let message = first_message(&caller.name, &caller.machine_name, &opener, a.prompt.trim());
-    let name = a.name.as_deref().map(str::trim).map(str::to_owned);
+    // Sin caracteres de control y con tope (`clean_name`); vacío, el de la carpeta.
+    let name = a.name.as_deref().map(clean_name).filter(|n| !n.is_empty());
     let created = {
         let mut reg = st.registry.lock().await;
-        if !caller.local {
-            let from = format!("{}/", caller.machine_key);
-            let alive = reg
-                .sessions()
-                .iter()
-                .filter(|s| s.opened_by.as_deref().is_some_and(|o| o.starts_with(&from)))
-                .map(|s| launch::is_alive(&st.paths, &s.id));
-            if !open_allowed(alive) {
-                return Err(fail(
-                    StatusCode::CONFLICT,
-                    "demasiadas sesiones abiertas desde ese equipo; cierra alguna",
-                ));
-            }
+        // Con tope también las de aquí (las abiertas con `open` desde este equipo, de cualquier
+        // sesión): una sesión desbocada no llena el equipo de Claudes.
+        let from = format!("{}/", caller.machine_key);
+        let alive = reg
+            .sessions()
+            .iter()
+            .filter(|s| s.opened_by.as_deref().is_some_and(|o| o.starts_with(&from)))
+            .map(|s| launch::is_alive(&st.paths, &s.id));
+        if !open_allowed(alive) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                if caller.local {
+                    "demasiadas sesiones abiertas con open en este equipo; cierra alguna"
+                } else {
+                    "demasiadas sesiones abiertas desde ese equipo; cierra alguna"
+                },
+            ));
         }
         let session = opened_session(&reg, cwd, name, model.as_deref(), &message, opener);
         reg.add(session).map_err(Fail::from)?
@@ -2241,11 +2251,54 @@ async fn tool_open(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
     server::wait_alive(st, &created.id).await;
     st.launched(&created.id, hold);
     st.refresh.notify_one();
+    let trust = waits_for_trust(st, &created.id).await;
     let Some(v) = view(st, &created.id).await else {
         return Err(fail(StatusCode::NOT_FOUND, "no existe esa sesión"));
     };
     let (state, _) = status_of(st, &v).await;
-    to_json(&entry(st, me, caller, &v, state))
+    let mut out = to_json(&entry(st, me, caller, &v, state))?;
+    if trust {
+        out["note"] = i18n::tr(&trust_note(&v.cwd)).into();
+    }
+    Ok(out)
+}
+
+/// Cuánto se mira la pantalla de una sesión recién abierta con `open` por si sale la pregunta de
+/// confiar en la carpeta: hasta que se queda quieta (dos veces igual), o este rato. En blanco
+/// (aún no ha pintado nada), solo `OPEN_LOOK_BLANK`: si sale luego, `answer` también lo dice.
+const OPEN_LOOK: Duration = Duration::from_secs(4);
+const OPEN_LOOK_BLANK: Duration = Duration::from_millis(1500);
+
+/// ¿Se ha quedado la sesión `id`, recién abierta, en la pregunta de confiar en su carpeta? Se
+/// mira su pantalla (ver `OPEN_LOOK`).
+async fn waits_for_trust(st: &AppState, id: &str) -> bool {
+    let start = Instant::now();
+    let mut last: Option<String> = None;
+    loop {
+        let screen = screen_of(st, id).await.unwrap_or_default();
+        if prompt::trust_screen(&screen) {
+            return true;
+        }
+        let blank = screen.trim().is_empty();
+        if !blank && last.as_deref() == Some(screen.as_str()) {
+            return false;
+        }
+        let limit = if blank { OPEN_LOOK_BLANK } else { OPEN_LOOK };
+        if start.elapsed() >= limit || !launch::is_alive(&st.paths, id) {
+            return false;
+        }
+        last = (!blank).then_some(screen);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Lo que se dice a la madre de una sesión en la pregunta de confiar en su carpeta.
+fn trust_note(cwd: &Path) -> String {
+    format!(
+        "la sesión espera a que el usuario confíe en la carpeta {}; solo el usuario puede \
+         hacerlo (ya se le ha avisado)",
+        cwd.display()
+    )
 }
 
 /// La sesión que apunta `open` en el registro (sin arrancarla): con el nombre pedido o uno libre
@@ -2311,6 +2364,11 @@ async fn tool_answer(st: &AppState, me: &Machine, caller: &Caller, args: Value) 
         .screen()
         .await
         .map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    // Confiar en la carpeta es siempre del usuario (a él se le avisa: ver
+    // `AppState::trust_waiting`).
+    if prompt::trust_screen(&screen) {
+        return Err(fail(StatusCode::FORBIDDEN, trust_note(&s.cwd)));
+    }
     let Some(menu) = prompt::parse(&screen) else {
         return Err(fail(
             StatusCode::CONFLICT,
@@ -3819,13 +3877,13 @@ mod tests {
         for model in [Some("haiku"), None] {
             let plain = open_argv("web", "sid-1", model, &msg);
             let with = claude::with_nido_mcp(&plain, true);
-            assert_eq!(values(&with, "--allowedTools"), ["mcp__nido__*"]);
+            assert_eq!(values(&with, "--allowedTools"), claude::NIDO_TOOLS);
             assert_eq!(
                 values(&with, "--dangerously-load-development-channels"),
                 ["server:nido"]
             );
             assert_eq!(with.last(), Some(&msg));
-            assert_eq!(with.len(), plain.len() + 4, "{with:?}");
+            assert_eq!(with.len(), plain.len() + 7, "{with:?}");
             assert_eq!(claude::extra_args(&with), claude::extra_args(&plain));
         }
         assert_eq!(

@@ -992,7 +992,9 @@ fn mcp_switch(paths: &Paths, action: McpCmd) -> io::Result<()> {
     } else {
         println!(
             "MCP de nido apagado: las próximas sesiones de Claude arrancarán sin él (las que ya \
-             están en marcha siguen igual)."
+             están en marcha siguen igual).\n\
+             Sigue registrado en Claude; para quitarlo también: claude mcp remove -s user nido \
+             (y en cada perfil: CLAUDE_CONFIG_DIR=<perfil> claude mcp remove -s user nido)."
         );
     }
     Ok(())

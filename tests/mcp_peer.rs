@@ -377,7 +377,7 @@ async fn peer_calls_end_to_end() {
         failed(ask(&state, &mac, "open", open_one.clone()).await),
         too_many
     );
-    // Las de aquí no tienen ese tope.
+    // Las de aquí llevan su propia cuenta: las del Mac no las dejan fuera.
     let (code, local_one) = tool(
         addr,
         &local,
@@ -386,6 +386,17 @@ async fn peer_calls_end_to_end() {
     )
     .await;
     assert_eq!(code, 200, "{local_one}");
+    // Cómo se apuntan las de aquí («<este equipo>/»), para rellenar luego.
+    let here_prefix = {
+        let reg = state.registry.lock().await;
+        let by = reg
+            .get(local_one["id"].as_str().unwrap())
+            .unwrap()
+            .opened_by
+            .clone()
+            .unwrap();
+        format!("{}/", by.rsplit_once('/').unwrap().0)
+    };
     let (code, _) = tool(addr, &local, "close", json!({"session": local_one["id"]})).await;
     assert_eq!(code, 200);
     // Cerrada una, vuelve a haber sitio.
@@ -424,6 +435,35 @@ async fn peer_calls_end_to_end() {
         .unwrap();
     let o = ok(ask(&state, &mac, "open", open_one.clone()).await);
     ok(ask(&state, &mac, "close", p(json!({"session": o["id"]}))).await);
+    {
+        let mut reg = state.registry.lock().await;
+        for id in &filler {
+            reg.remove(id).unwrap();
+        }
+    }
+    // Las de aquí también tienen tope: con 50 apuntadas desde este equipo, no se abre otra.
+    let filler: Vec<String> = {
+        let mut reg = state.registry.lock().await;
+        (0..50)
+            .map(|i| {
+                let mut s = session(&format!("aqui-{i}"), tmp.path(), None);
+                s.opened_by = Some(format!("{here_prefix}zz{i}"));
+                reg.add(s).unwrap().id
+            })
+            .collect()
+    };
+    let (code, e) = tool(
+        addr,
+        &local,
+        "open",
+        json!({"machine": "Prueba", "folder": limited, "prompt": "x"}),
+    )
+    .await;
+    assert_eq!(code, 409, "{e}");
+    assert_eq!(
+        e["error"], "too many sessions opened with open on this machine; close some",
+        "{e}"
+    );
     {
         let mut reg = state.registry.lock().await;
         for id in &filler {

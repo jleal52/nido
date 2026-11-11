@@ -94,7 +94,9 @@ impl PeerReplays {
     /// La apunta y dice si es la primera vez que llega. Al apuntar, fuera las ya caducadas.
     pub fn first_time(&self, ephemeral: &[u8], now: Instant) -> bool {
         let mut seen = self.seen.lock().expect("peticiones");
-        seen.retain(|_, at| now.saturating_duration_since(*at) < PEER_REPLAY);
+        // Justo en el borde aún se recuerda: la hora de la petición (±`PEER_SKEW_MS`) la deja
+        // pasar hasta entonces.
+        seen.retain(|_, at| now.saturating_duration_since(*at) <= PEER_REPLAY);
         if seen.contains_key(ephemeral) {
             return false;
         }
@@ -1801,6 +1803,10 @@ mod tests {
         let t0 = Instant::now();
         assert!(r.first_time(&[1; 32], t0));
         assert!(!r.first_time(&[1; 32], t0 + Duration::from_secs(119)));
+        assert!(
+            !r.first_time(&[1; 32], t0 + PEER_REPLAY),
+            "en el borde, aún"
+        );
         assert!(r.first_time(&[2; 32], t0 + Duration::from_secs(1)));
         // Pasados los 120 s se olvida (ya lo rechaza la hora de la petición).
         assert!(r.first_time(&[3; 32], t0 + Duration::from_millis(120_500)));

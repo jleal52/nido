@@ -273,6 +273,10 @@ const TABLE: &[(&str, &str)] = &[
         "you can only close sessions you opened",
     ),
     (
+        "la sesión espera a que el usuario confíe en la carpeta {}; solo el usuario puede hacerlo (ya se le ha avisado)",
+        "the session is waiting for the user to trust the folder {0}; only the user can do that (they have been told)",
+    ),
+    (
         "falta la opción o el texto",
         "the option or the text is missing",
     ),
@@ -319,6 +323,10 @@ const TABLE: &[(&str, &str)] = &[
         "demasiadas sesiones abiertas desde ese equipo; cierra alguna",
         "too many sessions opened from that machine; close some",
     ),
+    (
+        "demasiadas sesiones abiertas con open en este equipo; cierra alguna",
+        "too many sessions opened with open on this machine; close some",
+    ),
     // server.rs (canal «peer»)
     (
         "«{}» no es ningún equipo del grupo",
@@ -343,6 +351,10 @@ const TABLE: &[(&str, &str)] = &[
     (
         "esa sesión no admite mensajes (no tiene channel): su Claude no está en marcha",
         "this session does not accept messages (no channel): its Claude is not running",
+    ),
+    (
+        "esa sesión no admite mensajes (no tiene channel): su Claude Code es anterior a los channels",
+        "this session does not accept messages (no channel): its Claude Code predates channels",
     ),
     (
         "la bandeja de esa sesión está llena",

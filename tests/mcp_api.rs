@@ -517,16 +517,19 @@ async fn mcp_api_end_to_end() {
         .collect();
     let from = args.iter().position(|a| a == "claude").expect("claude");
     let argv = &args[from..];
-    // Con el MCP de nido delante de las opciones: tras `mcp__nido__*` viene una opción y el
-    // mensaje no se toma por otra herramienta permitida.
+    // Con el MCP de nido delante de las opciones: tras las herramientas permitidas viene una
+    // opción y el mensaje no se toma por otra. `open`, `answer` y `close` no van: piden permiso.
     assert_eq!(
-        &argv[..6],
+        &argv[..9],
         [
             "claude",
             "--dangerously-load-development-channels",
             "server:nido",
             "--allowedTools",
-            "mcp__nido__*",
+            "mcp__nido__sessions",
+            "mcp__nido__read",
+            "mcp__nido__send",
+            "mcp__nido__alert",
             "--session-id"
         ]
     );

@@ -404,11 +404,23 @@ pub fn is_claude(argv: &[String]) -> bool {
 }
 
 /// El channel de nido en Claude: cargarlo (es de desarrollo: Claude pregunta al arrancar) y que
-/// sus herramientas no pidan permiso.
+/// algunas de sus herramientas no pidan permiso.
 const CHANNELS_OPT: &str = "--dangerously-load-development-channels";
 const NIDO_CHANNEL: &str = "server:nido";
 const ALLOWED_OPTS: [&str; 2] = ["--allowedTools", "--allowed-tools"];
-const NIDO_TOOLS: &str = "mcp__nido__*";
+/// Las herramientas de nido que no piden permiso: las que miran y hablan. Las que actúan sobre
+/// otras sesiones (`open`, `answer`, `close`) pasan por el permiso de Claude como cualquier otra
+/// (en modo auto, lo decide su clasificador): una sesión engañada (un mensaje con instrucciones
+/// metidas) no puede abrir sesiones ni aprobar sus preguntas sin que nadie lo vea.
+pub const NIDO_TOOLS: [&str; 4] = [
+    "mcp__nido__sessions",
+    "mcp__nido__read",
+    "mcp__nido__send",
+    "mcp__nido__alert",
+];
+/// Lo que ponía nido antes: todas sus herramientas sin permiso. Si viene en una orden (de una
+/// sesión de entonces), sale.
+const OLD_NIDO_TOOLS: &str = "mcp__nido__*";
 
 /// Los valores que lleva la opción `names` en `argv`, como los lee Claude (commander): con `=`,
 /// uno; si no, todo lo que la sigue hasta la siguiente opción.
@@ -436,7 +448,8 @@ fn option_values<'a>(argv: &'a [String], names: &[&str]) -> Vec<&'a str> {
 }
 
 /// La orden de una sesión de Claude con el MCP de nido (si `on`, el MCP está encendido en este
-/// equipo): el channel y sus herramientas sin pedir permiso, si no están ya.
+/// equipo): el channel y sus herramientas que no piden permiso (`NIDO_TOOLS`), si no están ya.
+/// Todas las de nido sin permiso (`mcp__nido__*`, como iba antes), fuera.
 ///
 /// Las dos opciones admiten varios valores: lo que las sigue, hasta la siguiente opción, es
 /// suyo. Por eso van delante de la primera opción (justo tras el programa, en las órdenes de
@@ -445,12 +458,20 @@ pub fn with_nido_mcp(argv: &[String], on: bool) -> Vec<String> {
     if !on || !is_claude(argv) {
         return argv.to_vec();
     }
+    let argv = &without_old_tools(argv);
     let mut add: Vec<String> = Vec::new();
     if !option_values(argv, &[CHANNELS_OPT]).contains(&NIDO_CHANNEL) {
         add.extend([CHANNELS_OPT.to_owned(), NIDO_CHANNEL.to_owned()]);
     }
-    if !option_values(argv, &ALLOWED_OPTS).contains(&NIDO_TOOLS) {
-        add.extend([ALLOWED_OPTS[0].to_owned(), NIDO_TOOLS.to_owned()]);
+    let allowed = option_values(argv, &ALLOWED_OPTS);
+    let missing: Vec<String> = NIDO_TOOLS
+        .iter()
+        .filter(|t| !allowed.contains(t))
+        .map(|t| (*t).to_owned())
+        .collect();
+    if !missing.is_empty() {
+        add.push(ALLOWED_OPTS[0].to_owned());
+        add.extend(missing);
     }
     if add.is_empty() {
         return argv.to_vec();
@@ -475,6 +496,97 @@ pub fn with_nido_mcp(argv: &[String], on: bool) -> Vec<String> {
     out
 }
 
+/// La primera versión de Claude Code con channels (`--channels` y
+/// `--dangerously-load-development-channels`, en vista previa). No sale en `claude --help`
+/// (están ocultas mientras dure la vista previa), así que se mira la versión. Un Claude más
+/// antiguo no conoce esas opciones y no arranca con ellas.
+pub const CHANNELS_SINCE: (u32, u32, u32) = (2, 1, 80);
+
+/// La versión de `claude --version` («2.1.322 (Claude Code)»).
+pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let word = text.split_whitespace().next()?;
+    let mut n = word.split('.').map(|p| p.parse::<u32>().ok());
+    let v = (n.next()??, n.next()??, n.next()??);
+    n.next().is_none().then_some(v)
+}
+
+/// ¿Conoce el `claude` de `program` las opciones del channel (ver `CHANNELS_SINCE`)? Se le
+/// pregunta la versión una vez por programa: por su ruta de verdad (sin enlaces) y su fecha de
+/// modificación, que cambian al actualizarlo. `None`: no se sabe (no contesta, o no dice una
+/// versión), y se lanza con ellas como siempre. La primera vez que no, se dice en el log.
+pub fn channels_supported(program: &Path) -> Option<bool> {
+    use std::sync::{Mutex, OnceLock};
+    type Seen = HashMap<(PathBuf, std::time::SystemTime), Option<bool>>;
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let real = std::fs::canonicalize(program).ok()?;
+    let modified = std::fs::metadata(&real).and_then(|m| m.modified()).ok()?;
+    let key = (real, modified);
+    let seen = SEEN.get_or_init(Mutex::default);
+    if let Some(known) = seen.lock().expect("versiones").get(&key) {
+        return *known;
+    }
+    let cli = Program {
+        path: program.to_owned(),
+        home: None,
+        cwd: Some(std::env::temp_dir()),
+    };
+    let version = cli
+        .run(None, &["--version"])
+        .ok()
+        .filter(|(ok, _)| *ok)
+        .and_then(|(_, text)| parse_version(&text));
+    let supported = version.map(|v| v >= CHANNELS_SINCE);
+    if let (Some(false), Some((a, b, c))) = (supported, version) {
+        let (x, y, z) = CHANNELS_SINCE;
+        eprintln!(
+            "nido: {} es Claude Code {a}.{b}.{c}, sin channels (hacen falta la {x}.{y}.{z} o \
+             más): sus sesiones se lanzan sin el MCP de nido",
+            program.display()
+        );
+    }
+    seen.lock().expect("versiones").insert(key, supported);
+    supported
+}
+
+/// `argv` sin `mcp__nido__*` en `--allowedTools` (ni la opción, si solo llevaba ese).
+fn without_old_tools(argv: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if i > 0 && a == "--" {
+            out.extend_from_slice(&argv[i..]);
+            break;
+        }
+        if i > 0
+            && let Some((opt, value)) = a.split_once('=')
+            && ALLOWED_OPTS.contains(&opt)
+            && value == OLD_NIDO_TOOLS
+        {
+            i += 1;
+            continue;
+        }
+        if i > 0 && ALLOWED_OPTS.contains(&a) {
+            let mut values = Vec::new();
+            while let Some(v) = argv.get(i + 1).filter(|v| !v.starts_with('-')) {
+                values.push(v.clone());
+                i += 1;
+            }
+            let had = !values.is_empty();
+            values.retain(|v| v != OLD_NIDO_TOOLS);
+            if !had || !values.is_empty() {
+                out.push(a.to_owned());
+                out.extend(values);
+            }
+            i += 1;
+            continue;
+        }
+        out.push(a.to_owned());
+        i += 1;
+    }
+    out
+}
+
 /// Las opciones propias con las que se lanzó `claude` (`--model haiku`, `--mcp-config x`…), para
 /// conservarlas al retomar. Fuera las que eligen la conversación o el nombre (al retomar las pone
 /// nido), las del MCP de nido (las pone en cada arranque) y lo que no es una opción (el mensaje
@@ -489,7 +601,8 @@ pub fn extra_args(argv: &[String]) -> Vec<String> {
     // El valor que pone nido en cada arranque: ese sale, los demás de la opción se quedan.
     let nido_value = |opt: &str, value: &str| {
         (opt == CHANNELS_OPT && value == NIDO_CHANNEL)
-            || (ALLOWED_OPTS.contains(&opt) && value == NIDO_TOOLS)
+            || (ALLOWED_OPTS.contains(&opt)
+                && (NIDO_TOOLS.contains(&value) || value == OLD_NIDO_TOOLS))
     };
     let mut out = Vec::new();
     let mut i = 1;
@@ -1000,12 +1113,16 @@ mod tests {
         a.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Las cuatro de nido, como van en la orden.
-    const FLAGS: [&str; 4] = [
+    /// Las de nido, como van en la orden: el channel y las herramientas que no piden permiso
+    /// (las que miran y hablan; `open`, `answer` y `close` no).
+    const FLAGS: [&str; 7] = [
         "--dangerously-load-development-channels",
         "server:nido",
         "--allowedTools",
-        "mcp__nido__*",
+        "mcp__nido__sessions",
+        "mcp__nido__read",
+        "mcp__nido__send",
+        "mcp__nido__alert",
     ];
 
     fn flagged(program: &str, rest: &[&str]) -> Vec<String> {
@@ -1017,7 +1134,7 @@ mod tests {
 
     #[test]
     fn claude_gets_the_nido_mcp_flags_right_after_the_program() {
-        // Nueva: antes de `--session-id`, para que tras `mcp__nido__*` venga una opción.
+        // Nueva: antes de `--session-id`, para que tras las herramientas venga una opción.
         assert_eq!(
             with_nido_mcp(&new_argv("p", "u-1"), true),
             flagged("claude", &["--session-id", "u-1", "-n", "p"])
@@ -1049,23 +1166,28 @@ mod tests {
             flagged("claude", &["--", "hola", "y adiós"])
         );
         // Un mensaje y luego opciones: delante de la primera opción.
+        let mut want = v(&["claude", "hola"]);
+        want.extend(FLAGS.iter().map(|s| s.to_string()));
+        want.extend(v(&["--model", "haiku"]));
         assert_eq!(
             with_nido_mcp(&v(&["claude", "hola", "--model", "haiku"]), true),
-            v(&[
-                "claude", "hola", FLAGS[0], FLAGS[1], FLAGS[2], FLAGS[3], "--model", "haiku"
-            ])
+            want
         );
-        // Sin repetirlas: ni las dos, ni la que ya esté (también con `=`).
+        // Sin repetirlas: ni el channel ni las herramientas que ya estén (también con `=`).
         let once = with_nido_mcp(&new_argv("p", "u-1"), true);
         assert_eq!(with_nido_mcp(&once, true), once);
-        let one = v(&["claude", "--allowedTools=mcp__nido__*", "-c"]);
+        let one = v(&["claude", "--allowedTools=mcp__nido__read", "-c"]);
         assert_eq!(
             with_nido_mcp(&one, true),
             v(&[
                 "claude",
                 FLAGS[0],
                 FLAGS[1],
-                "--allowedTools=mcp__nido__*",
+                FLAGS[2],
+                "mcp__nido__sessions",
+                "mcp__nido__send",
+                "mcp__nido__alert",
+                "--allowedTools=mcp__nido__read",
                 "-c"
             ])
         );
@@ -1076,9 +1198,34 @@ mod tests {
             "server:nido",
             "--allowed-tools",
             "Bash",
-            "mcp__nido__*",
+            "mcp__nido__sessions",
+            "mcp__nido__read",
+            "mcp__nido__send",
+            "mcp__nido__alert",
         ]);
         assert_eq!(with_nido_mcp(&theirs, true), theirs);
+        // Las de una orden de antes (todas sin permiso), fuera: con `=`, sola o con otras.
+        for old in [
+            v(&["claude", "--allowedTools=mcp__nido__*", "-c"]),
+            v(&["claude", "--allowedTools", "mcp__nido__*", "-c"]),
+        ] {
+            assert_eq!(
+                with_nido_mcp(&old, true),
+                flagged("claude", &["-c"]),
+                "{old:?}"
+            );
+        }
+        let mixed = v(&["claude", "--allowed-tools", "Bash", "mcp__nido__*", "-c"]);
+        assert_eq!(
+            with_nido_mcp(&mixed, true),
+            flagged("claude", &["--allowed-tools", "Bash", "-c"])
+        );
+        // Tras `--` es el mensaje: no se toca.
+        let said = v(&["claude", "-c", "--", "--allowedTools", "mcp__nido__*"]);
+        assert_eq!(
+            with_nido_mcp(&said, true),
+            flagged("claude", &["-c", "--", "--allowedTools", "mcp__nido__*"])
+        );
         // Apagado, u otro programa: tal cual.
         assert_eq!(
             with_nido_mcp(&new_argv("p", "u-1"), false),
@@ -1087,6 +1234,63 @@ mod tests {
         assert_eq!(with_nido_mcp(&v(&["npm", "run"]), true), v(&["npm", "run"]));
         assert_eq!(with_nido_mcp(&v(&["claudette"]), true), v(&["claudette"]));
         assert_eq!(with_nido_mcp(&[], true), Vec::<String>::new());
+    }
+
+    #[test]
+    fn claude_versions() {
+        assert_eq!(parse_version("2.1.322 (Claude Code)\n"), Some((2, 1, 322)));
+        assert_eq!(parse_version("2.1.80"), Some((2, 1, 80)));
+        for bad in ["", "Claude Code", "2.1", "2.1.x (Claude Code)", "2.1.3.4"] {
+            assert_eq!(parse_version(bad), None, "{bad}");
+        }
+        assert!((2, 1, 80) >= CHANNELS_SINCE && (2, 1, 79) < CHANNELS_SINCE);
+        assert!((3, 0, 0) >= CHANNELS_SINCE && (2, 0, 99) < CHANNELS_SINCE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn channels_only_with_a_claude_that_knows_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = |name: &str, out: &str| {
+            let p = tmp.path().join(name);
+            let runs = tmp.path().join(format!("{name}.runs"));
+            let script = format!(
+                "#!/bin/sh\necho \"{out}\"\necho x >> '{}'\n",
+                runs.display()
+            );
+            std::fs::write(&p, script).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let runs = |name: &str| {
+            std::fs::read_to_string(tmp.path().join(format!("{name}.runs")))
+                .map_or(0, |s| s.lines().count())
+        };
+        let new = fake("nuevo", "2.1.322 (Claude Code)");
+        let old = fake("viejo", "2.0.14 (Claude Code)");
+        let odd = fake("raro", "no sé");
+        assert_eq!(channels_supported(&new), Some(true));
+        assert_eq!(channels_supported(&old), Some(false));
+        assert_eq!(channels_supported(&odd), None, "sin versión: no se sabe");
+        assert_eq!(channels_supported(&tmp.path().join("no-existe")), None);
+        // Una vez por programa (también por un enlace a él).
+        let link = tmp.path().join("enlace");
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        assert_eq!(channels_supported(&old), Some(false));
+        assert_eq!(channels_supported(&link), Some(false));
+        assert_eq!(runs("viejo"), 1);
+        // Actualizado (otra fecha): se pregunta otra vez.
+        let new_old = fake("viejo", "2.1.90 (Claude Code)");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&new_old)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(channels_supported(&old), Some(true));
+        assert_eq!(runs("viejo"), 2);
     }
 
     #[test]
