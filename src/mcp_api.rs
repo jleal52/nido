@@ -2377,7 +2377,7 @@ async fn tool_answer(st: &AppState, me: &Machine, caller: &Caller, args: Value) 
     if a.option.is_none() && a.text.is_none() {
         return Err(fail(StatusCode::BAD_REQUEST, "falta la opción o el texto"));
     }
-    let _one = st.answering.lock().await;
+    let _one = st.turn(&s.id).await;
     let Ok(stream) = server::holder_connect(st, &s.id, viewer()).await else {
         return Err(fail(StatusCode::CONFLICT, "la sesión no está en marcha"));
     };

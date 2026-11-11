@@ -576,6 +576,50 @@ pub fn last_model(path: &Path) -> Option<(String, u64)> {
     }
 }
 
+/// Lo nuevo de la transcripción desde `from` (el principio de una línea): el modelo de la última
+/// respuesta en las líneas ya enteras (y dónde empieza esa línea), y dónde empieza lo que aún no
+/// es una línea entera (de ahí se sigue la próxima vez).
+pub fn models_since(path: &Path, from: u64) -> (Option<(String, u64)>, u64) {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (None, from);
+    };
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return (None, from);
+    }
+    let mut found = None;
+    let mut at = 0;
+    while let Some(i) = buf[at..].iter().position(|&b| b == b'\n') {
+        if let Some(model) = assistant_model(&buf[at..at + i]) {
+            found = Some((model, from + at as u64));
+        }
+        at += i + 1;
+    }
+    (found, from + at as u64)
+}
+
+/// Dónde acaba la última línea entera de los primeros `len` bytes (tras su `\n`): mirando hacia
+/// atrás desde el final, a trozos.
+pub fn whole_lines_end(path: &Path, len: u64) -> u64 {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return 0;
+    };
+    const CHUNK: u64 = 64 * 1024;
+    let mut end = len;
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let mut buf = vec![0; (end - start) as usize];
+        if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut buf).is_err() {
+            return 0;
+        }
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            return start + i as u64 + 1;
+        }
+        end = start;
+    }
+    0
+}
+
 fn assistant_model(line: &[u8]) -> Option<String> {
     // Antes de entender la línea, que diga algo de eso (las hay de megas).
     if !line.windows(11).any(|w| w == b"\"assistant\"") {
@@ -853,6 +897,39 @@ mod tests {
         std::fs::write(&path, &filler).unwrap();
         assert_eq!(last_model(&path), None);
         assert_eq!(last_model(&dir.path().join("no")), None);
+    }
+
+    #[test]
+    fn the_models_of_what_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let reply = |model: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "assistant", "message": {"model": model}})
+            )
+        };
+        let a = reply("claude-haiku-5-5");
+        let b = reply("claude-opus-5-5");
+        std::fs::write(&path, format!("{a}{b}{}", &a[..10])).unwrap();
+        let whole = (a.len() + b.len()) as u64;
+        assert_eq!(whole_lines_end(&path, whole + 10), whole);
+        assert_eq!(whole_lines_end(&path, 5), 0);
+        // Desde el principio: el último, y hasta donde las líneas están enteras.
+        assert_eq!(
+            models_since(&path, 0),
+            (Some(("claude-opus-5-5".to_owned(), a.len() as u64)), whole)
+        );
+        // Desde el final de las enteras: nada aún.
+        assert_eq!(models_since(&path, whole), (None, whole));
+        std::fs::write(&path, format!("{a}{b}{a}")).unwrap();
+        assert_eq!(
+            models_since(&path, whole),
+            (
+                Some(("claude-haiku-5-5".to_owned(), whole)),
+                whole + a.len() as u64
+            )
+        );
     }
 
     #[test]
