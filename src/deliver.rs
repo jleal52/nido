@@ -367,6 +367,34 @@ pub async fn api_secret_answer(
     }
 }
 
+/// `GET /api/v1/secrets`: los secretos recordados de este equipo, sin su valor.
+pub async fn api_secrets(State(st): State<Arc<AppState>>) -> Response {
+    Json(json!({ "secrets": st.secrets.list(now_ms()) })).into_response()
+}
+
+/// `DELETE /api/v1/secrets/{name}`: olvida uno (la próxima vez se pregunta).
+pub async fn api_forget_secret(
+    State(st): State<Arc<AppState>>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    if !secrets::valid_name(&name) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "nombre de secreto no válido: {name:?} (letras, números, «.», «_» o «-»; hasta 64)"
+            ),
+        );
+    }
+    match st.secrets.forget(&name) {
+        Ok(true) => Json(json!({ "ok": true })).into_response(),
+        Ok(false) => error(
+            StatusCode::NOT_FOUND,
+            format!("no hay ningún secreto recordado {name:?}"),
+        ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

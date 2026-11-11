@@ -118,6 +118,11 @@ enum Cmd {
     Ls,
     /// Las alertas de las sesiones que aún no has visto.
     Alerts,
+    /// Los secretos que recuerda este equipo (sin su valor); `forget` olvida uno.
+    Secrets {
+        #[command(subcommand)]
+        action: Option<SecretsCmd>,
+    },
     /// Emparejar un teléfono con la app de nido: enseña un QR para escanear (vale 10 minutos).
     Pair {
         /// Un código reutilizable durante estos días (máx. 90), para una demostración: quien lo
@@ -194,6 +199,12 @@ enum Cmd {
         #[command(subcommand)]
         action: ServiceCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum SecretsCmd {
+    /// Olvida un secreto recordado: la próxima vez que una sesión lo pida, se pregunta.
+    Forget { name: String },
 }
 
 #[derive(Subcommand)]
@@ -853,6 +864,30 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                 eprintln!("{w}");
             }
         }
+        Cmd::Secrets { action: None } => {
+            let v = api.call("GET", "/api/v1/secrets", None)?;
+            let now = nido::sys::local_time(registry::now_ms()).unwrap_or_default();
+            let lines = secret_lines(&v, now, |at| nido::sys::local_time(at).unwrap_or_default());
+            if lines.is_empty() {
+                println!("No hay secretos recordados.");
+            }
+            for l in lines {
+                println!("{l}");
+            }
+        }
+        Cmd::Secrets {
+            action: Some(SecretsCmd::Forget { name }),
+        } => {
+            // Los nombres válidos son `[A-Za-z0-9._-]`: van tal cual en la URL; con otra cosa, el
+            // gestor dice que no es válido.
+            if !nido::secrets::valid_name(&name) {
+                return Err(io::Error::other(format!(
+                    "nombre de secreto no válido: {name:?} (letras, números, «.», «_» o «-»; hasta 64)"
+                )));
+            }
+            api.call("DELETE", &format!("/api/v1/secrets/{name}"), None)?;
+            println!("Olvidado: {name}.");
+        }
         Cmd::New {
             name,
             cwd,
@@ -1248,6 +1283,32 @@ fn clock(at: LocalTime, now: LocalTime) -> String {
     }
 }
 
+/// Lo que enseña `nido secrets` de `GET /api/v1/secrets`: «nombre · hasta cuándo · quién lo
+/// pidió y cuándo».
+fn secret_lines(
+    v: &serde_json::Value,
+    now: LocalTime,
+    local_time: impl Fn(u64) -> LocalTime,
+) -> Vec<String> {
+    v["secrets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| {
+            let until = match s["expires"].as_u64() {
+                None => "siempre".to_owned(),
+                Some(t) => format!("hasta las {}", clock(local_time(t), now)),
+            };
+            let at = clock(local_time(s["at"].as_u64().unwrap_or(0)), now);
+            format!(
+                "{} · {until} · lo pidió {} a las {at}",
+                s["name"].as_str().unwrap_or("?"),
+                s["by"].as_str().unwrap_or("?")
+            )
+        })
+        .collect()
+}
+
 /// Una línea de `nido alerts`: «equipo · sesión · hora · texto» (sin equipo, si no se sabe).
 fn alert_line(
     machine: Option<&str>,
@@ -1388,6 +1449,27 @@ mod tests {
         );
         let (lines, warnings) = alert_lines(&serde_json::json!({"alerts": []}), now, |_| now);
         assert!(lines.is_empty() && warnings.is_empty());
+    }
+
+    #[test]
+    fn remembered_secrets_list() {
+        let now = t(2026, 11, 11, 18, 0);
+        let v = serde_json::json!({"secrets": [
+            {"name": "gh", "expires": null, "by": "api", "at": 2},
+            {"name": "npm", "expires": 5, "by": "web, api", "at": 3},
+        ]});
+        let lines = secret_lines(&v, now, |at| LocalTime {
+            hour: at as u32,
+            ..now
+        });
+        assert_eq!(
+            lines,
+            [
+                "gh · siempre · lo pidió api a las 02:00",
+                "npm · hasta las 05:00 · lo pidió web, api a las 03:00",
+            ]
+        );
+        assert!(secret_lines(&serde_json::json!({"secrets": []}), now, |_| now).is_empty());
     }
 
     #[test]

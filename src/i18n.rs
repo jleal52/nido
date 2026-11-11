@@ -815,6 +815,10 @@ const TABLE: &[(&str, &str)] = &[
         "ese secreto ya no espera respuesta",
         "that secret is no longer waiting for an answer",
     ),
+    (
+        "no hay ningún secreto recordado {}",
+        "there is no remembered secret {0}",
+    ),
 ];
 
 #[cfg(test)]

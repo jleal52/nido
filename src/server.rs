@@ -2060,6 +2060,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/sessions/{id}/secret",
             post(crate::deliver::api_secret_answer),
         )
+        .route("/api/v1/secrets", get(crate::deliver::api_secrets))
+        .route(
+            "/api/v1/secrets/{name}",
+            axum::routing::delete(crate::deliver::api_forget_secret),
+        )
         .route("/api/v1/sessions/{id}/answer", post(api_answer))
         .route("/api/v1/sessions/{id}/stop", post(api_stop))
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
