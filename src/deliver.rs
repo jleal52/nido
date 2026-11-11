@@ -77,6 +77,7 @@ pub(crate) async fn tool_clipboard(st: &Arc<AppState>, caller: &Session, args: V
             )
         })?
     };
+    forget_if_gone(st, std::slice::from_ref(&caller.id)).await;
     st.session_note(
         &caller.id,
         Some(NoteKind::Clipboard),
@@ -101,6 +102,7 @@ pub(crate) async fn tool_send_file(st: &Arc<AppState>, caller: &Session, args: V
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(send_fail)?
     };
+    forget_if_gone(st, std::slice::from_ref(&caller.id)).await;
     st.session_note(
         &caller.id,
         Some(NoteKind::File),
@@ -110,6 +112,30 @@ pub(crate) async fn tool_send_file(st: &Arc<AppState>, caller: &Session, args: V
     .await
     .map_err(Fail::from)?;
     Ok(json!({ "status": "sent", "name": item.name, "size": item.size }))
+}
+
+/// Lo de las sesiones `ids` que se borraron mientras se guardaba algo suyo (secretos y envíos),
+/// fuera. `delete_session` las quita del registro antes de borrar lo suyo: o lo borra él o lo ve
+/// aquí.
+async fn forget_if_gone(st: &Arc<AppState>, ids: &[String]) {
+    let gone: Vec<String> = {
+        let reg = st.registry.lock().await;
+        ids.iter()
+            .filter(|id| reg.get(id).is_none())
+            .cloned()
+            .collect()
+    };
+    if gone.is_empty() {
+        return;
+    }
+    let st = st.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        for id in gone {
+            st.secrets.forget_session(&id);
+            st.outbox.forget(&id);
+        }
+    })
+    .await;
 }
 
 /// El error de `send_file`: lo que no se puede mandar, 400; no poder guardar la copia, 500.
@@ -445,6 +471,7 @@ async fn save_answer(
     .await;
     match saved {
         Ok(Ok(paths)) => {
+            forget_if_gone(&st, &taken.sessions).await;
             taken.finish(Outcome::Saved(paths));
             Ok(())
         }
@@ -534,6 +561,36 @@ mod tests {
             .unwrap()
             .token;
         (st, id, token)
+    }
+
+    /// Si la sesión se borra mientras se guarda lo que contestó el usuario, no queda nada suyo
+    /// (`delete_session` ya pasó y no lo volvería a mirar).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_for_a_session_deleted_meanwhile_leaves_nothing() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, id, _) = nido_in(tmp.path()).await;
+        let (_waiter, _) = st.asks.join("tok", "x", &id, 1).unwrap();
+        let ask = st.asks.view_for(&id).unwrap().id;
+        let taken = st.asks.take(&ask, &id).unwrap();
+        st.registry.lock().await.remove(&id).unwrap();
+        save_answer(st.clone(), taken, "v".into(), Remember::No)
+            .await
+            .unwrap();
+        assert!(!st.secrets.dir().join("sesiones").join(&id).exists());
+    }
+
+    /// Lo mismo con un envío: si la sesión ya no está, su copia tampoco.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_for_a_session_deleted_meanwhile_leaves_nothing() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, id, _) = nido_in(tmp.path()).await;
+        let caller = st.registry.lock().await.remove(&id).unwrap();
+        let _ = tool_clipboard(&st, &caller, json!({"text": "hola"})).await;
+        std::fs::write(tmp.path().join("f.txt"), "hola").unwrap();
+        let _ = tool_send_file(&st, &caller, json!({"path": "f.txt"})).await;
+        assert!(!tmp.path().join("state/outbox").join(&id).exists());
     }
 
     /// Si se corta la petición de quien contesta mientras se guarda, se guarda igual y la sesión
