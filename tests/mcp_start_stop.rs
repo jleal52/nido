@@ -255,12 +255,24 @@ async fn start_and_stop_end_to_end() {
     }
     assert!(gone);
     assert!(state.registry.lock().await.get(&other).unwrap().autostart);
+    // Y su pidfile se quedó viejo: el número es ya de otro proceso, que no se toca.
+    let mut stranger = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    std::fs::write(paths.pidfile(&other), stranger.id().to_string()).unwrap();
     let (code, r) = tool(addr, me, "stop", json!({"session": other})).await;
     assert_eq!(
         (code, r["note"].as_str()),
         (200, Some("it was already stopped"))
     );
     assert!(!state.registry.lock().await.get(&other).unwrap().autostart);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let untouched = stranger.try_wait().unwrap().is_none();
+    let _ = stranger.kill();
+    let _ = stranger.wait();
+    let _ = std::fs::remove_file(paths.pidfile(&other));
+    assert!(untouched, "stop mató a un proceso que no era de nido");
 
     // Una que no existe, o que no es de Claude: no.
     let (code, _) = tool(addr, me, "start", json!({"session": "ffffffff"})).await;

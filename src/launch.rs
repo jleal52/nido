@@ -274,7 +274,28 @@ pub fn holder_id(paths: &Paths, id: &str) -> Option<HolderId> {
 pub fn holder_running(paths: &Paths, id: &str) -> bool {
     holder_pid(paths, id)
         .and_then(|p| u32::try_from(p).ok())
-        .is_some_and(crate::sys::pid_alive)
+        .is_some_and(|p| crate::sys::pid_alive(p) && is_nido(p))
+}
+
+/// ¿Es `pid` un proceso de nido? El pidfile puede ser viejo (un guardián que murió sin
+/// borrarlo) y su número, de otro proceso que lo heredó: se mira el nombre (`nido`, o el del
+/// ejecutable con el que se lanzan los guardianes).
+fn is_nido(pid: u32) -> bool {
+    let Some(comm) = crate::claude::Procfs::default().comm(pid) else {
+        return false;
+    };
+    let exe = nido_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+    std::iter::once("nido".to_owned())
+        .chain(exe)
+        .any(|n| same_name(&comm, &n))
+}
+
+/// El nombre de un proceso (`comm`) es `name`. Linux lo corta a 15 caracteres.
+fn same_name(comm: &str, name: &str) -> bool {
+    comm.eq_ignore_ascii_case(name)
+        || (comm.len() == 15 && name.len() > 15 && name.starts_with(comm))
 }
 
 /// Para la sesión: SIGTERM al guardián (cuelga al proceso; si no termina, SIGKILL a los 5 s). En
@@ -290,10 +311,9 @@ pub fn stop(paths: &Paths, launcher: Launcher, id: &str) -> io::Result<()> {
         return Ok(());
     }
     if let Some(pid) = holder_pid(paths, id).and_then(|p| u32::try_from(p).ok()) {
-        // En Windows se termina el árbol entero: que el pid (de un fichero que puede ser viejo)
-        // sea de verdad un nido y no otro proceso que heredó el número.
-        #[cfg(windows)]
-        if !crate::sys::win::comm(pid).is_some_and(|n| n.eq_ignore_ascii_case("nido")) {
+        // Que el pid (de un fichero que puede ser viejo) sea de verdad un nido y no otro proceso
+        // que heredó el número. En Windows, además, se termina el árbol entero.
+        if !is_nido(pid) {
             return Ok(());
         }
         crate::sys::terminate(pid);
@@ -601,6 +621,37 @@ mod tests {
         let cfg = holder_config(&p, &claude_session(true), 80, 24);
         assert!(!cfg.channel);
         assert!(cfg.argv.ends_with(&["bash".to_string()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_leaves_alone_a_process_that_only_inherited_the_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let id = "abcd1234";
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        std::fs::create_dir_all(p.pidfile(id).parent().unwrap()).unwrap();
+        std::fs::write(p.pidfile(id), stranger.id().to_string()).unwrap();
+        assert!(!holder_running(&p, id), "no es un guardián");
+        stop(&p, Launcher::Detached, id).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let untouched = stranger.try_wait().unwrap().is_none();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert!(untouched, "stop mató a un proceso que no era de nido");
+    }
+
+    #[test]
+    fn holder_names() {
+        assert!(same_name("nido", "nido"));
+        assert!(same_name("NIDO", "nido"));
+        // Linux corta el nombre a 15 caracteres.
+        assert!(same_name("nido-e5e0c9510a", "nido-e5e0c9510a0ddd90"));
+        assert!(!same_name("sleep", "nido"));
+        assert!(!same_name("nid", "nido"));
     }
 
     #[test]

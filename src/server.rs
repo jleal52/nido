@@ -2541,7 +2541,7 @@ async fn api_alert(
 
 /// Arrancarla o pararla a mano decide si vuelve a arrancar al reiniciar el equipo o nido: se
 /// queda como la dejaste.
-async fn remember_running(st: &AppState, id: &str, running: bool) {
+pub(crate) async fn remember_running(st: &AppState, id: &str, running: bool) {
     let mut reg = st.registry.lock().await;
     if reg.get(id).is_some_and(|s| s.autostart != running)
         && let Err(e) = reg.update(id, |s| s.autostart = running)
