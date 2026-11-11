@@ -251,6 +251,9 @@ Solo se atiende en este equipo (`127.0.0.1`), con `Authorization: Bearer <token>
 cifrado). Desde fuera de este equipo solo responde el canal cifrado (`/api/v1/e2e`). Los mensajes
 van en inglés, o en español si la petición lo pide con `Accept-Language: es`.
 
+`DELETE /api/v1/phones/me`: el teléfono o el navegador emparejado que la llama se da de baja en
+todos los equipos del grupo (el «Cerrar sesión» de la web).
+
 ## Instalar
 
 Hay ejecutables para Linux (x86_64 y ARM64), macOS (Apple Silicon e Intel) y Windows (x86_64) en

@@ -308,6 +308,11 @@ impl Group {
             .map(|d| d.name.clone())
     }
 
+    /// ¿Está autorizado en el grupo (y no dado de baja)?
+    pub fn has_device(&self, key: &[u8]) -> bool {
+        self.snapshot().device(&B64.encode(key)).is_some()
+    }
+
     /// Los dispositivos dados de baja en el grupo (para quitarlos también de este equipo).
     pub fn removed_devices(&self) -> Vec<String> {
         self.snapshot()
@@ -469,6 +474,20 @@ mod tests {
             devices: vec![device("iphone", 40, false)]
         }));
         assert!(a.device("iphone").is_some());
+    }
+
+    #[test]
+    fn devices_come_and_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        assert!(!g.has_device(&[7u8; 32]));
+        g.add_device(&[7u8; 32], "Firefox");
+        g.add_device(&[8u8; 32], "iPhone");
+        assert!(g.has_device(&[7u8; 32]));
+        g.remove_device(&B64.encode([7u8; 32]));
+        assert!(!g.has_device(&[7u8; 32]), "dado de baja");
+        assert!(g.has_device(&[8u8; 32]), "el otro sigue");
+        assert_eq!(g.removed_devices(), [B64.encode([7u8; 32])]);
     }
 
     #[test]

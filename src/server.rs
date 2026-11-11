@@ -2031,6 +2031,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(api_group_remove),
         )
         .route("/api/v1/phones", get(api_phones))
+        .route("/api/v1/phones/me", axum::routing::delete(api_remove_me))
         .route(
             "/api/v1/phones/{id}",
             axum::routing::delete(api_remove_phone),
@@ -3095,8 +3096,8 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
     }
 }
 
-async fn api_remove_phone(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    // Quitarlo aquí es quitarlo en todo el grupo.
+/// Quita un dispositivo de este equipo y de todo el grupo (por su clave).
+fn remove_phone(st: &AppState, id: &str) -> Response {
     let key = st
         .phones
         .lock()
@@ -3109,10 +3110,32 @@ async fn api_remove_phone(State(st): State<Arc<AppState>>, Path(id): Path<String
         st.group.remove_device(k);
         st.group_dirty.notify_one();
     }
-    match st.phones.lock().expect("teléfonos").remove(&id) {
+    match st.phones.lock().expect("teléfonos").remove(id) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "ese teléfono no está emparejado"),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_remove_phone(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    // Quitarlo aquí es quitarlo en todo el grupo.
+    remove_phone(&st, &id)
+}
+
+/// `DELETE /api/v1/phones/me`: el dispositivo que llama (por su token) se da de baja: «Cerrar
+/// sesión» en la web. Con el token principal no hay dispositivo que quitar.
+async fn api_remove_me(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let id = crate::auth::bearer(&headers)
+        .and_then(|t| st.phones.lock().expect("teléfonos").id_by_token(t));
+    match id {
+        Some(id) => remove_phone(&st, &id),
+        None => error(
+            StatusCode::BAD_REQUEST,
+            "solo un teléfono o una web emparejados pueden cerrar su sesión",
+        ),
     }
 }
 

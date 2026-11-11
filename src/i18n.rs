@@ -824,6 +824,10 @@ const TABLE: &[(&str, &str)] = &[
         "only a paired phone or browser can answer a secret",
     ),
     (
+        "solo un teléfono o una web emparejados pueden cerrar su sesión",
+        "only a paired phone or browser can sign itself out",
+    ),
+    (
         "no hay ningún secreto recordado {}",
         "there is no remembered secret {0}",
     ),

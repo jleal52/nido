@@ -250,6 +250,9 @@ It only answers on this computer (`127.0.0.1`), with `Authorization: Bearer <tok
 channel). From outside this computer only the encrypted channel answers (`/api/v1/e2e`). Messages
 come in English, or in Spanish if the request asks for it with `Accept-Language: es`.
 
+`DELETE /api/v1/phones/me`: the paired phone or browser that calls it signs itself out of every
+computer in the group (the web app's "Sign out").
+
 ## Install
 
 There are binaries for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel) and Windows
