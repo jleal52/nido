@@ -78,8 +78,21 @@ impl Nido {
         }
     }
 
-    /// `nido clip args` en `dir`, como una orden de la sesión `session`, con `input` en la entrada.
+    /// `nido clip args` en `dir`, como una orden de la sesión `session`, con `input` en la
+    /// entrada, en una terminal en español.
     fn clip(&self, session: Option<&str>, dir: &Path, args: &[&str], input: &[u8]) -> Output {
+        self.clip_in("es_ES.UTF-8", session, dir, args, input)
+    }
+
+    /// Lo mismo, con `LANG=lang`.
+    fn clip_in(
+        &self,
+        lang: &str,
+        session: Option<&str>,
+        dir: &Path,
+        args: &[&str],
+        input: &[u8],
+    ) -> Output {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nido"));
         c.arg("clip")
             .args(args)
@@ -87,6 +100,9 @@ impl Nido {
             .env("NIDO_HOME", &self.home)
             .env("NIDO_SERVER", self.addr.to_string())
             .env_remove("NIDO_SESSION")
+            .env_remove("LC_ALL")
+            .env_remove("LC_MESSAGES")
+            .env("LANG", lang)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -253,4 +269,37 @@ fn sends_stdin_or_a_file_to_the_session_clipboard() {
 
     assert_eq!(nido.items().len(), sent);
     assert_eq!(nido.clipboard_alerts(), sent);
+
+    // En una terminal que no es en español (lo normal donde corre Claude), en inglés: lo suyo y
+    // lo del gestor.
+    for lang in ["C.UTF-8", "en_US.UTF-8"] {
+        let o = nido.clip_in(lang, me, &work, &["--title", "en"], b"hello");
+        assert!(o.status.success(), "{}", stderr(&o));
+        assert_eq!(stdout(&o), "sent to the clipboard (1 KB)\n");
+    }
+    let en = |o: Output, msg: &str| {
+        assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+        assert_eq!(stderr(&o), format!("nido: {msg}\n"));
+    };
+    en(
+        nido.clip_in("C.UTF-8", me, &work, &[], b""),
+        "the text is empty",
+    );
+    en(
+        nido.clip_in("C.UTF-8", me, &work, &[], png),
+        "the input is not text (UTF-8): to send a binary file, use send_file",
+    );
+    en(
+        nido.clip_in("C.UTF-8", None, &work, &[], b"x"),
+        "NIDO_SESSION is missing or invalid: `nido clip` is for the commands of a nido session",
+    );
+    let foto = work.join("foto.png");
+    en(
+        nido.clip_in("C.UTF-8", me, &work, &["foto.png"], b""),
+        &format!(
+            "{} is not text (UTF-8): to send it, use send_file",
+            foto.display()
+        ),
+    );
+    assert_eq!(nido.items().len(), sent + 2);
 }

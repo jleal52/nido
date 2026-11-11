@@ -1049,8 +1049,23 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
 /// `nido clip`: lo que hace la herramienta `clipboard` del MCP, desde una orden de la sesión (la
 /// de `NIDO_SESSION`). Con un fichero, lo lee el gestor con las comprobaciones de `send_file`
 /// (nada de la carpeta de secretos); sin él, la entrada estándar. El contenido no sale por la
-/// salida: solo cuánto se ha mandado.
+/// salida: solo cuánto se ha mandado. Lo lee sobre todo Claude: en el idioma de la terminal
+/// (`LANG`), no siempre en español.
 fn clip_cmd(api: &Api, file: Option<PathBuf>, title: Option<String>) -> io::Result<()> {
+    let lang = nido::i18n::env_lang();
+    let tr = |msg: &str| nido::i18n::in_lang(lang, msg);
+    clip_send(api, lang, file, title)
+        .map(|size| println!("{}", tr(&format!("enviado al portapapeles ({size} KB)"))))
+        .map_err(|e| io::Error::new(e.kind(), tr(&e.to_string())))
+}
+
+/// Lo de `nido clip`, con los errores en español; devuelve los KB mandados.
+fn clip_send(
+    api: &Api,
+    lang: nido::i18n::Lang,
+    file: Option<PathBuf>,
+    title: Option<String>,
+) -> io::Result<u64> {
     use nido::outbox::{self, MAX_TEXT};
     use std::io::{IsTerminal, Read};
     let Some(session) = nido::mcp::session_from(std::env::var("NIDO_SESSION").ok()) else {
@@ -1071,7 +1086,10 @@ fn clip_cmd(api: &Api, file: Option<PathBuf>, title: Option<String>) -> io::Resu
                 let clip = cli.find_subcommand_mut("clip").expect("la orden clip");
                 clip.error(
                     clap::error::ErrorKind::MissingRequiredArgument,
-                    "falta qué mandar: un fichero, o la salida de una orden (`orden | nido clip`)",
+                    nido::i18n::in_lang(
+                        lang,
+                        "falta qué mandar: un fichero, o la salida de una orden (`orden | nido clip`)",
+                    ),
                 )
                 .exit();
             }
@@ -1100,18 +1118,18 @@ fn clip_cmd(api: &Api, file: Option<PathBuf>, title: Option<String>) -> io::Resu
     if let Some(t) = title {
         body["title"] = t.into();
     }
+    // Los errores del gestor, en el mismo idioma.
+    let accept = match lang {
+        nido::i18n::Lang::Es => "es",
+        nido::i18n::Lang::En => "en",
+    };
     let r = api.call_with(
         "POST",
         "/api/v1/mcp/clipboard",
         Some(&body),
-        &[("X-Nido-Session", &session)],
+        &[("X-Nido-Session", &session), ("Accept-Language", accept)],
     )?;
-    let size = r["size"].as_u64().unwrap_or(0);
-    println!(
-        "enviado al portapapeles ({} KB)",
-        size.div_ceil(1024).max(1)
-    );
-    Ok(())
+    Ok(r["size"].as_u64().unwrap_or(0).div_ceil(1024).max(1))
 }
 
 /// `nido mcp on|off`: crea o borra `<config>/mcp-off`. Vale para las sesiones que arranquen luego.

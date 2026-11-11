@@ -1,6 +1,7 @@
 //! El idioma de lo que la API manda a la app y a la web para enseñar (errores, avisos). nido
 //! escribe sus mensajes en español; si la petición no prefiere español (`Accept-Language`), salen
-//! en inglés, traducidos en la frontera con [`tr`]. La terminal no pasa por aquí.
+//! en inglés, traducidos en la frontera con [`tr`]. La terminal no pasa por aquí, salvo lo que
+//! leen otros programas (`nido clip`, con [`env_lang`]).
 //!
 //! El idioma va con la tarea de la petición (`LANG`): lo pone [`lang_layer`] y lo leen [`lang`] y
 //! [`tr`]. Lo que no corre en esa tarea (`spawn_blocking`, `on_upgrade`, tareas de fondo) no lo
@@ -31,6 +32,34 @@ pub fn lang() -> Lang {
 /// Corre `f` con este idioma (para lo que sale de la tarea de la petición, como un WebSocket).
 pub async fn scope<F: Future>(lang: Lang, f: F) -> F::Output {
     LANG.scope(lang, f).await
+}
+
+/// El idioma de la terminal, para las órdenes que leen otros programas (`nido clip`, que corre
+/// en una sesión y lee Claude): `Es` si el primero de `LC_ALL`, `LC_MESSAGES` y `LANG` que tenga
+/// valor es español (`es_ES.UTF-8`…); si no, `En`.
+pub fn env_lang() -> Lang {
+    lang_of_env(|k| std::env::var(k).ok())
+}
+
+fn lang_of_env(get: impl Fn(&str) -> Option<String>) -> Lang {
+    let value = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|k| get(k).filter(|v| !v.is_empty()))
+        .unwrap_or_default();
+    let primary = value.split(['_', '-', '.', '@']).next().unwrap_or("");
+    if primary.eq_ignore_ascii_case("es") {
+        Lang::Es
+    } else {
+        Lang::En
+    }
+}
+
+/// `msg` en `lang`: tal cual en español; si no, su traducción.
+pub fn in_lang(lang: Lang, msg: &str) -> String {
+    match lang {
+        Lang::Es => msg.to_owned(),
+        Lang::En => english(msg),
+    }
 }
 
 /// `Es` si el idioma preferido (el de más `q`; a igualdad, el primero) es español (`es`,
@@ -834,6 +863,27 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("{} pasa de 64 MB ({})", "{0} is over 64 MB ({1})"),
     ("{} pasa de 64 KB", "{0} is over 64 KB"),
+    // nido clip
+    (
+        "no responde el gestor en {} ({}); ¿está `nido serve` en marcha?",
+        "nido is not answering at {0} ({1}); is `nido serve` running?",
+    ),
+    (
+        "enviado al portapapeles ({} KB)",
+        "sent to the clipboard ({0} KB)",
+    ),
+    (
+        "falta o no es válida NIDO_SESSION: `nido clip` es para las órdenes de una sesión de nido",
+        "NIDO_SESSION is missing or invalid: `nido clip` is for the commands of a nido session",
+    ),
+    (
+        "la entrada no es texto (UTF-8): para mandar un binario, usa send_file",
+        "the input is not text (UTF-8): to send a binary file, use send_file",
+    ),
+    (
+        "falta qué mandar: un fichero, o la salida de una orden (`orden | nido clip`)",
+        "nothing to send: give a file, or a command's output (`command | nido clip`)",
+    ),
     (
         "{} no es texto (UTF-8): para mandarlo, usa send_file",
         "{0} is not text (UTF-8): to send it, use send_file",
@@ -1059,6 +1109,37 @@ mod tests {
 
     /// Cada `{}` del patrón tiene su `{n}` en la plantilla (de 0 a n-1, cada uno al menos una
     /// vez), sin huecos seguidos ni patrones sin texto fijo, y sin patrones repetidos.
+    #[test]
+    fn the_terminal_language_comes_from_the_locale() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            lang_of_env(move |k| {
+                vars.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_owned())
+            })
+        };
+        assert_eq!(env(&[("LANG", "es_ES.UTF-8")]), Lang::Es);
+        assert_eq!(env(&[("LANG", "es")]), Lang::Es);
+        assert_eq!(env(&[("LANG", "C.UTF-8")]), Lang::En);
+        assert_eq!(env(&[("LANG", "en_US.UTF-8")]), Lang::En);
+        assert_eq!(env(&[]), Lang::En);
+        // LC_ALL manda; uno vacío no cuenta.
+        assert_eq!(env(&[("LC_ALL", "en_GB"), ("LANG", "es_ES")]), Lang::En);
+        assert_eq!(env(&[("LC_ALL", ""), ("LANG", "es_ES")]), Lang::Es);
+        assert_eq!(
+            env(&[("LC_MESSAGES", "es_MX.UTF-8"), ("LANG", "C")]),
+            Lang::Es
+        );
+        assert_eq!(
+            in_lang(Lang::En, "el texto está vacío"),
+            "the text is empty"
+        );
+        assert_eq!(
+            in_lang(Lang::Es, "el texto está vacío"),
+            "el texto está vacío"
+        );
+    }
+
     #[test]
     fn table_is_consistent() {
         let mut seen = std::collections::HashSet::new();

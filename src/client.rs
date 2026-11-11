@@ -85,7 +85,8 @@ impl Api {
         self.call_with(method, path, body, &[])
     }
 
-    /// Como `call`, con cabeceras de más (`X-Nido-Session` para hablar como una sesión).
+    /// Como `call`, con cabeceras de más (`X-Nido-Session` para hablar como una sesión, otro
+    /// `Accept-Language`).
     pub fn call_with(
         &self,
         method: &str,
@@ -93,8 +94,13 @@ impl Api {
         body: Option<&serde_json::Value>,
         headers: &[(&str, &str)],
     ) -> io::Result<serde_json::Value> {
-        let mut all = vec![("Accept-Language", "es")];
-        all.extend_from_slice(headers);
+        let mut all = headers.to_vec();
+        if !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("Accept-Language"))
+        {
+            all.push(("Accept-Language", "es"));
+        }
         let (code, json) =
             self.request_with(method, path, body, &all, Some(Duration::from_secs(30)))?;
         ok_or_message(code, json)
