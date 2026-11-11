@@ -263,8 +263,8 @@ const TOOLS: &[Tool] = &[
                 by its id when two machines share a name), machine (name), machine_id, id, \
                 name, folder (cwd), state (working, idle, question or stopped), since (when \
                 it started, if running, or stopped, if stopped; ms since 1970; missing if \
-                unknown), opened_by, channel (whether it can receive messages) and whether \
-                this session opened it (mine). channel_error, if present, says why it has no \
+                unknown), opened_by, channel (whether it can receive messages) and mine \
+                (whether this session opened it with `open`; false for this session itself). channel_error, if present, says why it has no \
                 channel (e.g. blocked by org policy, or its Claude Code predates channels); \
                 delivery_error, if present, says that messages sent to it never showed up in \
                 its conversation (they stay queued). Machines that don't answer are listed in \
@@ -364,8 +364,9 @@ const TOOLS: &[Tool] = &[
         any_of: &[],
         name: "stop",
         about: "Stop a Claude session on any machine of the group. Its conversation is kept: \
-                `start` resumes it. Refuses if the session is working or has a pending \
-                question, unless force is true. A session cannot stop itself.",
+                `start` resumes it. Refuses if the session is working, has a pending \
+                question or has subagents or shells running in the background, unless force is \
+                true. A session cannot stop itself.",
         args: &[
             SESSION,
             opt(

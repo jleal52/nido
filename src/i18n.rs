@@ -337,6 +337,10 @@ const TABLE: &[(&str, &str)] = &[
         "it is working (or has a pending question): to stop it anyway, force: true",
     ),
     (
+        "tiene subagentes u órdenes en segundo plano: para pararla igualmente, force: true",
+        "it has subagents or commands running in the background: to stop it anyway, force: true",
+    ),
+    (
         "una sesión no puede pararse a sí misma",
         "a session cannot stop itself",
     ),

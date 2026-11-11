@@ -131,8 +131,9 @@ Each Claude that nido launches gets nido's MCP server (`nido mcp`), with these t
 - `open`, `answer` and `close`: open a new Claude session (a child) in a folder on any computer
   in the group, answer its questions and permission requests, and close it.
 - `start` and `stop`: start a stopped Claude session on any computer in the group, picking up its
-  conversation, and stop one (its conversation is kept). `stop` refuses a session that is working
-  or has a pending question, unless asked with `force`; a session can't stop itself.
+  conversation, and stop one (its conversation is kept). `stop` refuses a session that is working,
+  has a pending question or has subagents or commands running in the background, unless asked with
+  `force`; a session can't stop itself.
 - `alert`: a notification to your phone (and a 🔔 in `nido ls` and in the apps), for when you
   asked to be told about something.
 - `secret`: asks you for a token or a password without it going through the conversation (see

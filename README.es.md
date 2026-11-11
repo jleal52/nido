@@ -132,7 +132,8 @@ Cada Claude que lanza nido tiene el servidor MCP de nido (`nido mcp`), con estas
   cualquier equipo del grupo, contestar sus preguntas y peticiones de permiso, y cerrarla.
 - `start` y `stop`: arrancar una sesión de Claude parada de cualquier equipo del grupo, retomando
   su conversación, y parar una (su conversación se guarda). `stop` no para una sesión que está
-  trabajando o tiene una pregunta pendiente, salvo con `force`; una sesión no se para a sí misma.
+  trabajando, tiene una pregunta pendiente o tiene subagentes u órdenes en segundo plano, salvo con
+  `force`; una sesión no se para a sí misma.
 - `alert`: un aviso a tu móvil (y una 🔔 en `nido ls` y en las apps), para cuando pediste que te
   avisaran de algo.
 - `secret`: te pide un token o una contraseña sin que pase por la conversación (ver

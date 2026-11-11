@@ -2489,16 +2489,35 @@ async fn tool_start(st: &AppState, me: &Machine, caller: &Caller, args: Value) -
     Ok(out)
 }
 
-/// Si se puede parar una sesión en este estado: trabajando o con una pregunta pendiente, solo con
-/// `force`.
-fn may_stop(state: Status, force: bool) -> Result<(), Fail> {
-    if !force && matches!(state, Status::Working | Status::Question) {
+/// Si se puede parar una sesión en este estado: trabajando, con una pregunta pendiente o con
+/// subagentes u órdenes en segundo plano (que se perderían), solo con `force`.
+fn may_stop(state: Status, background: bool, force: bool) -> Result<(), Fail> {
+    if force {
+        return Ok(());
+    }
+    if matches!(state, Status::Working | Status::Question) {
         return Err(fail(
             StatusCode::CONFLICT,
             "está trabajando (o tiene una pregunta pendiente): para pararla igualmente, force: true",
         ));
     }
+    if background {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "tiene subagentes u órdenes en segundo plano: para pararla igualmente, force: true",
+        ));
+    }
     Ok(())
+}
+
+/// Si la sesión tiene subagentes u órdenes en segundo plano, según su pantalla (al día cada
+/// pocos segundos: ver `server::spawn_background`).
+fn has_background(bg: Option<&Value>) -> bool {
+    let Some(bg) = bg else {
+        return false;
+    };
+    let agents = bg["agents"].as_array().is_some_and(|a| !a.is_empty());
+    agents || bg["shells"].as_u64().is_some_and(|n| n > 0)
 }
 
 /// `stop`: para una sesión de Claude de cualquier equipo del grupo (la conversación se conserva;
@@ -2519,9 +2538,12 @@ async fn tool_stop(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         ));
     }
     let s = session_here(st, id).await?;
-    let state = match view(st, &s.id).await {
-        Some(v) => status_of(st, &v).await.0,
-        None => Status::Stopped,
+    let (state, background) = match view(st, &s.id).await {
+        Some(v) => {
+            let bg = v.claude.as_ref().and_then(|c| c.background.as_ref());
+            (status_of(st, &v).await.0, has_background(bg))
+        }
+        None => (Status::Stopped, false),
     };
     if state == Status::Stopped {
         // Se apunta que se queda parada: la que salió sola volvería a arrancar con el equipo.
@@ -2530,7 +2552,7 @@ async fn tool_stop(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         server::stop_session(st, &s.id).await;
         return Ok(json!({ "state": Status::Stopped, "note": i18n::tr("ya estaba parada") }));
     }
-    may_stop(state, a.force)?;
+    may_stop(state, background, a.force)?;
     server::stop_session(st, &s.id).await;
     Ok(json!({ "state": Status::Stopped }))
 }
@@ -2661,13 +2683,27 @@ mod tests {
     #[test]
     fn stop_refuses_a_busy_session_unless_forced() {
         for busy in [Status::Working, Status::Question] {
-            let e = may_stop(busy, false).unwrap_err();
+            let e = may_stop(busy, false, false).unwrap_err();
             assert_eq!(e.0, StatusCode::CONFLICT);
             assert!(e.1.starts_with("está trabajando"), "{}", e.1);
-            assert!(may_stop(busy, true).is_ok());
+            assert!(may_stop(busy, true, true).is_ok());
         }
-        assert!(may_stop(Status::Idle, false).is_ok());
-        assert!(may_stop(Status::Stopped, false).is_ok());
+        assert!(may_stop(Status::Idle, false, false).is_ok());
+        assert!(may_stop(Status::Stopped, false, false).is_ok());
+        // Esperando, pero con algo en segundo plano que se perdería.
+        let e = may_stop(Status::Idle, true, false).unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        assert!(e.1.starts_with("tiene subagentes"), "{}", e.1);
+        assert!(may_stop(Status::Idle, true, true).is_ok());
+    }
+
+    #[test]
+    fn background_work_is_subagents_or_shells() {
+        let bg = |v: Value| has_background(Some(&v));
+        assert!(!has_background(None));
+        assert!(!bg(json!({"agents": [], "shells": 0})));
+        assert!(bg(json!({"agents": [], "shells": 1})));
+        assert!(bg(json!({"agents": [{"kind": "Explore"}], "shells": 0})));
     }
 
     #[test]
