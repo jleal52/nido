@@ -36,8 +36,10 @@ fn runs_the_command_with_the_secret_in_a_variable() {
     let store = Store::new(home.join("state/secrets"));
     let now = nido::registry::now_ms();
     store
-        .save_session("aaaa1111", "tok", b"de-la-sesion")
+        .save_session("aaaa1111", "solo", b"de-la-sesion")
         .unwrap();
+    // Con uno recordado vigente, el de la sesión no lo tapa (como en `secret`).
+    store.save_session("aaaa1111", "tok", b"tapado").unwrap();
     store
         .save_team("tok", b"del-equipo", Remember::Always, "api", now)
         .unwrap();
@@ -60,15 +62,20 @@ fn runs_the_command_with_the_secret_in_a_variable() {
         )
     };
 
-    let o = run(Some("aaaa1111"), "tok");
+    let o = run(Some("aaaa1111"), "solo");
     assert_eq!(o.status.code(), Some(7), "{}", shown(&o));
     assert_eq!(std::fs::read_to_string(&got).unwrap(), "de-la-sesion");
     assert!(!shown(&o).contains("de-la-sesion"), "{}", shown(&o));
-    // Otra sesión: el del equipo.
-    let o = run(Some("bbbb2222"), "tok");
-    assert_eq!(o.status.code(), Some(7), "{}", shown(&o));
-    assert_eq!(std::fs::read_to_string(&got).unwrap(), "del-equipo");
-    assert!(!shown(&o).contains("del-equipo"), "{}", shown(&o));
+    // Otra sesión no tiene ese.
+    let o = run(Some("bbbb2222"), "solo");
+    assert_eq!(o.status.code(), Some(1));
+    // El del equipo, para las dos.
+    for s in ["aaaa1111", "bbbb2222"] {
+        let o = run(Some(s), "tok");
+        assert_eq!(o.status.code(), Some(7), "{}", shown(&o));
+        assert_eq!(std::fs::read_to_string(&got).unwrap(), "del-equipo");
+        assert!(!shown(&o).contains("del-equipo"), "{}", shown(&o));
+    }
 
     // Los errores, claros y sin el valor.
     let o = run(None, "tok");

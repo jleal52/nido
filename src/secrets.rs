@@ -260,6 +260,18 @@ impl Store {
     ) -> io::Result<PathBuf> {
         check_name(name)?;
         let _one = self.one();
+        self.write_team(name, value, remember, by, now)
+    }
+
+    /// `save_team` con el cerrojo ya cogido.
+    fn write_team(
+        &self,
+        name: &str,
+        value: &[u8],
+        remember: Remember,
+        by: &str,
+        now: u64,
+    ) -> io::Result<PathBuf> {
         let dir = self.team_dir();
         self.private_dirs(&dir)?;
         let path = dir.join(name);
@@ -291,7 +303,8 @@ impl Store {
 
     /// Lo que contestó el usuario a una pregunta de `sessions`: sin recordar, uno para cada una;
     /// recordado, uno para el equipo. Con `force` y sin recordar, el recordado de antes ya no
-    /// valía: se olvida. Devuelve la ruta de cada sesión.
+    /// valía: se olvida. Recordado, las copias sin recordar de esas sesiones ya no valen: fuera
+    /// (si no, `nido secrets run` podría seguir con una vieja). Devuelve la ruta de cada sesión.
     #[allow(clippy::too_many_arguments)]
     pub fn save_answer(
         &self,
@@ -312,7 +325,14 @@ impl Store {
                 .map(|s| Ok((s.clone(), self.save_session(s, name, value)?)))
                 .collect();
         }
-        let path = self.save_team(name, value, remember, by, now)?;
+        check_name(name)?;
+        let _one = self.one();
+        let path = self.write_team(name, value, remember, by, now)?;
+        for s in sessions {
+            if check_session(s).is_ok() {
+                let _ = std::fs::remove_file(self.sessions_dir().join(s).join(name));
+            }
+        }
         Ok(sessions.iter().map(|s| (s.clone(), path.clone())).collect())
     }
 
@@ -410,7 +430,7 @@ impl std::fmt::Display for UseError {
         match self {
             UseError::NoSession => write!(
                 f,
-                "falta NIDO_SESSION: `nido secrets run` es para las órdenes de una sesión de nido"
+                "falta o no es válida NIDO_SESSION: `nido secrets run` es para las órdenes de una sesión de nido"
             ),
             UseError::BadName(n) => write!(
                 f,
@@ -426,9 +446,10 @@ impl std::fmt::Display for UseError {
 }
 
 impl Store {
-    /// El secreto `name` que puede usar la sesión `session` (`NIDO_SESSION`): el suyo sin
-    /// recordar (si no tiene más de 24 h) y, si no, el recordado del equipo que no ha caducado.
-    /// La edad del suyo se mira con el reloj de verdad; `now` solo cuenta para los recordados.
+    /// El secreto `name` que puede usar la sesión `session` (`NIDO_SESSION`), en el mismo orden
+    /// que `secret`: el recordado del equipo que no ha caducado y, si no, el suyo sin recordar
+    /// (si no tiene más de 24 h). La edad del suyo se mira con el reloj de verdad; `now` solo
+    /// cuenta para los recordados.
     pub fn usable(&self, session: Option<&str>, name: &str, now: u64) -> Result<PathBuf, UseError> {
         let session = session
             .and_then(|s| crate::mcp::session_from(Some(s.to_owned())))
@@ -436,13 +457,15 @@ impl Store {
         if !valid_name(name) {
             return Err(UseError::BadName(name.to_owned()));
         }
+        if let Some(team) = self.remembered(name, now) {
+            return Ok(team);
+        }
         let own = self.sessions_dir().join(&session).join(name);
         let wall = crate::registry::now_ms();
         if own.is_file() && !older_than(&own, wall, SESSION_KEEP_MS) {
             return Ok(own);
         }
-        self.remembered(name, now)
-            .ok_or_else(|| UseError::Missing(name.to_owned()))
+        Err(UseError::Missing(name.to_owned()))
     }
 }
 
@@ -762,8 +785,10 @@ mod tests {
         (tmp, s)
     }
 
+    /// `nido secrets run` usa lo mismo que devolvería `secret`: el recordado del equipo que no
+    /// ha caducado y, si no, el de la sesión (de 24 h como mucho).
     #[test]
-    fn a_session_uses_its_own_secret_first_then_the_machines() {
+    fn a_session_uses_the_machines_secret_then_its_own() {
         let (_tmp, s) = store();
         assert_eq!(s.usable(None, "tok", 1), Err(UseError::NoSession));
         assert_eq!(s.usable(Some("../x"), "tok", 1), Err(UseError::NoSession));
@@ -775,32 +800,63 @@ mod tests {
             s.usable(Some("aaaa1111"), "tok", 1),
             Err(UseError::Missing("tok".into()))
         );
-        let team = s
-            .save_team("tok", b"equipo", Remember::TwoHours, "api", 1)
-            .unwrap();
-        assert_eq!(s.usable(Some("aaaa1111"), "tok", 1), Ok(team.clone()));
+        // Sin recordar: solo para ella.
         let own = s.save_session("aaaa1111", "tok", b"suyo").unwrap();
         assert_eq!(s.usable(Some("aaaa1111"), "tok", 1), Ok(own.clone()));
+        assert_eq!(
+            s.usable(Some("bbbb2222"), "tok", 1),
+            Err(UseError::Missing("tok".into()))
+        );
+        // Lo pide otra vez (`force`) y el usuario lo recuerda: el nuevo, para todas, y la copia
+        // vieja de la sesión, fuera (si no, `secrets run` seguiría con ella).
+        let paths = s
+            .save_answer(
+                "tok",
+                &["aaaa1111".to_owned()],
+                b"equipo",
+                Remember::TwoHours,
+                true,
+                "api",
+                1,
+            )
+            .unwrap();
+        let team = paths["aaaa1111"].clone();
+        assert_eq!(team, s.dir().join("equipo/tok"));
+        assert!(!own.exists());
+        assert_eq!(s.usable(Some("aaaa1111"), "tok", 1), Ok(team.clone()));
         assert_eq!(s.usable(Some("bbbb2222"), "tok", 1), Ok(team.clone()));
-        // El recordado caducado ya no vale.
+        // Con el recordado vigente, el de la sesión no lo tapa (como en `secret`).
+        let own = s.save_session("aaaa1111", "tok", b"suyo").unwrap();
+        assert_eq!(s.usable(Some("aaaa1111"), "tok", 1), Ok(team));
+        // El recordado caducado ya no vale: el de la sesión, o nada.
         let later = 1 + 2 * 3600 * 1000;
+        assert_eq!(s.usable(Some("aaaa1111"), "tok", later), Ok(own.clone()));
         assert_eq!(
             s.usable(Some("bbbb2222"), "tok", later),
             Err(UseError::Missing("tok".into()))
         );
-        // El propio de más de 24 h tampoco: el del equipo.
+        // El de la sesión de más de 24 h tampoco.
         std::fs::File::options()
             .write(true)
             .open(&own)
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600))
             .unwrap();
-        assert_eq!(s.usable(Some("aaaa1111"), "tok", 1), Ok(team));
+        assert_eq!(
+            s.usable(Some("aaaa1111"), "tok", later),
+            Err(UseError::Missing("tok".into()))
+        );
         assert_eq!(
             UseError::Missing("tok".into()).to_string(),
             "no hay ningún secreto «tok» para esta sesión: pídelo antes con la herramienta secret"
         );
-        assert!(UseError::NoSession.to_string().contains("NIDO_SESSION"));
+        assert!(
+            UseError::NoSession
+                .to_string()
+                .starts_with("falta o no es válida NIDO_SESSION"),
+            "{}",
+            UseError::NoSession
+        );
     }
 
     #[test]
