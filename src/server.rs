@@ -112,8 +112,9 @@ pub struct AppState {
     /// Los índices de las conversaciones para buscar (`/api/v1/search`).
     pub search: Arc<crate::search::Indexes>,
     /// Que las búsquedas vayan de una en una (la primera hace los índices: las que lleguen
-    /// mientras esperan y aprovechan lo hecho; las que se cancelan, ni empiezan).
-    searching: Mutex<()>,
+    /// mientras esperan y aprovechan lo hecho; las que se cancelan, ni empiezan). Lo tiene el
+    /// hilo que busca: aunque se cancele la petición, la siguiente espera a que acabe.
+    searching: Arc<Mutex<()>>,
 }
 
 /// Los modelos que se ofrecen si nido aún no ha visto el menú de `/model` (también valen como
@@ -642,7 +643,7 @@ impl AppState {
             model_missing_ttl: std::sync::Mutex::new(MODEL_MISSING_TTL),
             model_chosen: Default::default(),
             search: Default::default(),
-            searching: Mutex::new(()),
+            searching: Default::default(),
         }))
     }
 
@@ -3463,9 +3464,14 @@ async fn api_search(State(st): State<Arc<AppState>>, Query(q): Query<SearchQuery
             })
         })
         .collect();
-    let _one = st.searching.lock().await;
+    let one = st.searching.clone().lock_owned().await;
     let index = st.search.clone();
-    match tokio::task::spawn_blocking(move || index.search(targets, &terms, limit)).await {
+    let search = move || {
+        let found = index.search(targets, &terms, limit);
+        drop(one);
+        found
+    };
+    match tokio::task::spawn_blocking(search).await {
         Ok((messages, truncated)) => Json(serde_json::json!({
             "sessions": sessions,
             "messages": messages,
