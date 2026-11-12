@@ -876,6 +876,26 @@ pub fn read_chunk(path: &Path, offset: u64, limit: Option<usize>) -> io::Result<
     // El fichero se rehízo (más corto que lo ya leído): empezar de cero.
     let reset = offset > len;
     let offset = if reset { 0 } else { offset };
+    // Los últimos `limit` desde el principio: hacia atrás desde el final, sin leer lo de antes
+    // (las transcripciones llegan a cientos de megas). Lo mismo que leerlo todo y quedarse con
+    // el final, salvo los resultados de herramientas que no son de ningún mensaje del trozo
+    // (`results`): el cliente empieza de cero y no tiene dónde ponerlos.
+    if let Some(limit) = limit
+        && offset == 0
+    {
+        drop(f);
+        let w = read_around(path, u64::MAX, limit, 0)?;
+        let mut items = w.items;
+        let cut = items.len().saturating_sub(limit);
+        items.drain(..cut);
+        return Ok(Chunk {
+            offset: w.offset,
+            items,
+            results: Vec::new(),
+            truncated: w.more_before || cut > 0,
+            reset,
+        });
+    }
     f.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
@@ -1858,6 +1878,145 @@ mod tests {
         assert_eq!(said_all[0].ts.as_deref(), Some("2026-11-12T10:00:00.000Z"));
         assert_eq!(said_all[1].text, "Voy a mirar.");
         assert_eq!(said_all[5].text, "Código \u{1F600} ñ \"comillas\"");
+    }
+
+    /// Lo de antes: leerlo todo y quedarse con los últimos `limit`.
+    fn read_last_whole(path: &Path, limit: usize) -> Chunk {
+        let mut c = read_chunk(path, 0, None).unwrap();
+        if c.items.len() > limit {
+            c.items.drain(..c.items.len() - limit);
+            c.truncated = true;
+        }
+        c
+    }
+
+    fn same_chunk(path: &Path, limit: usize, what: &str) {
+        let new = read_chunk(path, 0, Some(limit)).unwrap();
+        let old = read_last_whole(path, limit);
+        assert_eq!(new.items, old.items, "{what}, limit {limit}");
+        assert_eq!(
+            (new.offset, new.truncated, new.reset),
+            (old.offset, old.truncated, old.reset),
+            "{what}, limit {limit}"
+        );
+        assert!(new.results.is_empty());
+        // Lo de antes solo traía resultados de herramientas que no están en el trozo.
+        assert!(old.results.iter().all(|r| {
+            new.items
+                .iter()
+                .all(|i| !matches!(i, ChatItem::Tool { tool_id, .. } if *tool_id == r.tool_id))
+        }));
+    }
+
+    /// Una transcripción de prueba de `n` líneas, variada, a partir de `seed`: mensajes tuyos y
+    /// de Claude, herramientas (con el resultado en seguida, más tarde, nunca, o sin la
+    /// herramienta), varias cosas en una línea, avisos, subagentes, internos, adjuntos, imágenes,
+    /// líneas que no son mensajes y líneas rotas.
+    fn varied(seed: u64, n: usize) -> String {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let mut text = String::new();
+        let mut open: Vec<String> = Vec::new();
+        for i in 0..n {
+            let uuid = format!("l{i}");
+            let v = match rnd(14) {
+                0 | 1 => {
+                    serde_json::json!({"type":"user","uuid":uuid,"message":{"content":format!("tuyo {i}")}})
+                }
+                2 | 3 => {
+                    serde_json::json!({"type":"assistant","uuid":uuid,"message":{"content":[{"type":"text","text":format!("de Claude {i}")}]}})
+                }
+                4 | 5 => {
+                    let t = format!("t{i}");
+                    open.push(t.clone());
+                    serde_json::json!({"type":"assistant","uuid":uuid,"message":{"content":[
+                        {"type":"text","text":format!("miro {i}")},
+                        {"type":"tool_use","id":t,"name":"Bash","input":{"command":"ls"}},
+                        {"type":"tool_use","id":format!("{i}b"),"name":"Read","input":{"file_path":"/a"}}]}})
+                }
+                6 | 7 if !open.is_empty() => {
+                    let k = rnd(open.len() as u64) as usize;
+                    let t = open.remove(k);
+                    serde_json::json!({"type":"user","uuid":uuid,"message":{"content":[
+                        {"type":"tool_result","tool_use_id":t,"content":format!("salida {i}")},
+                        {"type":"tool_result","tool_use_id":format!("{}b", &t[1..]),"content":"b"}]}})
+                }
+                8 => {
+                    serde_json::json!({"type":"user","uuid":uuid,"message":{"content":"<task-notification><status>completed</status><summary>hecho</summary></task-notification>"}})
+                }
+                9 => {
+                    serde_json::json!({"type":"assistant","uuid":uuid,"isSidechain":true,"message":{"content":[{"type":"text","text":"sub"}]}})
+                }
+                10 => {
+                    serde_json::json!({"type":"attachment","uuid":uuid,"attachment":{"type":"queued_command","prompt":format!("en cola {i}"),"origin":{"kind":"human"}}})
+                }
+                11 => {
+                    serde_json::json!({"type":"user","uuid":uuid,"message":{"content":[{"type":"image","source":{}}]}})
+                }
+                12 => {
+                    serde_json::json!({"type":"user","uuid":uuid,"isMeta":true,"message":{"content":"interno"}})
+                }
+                _ => serde_json::json!({"type":"api-request","x":"y".repeat(rnd(300) as usize)}),
+            };
+            text += &line(v);
+            match rnd(25) {
+                0 => text += "{roto\n",
+                // El resultado de una herramienta que no está en la transcripción.
+                1 => {
+                    text += &line(
+                        serde_json::json!({"type":"user","uuid":"h","message":{"content":[
+                        {"type":"tool_result","tool_use_id":"nadie","content":"huérfano"}]}}),
+                    )
+                }
+                _ => {}
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn the_last_messages_read_backwards_are_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        // Vacía, sin mensajes, y con solo una línea a medio escribir.
+        for text in [
+            String::new(),
+            line(serde_json::json!({"type":"permission-mode"})),
+            "{\"type\":\"user\",\"uuid\":\"x\"".to_owned(),
+        ] {
+            std::fs::write(&path, &text).unwrap();
+            for limit in [0, 1, 300] {
+                same_chunk(&path, limit, "casi vacía");
+            }
+        }
+        for seed in 0..40 {
+            let text = varied(seed, 10 + seed as usize * 3);
+            // Y a medio escribir la última.
+            let text = text.clone() + &text[..text.find('\n').unwrap() / 2];
+            std::fs::write(&path, &text).unwrap();
+            let all = read_chunk(&path, 0, None).unwrap().items.len();
+            for limit in 0..=all + 2 {
+                same_chunk(&path, limit, &format!("semilla {seed}"));
+            }
+        }
+        // La conversación de siempre: la herramienta de la primera línea que entra, con su
+        // resultado, que está dentro.
+        let (text, _) = conversation(6);
+        std::fs::write(&path, &text).unwrap();
+        for limit in 0..30 {
+            same_chunk(&path, limit, "conversación");
+        }
+        // Se rehízo (más corta que lo que tenía el cliente): igual, y `reset`.
+        let c = read_chunk(&path, text.len() as u64 + 10, Some(5)).unwrap();
+        assert!(c.reset && c.truncated);
+        assert_eq!(c.items, read_last_whole(&path, 5).items);
     }
 
     #[test]
