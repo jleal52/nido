@@ -23,12 +23,16 @@ const MAX_SUMMARY: usize = 40_000;
 pub enum ChatItem {
     User {
         id: String,
+        /// Dónde empieza su línea en la transcripción (bytes): la identifica (`around`, búsqueda).
+        at: u64,
         ts: Option<String>,
         text: String,
         images: usize,
     },
     Assistant {
         id: String,
+        /// Dónde empieza su línea en la transcripción (bytes): la identifica (`around`, búsqueda).
+        at: u64,
         ts: Option<String>,
         text: String,
     },
@@ -36,6 +40,8 @@ pub enum ChatItem {
     /// llega como un mensaje tuyo, pero no lo es.
     Notice {
         id: String,
+        /// Dónde empieza su línea en la transcripción (bytes): la identifica (`around`, búsqueda).
+        at: u64,
         ts: Option<String>,
         text: String,
         /// `completed`, `failed`, `killed`…
@@ -45,6 +51,8 @@ pub enum ChatItem {
     },
     Tool {
         id: String,
+        /// Dónde empieza su línea en la transcripción (bytes): la identifica (`around`, búsqueda).
+        at: u64,
         ts: Option<String>,
         tool_id: String,
         name: String,
@@ -63,6 +71,18 @@ pub enum ChatItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         answers: Option<Value>,
     },
+}
+
+impl ChatItem {
+    /// Dónde empieza su línea en la transcripción.
+    pub fn at(&self) -> u64 {
+        match self {
+            ChatItem::User { at, .. }
+            | ChatItem::Assistant { at, .. }
+            | ChatItem::Notice { at, .. }
+            | ChatItem::Tool { at, .. } => *at,
+        }
+    }
 }
 
 /// El resultado de una herramienta que llegó en un trozo posterior a la llamada.
@@ -136,7 +156,7 @@ fn tag<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 /// `<task-notification>…</task-notification>` → el aviso con su resumen.
-fn task_notice(text: &str, id: &str, ts: &Option<String>) -> Option<ChatItem> {
+fn task_notice(text: &str, id: &str, ts: &Option<String>, at: u64) -> Option<ChatItem> {
     if !text.starts_with("<task-notification>") {
         return None;
     }
@@ -149,6 +169,7 @@ fn task_notice(text: &str, id: &str, ts: &Option<String>) -> Option<ChatItem> {
     });
     Some(ChatItem::Notice {
         id: id.to_owned(),
+        at,
         ts: ts.clone(),
         text: clip(&summary, 500),
         status,
@@ -245,7 +266,7 @@ fn result_text(content: &Value) -> String {
     clip(&strip_reminders(&text), MAX_RESULT)
 }
 
-fn queued_prompt(d: &Value) -> Option<ChatItem> {
+fn queued_prompt(d: &Value, at: u64) -> Option<ChatItem> {
     let att = d.get("attachment")?;
     if att.get("type")?.as_str()? != "queued_command"
         || att.pointer("/origin/kind").and_then(Value::as_str) != Some("human")
@@ -275,6 +296,7 @@ fn queued_prompt(d: &Value) -> Option<ChatItem> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        at,
         ts: att
             .get("timestamp")
             .or_else(|| d.get("timestamp"))
@@ -285,31 +307,44 @@ fn queued_prompt(d: &Value) -> Option<ChatItem> {
     })
 }
 
-/// Convierte líneas de la transcripción en mensajes. `tools` acumula dónde está cada llamada
-/// para enganchar su resultado, aunque llegue en otro trozo.
-fn parse_lines<'a>(
-    lines: impl Iterator<Item = &'a str>,
-    items: &mut Vec<ChatItem>,
-    results: &mut Vec<ToolResult>,
-) {
-    let mut tools: HashMap<String, usize> = HashMap::new();
-    for line in lines {
+/// Lo que no es tuyo aunque llegue como un mensaje tuyo: órdenes (`/model`…), su salida, avisos
+/// de interrupción y de tareas en segundo plano. Recibe el texto ya sin los `<system-reminder>`.
+fn user_text_shown(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with("<local-command")
+        && !text.starts_with("<command-")
+        && !text.starts_with("[Request interrupted")
+}
+
+/// Convierte líneas de la transcripción en mensajes, de una en una. `tools` acumula dónde está
+/// cada llamada para enganchar su resultado, aunque llegue en otra línea o en otro trozo.
+#[derive(Default)]
+struct Parser {
+    tools: HashMap<String, usize>,
+    items: Vec<ChatItem>,
+    results: Vec<ToolResult>,
+}
+
+impl Parser {
+    /// Una línea, que empieza en `at` (bytes) en el fichero.
+    fn line(&mut self, at: u64, line: &str) {
         let Ok(d) = serde_json::from_str::<Value>(line) else {
-            continue;
+            return;
         };
+        let (items, results, tools) = (&mut self.items, &mut self.results, &mut self.tools);
         let kind = d.get("type").and_then(Value::as_str);
         // Lo que escribes mientras Claude trabaja llega como un adjunto «queued_command».
         if kind == Some("attachment") {
-            if let Some(item) = queued_prompt(&d) {
+            if let Some(item) = queued_prompt(&d, at) {
                 items.push(item);
             }
-            continue;
+            return;
         }
         if !matches!(kind, Some("user" | "assistant")) {
-            continue;
+            return;
         }
         if d.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
+            return;
         }
         let id = d
             .get("uuid")
@@ -333,26 +368,24 @@ fn parse_lines<'a>(
             };
             items.push(ChatItem::Notice {
                 id,
+                at,
                 ts,
                 text: "Claude resumió la conversación para seguir (se le acababa el contexto)"
                     .into(),
                 status: Some("compact".into()),
                 result: Some(clip(text.trim(), MAX_SUMMARY)),
             });
-            continue;
+            return;
         }
         match (kind, content) {
             (Some("user"), Some(Value::String(s))) if !meta => {
                 let text = strip_reminders(s);
-                if let Some(notice) = task_notice(&text, &id, &ts) {
+                if let Some(notice) = task_notice(&text, &id, &ts, at) {
                     items.push(notice);
-                } else if !text.is_empty()
-                    && !text.starts_with("<local-command")
-                    && !text.starts_with("<command-")
-                    && !text.starts_with("[Request interrupted")
-                {
+                } else if user_text_shown(&text) {
                     items.push(ChatItem::User {
                         id,
+                        at,
                         ts,
                         text,
                         images: 0,
@@ -410,11 +443,12 @@ fn parse_lines<'a>(
                 } else {
                     text
                 };
-                if let Some(notice) = task_notice(&text, &id, &ts) {
+                if let Some(notice) = task_notice(&text, &id, &ts, at) {
                     items.push(notice);
                 } else if !text.is_empty() || images > 0 {
                     items.push(ChatItem::User {
                         id,
+                        at,
                         ts,
                         text,
                         images,
@@ -440,6 +474,7 @@ fn parse_lines<'a>(
                                 // «You've hit your weekly limit · resets…»: no lo dice Claude.
                                 items.push(ChatItem::Notice {
                                     id: bid,
+                                    at,
                                     ts: ts.clone(),
                                     text: text.to_owned(),
                                     status: Some("limit".into()),
@@ -448,6 +483,7 @@ fn parse_lines<'a>(
                             } else {
                                 items.push(ChatItem::Assistant {
                                     id: bid,
+                                    at,
                                     ts: ts.clone(),
                                     text: text.to_owned(),
                                 });
@@ -479,6 +515,7 @@ fn parse_lines<'a>(
                                 .flatten();
                             items.push(ChatItem::Tool {
                                 id: bid,
+                                at,
                                 ts: ts.clone(),
                                 tool_id,
                                 summary: tool_summary(&name, &input),
@@ -811,6 +848,25 @@ fn summary(path: &Path) -> (Option<String>, Option<String>, bool) {
     )
 }
 
+/// Las líneas enteras de `buf` (que está en `base` en el fichero), cada una con dónde empieza:
+/// sobre los bytes, para que las posiciones sean las del fichero aunque haya bytes que no sean
+/// UTF-8 o finales `\r\n`.
+fn lines_at(buf: &[u8], base: u64) -> impl Iterator<Item = (u64, &[u8])> {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        if at >= buf.len() {
+            return None;
+        }
+        let end = buf[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| at + i);
+        let line = (base + at as u64, &buf[at..end]);
+        at = end + 1;
+        Some(line)
+    })
+}
+
 /// Lee desde `offset` hasta la última línea completa (Claude puede estar escribiendo la
 /// siguiente). Si se lee desde el principio (`offset = 0`, o el fichero se rehízo), con `limit`
 /// devuelve solo los últimos `limit` mensajes.
@@ -820,17 +876,41 @@ pub fn read_chunk(path: &Path, offset: u64, limit: Option<usize>) -> io::Result<
     // El fichero se rehízo (más corto que lo ya leído): empezar de cero.
     let reset = offset > len;
     let offset = if reset { 0 } else { offset };
+    // Los últimos `limit` desde el principio: hacia atrás desde el final, sin leer lo de antes
+    // (las transcripciones llegan a cientos de megas). Lo mismo que leerlo todo y quedarse con
+    // el final, salvo los resultados de herramientas que no son de ningún mensaje del trozo
+    // (`results`): el cliente empieza de cero y no tiene dónde ponerlos.
+    if let Some(limit) = limit
+        && offset == 0
+    {
+        drop(f);
+        let w = read_around(path, u64::MAX, limit, 0)?;
+        let mut items = w.items;
+        let cut = items.len().saturating_sub(limit);
+        items.drain(..cut);
+        return Ok(Chunk {
+            offset: w.offset,
+            items,
+            results: Vec::new(),
+            truncated: w.more_before || cut > 0,
+            reset,
+        });
+    }
     f.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     let complete = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    let text = String::from_utf8_lossy(&buf[..complete]);
+    let mut p = Parser::default();
+    for (at, line) in lines_at(&buf[..complete], offset) {
+        p.line(at, &String::from_utf8_lossy(line));
+    }
     let mut chunk = Chunk {
         offset: offset + complete as u64,
         reset,
+        items: p.items,
+        results: p.results,
         ..Default::default()
     };
-    parse_lines(text.lines(), &mut chunk.items, &mut chunk.results);
     // El límite vale al leer desde el principio (también si el fichero se rehízo).
     if let Some(limit) = limit.filter(|_| offset == 0)
         && chunk.items.len() > limit
@@ -839,6 +919,321 @@ pub fn read_chunk(path: &Path, offset: u64, limit: Option<usize>) -> io::Result<
         chunk.truncated = true;
     }
     Ok(chunk)
+}
+
+/// Una ventana de la conversación alrededor de un punto (`around`): líneas enteras, de `start`
+/// a `offset`.
+#[derive(Debug, Default, Serialize)]
+pub struct Window {
+    /// Dónde empieza la primera línea de la ventana: lo anterior se pide con `around=start`.
+    pub start: u64,
+    /// Dónde acaba la última (tras su `\n`): lo siguiente se pide con `around=offset`, y si ya no
+    /// hay nada más (`more_after`), desde ahí se sigue en vivo.
+    pub offset: u64,
+    pub items: Vec<ChatItem>,
+    /// Resultados que traen las líneas de la ventana de herramientas de antes de ella.
+    pub results: Vec<ToolResult>,
+    /// Hay mensajes antes de `start`.
+    pub more_before: bool,
+    /// Hay mensajes después de `offset`.
+    pub more_after: bool,
+}
+
+/// Cuánto se sigue leyendo tras la ventana para encontrar los resultados de sus herramientas.
+const LOOKAHEAD: u64 = 8 * 1024 * 1024;
+
+/// Dónde empieza la línea que acaba en `end` (justo tras su `\n`), mirando hacia atrás a trozos.
+fn line_start_before(f: &mut std::fs::File, end: u64) -> io::Result<u64> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut hi = end.saturating_sub(1);
+    while hi > 0 {
+        let lo = hi.saturating_sub(CHUNK);
+        let mut buf = vec![0; (hi - lo) as usize];
+        f.seek(SeekFrom::Start(lo))?;
+        f.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            return Ok(lo + i as u64 + 1);
+        }
+        hi = lo;
+    }
+    Ok(0)
+}
+
+/// El principio de la primera línea que empieza en `at` o después (`end` si no hay ninguna
+/// entera): un `at` a media línea cuenta como el principio de la siguiente.
+fn line_start_from(f: &mut std::fs::File, at: u64, end: u64) -> io::Result<u64> {
+    if at == 0 || at >= end {
+        return Ok(at.min(end));
+    }
+    f.seek(SeekFrom::Start(at - 1))?;
+    let mut r = io::BufReader::new(f.take(end - (at - 1)));
+    let mut skipped = Vec::new();
+    let n = io::BufRead::read_until(&mut r, b'\n', &mut skipped)?;
+    Ok(at - 1 + n as u64)
+}
+
+/// Los mensajes de la conversación alrededor de `at` (el principio de una línea, como el `at` de
+/// cada mensaje): como mucho `before` de las líneas anteriores y `after` desde esa línea en
+/// adelante, más los que vengan en la misma línea que el último de cada lado (la ventana no
+/// parte líneas). Solo se lee la ventana (hacia atrás desde `at`) y un poco más allá: lo que
+/// cuesta no depende del tamaño de la transcripción.
+pub fn read_around(path: &Path, at: u64, before: usize, after: usize) -> io::Result<Window> {
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let end = whole_lines_end(path, len);
+    let anchor = line_start_from(&mut f, at, end)?;
+    let mut w = Window {
+        start: anchor,
+        ..Default::default()
+    };
+
+    // Hacia atrás: las líneas que hagan falta para `before` mensajes, y si queda alguno antes.
+    let (mut probe, mut count) = (anchor, 0);
+    while probe > 0 {
+        let from = line_start_before(&mut f, probe)?;
+        let mut buf = vec![0; (probe - from) as usize];
+        f.seek(SeekFrom::Start(from))?;
+        f.read_exact(&mut buf)?;
+        let mut p = Parser::default();
+        p.line(from, &String::from_utf8_lossy(&buf));
+        probe = from;
+        if count < before {
+            count += p.items.len();
+            w.start = from;
+        } else if !p.items.is_empty() {
+            w.more_before = true;
+            break;
+        }
+    }
+
+    // Hacia delante desde `start`: la ventana, y luego lo justo para saber si hay más y para
+    // los resultados de sus herramientas.
+    f.seek(SeekFrom::Start(w.start))?;
+    let mut r = io::BufReader::with_capacity(1 << 20, f.take(end - w.start));
+    let mut p = Parser::default();
+    let (mut pos, mut line) = (w.start, Vec::new());
+    // Mensajes antes de `anchor`, y los de la ventana con sus resultados (cuando se cierra).
+    let mut before_items = None;
+    let mut closed: Option<(usize, usize)> = None;
+    loop {
+        if before_items.is_none() && pos >= anchor {
+            before_items = Some(p.items.len());
+            if after == 0 {
+                closed = Some((p.items.len(), p.results.len()));
+                w.offset = pos;
+            }
+        }
+        if let Some((n, _)) = closed {
+            let more = p.items.len() > n;
+            let pending = p.items[..n]
+                .iter()
+                .any(|i| matches!(i, ChatItem::Tool { result: None, .. }));
+            // Se sabe si hay más y no falta ningún resultado (o ya se ha mirado bastante).
+            if more && (!pending || pos - w.offset > LOOKAHEAD) {
+                break;
+            }
+        }
+        line.clear();
+        let got = io::BufRead::read_until(&mut r, b'\n', &mut line)?;
+        if got == 0 {
+            break;
+        }
+        p.line(pos, &String::from_utf8_lossy(&line[..got - 1]));
+        pos += got as u64;
+        if closed.is_none()
+            && let Some(b) = before_items
+            && p.items.len() - b >= after
+        {
+            closed = Some((p.items.len(), p.results.len()));
+            w.offset = pos;
+        }
+    }
+    let (n, results) = closed.unwrap_or_else(|| {
+        w.offset = pos;
+        (p.items.len(), p.results.len())
+    });
+    w.more_after = p.items.len() > n;
+    p.items.truncate(n);
+    p.results.truncate(results);
+    w.items = p.items;
+    w.results = p.results;
+    Ok(w)
+}
+
+/// Algo que dijiste tú o Claude, solo el texto: lo que se busca (`search`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Said {
+    /// Dónde empieza su línea (el `at` del mensaje en el chat).
+    pub at: u64,
+    /// El `id` del mensaje en el chat.
+    pub id: String,
+    pub ts: Option<String>,
+    /// Tuyo (si no, de Claude).
+    pub user: bool,
+    pub text: String,
+}
+
+/// Lo poco que hace falta de una línea para `said`: lo demás (resultados de herramientas de
+/// megas, peticiones a la API…) se salta sin copiarlo.
+#[derive(serde::Deserialize)]
+struct Head<'a> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "isSidechain", borrow, default)]
+    sidechain: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "isMeta", borrow, default)]
+    meta: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "isCompactSummary", borrow, default)]
+    compact: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "isApiErrorMessage", borrow, default)]
+    api_error: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    error: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    uuid: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    timestamp: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    message: Option<Body<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct Body<'a> {
+    #[serde(borrow, default)]
+    content: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    model: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(serde::Deserialize)]
+struct Block<'a> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    text: Option<&'a serde_json::value::RawValue>,
+}
+
+fn raw_is(r: Option<&serde_json::value::RawValue>, json: &str) -> bool {
+    r.is_some_and(|r| r.get() == json)
+}
+
+fn raw_string(r: Option<&serde_json::value::RawValue>) -> Option<String> {
+    serde_json::from_str(r?.get()).ok()
+}
+
+/// Lo que se ve en el chat como mensaje tuyo o de Claude en una línea de la transcripción (que
+/// empieza en `at`), solo su texto, con el mismo criterio que la vista chat (`Parser`): fuera
+/// herramientas y sus resultados, órdenes, avisos, subagentes (`isSidechain`), mensajes
+/// internos (`isMeta`), el resumen al compactar y los mensajes que pone Claude Code en nombre
+/// de Claude (`<synthetic>`, errores de la API, el límite de uso), y los mensajes sin texto
+/// (solo imágenes). Mucho más rápido que `Parser`: no construye la línea entera.
+pub fn said(line: &[u8], at: u64) -> Vec<Said> {
+    let text = String::from_utf8_lossy(line);
+    let Ok(h) = serde_json::from_str::<Head>(&text) else {
+        return Vec::new();
+    };
+    let kind = h.kind.map(|k| k.get());
+    let shown = |user: bool, id: String, text: String| Said {
+        at,
+        id,
+        ts: raw_string(h.timestamp),
+        user,
+        text,
+    };
+    if kind == Some("\"attachment\"") {
+        if !text.contains("queued_command") {
+            return Vec::new();
+        }
+        let Ok(d) = serde_json::from_str::<Value>(&text) else {
+            return Vec::new();
+        };
+        return match queued_prompt(&d, at) {
+            Some(ChatItem::User { id, ts, text, .. }) if !text.is_empty() => vec![Said {
+                at,
+                id,
+                ts,
+                user: true,
+                text,
+            }],
+            _ => Vec::new(),
+        };
+    }
+    let user = match kind {
+        Some("\"user\"") => true,
+        Some("\"assistant\"") => false,
+        _ => return Vec::new(),
+    };
+    if raw_is(h.sidechain, "true") || (user && raw_is(h.compact, "true")) {
+        return Vec::new();
+    }
+    let Some(body) = &h.message else {
+        return Vec::new();
+    };
+    let Some(content) = body.content.map(|c| c.get().trim_start()) else {
+        return Vec::new();
+    };
+    let id = raw_string(h.uuid).unwrap_or_default();
+    if user {
+        if raw_is(h.meta, "true") {
+            return Vec::new();
+        }
+        let text = if content.starts_with('"') {
+            let Ok(s) = serde_json::from_str::<String>(content) else {
+                return Vec::new();
+            };
+            let text = strip_reminders(&s);
+            if !user_text_shown(&text) {
+                return Vec::new();
+            }
+            text
+        } else if content.starts_with('[') {
+            let Ok(blocks) = serde_json::from_str::<Vec<Block>>(content) else {
+                return Vec::new();
+            };
+            let texts: Vec<String> = blocks
+                .iter()
+                .filter(|b| raw_is(b.kind, "\"text\""))
+                .filter_map(|b| raw_string(b.text))
+                .map(|t| strip_reminders(&t))
+                .collect();
+            let text = texts.join("\n").trim().to_owned();
+            if text.starts_with("[Request interrupted") {
+                return Vec::new();
+            }
+            text
+        } else {
+            return Vec::new();
+        };
+        if text.is_empty() || text.starts_with("<task-notification>") {
+            return Vec::new();
+        }
+        return vec![shown(true, id, text)];
+    }
+    // De Claude, salvo lo que pone Claude Code en su nombre.
+    let synthetic = body.model.is_some_and(|m| m.get().starts_with("\"<"));
+    if raw_is(h.error, "\"rate_limit\"") || raw_is(h.api_error, "true") || synthetic {
+        return Vec::new();
+    }
+    if !content.starts_with('[') {
+        return Vec::new();
+    }
+    let Ok(blocks) = serde_json::from_str::<Vec<Block>>(content) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| raw_is(b.kind, "\"text\""))
+        .filter_map(|(n, b)| {
+            let text = raw_string(b.text)?.trim().to_owned();
+            let bid = if n == 0 {
+                id.clone()
+            } else {
+                format!("{id}:{n}")
+            };
+            (!text.is_empty()).then(|| shown(false, bid, text))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -951,8 +1346,13 @@ mod tests {
             serde_json::json!({"type":"attachment","uuid":"q1","attachment":{"type":"queued_command","prompt":"y en móvil","origin":{"kind":"human"},"timestamp":"t9"}}),
             serde_json::json!({"type":"attachment","uuid":"q2","attachment":{"type":"queued_command","prompt":"automático","origin":{"kind":"hook"}}}),
         ];
+        let mut starts = Vec::new();
+        let mut pos = 0;
         for l in lines {
-            f.write_all(line(l).as_bytes()).unwrap();
+            let l = line(l);
+            starts.push(pos as u64);
+            pos += l.len();
+            f.write_all(l.as_bytes()).unwrap();
         }
         // Una línea a medio escribir no se lee todavía.
         f.write_all(b"{\"type\":\"assistant\",\"uuid\":\"a2\"")
@@ -965,6 +1365,7 @@ mod tests {
             c.items[4],
             ChatItem::User {
                 id: "q1".into(),
+                at: starts[7],
                 ts: Some("t9".into()),
                 text: "y en móvil".into(),
                 images: 0
@@ -974,12 +1375,18 @@ mod tests {
             c.items[0],
             ChatItem::User {
                 id: "u1".into(),
+                at: 0,
                 ts: Some("t1".into()),
                 text: "hola".into(),
                 images: 0
             }
         );
         assert!(matches!(&c.items[1], ChatItem::Assistant { text, .. } if text == "Voy a mirar."));
+        // Cada mensaje, con dónde empieza su línea; los de una misma línea, con la misma.
+        assert_eq!(
+            c.items.iter().map(ChatItem::at).collect::<Vec<_>>(),
+            [starts[0], starts[1], starts[1], starts[6], starts[7]]
+        );
         match &c.items[2] {
             ChatItem::Tool {
                 name,
@@ -1008,6 +1415,7 @@ mod tests {
         drop(f);
         let next = read_chunk(&path, c.offset, None).unwrap();
         assert!(matches!(&next.items[0], ChatItem::Tool { summary, .. } if summary == "/a/b.rs"));
+        assert_eq!(next.items[0].at(), c.offset);
         assert_eq!(
             next.results,
             [ToolResult {
@@ -1202,12 +1610,413 @@ mod tests {
             c.items,
             vec![ChatItem::Notice {
                 id: "n1".into(),
+                at: 0,
                 ts: Some("t1".into()),
                 text: "Background command \"Esperar CI\" completed (exit code 0)".into(),
                 status: Some("completed".into()),
                 result: Some("todo verde".into()),
             }]
         );
+    }
+
+    /// Una conversación de `n` turnos: tu mensaje, y la respuesta de Claude con un texto y una
+    /// herramienta en la misma línea, el resultado en la siguiente y un texto final. Con líneas
+    /// que no son mensajes por medio. Devuelve el texto y dónde empieza cada línea con mensajes.
+    fn conversation(n: usize) -> (String, Vec<u64>) {
+        let mut text = String::new();
+        let mut starts = Vec::new();
+        let mut push = |text: &mut String, v: Value, msg: bool| {
+            if msg {
+                starts.push(text.len() as u64);
+            }
+            *text += &line(v);
+        };
+        for i in 0..n {
+            push(
+                &mut text,
+                serde_json::json!({"type":"user","uuid":format!("u{i}"),"message":{"content":format!("pregunta {i}")}}),
+                true,
+            );
+            push(
+                &mut text,
+                serde_json::json!({"type":"api-request","x":"y".repeat(100)}),
+                false,
+            );
+            push(
+                &mut text,
+                serde_json::json!({"type":"assistant","uuid":format!("a{i}"),"message":{"content":[
+                    {"type":"text","text":format!("miro {i}")},
+                    {"type":"tool_use","id":format!("t{i}"),"name":"Bash","input":{"command":"ls"}}]}}),
+                true,
+            );
+            push(
+                &mut text,
+                serde_json::json!({"type":"user","uuid":format!("r{i}"),"message":{"content":[
+                    {"type":"tool_result","tool_use_id":format!("t{i}"),"content":format!("salida {i}")}]}}),
+                false,
+            );
+            push(
+                &mut text,
+                serde_json::json!({"type":"assistant","uuid":format!("f{i}"),"message":{"content":[{"type":"text","text":format!("listo {i}")}]}}),
+                true,
+            );
+        }
+        (text, starts)
+    }
+
+    fn ids(items: &[ChatItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match i {
+                ChatItem::User { id, .. }
+                | ChatItem::Assistant { id, .. }
+                | ChatItem::Notice { id, .. }
+                | ChatItem::Tool { id, .. } => id.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_window_around_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let (text, starts) = conversation(10);
+        std::fs::write(&path, &text).unwrap();
+        let all = read_chunk(&path, 0, None).unwrap().items;
+        assert_eq!(all.len(), 40);
+        // Alrededor de «pregunta 5» (la línea starts[15]): 2 antes y 3 desde ella.
+        let w = read_around(&path, starts[15], 2, 3).unwrap();
+        assert_eq!(ids(&w.items), ["a4", "a4:1", "f4", "u5", "a5", "a5:1"]);
+        // «miro 4» y su herramienta van en la misma línea: entran las dos, y 3 desde `at` acaba
+        // en una línea con dos (también las dos).
+        assert_eq!(w.start, starts[13]);
+        let end_of = |at: u64| at + text[at as usize..].find('\n').unwrap() as u64 + 1;
+        assert_eq!(w.offset, end_of(starts[16]));
+        assert!(w.more_before && w.more_after);
+        // Las herramientas de la ventana, con su resultado aunque esté justo detrás.
+        assert!(matches!(&w.items[5], ChatItem::Tool { result: Some(r), .. } if r == "salida 5"));
+        assert!(matches!(&w.items[1], ChatItem::Tool { result: Some(r), .. } if r == "salida 4"));
+        assert!(w.results.is_empty());
+        // Cada mensaje igual que en el chat entero.
+        let from = all.iter().position(|i| i.at() == starts[13]).unwrap();
+        assert_eq!(w.items, all[from..from + 6]);
+    }
+
+    #[test]
+    fn paging_up_and_down_covers_everything_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let (text, starts) = conversation(7);
+        std::fs::write(&path, &text).unwrap();
+        let all = read_chunk(&path, 0, None).unwrap().items;
+        let first = read_around(&path, starts[10], 3, 3).unwrap();
+        let mut got = first.items.clone();
+        // Hacia arriba con `start`, hasta que no haya más.
+        let mut w = first;
+        while w.more_before {
+            let start = w.start;
+            w = read_around(&path, start, 4, 0).unwrap();
+            assert!(w.items.iter().all(|i| i.at() < start));
+            assert_eq!(w.offset, start);
+            got.splice(0..0, w.items.clone());
+        }
+        assert_eq!(w.start, 0);
+        // Hacia abajo con `offset`.
+        let mut w = read_around(&path, starts[10], 3, 3).unwrap();
+        while w.more_after {
+            let offset = w.offset;
+            w = read_around(&path, offset, 0, 5).unwrap();
+            assert!(w.items.iter().all(|i| i.at() >= offset));
+            assert_eq!(w.start, offset);
+            got.extend(w.items.clone());
+        }
+        assert_eq!(ids(&got), ids(&all));
+        assert_eq!(got, all);
+        // Al final, `offset` es donde sigue el chat en vivo.
+        assert_eq!(w.offset, text.len() as u64);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(
+            line(serde_json::json!({"type":"user","uuid":"nuevo","message":{"content":"otra"}}))
+                .as_bytes(),
+        )
+        .unwrap();
+        drop(f);
+        let live = read_chunk(&path, w.offset, Some(300)).unwrap();
+        assert_eq!(ids(&live.items), ["nuevo"]);
+    }
+
+    #[test]
+    fn around_the_ends_and_odd_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let (text, starts) = conversation(3);
+        // Y una línea a medio escribir, que no cuenta.
+        std::fs::write(&path, text.clone() + "{\"type\":\"user\",\"uuid\":\"x\"").unwrap();
+        let all = read_chunk(&path, 0, None).unwrap().items;
+        let end = text.len() as u64;
+        // Al principio: nada antes.
+        let w = read_around(&path, 0, 5, 2).unwrap();
+        assert_eq!(ids(&w.items), ["u0", "a0", "a0:1"]);
+        assert!(!w.more_before && w.more_after);
+        assert_eq!(w.start, 0);
+        // Al final, o más allá: los últimos, nada después; `offset`, las líneas enteras.
+        for at in [end, end + 5, u64::MAX] {
+            let w = read_around(&path, at, 2, 30).unwrap();
+            assert_eq!(ids(&w.items), ["a2", "a2:1", "f2"], "{at}");
+            assert!(w.more_before && !w.more_after);
+            assert_eq!(w.offset, end);
+        }
+        // Todo de una vez.
+        let w = read_around(&path, starts[4], 100, 100).unwrap();
+        assert_eq!(w.items, all);
+        assert!(!w.more_before && !w.more_after);
+        // A media línea: como el principio de la siguiente.
+        let w = read_around(&path, starts[4] + 3, 0, 1).unwrap();
+        assert_eq!(ids(&w.items), ["f1"]);
+        // Nada a ningún lado: vacío, pero dice si hay.
+        let w = read_around(&path, starts[4], 0, 0).unwrap();
+        assert!(w.items.is_empty() && w.more_before && w.more_after);
+        assert_eq!((w.start, w.offset), (starts[4], starts[4]));
+        // Un fichero vacío, o sin mensajes.
+        std::fs::write(&path, line(serde_json::json!({"type":"permission-mode"}))).unwrap();
+        let w = read_around(&path, 0, 30, 30).unwrap();
+        assert!(w.items.is_empty() && !w.more_before && !w.more_after);
+    }
+
+    #[test]
+    fn around_brings_results_of_earlier_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let (text, starts) = conversation(2);
+        std::fs::write(&path, &text).unwrap();
+        // Desde «listo 0»: el resultado de la herramienta de antes viene en `results`.
+        let res = starts[1] as usize + text[starts[1] as usize..].find('\n').unwrap() + 1;
+        let w = read_around(&path, res as u64, 0, 2).unwrap();
+        assert_eq!(ids(&w.items), ["f0", "u1"]);
+        assert_eq!(w.results.len(), 1);
+        assert_eq!(w.results[0].tool_id, "t0");
+        assert_eq!(w.results[0].result, "salida 0");
+    }
+
+    /// Lo que se busca es justo lo que el chat enseña como tuyo o de Claude, con el mismo `at` e
+    /// `id`, salvo lo que pone Claude Code en nombre de Claude.
+    #[test]
+    fn said_is_what_the_chat_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user","uuid":"u1","timestamp":"2026-11-12T10:00:00.000Z","message":{"content":"Hola <system-reminder>interno</system-reminder>"}}),
+            serde_json::json!({"type":"assistant","uuid":"a1","timestamp":"t","message":{"model":"claude-opus-5-5","content":[
+                {"type":"thinking","thinking":"pienso"},
+                {"type":"text","text":"  Voy a mirar.  "},
+                {"type":"tool_use","id":"t-1","name":"Bash","input":{"command":"ls","text":"no"}},
+                {"type":"text","text":"Y esto también."}]}}),
+            serde_json::json!({"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"t-1","content":[{"type":"text","text":"salida"}]}]}}),
+            serde_json::json!({"type":"user","uuid":"u3","isMeta":true,"message":{"content":"interno"}}),
+            serde_json::json!({"type":"user","uuid":"u3b","isMeta":true,"message":{"content":[{"type":"text","text":"interno"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"s1","isSidechain":true,"message":{"content":[{"type":"text","text":"subagente"}]}}),
+            serde_json::json!({"type":"user","uuid":"s2","isSidechain":true,"message":{"content":"al subagente"}}),
+            serde_json::json!({"type":"user","uuid":"c1","message":{"content":"<command-name>/model</command-name>"}}),
+            serde_json::json!({"type":"user","uuid":"c2","message":{"content":"<local-command-stdout>ok</local-command-stdout>"}}),
+            serde_json::json!({"type":"user","uuid":"c3","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}),
+            serde_json::json!({"type":"user","uuid":"n1","message":{"content":"<task-notification><status>completed</status><summary>hecho</summary></task-notification>"}}),
+            serde_json::json!({"type":"user","uuid":"k1","isCompactSummary":true,"message":{"content":"resumen"}}),
+            serde_json::json!({"type":"assistant","uuid":"l1","error":"rate_limit","isApiErrorMessage":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your limit"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"x1","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}),
+            serde_json::json!({"type":"assistant","uuid":"x2","error":"authentication_failed","isApiErrorMessage":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"Not logged in"}]}}),
+            serde_json::json!({"type":"user","uuid":"i1","message":{"content":[{"type":"text","text":"mira esto"},{"type":"image","source":{}}]}}),
+            serde_json::json!({"type":"user","uuid":"i2","message":{"content":[{"type":"image","source":{}}]}}),
+            serde_json::json!({"type":"attachment","uuid":"q1","attachment":{"type":"queued_command","prompt":"y en móvil","origin":{"kind":"human"},"timestamp":"t9"}}),
+            serde_json::json!({"type":"attachment","uuid":"q2","attachment":{"type":"queued_command","prompt":"automático","origin":{"kind":"hook"}}}),
+            serde_json::json!({"type":"api-request","uuid":"r","message":{"content":"no es un mensaje"}}),
+            serde_json::json!({"type":"user","uuid":"e1","message":{"content":"Código \u{1F600} ñ \"comillas\""}}),
+        ];
+        let mut text = String::new();
+        let mut said_all = Vec::new();
+        for l in lines {
+            let l = line(l);
+            said_all.extend(said(l.trim_end().as_bytes(), text.len() as u64));
+            text += &l;
+        }
+        // Lo que no se entiende, fuera.
+        assert!(said(b"{no es json", 0).is_empty());
+        std::fs::write(&path, &text).unwrap();
+        let chat: Vec<Said> = read_chunk(&path, 0, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .filter_map(|i| match i {
+                ChatItem::User {
+                    id, at, ts, text, ..
+                } if !text.is_empty() => Some(Said {
+                    at,
+                    id,
+                    ts,
+                    user: true,
+                    text,
+                }),
+                ChatItem::Assistant { id, at, ts, text } => Some(Said {
+                    at,
+                    id,
+                    ts,
+                    user: false,
+                    text,
+                }),
+                _ => None,
+            })
+            .filter(|s| !matches!(s.id.as_str(), "x1" | "x2"))
+            .collect();
+        assert_eq!(said_all, chat);
+        assert_eq!(
+            said_all.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["u1", "a1:1", "a1:3", "i1", "q1", "e1"]
+        );
+        assert_eq!(said_all[0].text, "Hola");
+        assert_eq!(said_all[0].ts.as_deref(), Some("2026-11-12T10:00:00.000Z"));
+        assert_eq!(said_all[1].text, "Voy a mirar.");
+        assert_eq!(said_all[5].text, "Código \u{1F600} ñ \"comillas\"");
+    }
+
+    /// Lo de antes: leerlo todo y quedarse con los últimos `limit`.
+    fn read_last_whole(path: &Path, limit: usize) -> Chunk {
+        let mut c = read_chunk(path, 0, None).unwrap();
+        if c.items.len() > limit {
+            c.items.drain(..c.items.len() - limit);
+            c.truncated = true;
+        }
+        c
+    }
+
+    fn same_chunk(path: &Path, limit: usize, what: &str) {
+        let new = read_chunk(path, 0, Some(limit)).unwrap();
+        let old = read_last_whole(path, limit);
+        assert_eq!(new.items, old.items, "{what}, limit {limit}");
+        assert_eq!(
+            (new.offset, new.truncated, new.reset),
+            (old.offset, old.truncated, old.reset),
+            "{what}, limit {limit}"
+        );
+        assert!(new.results.is_empty());
+        // Lo de antes solo traía resultados de herramientas que no están en el trozo.
+        assert!(old.results.iter().all(|r| {
+            new.items
+                .iter()
+                .all(|i| !matches!(i, ChatItem::Tool { tool_id, .. } if *tool_id == r.tool_id))
+        }));
+    }
+
+    /// Una transcripción de prueba de `n` líneas, variada, a partir de `seed`: mensajes tuyos y
+    /// de Claude, herramientas (con el resultado en seguida, más tarde, nunca, o sin la
+    /// herramienta), varias cosas en una línea, avisos, subagentes, internos, adjuntos, imágenes,
+    /// líneas que no son mensajes y líneas rotas.
+    fn varied(seed: u64, n: usize) -> String {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let mut text = String::new();
+        let mut open: Vec<String> = Vec::new();
+        for i in 0..n {
+            let uuid = format!("l{i}");
+            let v = match rnd(14) {
+                0 | 1 => {
+                    serde_json::json!({"type":"user","uuid":uuid,"message":{"content":format!("tuyo {i}")}})
+                }
+                2 | 3 => {
+                    serde_json::json!({"type":"assistant","uuid":uuid,"message":{"content":[{"type":"text","text":format!("de Claude {i}")}]}})
+                }
+                4 | 5 => {
+                    let t = format!("t{i}");
+                    open.push(t.clone());
+                    serde_json::json!({"type":"assistant","uuid":uuid,"message":{"content":[
+                        {"type":"text","text":format!("miro {i}")},
+                        {"type":"tool_use","id":t,"name":"Bash","input":{"command":"ls"}},
+                        {"type":"tool_use","id":format!("{i}b"),"name":"Read","input":{"file_path":"/a"}}]}})
+                }
+                6 | 7 if !open.is_empty() => {
+                    let k = rnd(open.len() as u64) as usize;
+                    let t = open.remove(k);
+                    serde_json::json!({"type":"user","uuid":uuid,"message":{"content":[
+                        {"type":"tool_result","tool_use_id":t,"content":format!("salida {i}")},
+                        {"type":"tool_result","tool_use_id":format!("{}b", &t[1..]),"content":"b"}]}})
+                }
+                8 => {
+                    serde_json::json!({"type":"user","uuid":uuid,"message":{"content":"<task-notification><status>completed</status><summary>hecho</summary></task-notification>"}})
+                }
+                9 => {
+                    serde_json::json!({"type":"assistant","uuid":uuid,"isSidechain":true,"message":{"content":[{"type":"text","text":"sub"}]}})
+                }
+                10 => {
+                    serde_json::json!({"type":"attachment","uuid":uuid,"attachment":{"type":"queued_command","prompt":format!("en cola {i}"),"origin":{"kind":"human"}}})
+                }
+                11 => {
+                    serde_json::json!({"type":"user","uuid":uuid,"message":{"content":[{"type":"image","source":{}}]}})
+                }
+                12 => {
+                    serde_json::json!({"type":"user","uuid":uuid,"isMeta":true,"message":{"content":"interno"}})
+                }
+                _ => serde_json::json!({"type":"api-request","x":"y".repeat(rnd(300) as usize)}),
+            };
+            text += &line(v);
+            match rnd(25) {
+                0 => text += "{roto\n",
+                // El resultado de una herramienta que no está en la transcripción.
+                1 => {
+                    text += &line(
+                        serde_json::json!({"type":"user","uuid":"h","message":{"content":[
+                        {"type":"tool_result","tool_use_id":"nadie","content":"huérfano"}]}}),
+                    )
+                }
+                _ => {}
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn the_last_messages_read_backwards_are_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        // Vacía, sin mensajes, y con solo una línea a medio escribir.
+        for text in [
+            String::new(),
+            line(serde_json::json!({"type":"permission-mode"})),
+            "{\"type\":\"user\",\"uuid\":\"x\"".to_owned(),
+        ] {
+            std::fs::write(&path, &text).unwrap();
+            for limit in [0, 1, 300] {
+                same_chunk(&path, limit, "casi vacía");
+            }
+        }
+        for seed in 0..40 {
+            let text = varied(seed, 10 + seed as usize * 3);
+            // Y a medio escribir la última.
+            let text = text.clone() + &text[..text.find('\n').unwrap() / 2];
+            std::fs::write(&path, &text).unwrap();
+            let all = read_chunk(&path, 0, None).unwrap().items.len();
+            for limit in 0..=all + 2 {
+                same_chunk(&path, limit, &format!("semilla {seed}"));
+            }
+        }
+        // La conversación de siempre: la herramienta de la primera línea que entra, con su
+        // resultado, que está dentro.
+        let (text, _) = conversation(6);
+        std::fs::write(&path, &text).unwrap();
+        for limit in 0..30 {
+            same_chunk(&path, limit, "conversación");
+        }
+        // Se rehízo (más corta que lo que tenía el cliente): igual, y `reset`.
+        let c = read_chunk(&path, text.len() as u64 + 10, Some(5)).unwrap();
+        assert!(c.reset && c.truncated);
+        assert_eq!(c.items, read_last_whole(&path, 5).items);
     }
 
     #[test]

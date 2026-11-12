@@ -294,6 +294,109 @@ the model as the menu shows it; `400` without a model; `409` if it could not (Cl
 menu or a draft on screen, the option not in the menu, no "session only" in the menu…), after
 closing the menu with Esc if it was open.
 
+### Searching conversations
+
+`GET /api/v1/search?q=<text>&limit=50` searches the current conversation of every Claude session
+of this computer (the one the chat view shows; not the ones before a `/clear` or a restart). Only
+what you wrote and what Claude answered, as text: not tool calls or their output, commands
+(`/model`…), background task notices, subagents, Claude Code's internal messages, messages Claude
+Code writes on Claude's behalf (usage limit, API errors, `<synthetic>`), nor the summary written
+when the conversation is compacted.
+
+- Case and accents don't count: both sides are lowercased and decomposed (NFD) without combining
+  marks, so `codigo` finds `Código`.
+- `q` is split on whitespace and every word must be in the message (AND); all of them are
+  highlighted. `400` (`{"error": …}`) if `q`, trimmed, has fewer than 2 characters, or nothing is
+  left to search after normalizing.
+- `limit`: 50 by default, at most 200 (a bigger one counts as 200).
+
+```json
+{
+  "sessions": ["3f9c1a2b"],
+  "messages": [
+    {
+      "session": "3f9c1a2b",
+      "sid": "8e1b…",
+      "at": 1048576,
+      "id": "5d2e…",
+      "ts": 1794478830123,
+      "role": "assistant",
+      "text": "…the login code is in src/auth.rs, the function that checks the token…",
+      "hits": [[5, 10], [11, 15]]
+    }
+  ],
+  "truncated": false
+}
+```
+
+- `sessions`: ids of the sessions whose name, folder or working directory contain every word
+  (same normalization).
+- `messages`: newest first (by `ts`, then by position), at most `limit`. `session` is the nido
+  session, `sid` its Claude conversation (`claude.session_id`), `at` and `id` the message's `at`
+  and `id` in the chat (see below: open it with `chat?around=<at>&sid=<sid>`), `ts` when it was
+  written (ms since 1970; `0` if unknown), `role` `"user"` or `"assistant"`.
+- `text`: about 160 characters of the message around its first match, with `…` where it was cut
+  and line breaks as spaces. `hits`: where the words are in `text`, as `[start, end)` indexes in
+  **Unicode characters (code points), not UTF-16 units nor bytes** (an emoji is one character;
+  in JavaScript, index `[...text]`, not `text`). Sorted, with overlapping matches merged.
+- `truncated`: some conversation has more text than nido keeps for searching (8 MB of text per
+  conversation, the most recent), so its oldest messages were not searched.
+
+The index lives in memory: it is built the first time something is searched (it reads the whole
+transcripts, so it takes as long as reading them from disk) and afterwards only what is new in
+each transcript is read, so later searches take milliseconds. It starts again if the session's
+conversation changes or the transcript is rewritten.
+
+### The chat around a message
+
+`GET /api/v1/sessions/{id}/chat` (and the `chat` messages of `/api/v1/sessions/{id}/live`) give
+every item an `at`: the byte offset where its line starts in the transcript. It identifies the
+message (several items of one line, e.g. Claude's text and a tool call, share it) and it is what
+search returns.
+
+`GET /api/v1/sessions/{id}/chat?around=<at>&before=30&after=30&sid=<sid>` returns, instead of the
+end of the conversation, up to `before` items before `at` and up to `after` items from `at` on, in
+the same shape as without `around`, plus a few fields:
+
+```json
+{
+  "session_id": "8e1b…",
+  "items": [{"kind": "user", "id": "…", "at": 1040002, "ts": "…", "text": "…", "images": 0}, …],
+  "results": [],
+  "start": 1040002,
+  "offset": 1061377,
+  "more_before": true,
+  "more_after": true,
+  "truncated": true,
+  "reset": false
+}
+```
+
+- Windows are whole lines: a side may bring one or two items more than asked so that the items of
+  a line are never split. Every tool call in the window comes with its result if the
+  transcript already has it, even when the result's line is after the window (nido looks up to
+  8 MB past it).
+- `start`: where the first line of the window starts. **Older** items: `around=<start>&before=N&after=0`
+  (only items before `start`).
+- `offset`: just after the last line of the window. **Newer** items:
+  `around=<offset>&before=0&after=N` (only items from `offset` on). `results` has the results that
+  lines in the window bring for tool calls of earlier windows (`tool_id`, like `/live`).
+- `more_before` / `more_after`: whether there are items before `start` / after `offset`.
+  `truncated` is `more_before` and `reset` is `false`, so old clients read it like a first chunk.
+- **Back to the end and live**: when `more_after` is `false`, nothing is missing after `offset`:
+  connect `/live?sid=<session_id>&offset=<offset>` and new items and results arrive from there.
+  Otherwise, open `/live` from the start as usual (`offset=0&limit=…`).
+- `before` and `after` default to 30 and are capped at 1000; `0` is allowed (`before=0&after=0`
+  only tells, with `more_*`, whether there is anything on each side).
+- An `at` that is not where a line starts counts as the start of the next line; one past the end
+  returns the last `before` items with `more_after: false`. If the session has no transcript yet,
+  the window is empty.
+- `sid`: the conversation `at` belongs to (`sid` in search results). `409` if it is no longer the
+  session's current one (e.g. after a `/clear`): `at` would point somewhere else.
+- Only the window is read (backwards from `at`), so it does not depend on the size of the
+  transcript. The same goes for the first load without `around` (`offset=0` with `limit`, in
+  `/chat` and `/live`): the last items are read backwards from the end.
+
 ## Install
 
 There are binaries for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel) and Windows

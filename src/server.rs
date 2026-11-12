@@ -109,6 +109,12 @@ pub struct AppState {
     model_missing_ttl: std::sync::Mutex<Duration>,
     /// El modelo que nido le puso a cada sesión con `/model`, hasta que Claude conteste.
     model_chosen: std::sync::Mutex<std::collections::HashMap<String, ModelChosen>>,
+    /// Los índices de las conversaciones para buscar (`/api/v1/search`).
+    pub search: Arc<crate::search::Indexes>,
+    /// Que las búsquedas vayan de una en una (la primera hace los índices: las que lleguen
+    /// mientras esperan y aprovechan lo hecho; las que se cancelan, ni empiezan). Lo tiene el
+    /// hilo que busca: aunque se cancele la petición, la siguiente espera a que acabe.
+    searching: Arc<Mutex<()>>,
 }
 
 /// Los modelos que se ofrecen si nido aún no ha visto el menú de `/model` (también valen como
@@ -636,6 +642,8 @@ impl AppState {
             model_refreshing: Mutex::new(()),
             model_missing_ttl: std::sync::Mutex::new(MODEL_MISSING_TTL),
             model_chosen: Default::default(),
+            search: Default::default(),
+            searching: Default::default(),
         }))
     }
 
@@ -2295,6 +2303,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
         .route("/api/v1/sessions/{id}/history", get(api_history))
         .route("/api/v1/sessions/{id}/chat", get(api_chat))
+        .route("/api/v1/search", get(api_search))
         .route("/api/v1/sessions/{id}/live", get(ws_live))
         .route("/api/v1/sessions/{id}/term", get(ws_term))
         .route("/api/v1/events", get(ws_events))
@@ -3318,7 +3327,18 @@ struct ChatQuery {
     offset: u64,
     /// Al empezar, solo los últimos N mensajes.
     limit: Option<usize>,
+    /// En vez de lo anterior, los mensajes alrededor de este punto (el `at` de un mensaje).
+    around: Option<u64>,
+    /// Con `around`: cuántos mensajes antes y desde ese punto.
+    before: Option<usize>,
+    after: Option<usize>,
+    /// Con `around`: la conversación de ese `at`; si ya no es la actual, 409.
+    sid: Option<String>,
 }
+
+/// Con `around`, cuántos mensajes a cada lado si no se dice, y como mucho.
+const AROUND_DEFAULT: usize = 30;
+const AROUND_MAX: usize = 1000;
 
 /// La transcripción de la conversación de Claude, si ya la ha empezado a escribir.
 pub(crate) fn transcript_of(st: &AppState, link: &ClaudeLink) -> Option<PathBuf> {
@@ -3329,7 +3349,8 @@ pub(crate) fn transcript_of(st: &AppState, link: &ClaudeLink) -> Option<PathBuf>
     crate::transcript::find(&config, &link.session_id)
 }
 
-/// La conversación de Claude de la sesión, leída de su transcripción, por trozos.
+/// La conversación de Claude de la sesión, leída de su transcripción, por trozos; o, con
+/// `around`, la parte alrededor de un mensaje.
 async fn api_chat(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3342,6 +3363,36 @@ async fn api_chat(
     let Some(link) = s.claude else {
         return error(StatusCode::NOT_FOUND, "en esta sesión no hay ningún Claude");
     };
+    if let Some(around) = q.around {
+        if q.sid.as_ref().is_some_and(|sid| *sid != link.session_id) {
+            return error(
+                StatusCode::CONFLICT,
+                "esa conversación ya no es la actual de la sesión",
+            );
+        }
+        let before = q.before.unwrap_or(AROUND_DEFAULT).min(AROUND_MAX);
+        let after = q.after.unwrap_or(AROUND_DEFAULT).min(AROUND_MAX);
+        let st2 = st.clone();
+        let read = tokio::task::spawn_blocking(move || match transcript_of(&st2, &link) {
+            Some(path) => crate::transcript::read_around(&path, around, before, after)
+                .map(|w| (link.session_id, w)),
+            None => Ok((link.session_id, crate::transcript::Window::default())),
+        })
+        .await;
+        return match read {
+            Ok(Ok((sid, w))) => {
+                let more_before = w.more_before;
+                let mut v = serde_json::to_value(&w).unwrap_or_default();
+                localize_chunk(&mut v);
+                v["session_id"] = sid.into();
+                v["truncated"] = more_before.into();
+                v["reset"] = false.into();
+                Json(v).into_response()
+            }
+            Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+    }
     let Some(path) = transcript_of(&st, &link) else {
         // Un Claude recién creado aún no ha escrito nada.
         let empty = serde_json::json!({ "session_id": link.session_id, "offset": 0, "items": [], "results": [], "truncated": false });
@@ -3358,6 +3409,75 @@ async fn api_chat(
             Json(v).into_response()
         }
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+    limit: Option<usize>,
+}
+
+/// Busca en las conversaciones de las sesiones de este equipo: las sesiones cuyo nombre,
+/// carpeta o directorio casan, y los mensajes (tuyos y de Claude) que tienen todas las
+/// palabras, lo más reciente primero.
+async fn api_search(State(st): State<Arc<AppState>>, Query(q): Query<SearchQuery>) -> Response {
+    let Some(terms) = crate::search::terms(&q.q) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "hay que buscar al menos 2 caracteres",
+        );
+    };
+    let limit = q
+        .limit
+        .unwrap_or(crate::search::DEFAULT_LIMIT)
+        .clamp(1, crate::search::MAX_LIMIT);
+    let sessions: Vec<String> = st
+        .views
+        .borrow()
+        .sessions
+        .iter()
+        .filter(|s| {
+            let cwd = s.cwd.to_string_lossy();
+            let fields = [s.name.as_str(), s.folder.as_deref().unwrap_or(""), &cwd];
+            crate::search::matches_any(&fields, &terms)
+        })
+        .map(|s| s.id.clone())
+        .collect();
+    let targets: Vec<crate::search::Target> = st
+        .registry
+        .lock()
+        .await
+        .sessions()
+        .iter()
+        .filter_map(|s| {
+            let link = s.claude.as_ref()?;
+            Some(crate::search::Target {
+                id: s.id.clone(),
+                session_id: link.session_id.clone(),
+                config_dir: link
+                    .config_dir
+                    .clone()
+                    .unwrap_or_else(|| claude::default_config_dir(&st.paths.home)),
+            })
+        })
+        .collect();
+    let one = st.searching.clone().lock_owned().await;
+    let index = st.search.clone();
+    let search = move || {
+        let found = index.search(targets, &terms, limit);
+        drop(one);
+        found
+    };
+    match tokio::task::spawn_blocking(search).await {
+        Ok((messages, truncated)) => Json(serde_json::json!({
+            "sessions": sessions,
+            "messages": messages,
+            "truncated": truncated,
+        }))
+        .into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -5049,5 +5169,195 @@ mod tests {
         assert_eq!(alert_text("\u{1b}[0m\u{7}"), None);
         // Un ESC suelto al final no rompe nada.
         assert_eq!(alert_text("fin\u{1b}"), Some("fin".to_owned()));
+    }
+
+    // ---------- Buscar y el chat alrededor de un mensaje ----------
+
+    /// Un nido en `dir` con su API en un puerto propio y una sesión «trabajo» (carpeta «web»)
+    /// con un Claude cuya transcripción es `transcript`.
+    async fn with_transcript(
+        dir: &std::path::Path,
+        transcript: &str,
+    ) -> (Arc<AppState>, std::net::SocketAddr, String) {
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, None, true).unwrap();
+        let project = dir.join("claude").join("projects").join("-w");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("conv.jsonl"), transcript).unwrap();
+        let session = Session {
+            id: new_id(),
+            name: "trabajo".into(),
+            cwd: dir.to_owned(),
+            argv: vec!["claude".into()],
+            env: vec![],
+            autostart: false,
+            created: now(),
+            claude: Some(ClaudeLink {
+                session_id: "conv".into(),
+                config_dir: Some(dir.join("claude")),
+                account: None,
+                inside_shell: false,
+            }),
+            folder: Some("Web".into()),
+            finished: 0,
+            stopped: 0,
+            seen: 0,
+            opened_by: None,
+            alerts: vec![],
+        };
+        let id = st.registry.lock().await.add(session).unwrap().id;
+        st.scan().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(st.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (st, addr, id)
+    }
+
+    async fn get_json(addr: std::net::SocketAddr, path: &str) -> (u16, serde_json::Value) {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::client::Api { addr, token: None }
+                .request_with("GET", &path, None, &[], None)
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    fn said_line(kind: &str, uuid: &str, text: &str, ts: &str) -> String {
+        let v = if kind == "user" {
+            json!({"type":"user","uuid":uuid,"timestamp":ts,"message":{"content":text}})
+        } else {
+            json!({"type":"assistant","uuid":uuid,"timestamp":ts,"message":{"content":[{"type":"text","text":text}]}})
+        };
+        format!("{v}\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_search_route() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let first = said_line(
+            "user",
+            "u1",
+            "¿Dónde está el CÓDIGO?",
+            "2026-11-12T10:00:00Z",
+        );
+        let text = first.clone()
+            + &said_line(
+                "assistant",
+                "a1",
+                "El código está en src/",
+                "2026-11-12T10:00:05Z",
+            );
+        let (_st, addr, id) = with_transcript(tmp.path(), &text).await;
+        // Menos de 2 caracteres: 400.
+        for q in ["", "a", "%20%20x%20", "%C3%A9"] {
+            let (code, r) = get_json(addr, &format!("/api/v1/search?q={q}")).await;
+            assert_eq!(code, 400, "{q}: {r}");
+            assert_eq!(r["error"], "search for at least 2 characters");
+        }
+        let (code, r) = get_json(addr, "/api/v1/search?q=codigo").await;
+        assert_eq!(code, 200, "{r}");
+        assert_eq!(r["truncated"], false);
+        assert_eq!(r["sessions"], json!([]));
+        assert_eq!(
+            r["messages"],
+            json!([
+                {"session": id, "sid": "conv", "at": first.len(),
+                 "id": "a1", "ts": crate::search::ts_ms("2026-11-12T10:00:05Z"),
+                 "role": "assistant", "text": "El código está en src/", "hits": [[3, 9]]},
+                {"session": id, "sid": "conv", "at": 0, "id": "u1",
+                 "ts": crate::search::ts_ms("2026-11-12T10:00:00Z"),
+                 "role": "user", "text": "¿Dónde está el CÓDIGO?", "hits": [[15, 21]]},
+            ])
+        );
+        // `limit`, y las sesiones por su nombre, carpeta o directorio.
+        let (code, r) = get_json(addr, "/api/v1/search?q=C%C3%B3digo&limit=1").await;
+        assert_eq!(code, 200);
+        assert_eq!(r["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(r["messages"][0]["id"], "a1");
+        let (_, r) = get_json(addr, "/api/v1/search?q=TRAB").await;
+        assert_eq!(
+            (r["sessions"].clone(), r["messages"].clone()),
+            (json!([id]), json!([]))
+        );
+        let (_, r) = get_json(addr, "/api/v1/search?q=web").await;
+        assert_eq!(r["sessions"], json!([id]));
+        // Un `limit` que no es un número: 400.
+        let (code, _) = get_json(addr, "/api/v1/search?q=codigo&limit=x").await;
+        assert_eq!(code, 400);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chat_around_a_message() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut text = String::new();
+        let mut starts = Vec::new();
+        for i in 0..20 {
+            starts.push(text.len() as u64);
+            text += &said_line("user", &format!("u{i}"), &format!("mensaje {i}"), "");
+        }
+        let (_st, addr, id) = with_transcript(tmp.path(), &text).await;
+        let chat = |q: String| {
+            let id = id.clone();
+            async move { get_json(addr, &format!("/api/v1/sessions/{id}/chat?{q}")).await }
+        };
+        let ids = |r: &serde_json::Value| -> Vec<String> {
+            r["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // Sin `around`, como siempre (y cada mensaje con su `at`).
+        let (code, r) = chat("limit=2".into()).await;
+        assert_eq!(code, 200);
+        assert_eq!(ids(&r), ["u18", "u19"]);
+        assert_eq!(r["items"][0]["at"], starts[18]);
+        assert_eq!(r["truncated"], true);
+        assert_eq!(r["offset"], text.len());
+        // Alrededor de «mensaje 10».
+        let (code, r) = chat(format!("around={}&before=2&after=3&sid=conv", starts[10])).await;
+        assert_eq!(code, 200, "{r}");
+        assert_eq!(ids(&r), ["u8", "u9", "u10", "u11", "u12"]);
+        assert_eq!(r["session_id"], "conv");
+        assert_eq!(r["start"], starts[8]);
+        assert_eq!(r["offset"], starts[13]);
+        assert_eq!(
+            (r["more_before"].clone(), r["more_after"].clone()),
+            (json!(true), json!(true))
+        );
+        assert_eq!(
+            (r["truncated"].clone(), r["reset"].clone()),
+            (json!(true), json!(false))
+        );
+        assert_eq!(r["results"], json!([]));
+        // Más arriba y más abajo.
+        let (_, up) = chat(format!("around={}&before=3&after=0", starts[8])).await;
+        assert_eq!(ids(&up), ["u5", "u6", "u7"]);
+        let (_, down) = chat(format!("around={}&before=0&after=30", starts[13])).await;
+        assert_eq!(ids(&down).len(), 7);
+        assert_eq!(down["more_after"], false);
+        assert_eq!(down["offset"], text.len());
+        // Por defecto, 30 a cada lado.
+        let (_, r) = chat(format!("around={}", starts[10])).await;
+        assert_eq!(ids(&r).len(), 20);
+        // Otra conversación: 409.
+        let (code, r) = chat(format!("around={}&sid=otra", starts[10])).await;
+        assert_eq!(code, 409, "{r}");
+        // Un `at` que no es de ningún mensaje: lo que haya desde ahí.
+        let (code, r) = chat(format!("around={}&before=0&after=1", starts[10] + 1)).await;
+        assert_eq!((code, ids(&r)), (200, vec!["u11".to_owned()]));
     }
 }

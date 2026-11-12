@@ -27,6 +27,7 @@ pub mod outbox;
 pub mod prompt;
 pub mod proto;
 pub mod registry;
+pub mod search;
 pub mod secrets;
 pub mod server;
 pub mod sys;
