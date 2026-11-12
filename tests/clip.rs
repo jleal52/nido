@@ -299,13 +299,19 @@ fn sends_stdin_or_a_file_to_the_session_clipboard() {
         nido.clip_in("C.UTF-8", None, &work, &[], b"x"),
         "NIDO_SESSION is missing or invalid: `nido clip` is for the commands of a nido session",
     );
-    let foto = work.join("foto.png");
-    en(
-        nido.clip_in("C.UTF-8", me, &work, &["foto.png"], b""),
-        &format!(
-            "{} is not text (UTF-8): to send it, use send_file",
-            foto.display()
-        ),
+    // La ruta, absoluta desde la carpeta de la orden tal como la da el sistema (en macOS,
+    // `/private/var/…` aunque la temporal diga `/var/…`): basta con cómo acaba.
+    let o = nido.clip_in("C.UTF-8", me, &work, &["foto.png"], b"");
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let msg = stderr(&o);
+    let foto = std::path::Path::new("trabajo").join("foto.png");
+    assert!(
+        msg.starts_with("nido: ")
+            && msg.ends_with(&format!(
+                "{} is not text (UTF-8): to send it, use send_file\n",
+                foto.display()
+            )),
+        "{msg}"
     );
     assert_eq!(nido.items().len(), sent + 2);
 }
