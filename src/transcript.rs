@@ -901,6 +901,145 @@ pub fn read_chunk(path: &Path, offset: u64, limit: Option<usize>) -> io::Result<
     Ok(chunk)
 }
 
+/// Una ventana de la conversación alrededor de un punto (`around`): líneas enteras, de `start`
+/// a `offset`.
+#[derive(Debug, Default, Serialize)]
+pub struct Window {
+    /// Dónde empieza la primera línea de la ventana: lo anterior se pide con `around=start`.
+    pub start: u64,
+    /// Dónde acaba la última (tras su `\n`): lo siguiente se pide con `around=offset`, y si ya no
+    /// hay nada más (`more_after`), desde ahí se sigue en vivo.
+    pub offset: u64,
+    pub items: Vec<ChatItem>,
+    /// Resultados que traen las líneas de la ventana de herramientas de antes de ella.
+    pub results: Vec<ToolResult>,
+    /// Hay mensajes antes de `start`.
+    pub more_before: bool,
+    /// Hay mensajes después de `offset`.
+    pub more_after: bool,
+}
+
+/// Cuánto se sigue leyendo tras la ventana para encontrar los resultados de sus herramientas.
+const LOOKAHEAD: u64 = 8 * 1024 * 1024;
+
+/// Dónde empieza la línea que acaba en `end` (justo tras su `\n`), mirando hacia atrás a trozos.
+fn line_start_before(f: &mut std::fs::File, end: u64) -> io::Result<u64> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut hi = end.saturating_sub(1);
+    while hi > 0 {
+        let lo = hi.saturating_sub(CHUNK);
+        let mut buf = vec![0; (hi - lo) as usize];
+        f.seek(SeekFrom::Start(lo))?;
+        f.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            return Ok(lo + i as u64 + 1);
+        }
+        hi = lo;
+    }
+    Ok(0)
+}
+
+/// El principio de la primera línea que empieza en `at` o después (`end` si no hay ninguna
+/// entera): un `at` a media línea cuenta como el principio de la siguiente.
+fn line_start_from(f: &mut std::fs::File, at: u64, end: u64) -> io::Result<u64> {
+    if at == 0 || at >= end {
+        return Ok(at.min(end));
+    }
+    f.seek(SeekFrom::Start(at - 1))?;
+    let mut r = io::BufReader::new(f.take(end - (at - 1)));
+    let mut skipped = Vec::new();
+    let n = io::BufRead::read_until(&mut r, b'\n', &mut skipped)?;
+    Ok(at - 1 + n as u64)
+}
+
+/// Los mensajes de la conversación alrededor de `at` (el principio de una línea, como el `at` de
+/// cada mensaje): como mucho `before` de las líneas anteriores y `after` desde esa línea en
+/// adelante, más los que vengan en la misma línea que el último de cada lado (la ventana no
+/// parte líneas). Solo se lee la ventana (hacia atrás desde `at`) y un poco más allá: lo que
+/// cuesta no depende del tamaño de la transcripción.
+pub fn read_around(path: &Path, at: u64, before: usize, after: usize) -> io::Result<Window> {
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let end = whole_lines_end(path, len);
+    let anchor = line_start_from(&mut f, at, end)?;
+    let mut w = Window {
+        start: anchor,
+        ..Default::default()
+    };
+
+    // Hacia atrás: las líneas que hagan falta para `before` mensajes, y si queda alguno antes.
+    let (mut probe, mut count) = (anchor, 0);
+    while probe > 0 {
+        let from = line_start_before(&mut f, probe)?;
+        let mut buf = vec![0; (probe - from) as usize];
+        f.seek(SeekFrom::Start(from))?;
+        f.read_exact(&mut buf)?;
+        let mut p = Parser::default();
+        p.line(from, &String::from_utf8_lossy(&buf));
+        probe = from;
+        if count < before {
+            count += p.items.len();
+            w.start = from;
+        } else if !p.items.is_empty() {
+            w.more_before = true;
+            break;
+        }
+    }
+
+    // Hacia delante desde `start`: la ventana, y luego lo justo para saber si hay más y para
+    // los resultados de sus herramientas.
+    f.seek(SeekFrom::Start(w.start))?;
+    let mut r = io::BufReader::with_capacity(1 << 20, f.take(end - w.start));
+    let mut p = Parser::default();
+    let (mut pos, mut line) = (w.start, Vec::new());
+    // Mensajes antes de `anchor`, y los de la ventana con sus resultados (cuando se cierra).
+    let mut before_items = None;
+    let mut closed: Option<(usize, usize)> = None;
+    loop {
+        if before_items.is_none() && pos >= anchor {
+            before_items = Some(p.items.len());
+            if after == 0 {
+                closed = Some((p.items.len(), p.results.len()));
+                w.offset = pos;
+            }
+        }
+        if let Some((n, _)) = closed {
+            let more = p.items.len() > n;
+            let pending = p.items[..n]
+                .iter()
+                .any(|i| matches!(i, ChatItem::Tool { result: None, .. }));
+            // Se sabe si hay más y no falta ningún resultado (o ya se ha mirado bastante).
+            if more && (!pending || pos - w.offset > LOOKAHEAD) {
+                break;
+            }
+        }
+        line.clear();
+        let got = io::BufRead::read_until(&mut r, b'\n', &mut line)?;
+        if got == 0 {
+            break;
+        }
+        p.line(pos, &String::from_utf8_lossy(&line[..got - 1]));
+        pos += got as u64;
+        if closed.is_none()
+            && let Some(b) = before_items
+            && p.items.len() - b >= after
+        {
+            closed = Some((p.items.len(), p.results.len()));
+            w.offset = pos;
+        }
+    }
+    let (n, results) = closed.unwrap_or_else(|| {
+        w.offset = pos;
+        (p.items.len(), p.results.len())
+    });
+    w.more_after = p.items.len() > n;
+    p.items.truncate(n);
+    p.results.truncate(results);
+    w.items = p.items;
+    w.results = p.results;
+    Ok(w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,6 +1421,188 @@ mod tests {
                 result: Some("todo verde".into()),
             }]
         );
+    }
+
+    /// Una conversación de `n` turnos: tu mensaje, y la respuesta de Claude con un texto y una
+    /// herramienta en la misma línea, el resultado en la siguiente y un texto final. Con líneas
+    /// que no son mensajes por medio. Devuelve el texto y dónde empieza cada línea con mensajes.
+    fn conversation(n: usize) -> (String, Vec<u64>) {
+        let mut text = String::new();
+        let mut starts = Vec::new();
+        let mut push = |text: &mut String, v: Value, msg: bool| {
+            if msg {
+                starts.push(text.len() as u64);
+            }
+            *text += &line(v);
+        };
+        for i in 0..n {
+            push(
+                &mut text,
+                serde_json::json!({"type":"user","uuid":format!("u{i}"),"message":{"content":format!("pregunta {i}")}}),
+                true,
+            );
+            push(
+                &mut text,
+                serde_json::json!({"type":"api-request","x":"y".repeat(100)}),
+                false,
+            );
+            push(
+                &mut text,
+                serde_json::json!({"type":"assistant","uuid":format!("a{i}"),"message":{"content":[
+                    {"type":"text","text":format!("miro {i}")},
+                    {"type":"tool_use","id":format!("t{i}"),"name":"Bash","input":{"command":"ls"}}]}}),
+                true,
+            );
+            push(
+                &mut text,
+                serde_json::json!({"type":"user","uuid":format!("r{i}"),"message":{"content":[
+                    {"type":"tool_result","tool_use_id":format!("t{i}"),"content":format!("salida {i}")}]}}),
+                false,
+            );
+            push(
+                &mut text,
+                serde_json::json!({"type":"assistant","uuid":format!("f{i}"),"message":{"content":[{"type":"text","text":format!("listo {i}")}]}}),
+                true,
+            );
+        }
+        (text, starts)
+    }
+
+    fn ids(items: &[ChatItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match i {
+                ChatItem::User { id, .. }
+                | ChatItem::Assistant { id, .. }
+                | ChatItem::Notice { id, .. }
+                | ChatItem::Tool { id, .. } => id.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_window_around_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let (text, starts) = conversation(10);
+        std::fs::write(&path, &text).unwrap();
+        let all = read_chunk(&path, 0, None).unwrap().items;
+        assert_eq!(all.len(), 40);
+        // Alrededor de «pregunta 5» (la línea starts[15]): 2 antes y 3 desde ella.
+        let w = read_around(&path, starts[15], 2, 3).unwrap();
+        assert_eq!(ids(&w.items), ["a4", "a4:1", "f4", "u5", "a5", "a5:1"]);
+        // «miro 4» y su herramienta van en la misma línea: entran las dos, y 3 desde `at` acaba
+        // en una línea con dos (también las dos).
+        assert_eq!(w.start, starts[13]);
+        let end_of = |at: u64| at + text[at as usize..].find('\n').unwrap() as u64 + 1;
+        assert_eq!(w.offset, end_of(starts[16]));
+        assert!(w.more_before && w.more_after);
+        // Las herramientas de la ventana, con su resultado aunque esté justo detrás.
+        assert!(matches!(&w.items[5], ChatItem::Tool { result: Some(r), .. } if r == "salida 5"));
+        assert!(matches!(&w.items[1], ChatItem::Tool { result: Some(r), .. } if r == "salida 4"));
+        assert!(w.results.is_empty());
+        // Cada mensaje igual que en el chat entero.
+        let from = all.iter().position(|i| i.at() == starts[13]).unwrap();
+        assert_eq!(w.items, all[from..from + 6]);
+    }
+
+    #[test]
+    fn paging_up_and_down_covers_everything_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let (text, starts) = conversation(7);
+        std::fs::write(&path, &text).unwrap();
+        let all = read_chunk(&path, 0, None).unwrap().items;
+        let first = read_around(&path, starts[10], 3, 3).unwrap();
+        let mut got = first.items.clone();
+        // Hacia arriba con `start`, hasta que no haya más.
+        let mut w = first;
+        while w.more_before {
+            let start = w.start;
+            w = read_around(&path, start, 4, 0).unwrap();
+            assert!(w.items.iter().all(|i| i.at() < start));
+            assert_eq!(w.offset, start);
+            got.splice(0..0, w.items.clone());
+        }
+        assert_eq!(w.start, 0);
+        // Hacia abajo con `offset`.
+        let mut w = read_around(&path, starts[10], 3, 3).unwrap();
+        while w.more_after {
+            let offset = w.offset;
+            w = read_around(&path, offset, 0, 5).unwrap();
+            assert!(w.items.iter().all(|i| i.at() >= offset));
+            assert_eq!(w.start, offset);
+            got.extend(w.items.clone());
+        }
+        assert_eq!(ids(&got), ids(&all));
+        assert_eq!(got, all);
+        // Al final, `offset` es donde sigue el chat en vivo.
+        assert_eq!(w.offset, text.len() as u64);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(
+            line(serde_json::json!({"type":"user","uuid":"nuevo","message":{"content":"otra"}}))
+                .as_bytes(),
+        )
+        .unwrap();
+        drop(f);
+        let live = read_chunk(&path, w.offset, Some(300)).unwrap();
+        assert_eq!(ids(&live.items), ["nuevo"]);
+    }
+
+    #[test]
+    fn around_the_ends_and_odd_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let (text, starts) = conversation(3);
+        // Y una línea a medio escribir, que no cuenta.
+        std::fs::write(&path, text.clone() + "{\"type\":\"user\",\"uuid\":\"x\"").unwrap();
+        let all = read_chunk(&path, 0, None).unwrap().items;
+        let end = text.len() as u64;
+        // Al principio: nada antes.
+        let w = read_around(&path, 0, 5, 2).unwrap();
+        assert_eq!(ids(&w.items), ["u0", "a0", "a0:1"]);
+        assert!(!w.more_before && w.more_after);
+        assert_eq!(w.start, 0);
+        // Al final, o más allá: los últimos, nada después; `offset`, las líneas enteras.
+        for at in [end, end + 5, u64::MAX] {
+            let w = read_around(&path, at, 2, 30).unwrap();
+            assert_eq!(ids(&w.items), ["a2", "a2:1", "f2"], "{at}");
+            assert!(w.more_before && !w.more_after);
+            assert_eq!(w.offset, end);
+        }
+        // Todo de una vez.
+        let w = read_around(&path, starts[4], 100, 100).unwrap();
+        assert_eq!(w.items, all);
+        assert!(!w.more_before && !w.more_after);
+        // A media línea: como el principio de la siguiente.
+        let w = read_around(&path, starts[4] + 3, 0, 1).unwrap();
+        assert_eq!(ids(&w.items), ["f1"]);
+        // Nada a ningún lado: vacío, pero dice si hay.
+        let w = read_around(&path, starts[4], 0, 0).unwrap();
+        assert!(w.items.is_empty() && w.more_before && w.more_after);
+        assert_eq!((w.start, w.offset), (starts[4], starts[4]));
+        // Un fichero vacío, o sin mensajes.
+        std::fs::write(&path, line(serde_json::json!({"type":"permission-mode"}))).unwrap();
+        let w = read_around(&path, 0, 30, 30).unwrap();
+        assert!(w.items.is_empty() && !w.more_before && !w.more_after);
+    }
+
+    #[test]
+    fn around_brings_results_of_earlier_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let (text, starts) = conversation(2);
+        std::fs::write(&path, &text).unwrap();
+        // Desde «listo 0»: el resultado de la herramienta de antes viene en `results`.
+        let res = starts[1] as usize + text[starts[1] as usize..].find('\n').unwrap() + 1;
+        let w = read_around(&path, res as u64, 0, 2).unwrap();
+        assert_eq!(ids(&w.items), ["f0", "u1"]);
+        assert_eq!(w.results.len(), 1);
+        assert_eq!(w.results[0].tool_id, "t0");
+        assert_eq!(w.results[0].result, "salida 0");
     }
 
     #[test]
