@@ -537,6 +537,131 @@ pub fn stopped_by_limit(path: &Path) -> bool {
     false
 }
 
+/// El modelo del último mensaje de Claude en la conversación principal (sin los de los subagentes,
+/// `isSidechain`, ni los que pone Claude Code, `<synthetic>`), tal como lo da la API
+/// (`claude-opus-5-5`), y dónde empieza esa línea en el fichero. Se busca desde el final, cada
+/// vez más atrás: hay líneas muy largas (las de las herramientas) que también dicen `model`.
+pub fn last_model(path: &Path) -> Option<(String, u64)> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut tail: u64 = 1024 * 1024;
+    loop {
+        let start = len.saturating_sub(tail);
+        f.seek(SeekFrom::Start(start)).ok()?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok()?;
+        // Las líneas enteras: la primera puede venir cortada (si no se empezó por el principio).
+        let mut at = if start == 0 {
+            0
+        } else {
+            buf.iter()
+                .position(|&b| b == b'\n')
+                .map_or(buf.len(), |i| i + 1)
+        };
+        let mut found = None;
+        while at < buf.len() {
+            let end = buf[at..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(buf.len(), |i| at + i);
+            if let Some(model) = assistant_model(&buf[at..end]) {
+                found = Some((model, start + at as u64));
+            }
+            at = end + 1;
+        }
+        if found.is_some() || start == 0 {
+            return found;
+        }
+        tail *= 8;
+    }
+}
+
+/// Lo nuevo de la transcripción desde `from` (el principio de una línea): el modelo de la última
+/// respuesta en las líneas ya enteras (y dónde empieza esa línea), y dónde empieza lo que aún no
+/// es una línea entera (de ahí se sigue la próxima vez).
+pub fn models_since(path: &Path, from: u64) -> (Option<(String, u64)>, u64) {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (None, from);
+    };
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return (None, from);
+    }
+    let mut found = None;
+    let mut at = 0;
+    while let Some(i) = buf[at..].iter().position(|&b| b == b'\n') {
+        if let Some(model) = assistant_model(&buf[at..at + i]) {
+            found = Some((model, from + at as u64));
+        }
+        at += i + 1;
+    }
+    (found, from + at as u64)
+}
+
+/// Dónde acaba la última línea entera de los primeros `len` bytes (tras su `\n`): mirando hacia
+/// atrás desde el final, a trozos.
+pub fn whole_lines_end(path: &Path, len: u64) -> u64 {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return 0;
+    };
+    const CHUNK: u64 = 64 * 1024;
+    let mut end = len;
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let mut buf = vec![0; (end - start) as usize];
+        if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut buf).is_err() {
+            return 0;
+        }
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            return start + i as u64 + 1;
+        }
+        end = start;
+    }
+    0
+}
+
+fn assistant_model(line: &[u8]) -> Option<String> {
+    // Antes de entender la línea, que diga algo de eso (las hay de megas).
+    if !line.windows(11).any(|w| w == b"\"assistant\"") {
+        return None;
+    }
+    let d: Value = serde_json::from_slice(line).ok()?;
+    if d.get("type").and_then(Value::as_str) != Some("assistant")
+        || d.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let model = d.pointer("/message/model")?.as_str()?;
+    (!model.is_empty() && !model.starts_with('<')).then(|| model.to_owned())
+}
+
+/// El nombre de un modelo para enseñarlo, como lo pone Claude en `/model`: `claude-opus-5-5` →
+/// «Opus 5.5», `claude-haiku-4-5-20251001` → «Haiku 4.5». Lo que no se entiende, tal cual.
+pub fn model_name(id: &str) -> String {
+    let base = id.split('[').next().unwrap_or(id);
+    let mut parts = base.split('-');
+    if parts.next() != Some("claude") {
+        return id.to_owned();
+    }
+    let (mut family, mut version) = (None, Vec::new());
+    for p in parts {
+        if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphabetic()) && family.is_none() {
+            family = Some(p);
+        } else if !p.is_empty() && p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit()) {
+            version.push(p);
+        }
+    }
+    let Some(family) = family else {
+        return id.to_owned();
+    };
+    let mut name: String = family[..1].to_uppercase() + &family[1..];
+    if !version.is_empty() {
+        name.push(' ');
+        name.push_str(&version.join("."));
+    }
+    name
+}
+
 /// Una conversación de Claude guardada, para retomarla.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Conversation {
@@ -723,6 +848,88 @@ mod tests {
 
     fn line(v: Value) -> String {
         format!("{}\n", v)
+    }
+
+    #[test]
+    fn model_names() {
+        assert_eq!(model_name("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(model_name("claude-fable-5-2"), "Fable 5.2");
+        assert_eq!(model_name("claude-haiku-4-5-20251001"), "Haiku 4.5");
+        assert_eq!(model_name("claude-sonnet-4-20250514"), "Sonnet 4");
+        assert_eq!(model_name("claude-3-5-sonnet-20241022"), "Sonnet 3.5");
+        assert_eq!(model_name("claude-opus-4-6[1m]"), "Opus 4.6");
+        assert_eq!(model_name("gpt-x"), "gpt-x");
+        assert_eq!(model_name("claude-7"), "claude-7");
+    }
+
+    #[test]
+    fn the_model_of_the_last_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let reply = |model: &str, side: bool| {
+            line(
+                serde_json::json!({"type":"assistant","isSidechain":side,"message":{"model":model,"content":[{"type":"text","text":"hola"}]}}),
+            )
+        };
+        let mut text = String::new();
+        text += &line(serde_json::json!({"type":"user","message":{"content":"hola"}}));
+        text += &reply("claude-opus-5-5", false);
+        let at = text.len() as u64;
+        text += &reply("claude-haiku-5-5", false);
+        // Lo que viene detrás no cuenta: un subagente, un aviso de Claude Code, una herramienta
+        // que dice `model`, la línea que se está escribiendo.
+        text += &reply("claude-fable-5-2", true);
+        text += &reply("<synthetic>", false);
+        text += &line(
+            serde_json::json!({"type":"attachment","attachment":{"type":"advisor_tool","model":"claude-fable-5-2"}}),
+        );
+        text += &line(
+            serde_json::json!({"type":"api-request-shape","shape":{"tools":[{"model":"claude-fable-5-2"}]}}),
+        );
+        text += "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-son";
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(last_model(&path), Some(("claude-haiku-5-5".to_owned(), at)));
+        // Lejos del final (más de lo que se mira de primeras): se va más atrás.
+        let filler =
+            line(serde_json::json!({"type":"api-request-shape","shape":"x".repeat(600 * 1024)}));
+        std::fs::write(&path, text.clone() + &filler + &filler).unwrap();
+        assert_eq!(last_model(&path), Some(("claude-haiku-5-5".to_owned(), at)));
+        std::fs::write(&path, &filler).unwrap();
+        assert_eq!(last_model(&path), None);
+        assert_eq!(last_model(&dir.path().join("no")), None);
+    }
+
+    #[test]
+    fn the_models_of_what_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let reply = |model: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "assistant", "message": {"model": model}})
+            )
+        };
+        let a = reply("claude-haiku-5-5");
+        let b = reply("claude-opus-5-5");
+        std::fs::write(&path, format!("{a}{b}{}", &a[..10])).unwrap();
+        let whole = (a.len() + b.len()) as u64;
+        assert_eq!(whole_lines_end(&path, whole + 10), whole);
+        assert_eq!(whole_lines_end(&path, 5), 0);
+        // Desde el principio: el último, y hasta donde las líneas están enteras.
+        assert_eq!(
+            models_since(&path, 0),
+            (Some(("claude-opus-5-5".to_owned(), a.len() as u64)), whole)
+        );
+        // Desde el final de las enteras: nada aún.
+        assert_eq!(models_since(&path, whole), (None, whole));
+        std::fs::write(&path, format!("{a}{b}{a}")).unwrap();
+        assert_eq!(
+            models_since(&path, whole),
+            (
+                Some(("claude-haiku-5-5".to_owned(), whole)),
+                whole + a.len() as u64
+            )
+        );
     }
 
     #[test]

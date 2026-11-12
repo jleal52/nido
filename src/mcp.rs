@@ -418,13 +418,26 @@ const TOOLS: &[Tool] = &[
         ],
     },
     Tool {
-        any_of: &[],
+        any_of: &["text", "path"],
         name: "clipboard",
-        about: "Send the user a text to copy (a command, a URL, a code), up to 64 KB: it shows \
-                up in this session in the user's nido web and app with a Copy button, and as a \
-                notification on their phone. Returns status sent.",
+        about: "Send the user a text to copy (a command, a URL, a code), up to 64 KB of UTF-8: \
+                it shows up in this session in the user's nido web and app with a Copy button, \
+                and as a notification on their phone. Give exactly one of text or path. If the \
+                content is in a file or comes out of a command, don't copy it into text: give \
+                path, or run `<command> | nido clip` (it never goes through the conversation). \
+                Returns status sent and size.",
         args: &[
-            req("text", "string", "The text to copy."),
+            opt(
+                "text",
+                "string",
+                "The text to copy, when you wrote it yourself.",
+            ),
+            opt(
+                "path",
+                "string",
+                "Instead of text: a text file to copy, absolute or relative to this session's \
+                 folder (binary files go with send_file).",
+            ),
             opt(
                 "title",
                 "string",
@@ -475,7 +488,9 @@ never print, cat or read it; pass the path to an option that reads from a file (
 --password-file <path>), or run the command with `nido secrets run <name> --env VAR -- <command>` \
 (with the nido path it returns, if `nido` is not found). Put those paths in double quotes: they \
 may contain spaces. `clipboard` and `send_file` send the \
-user a text to copy or a file.";
+user a text to copy or a file. If what to copy is in a file or comes out of a command, give \
+`clipboard` its `path` or run `<command> | nido clip` (`nido clip <file>` also works): don't \
+copy it into `text`, it would go through the conversation.";
 
 const OUTSIDE: &str = "This Claude session is not running inside nido: no nido tools here.";
 
@@ -1165,7 +1180,15 @@ mod tests {
         ] {
             assert!(about.contains(want), "{want}: {about}");
         }
-        assert_eq!(tools[10]["inputSchema"]["required"], json!(["text"]));
+        let clipboard = &tools[10]["inputSchema"];
+        assert!(clipboard["required"].as_array().is_none_or(Vec::is_empty));
+        assert_eq!(clipboard["properties"]["path"]["type"], "string");
+        assert!(
+            tools[10]["description"]
+                .as_str()
+                .unwrap()
+                .contains("nido clip")
+        );
         assert_eq!(tools[11]["inputSchema"]["required"], json!(["path"]));
     }
 
@@ -1176,6 +1199,8 @@ mod tests {
         assert!(INSTRUCTIONS.contains("--password-file"));
         assert!(INSTRUCTIONS.contains("in double quotes"));
         assert!(INSTRUCTIONS.contains("`clipboard`") && INSTRUCTIONS.contains("`send_file`"));
+        // Lo que sale de un fichero o de una orden, sin pasar por la conversación.
+        assert!(INSTRUCTIONS.contains("`path`") && INSTRUCTIONS.contains("| nido clip"));
     }
 
     #[test]

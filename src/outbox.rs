@@ -55,6 +55,10 @@ pub enum SendError {
     /// Está en la carpeta de secretos de nido.
     Secret(PathBuf),
     TooBig(PathBuf, u64),
+    /// Para copiar: pasa de `MAX_TEXT`.
+    TextTooBig(PathBuf),
+    /// Para copiar: no es texto (UTF-8, sin bytes nulos).
+    NotText(PathBuf),
     Io(io::Error),
 }
 
@@ -78,9 +82,20 @@ impl std::fmt::Display for SendError {
                     *n as f64 / 1048576.0
                 )
             }
+            SendError::TextTooBig(p) => write!(f, "{} pasa de 64 KB", p.display()),
+            SendError::NotText(p) => write!(
+                f,
+                "{} no es texto (UTF-8): para mandarlo, usa send_file",
+                p.display()
+            ),
             SendError::Io(e) => write!(f, "no se pudo guardar la copia: {e}"),
         }
     }
+}
+
+/// Lo que se puede copiar como texto: UTF-8 y sin bytes nulos (si no, es un binario).
+pub fn text_of(bytes: Vec<u8>) -> Option<String> {
+    String::from_utf8(bytes).ok().filter(|t| !t.contains('\0'))
 }
 
 /// Caracteres de formato de Unicode (categoría `Cf`): no se ven, pero cambian lo que se ve (el
@@ -191,6 +206,75 @@ fn open_read(path: &Path) -> io::Result<std::fs::File> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
     opts.open(path)
+}
+
+/// La ruta de lo que tiene abierto `f`, según el sistema (sin enlaces): en Linux,
+/// `/proc/self/fd/N`; en macOS, `F_GETPATH`; en Windows, `GetFinalPathNameByHandleW`. `None` en
+/// otros sistemas (se queda la comprobación de antes de abrir). Si no se puede saber, o el
+/// fichero ya no está, error: mejor no mandarlo.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn opened_path(f: &std::fs::File) -> io::Result<Option<PathBuf>> {
+    use std::os::fd::AsRawFd;
+    let p = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))?;
+    if p.to_string_lossy().ends_with(" (deleted)") {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "ya no existe"));
+    }
+    Ok(Some(p))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn opened_path(f: &std::fs::File) -> io::Result<Option<PathBuf>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `buf` tiene `PATH_MAX` bytes, lo que pide `F_GETPATH`.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..n]))))
+}
+
+#[cfg(windows)]
+pub(crate) fn opened_path(f: &std::fs::File) -> io::Result<Option<PathBuf>> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+    let mut buf: Vec<u16> = vec![0; 1024];
+    loop {
+        // SAFETY: el asa es de `f`, abierta; `buf` tiene la longitud que se dice.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                f.as_raw_handle() as _,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Si no cabe, dice cuánto hace falta.
+        if n >= buf.len() {
+            buf.resize(n + 1, 0);
+            continue;
+        }
+        return Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(
+            &buf[..n],
+        ))));
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
+pub(crate) fn opened_path(_: &std::fs::File) -> io::Result<Option<PathBuf>> {
+    Ok(None)
 }
 
 fn valid_session(id: &str) -> bool {
@@ -304,34 +388,7 @@ impl Outbox {
         title: Option<&str>,
         now: u64,
     ) -> Result<Item, SendError> {
-        // Dónde está de verdad (sin enlaces ni `..`): de la carpeta de secretos, nada.
-        let real = match std::fs::canonicalize(path) {
-            Ok(p) => p,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(SendError::NotFound(path.to_owned()));
-            }
-            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
-        };
-        if self.in_secrets(&real) {
-            return Err(SendError::Secret(path.to_owned()));
-        }
-        // Primero se abre y luego se mira qué es lo abierto: entre mirar y abrir no puede
-        // cambiar.
-        let src = match open_read(&real) {
-            Ok(f) => f,
-            // En Windows una carpeta no se abre como un fichero.
-            Err(_) if real.is_dir() => return Err(SendError::IsDir(path.to_owned())),
-            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
-        };
-        let meta = src
-            .metadata()
-            .map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
-        if meta.is_dir() {
-            return Err(SendError::IsDir(path.to_owned()));
-        }
-        if !meta.is_file() {
-            return Err(SendError::NotAFile(path.to_owned()));
-        }
+        let (src, meta) = self.open_checked(path)?;
         if meta.len() > MAX_FILE {
             return Err(SendError::TooBig(path.to_owned(), meta.len()));
         }
@@ -371,6 +428,65 @@ impl Outbox {
             },
         )
         .map_err(SendError::Io)
+    }
+
+    /// El contenido de un fichero para copiarlo (`clipboard` con `path`, `nido clip FICHERO`),
+    /// con las comprobaciones de `add_file` (nada de la carpeta de secretos, solo ficheros
+    /// normales): texto UTF-8 sin bytes nulos, hasta `MAX_TEXT`.
+    pub fn read_text(&self, path: &Path) -> Result<String, SendError> {
+        let (src, meta) = self.open_checked(path)?;
+        if meta.len() > MAX_TEXT as u64 {
+            return Err(SendError::TextTooBig(path.to_owned()));
+        }
+        let mut buf = Vec::new();
+        src.take(MAX_TEXT as u64 + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
+        if buf.len() > MAX_TEXT {
+            return Err(SendError::TextTooBig(path.to_owned()));
+        }
+        text_of(buf).ok_or_else(|| SendError::NotText(path.to_owned()))
+    }
+
+    /// Abre `path` para mandarlo: dónde está de verdad (sin enlaces ni `..`), que no sea de la
+    /// carpeta de secretos y que sea un fichero normal. Primero se abre y luego se mira qué es lo
+    /// abierto: entre mirar y abrir no puede cambiar.
+    fn open_checked(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), SendError> {
+        let real = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(SendError::NotFound(path.to_owned()));
+            }
+            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
+        };
+        if self.in_secrets(&real) {
+            return Err(SendError::Secret(path.to_owned()));
+        }
+        let src = match open_read(&real) {
+            Ok(f) => f,
+            // En Windows una carpeta no se abre como un fichero.
+            Err(_) if real.is_dir() => return Err(SendError::IsDir(path.to_owned())),
+            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
+        };
+        // Y lo que se ha abierto de verdad: entre `canonicalize` y abrir, un enlace del camino
+        // puede haber cambiado para apuntar a la carpeta de secretos.
+        match opened_path(&src) {
+            Ok(Some(opened)) if self.in_secrets(&opened) => {
+                return Err(SendError::Secret(path.to_owned()));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(SendError::Unreadable(path.to_owned(), e)),
+        }
+        let meta = src
+            .metadata()
+            .map_err(|e| SendError::Unreadable(path.to_owned(), e))?;
+        if meta.is_dir() {
+            return Err(SendError::IsDir(path.to_owned()));
+        }
+        if !meta.is_file() {
+            return Err(SendError::NotAFile(path.to_owned()));
+        }
+        Ok((src, meta))
     }
 
     /// `real` (ya sin enlaces) está en la carpeta de secretos.
@@ -476,6 +592,28 @@ impl Outbox {
 
 #[cfg(test)]
 mod tests {
+    /// (15) La ruta de lo abierto es la del fichero de verdad, aunque se abriera por un enlace
+    /// que luego apunta a otro sitio.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_path_of_what_was_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        std::os::unix::fs::symlink(dir.join("a.txt"), dir.join("enlace")).unwrap();
+        let f = std::fs::File::open(dir.join("enlace")).unwrap();
+        std::fs::remove_file(dir.join("enlace")).unwrap();
+        std::os::unix::fs::symlink(dir.join("b.txt"), dir.join("enlace")).unwrap();
+        assert_eq!(opened_path(&f).unwrap(), Some(dir.join("a.txt")));
+        // Borrado después de abrir: no se sabe dónde está.
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::remove_file(dir.join("a.txt")).unwrap();
+            assert!(opened_path(&f).is_err());
+        }
+    }
+
     use super::*;
     use std::time::Duration;
 

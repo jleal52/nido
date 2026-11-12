@@ -39,7 +39,9 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClipboardArgs {
-    text: String,
+    text: Option<String>,
+    /// En vez de `text`: un fichero (absoluto, o relativo a la carpeta de la sesión).
+    path: Option<String>,
     title: Option<String>,
 }
 
@@ -50,13 +52,31 @@ struct SendFileArgs {
     title: Option<String>,
 }
 
-/// `clipboard`: un texto para que el usuario lo copie con un botón.
+/// `clipboard`: un texto para que el usuario lo copie con un botón; el texto, o un fichero
+/// (`path`) de texto, con las comprobaciones de `send_file`.
 pub(crate) async fn tool_clipboard(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply {
     let a: ClipboardArgs = args_of(args)?;
-    if a.text.trim().is_empty() {
+    let text = match (a.text, a.path) {
+        (Some(t), None) => t,
+        (None, Some(p)) => {
+            let path = resolve(&caller.cwd, &p);
+            let st = st.clone();
+            tokio::task::spawn_blocking(move || st.outbox.read_text(&path))
+                .await
+                .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .map_err(send_fail)?
+        }
+        _ => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "hace falta text o path (uno de los dos)",
+            ));
+        }
+    };
+    if text.trim().is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "el texto está vacío"));
     }
-    if a.text.len() > MAX_TEXT {
+    if text.len() > MAX_TEXT {
         return Err(fail(
             StatusCode::BAD_REQUEST,
             format!("el texto pasa de {} KB", MAX_TEXT / 1024),
@@ -65,8 +85,7 @@ pub(crate) async fn tool_clipboard(st: &Arc<AppState>, caller: &Session, args: V
     let item = {
         let (st, id) = (st.clone(), caller.id.clone());
         tokio::task::spawn_blocking(move || {
-            st.outbox
-                .add_text(&id, &a.text, a.title.as_deref(), now_ms())
+            st.outbox.add_text(&id, &text, a.title.as_deref(), now_ms())
         })
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -86,7 +105,7 @@ pub(crate) async fn tool_clipboard(st: &Arc<AppState>, caller: &Session, args: V
     )
     .await
     .map_err(Fail::from)?;
-    Ok(json!({ "status": "sent" }))
+    Ok(json!({ "status": "sent", "size": item.size }))
 }
 
 /// `send_file`: una copia de un fichero (hasta 64 MB) para que el usuario la abra o la guarde.
@@ -593,6 +612,125 @@ mod tests {
         assert!(!tmp.path().join("state/outbox").join(&id).exists());
     }
 
+    /// `clipboard` con `path`: el fichero (relativo a la carpeta de la sesión, o absoluto), con
+    /// las comprobaciones de `send_file` y las del texto; `text` o `path`, uno de los dos.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clipboard_takes_the_text_or_a_text_file() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, id, _) = nido_in(tmp.path()).await;
+        let caller = st.registry.lock().await.get(&id).cloned().unwrap();
+        let clip = |args: Value| {
+            let (st, caller) = (st.clone(), caller.clone());
+            async move {
+                tool_clipboard(&st, &caller, args)
+                    .await
+                    .map_err(|f| (f.0, f.1))
+            }
+        };
+        let last = || {
+            let item = st.outbox.list(&id).into_iter().last().unwrap();
+            let (item, path) = st.outbox.open(&id, &item.id).unwrap();
+            (item.title, std::fs::read_to_string(path).unwrap())
+        };
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(
+            tmp.path().join("docs/clave.pub"),
+            "ssh-ed25519 AAAA prueba\n",
+        )
+        .unwrap();
+
+        // Relativo a la carpeta de la sesión.
+        let r = clip(json!({"path": "docs/clave.pub"})).await.unwrap();
+        assert_eq!(r, json!({"status": "sent", "size": 24}));
+        assert_eq!(last().1, "ssh-ed25519 AAAA prueba\n");
+        // Absoluto, con título.
+        let abs = tmp.path().join("docs/clave.pub");
+        let r = clip(json!({"path": abs, "title": "la clave"}))
+            .await
+            .unwrap();
+        assert_eq!(r["status"], "sent");
+        assert_eq!(
+            last(),
+            (
+                "la clave".to_owned(),
+                "ssh-ed25519 AAAA prueba\n".to_owned()
+            )
+        );
+        // El texto, como siempre.
+        let r = clip(json!({"text": "git push"})).await.unwrap();
+        assert_eq!(r, json!({"status": "sent", "size": 8}));
+
+        // Uno de los dos.
+        let both = json!({"text": "x", "path": "docs/clave.pub"});
+        for args in [both, json!({}), json!({"title": "t"})] {
+            assert_eq!(
+                clip(args).await.unwrap_err(),
+                (
+                    StatusCode::BAD_REQUEST,
+                    "hace falta text o path (uno de los dos)".to_owned()
+                )
+            );
+        }
+        // Binario, demasiado grande, vacío, inexistente, una carpeta: no.
+        let bad = |name: &str, bytes: &[u8]| {
+            std::fs::write(tmp.path().join(name), bytes).unwrap();
+            json!({ "path": name })
+        };
+        let e = clip(bad("foto.png", b"\x89PNG\r\n\x1a\n\0\0"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert!(
+            e.1.ends_with("foto.png no es texto (UTF-8): para mandarlo, usa send_file"),
+            "{e:?}"
+        );
+        let e = clip(bad("latin1.txt", b"camion \xe1rbol"))
+            .await
+            .unwrap_err();
+        assert!(
+            e.1.ends_with("latin1.txt no es texto (UTF-8): para mandarlo, usa send_file"),
+            "{e:?}"
+        );
+        let big = vec![b'a'; MAX_TEXT + 1];
+        let e = clip(bad("grande.txt", &big)).await.unwrap_err();
+        assert!(e.1.ends_with("grande.txt pasa de 64 KB"), "{e:?}");
+        // Justo 64 KB, sí.
+        let r = clip(bad("justo.txt", &big[..MAX_TEXT])).await.unwrap();
+        assert_eq!(r["size"], MAX_TEXT);
+        let e = clip(bad("vacio.txt", b" \n")).await.unwrap_err();
+        assert_eq!(e.1, "el texto está vacío");
+        let e = clip(json!({"path": "no-existe.txt"})).await.unwrap_err();
+        assert!(e.1.starts_with("no existe el fichero "), "{e:?}");
+        let e = clip(json!({"path": "docs"})).await.unwrap_err();
+        assert!(e.1.ends_with("docs es una carpeta"), "{e:?}");
+        // Nada de la carpeta de secretos.
+        let secret = st.secrets.save_session(&id, "tok", b"secreto").unwrap();
+        let e = clip(json!({ "path": secret })).await.unwrap_err();
+        assert!(e.1.contains("carpeta de secretos"), "{e:?}");
+        // Ni por un enlace, ni dando la vuelta con `..` (también con `send_file`).
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, tmp.path().join("atajo")).unwrap();
+            std::os::unix::fs::symlink(secret.parent().unwrap(), tmp.path().join("carpeta"))
+                .unwrap();
+            for p in ["atajo", "carpeta/tok", "docs/../carpeta/tok"] {
+                let e = clip(json!({ "path": p })).await.unwrap_err();
+                assert!(e.1.contains("carpeta de secretos"), "{p}: {e:?}");
+                let Err(e) = tool_send_file(&st, &caller, json!({ "path": p })).await else {
+                    panic!("{p}: mandado");
+                };
+                assert!(e.1.contains("carpeta de secretos"), "{p}: {}", e.1);
+            }
+        }
+        let rel = secret.strip_prefix(tmp.path()).unwrap();
+        let around = format!("docs/../{}", rel.display());
+        let e = clip(json!({ "path": around })).await.unwrap_err();
+        assert!(e.1.contains("carpeta de secretos"), "{e:?}");
+        // Lo que no se mandó no dejó nada: los tres de antes y el de 64 KB.
+        assert_eq!(st.outbox.list(&id).len(), 4);
+    }
+
     /// Si se corta la petición de quien contesta mientras se guarda, se guarda igual y la sesión
     /// que espera recibe su ruta (no «se cerró»).
     #[tokio::test(flavor = "multi_thread")]
@@ -869,6 +1007,17 @@ mod tests {
         assert_eq!(
             en(SendError::TooBig(p(), 70 * 1024 * 1024)),
             (bad, "/w/a.bin is over 64 MB (70.0 MB)".into())
+        );
+        assert_eq!(
+            en(SendError::TextTooBig(p())),
+            (bad, "/w/a.bin is over 64 KB".into())
+        );
+        assert_eq!(
+            en(SendError::NotText(p())),
+            (
+                bad,
+                "/w/a.bin is not text (UTF-8): to send it, use send_file".into()
+            )
         );
         assert_eq!(
             en(SendError::Io(std::io::Error::other("disco lleno"))),

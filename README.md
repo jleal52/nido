@@ -139,7 +139,10 @@ Each Claude that nido launches gets nido's MCP server (`nido mcp`), with these t
 - `secret`: asks you for a token or a password without it going through the conversation (see
   [Secrets, texts and files](#secrets-texts-and-files)).
 - `clipboard`: a text for you to copy (a box with a Copy button in the web and the app), and a
-  notification.
+  notification. Instead of `text`, it takes the `path` of a text file (relative to the session's
+  folder, like `send_file`), so the content doesn't go through the conversation; for a command's
+  output, the session runs `<command> | nido clip` (see
+  [Secrets, texts and files](#secrets-texts-and-files)).
 - `send_file`: a copy of a file to open or save from the web or the app, and a notification.
 
 What nido changes in your Claude setup:
@@ -193,6 +196,16 @@ The session uses the secret in one of two ways:
 
 If a program only takes the secret as an argument, Claude tells you so instead of using it.
 
+To send you a text without writing it into the conversation, a session uses `clipboard` with a
+file's `path`, or `nido clip`: `git diff | nido clip --title "the diff"` sends its standard input,
+and `nido clip ~/.ssh/id_ed25519.pub` a file. It goes to the clipboard of the session it runs in
+(`NIDO_SESSION`, so only inside a nido session), like `clipboard`: the web, the app and a
+notification. It only answers how much it sent (`sent to the clipboard (1 KB)`), never the
+content, in the terminal's language (`LC_ALL`, `LC_MESSAGES` or `LANG`: Spanish if it is `es…`,
+English otherwise), unlike the rest of the command line, which is in Spanish. Only UTF-8 text, up to 64 KB: anything else is an error (for a binary file, use
+`send_file`), and so is an empty text. Like `send_file`, it doesn't take anything from nido's
+secrets folder.
+
 Where they live and how long they last (`<state>` is `~/.local/state/nido`,
 `$XDG_STATE_HOME/nido` or `$NIDO_HOME/state`; on Windows, `%USERPROFILE%\.local\state\nido`):
 
@@ -210,6 +223,8 @@ Where they live and how long they last (`<state>` is `~/.local/state/nido`,
 nido secrets                                      # the secrets remembered on this computer (never their value)
 nido secrets forget <name>                        # forget one: the next session that needs it asks again
 nido secrets run <name> --env VAR -- <command>    # run a command with a secret in VAR
+<command> | nido clip [--title T]                 # send its output to the session's clipboard
+nido clip <file> [--title T]                      # send a text file to the session's clipboard
 ```
 
 If you set Claude Code's `MCP_TOOL_TIMEOUT` below 15 minutes, `secret` fails before you have time
@@ -252,6 +267,32 @@ come in English, or in Spanish if the request asks for it with `Accept-Language:
 
 `DELETE /api/v1/phones/me`: the paired phone or browser that calls it signs itself out of every
 computer in the group (the web app's "Sign out").
+
+Each Claude session in `GET /api/v1/sessions` has, in `claude`, `model` (the display name of the
+model of Claude's last reply, e.g. `"Opus 5.5"`, or the one nido last set; `null` if unknown) and
+`models` (the models that can be chosen, as Claude's `/model` menu showed them the last time nido
+opened it, without `Default`; until then `["Opus", "Fable", "Sonnet", "Haiku"]`, which also work
+as requests). `GET /api/v1/info` has `models` too. Each `screen` message of
+`/api/v1/sessions/{id}/live` has `mode`, the permission mode Claude's footer shows: `"auto"`,
+`"manual"`, `"acceptEdits"`, `"plan"`, `"bypassPermissions"` or `null` (not shown or not
+understood, e.g. while a menu is open).
+
+`POST /api/v1/sessions/{id}/mode` `{"mode": "plan"}` changes Claude's permission mode by pressing
+shift+tab and reading the footer after each press, until it shows the mode asked for; it works
+while Claude is working too, and on the way it may briefly go through other modes. Returns
+`{"ok": true, "mode": "plan"}`; `400` for an unknown mode; `409` if it could not (the session is
+not running, a menu or a question is on screen, the footer is not understood, or the mode is not
+reachable with shift+tab).
+
+`POST /api/v1/sessions/{id}/model` `{"model": "Opus 5.5"}` changes Claude's model for this
+session only: with Claude idle, no menu on screen and nothing typed in its input box, it types
+`/model`, moves the menu's cursor to that model with the arrow keys (never `Default`) and presses
+`s` ("use this session only"); it never presses Enter in that menu, which would make it the
+default for new sessions. A model, a label (`"Sonnet"`) or its beginning (`"Opus"`: the first
+option that starts like that) can be asked for. Returns `{"ok": true, "model": "Opus 5.5"}`, with
+the model as the menu shows it; `400` without a model; `409` if it could not (Claude working, a
+menu or a draft on screen, the option not in the menu, no "session only" in the menu…), after
+closing the menu with Esc if it was open.
 
 ## Install
 
