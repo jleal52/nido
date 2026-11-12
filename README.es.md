@@ -254,6 +254,111 @@ van en inglés, o en español si la petición lo pide con `Accept-Language: es`.
 `DELETE /api/v1/phones/me`: el teléfono o el navegador emparejado que la llama se da de baja en
 todos los equipos del grupo (el «Cerrar sesión» de la web).
 
+### Buscar en las conversaciones
+
+`GET /api/v1/search?q=<texto>&limit=50` busca en la conversación actual de cada sesión con Claude
+de este equipo (la que enseña la vista chat; no las de antes de un `/clear` o de reiniciar). Solo
+lo que escribiste tú y lo que contestó Claude, como texto: ni las llamadas a herramientas ni lo que
+devuelven, ni las órdenes (`/model`…), ni los avisos de tareas en segundo plano, ni los subagentes,
+ni los mensajes internos de Claude Code, ni los que pone Claude Code en nombre de Claude (límite de
+uso, errores de la API, `<synthetic>`), ni el resumen que se escribe al compactar la conversación.
+
+- Mayúsculas y acentos no cuentan: los dos lados se pasan a minúsculas y se descomponen (NFD) sin
+  las marcas combinantes, así que `codigo` encuentra `Código`.
+- `q` se parte por los espacios y todas las palabras tienen que estar en el mensaje (Y); se
+  resaltan todas. `400` (`{"error": …}`) si `q`, sin los espacios de los lados, tiene menos de 2
+  caracteres, o si al normalizarla no queda nada que buscar.
+- `limit`: 50 por defecto, como mucho 200 (uno mayor cuenta como 200).
+
+```json
+{
+  "sessions": ["3f9c1a2b"],
+  "messages": [
+    {
+      "session": "3f9c1a2b",
+      "sid": "8e1b…",
+      "at": 1048576,
+      "id": "5d2e…",
+      "ts": 1794478830123,
+      "role": "assistant",
+      "text": "…el código del login está en src/auth.rs, la función que comprueba el token…",
+      "hits": [[4, 10]]
+    }
+  ],
+  "truncated": false
+}
+```
+
+- `sessions`: los ids de las sesiones cuyo nombre, carpeta o directorio de trabajo contienen todas
+  las palabras (normalizadas igual).
+- `messages`: lo más reciente primero (por `ts` y luego por posición), como mucho `limit`.
+  `session` es la sesión de nido, `sid` su conversación de Claude (`claude.session_id`), `at` e
+  `id` los del mensaje en el chat (ver abajo: se abre con `chat?around=<at>&sid=<sid>`), `ts`
+  cuándo se escribió (ms desde 1970; `0` si no se sabe), `role` `"user"` o `"assistant"`.
+- `text`: unos 160 caracteres del mensaje alrededor de la primera coincidencia, con `…` donde se
+  corta y los saltos de línea como espacios. `hits`: dónde están las palabras en `text`, como
+  posiciones `[inicio, fin)` en **caracteres Unicode (code points), no en unidades UTF-16 ni en
+  bytes** (un emoji es un carácter; en JavaScript, sobre `[...text]`, no sobre `text`). Ordenadas,
+  y las que se solapan, juntas.
+- `truncated`: alguna conversación tiene más texto del que nido guarda para buscar (8 MB de texto
+  por conversación, lo más reciente), así que en lo más antiguo no se ha buscado.
+
+El índice está en memoria: se hace la primera vez que se busca (lee las transcripciones enteras,
+así que tarda lo que se tarde en leerlas del disco) y después solo se lee lo nuevo de cada una,
+así que las búsquedas siguientes tardan milisegundos. Vuelve a empezar si cambia la conversación
+de la sesión o se rehace la transcripción.
+
+### El chat alrededor de un mensaje
+
+`GET /api/v1/sessions/{id}/chat` (y los mensajes `chat` de `/api/v1/sessions/{id}/live`) dan a cada
+elemento un `at`: dónde empieza su línea en la transcripción, en bytes. Identifica el mensaje (los
+de una misma línea, p. ej. el texto de Claude y una llamada a una herramienta, lo comparten) y es lo
+que devuelve la búsqueda.
+
+`GET /api/v1/sessions/{id}/chat?around=<at>&before=30&after=30&sid=<sid>` devuelve, en vez del final
+de la conversación, hasta `before` elementos antes de `at` y hasta `after` desde `at` en adelante,
+con la misma forma que sin `around` y unos campos más:
+
+```json
+{
+  "session_id": "8e1b…",
+  "items": [{"kind": "user", "id": "…", "at": 1040002, "ts": "…", "text": "…", "images": 0}, …],
+  "results": [],
+  "start": 1040002,
+  "offset": 1061377,
+  "more_before": true,
+  "more_after": true,
+  "truncated": true,
+  "reset": false
+}
+```
+
+- Son líneas enteras: a cada lado puede venir uno o dos elementos más de los pedidos, para no
+  partir los de una línea. Cada llamada a una herramienta de la ventana viene con su resultado si
+  ya está en la transcripción, aunque la línea del resultado quede después de la ventana (nido
+  mira hasta 8 MB más allá).
+- `start`: dónde empieza la primera línea de la ventana. Lo **anterior**:
+  `around=<start>&before=N&after=0` (solo lo que hay antes de `start`).
+- `offset`: justo después de la última línea de la ventana. Lo **siguiente**:
+  `around=<offset>&before=0&after=N` (solo lo que hay desde `offset`). `results` trae los
+  resultados que traen las líneas de la ventana para herramientas de ventanas anteriores
+  (`tool_id`, como en `/live`).
+- `more_before` / `more_after`: si hay algo antes de `start` / después de `offset`. `truncated` es
+  `more_before` y `reset` es `false`, así que un cliente antiguo lo lee como un primer trozo.
+- **Volver al final y en vivo**: si `more_after` es `false`, después de `offset` no falta nada:
+  conecta `/live?sid=<session_id>&offset=<offset>` y desde ahí llegan los mensajes y resultados
+  nuevos. Si no, abre `/live` desde el principio como siempre (`offset=0&limit=…`).
+- `before` y `after` son 30 por defecto y como mucho 1000; `0` vale (`before=0&after=0` solo dice,
+  con `more_*`, si hay algo a cada lado).
+- Un `at` que no es el principio de una línea cuenta como el principio de la siguiente; uno más
+  allá del final devuelve los últimos `before` elementos con `more_after: false`. Si la sesión aún
+  no tiene transcripción, la ventana va vacía.
+- `sid`: la conversación de ese `at` (el `sid` de la búsqueda). `409` si ya no es la actual de la
+  sesión (p. ej. tras un `/clear`): `at` apuntaría a otra cosa.
+- Solo se lee la ventana (hacia atrás desde `at`): no depende del tamaño de la transcripción. Lo
+  mismo vale para la primera carga sin `around` (`offset=0` con `limit`, en `/chat` y en `/live`):
+  se leen los últimos mensajes hacia atrás desde el final.
+
 ## Instalar
 
 Hay ejecutables para Linux (x86_64 y ARM64), macOS (Apple Silicon e Intel) y Windows (x86_64) en

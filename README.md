@@ -394,7 +394,8 @@ the same shape as without `around`, plus a few fields:
 - `sid`: the conversation `at` belongs to (`sid` in search results). `409` if it is no longer the
   session's current one (e.g. after a `/clear`): `at` would point somewhere else.
 - Only the window is read (backwards from `at`), so it does not depend on the size of the
-  transcript.
+  transcript. The same goes for the first load without `around` (`offset=0` with `limit`, in
+  `/chat` and `/live`): the last items are read backwards from the end.
 
 ## Install
 
