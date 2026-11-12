@@ -281,8 +281,9 @@ understood, e.g. while a menu is open).
 shift+tab and reading the footer after each press, until it shows the mode asked for; it works
 while Claude is working too, and on the way it may briefly go through other modes. Returns
 `{"ok": true, "mode": "plan"}`; `400` for an unknown mode; `409` if it could not (the session is
-not running, a menu or a question is on screen, the footer is not understood, or the mode is not
-reachable with shift+tab).
+not running, a menu or a question is on screen, the footer is not understood, the mode is not
+reachable with shift+tab, or Claude is working in plan mode, where shift+tab could approve its
+plan; just passing through plan mode on the way is fine).
 
 `POST /api/v1/sessions/{id}/model` `{"model": "Opus 5.5"}` changes Claude's model for this
 session only: with Claude idle, no menu on screen and nothing typed in its input box, it types

@@ -1976,8 +1976,10 @@ pub async fn set_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             return Err(NO_MODE.into());
         }
         // En plan, con Claude trabajando, en cualquier momento puede salir el menú de aprobar el
-        // plan, que acepta shift+tab: no se pulsa (aunque solo se pase por plan de camino).
-        if cur == Mode::Plan && working(&text) {
+        // plan, que acepta shift+tab: si ya estaba en plan, no se pulsa. Pasando por plan de
+        // camino (de accept edits a auto) sí: Claude no sabe aún que está en plan y no puede
+        // tener un plan que aprobar; pararse ahí lo dejaría en plan, trabajando.
+        if start == Mode::Plan && cur == Mode::Plan && working(&text) {
             return Err(PLAN_WORKING.into());
         }
         scr.keys(SHIFT_TAB).await?;
@@ -3896,7 +3898,7 @@ mod tests {
     }
 
     /// (4) En modo plan con Claude trabajando, shift+tab puede caer en el menú de aprobar el
-    /// plan: no se pulsa.
+    /// plan: no se pulsa. Pasando por plan de camino, sí (si no, se quedaría en plan).
     #[tokio::test(start_paused = true)]
     async fn no_shift_tab_in_plan_mode_while_working() {
         let c = claude(|c| {
@@ -3906,14 +3908,15 @@ mod tests {
         let mut scr = fake::screen_of(&c);
         assert!(set_mode(&mut scr, Mode::Auto).await.is_err());
         assert!(keys(&c).is_empty());
-        // Ni pasando por él: de accept edits a auto se pasa por plan.
+        // Pasando por él, sí: de accept edits a auto se pasa por plan, y llega a auto.
         let c = claude(|c| {
             c.mode = 2;
             c.working = true;
         });
         let mut scr = fake::screen_of(&c);
-        assert!(set_mode(&mut scr, Mode::Auto).await.is_err());
-        assert_eq!(keys(&c).len(), 1);
+        assert_eq!(set_mode(&mut scr, Mode::Auto).await, Ok(Mode::Auto));
+        assert_eq!(keys(&c).len(), 2);
+        assert_eq!(mode(&c.lock().unwrap().screen()), Some(Mode::Auto));
         // Sin trabajar, sí.
         let c = claude(|c| c.mode = 3);
         let mut scr = fake::screen_of(&c);
