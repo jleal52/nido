@@ -238,6 +238,10 @@ const TABLE: &[(&str, &str)] = &[
         "that conversation is no longer the session's current one",
     ),
     (
+        "hay que buscar al menos 2 caracteres",
+        "search for at least 2 characters",
+    ),
+    (
         "no se pudo guardar el código: {}",
         "could not save the code: {0}",
     ),

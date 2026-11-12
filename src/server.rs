@@ -109,6 +109,11 @@ pub struct AppState {
     model_missing_ttl: std::sync::Mutex<Duration>,
     /// El modelo que nido le puso a cada sesión con `/model`, hasta que Claude conteste.
     model_chosen: std::sync::Mutex<std::collections::HashMap<String, ModelChosen>>,
+    /// Los índices de las conversaciones para buscar (`/api/v1/search`).
+    pub search: Arc<crate::search::Indexes>,
+    /// Que las búsquedas vayan de una en una (la primera hace los índices: las que lleguen
+    /// mientras esperan y aprovechan lo hecho; las que se cancelan, ni empiezan).
+    searching: Mutex<()>,
 }
 
 /// Los modelos que se ofrecen si nido aún no ha visto el menú de `/model` (también valen como
@@ -636,6 +641,8 @@ impl AppState {
             model_refreshing: Mutex::new(()),
             model_missing_ttl: std::sync::Mutex::new(MODEL_MISSING_TTL),
             model_chosen: Default::default(),
+            search: Default::default(),
+            searching: Mutex::new(()),
         }))
     }
 
@@ -2295,6 +2302,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
         .route("/api/v1/sessions/{id}/history", get(api_history))
         .route("/api/v1/sessions/{id}/chat", get(api_chat))
+        .route("/api/v1/search", get(api_search))
         .route("/api/v1/sessions/{id}/live", get(ws_live))
         .route("/api/v1/sessions/{id}/term", get(ws_term))
         .route("/api/v1/events", get(ws_events))
@@ -3400,6 +3408,70 @@ async fn api_chat(
             Json(v).into_response()
         }
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+    limit: Option<usize>,
+}
+
+/// Busca en las conversaciones de las sesiones de este equipo: las sesiones cuyo nombre,
+/// carpeta o directorio casan, y los mensajes (tuyos y de Claude) que tienen todas las
+/// palabras, lo más reciente primero.
+async fn api_search(State(st): State<Arc<AppState>>, Query(q): Query<SearchQuery>) -> Response {
+    let Some(terms) = crate::search::terms(&q.q) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "hay que buscar al menos 2 caracteres",
+        );
+    };
+    let limit = q
+        .limit
+        .unwrap_or(crate::search::DEFAULT_LIMIT)
+        .clamp(1, crate::search::MAX_LIMIT);
+    let sessions: Vec<String> = st
+        .views
+        .borrow()
+        .sessions
+        .iter()
+        .filter(|s| {
+            let cwd = s.cwd.to_string_lossy();
+            let fields = [s.name.as_str(), s.folder.as_deref().unwrap_or(""), &cwd];
+            crate::search::matches_any(&fields, &terms)
+        })
+        .map(|s| s.id.clone())
+        .collect();
+    let targets: Vec<crate::search::Target> = st
+        .registry
+        .lock()
+        .await
+        .sessions()
+        .iter()
+        .filter_map(|s| {
+            let link = s.claude.as_ref()?;
+            Some(crate::search::Target {
+                id: s.id.clone(),
+                session_id: link.session_id.clone(),
+                config_dir: link
+                    .config_dir
+                    .clone()
+                    .unwrap_or_else(|| claude::default_config_dir(&st.paths.home)),
+            })
+        })
+        .collect();
+    let _one = st.searching.lock().await;
+    let index = st.search.clone();
+    match tokio::task::spawn_blocking(move || index.search(targets, &terms, limit)).await {
+        Ok((messages, truncated)) => Json(serde_json::json!({
+            "sessions": sessions,
+            "messages": messages,
+            "truncated": truncated,
+        }))
+        .into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -5161,6 +5233,62 @@ mod tests {
             json!({"type":"assistant","uuid":uuid,"timestamp":ts,"message":{"content":[{"type":"text","text":text}]}})
         };
         format!("{v}\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_search_route() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let first = said_line(
+            "user",
+            "u1",
+            "¿Dónde está el CÓDIGO?",
+            "2026-11-12T10:00:00Z",
+        );
+        let text = first.clone()
+            + &said_line(
+                "assistant",
+                "a1",
+                "El código está en src/",
+                "2026-11-12T10:00:05Z",
+            );
+        let (_st, addr, id) = with_transcript(tmp.path(), &text).await;
+        // Menos de 2 caracteres: 400.
+        for q in ["", "a", "%20%20x%20", "%C3%A9"] {
+            let (code, r) = get_json(addr, &format!("/api/v1/search?q={q}")).await;
+            assert_eq!(code, 400, "{q}: {r}");
+            assert_eq!(r["error"], "search for at least 2 characters");
+        }
+        let (code, r) = get_json(addr, "/api/v1/search?q=codigo").await;
+        assert_eq!(code, 200, "{r}");
+        assert_eq!(r["truncated"], false);
+        assert_eq!(r["sessions"], json!([]));
+        assert_eq!(
+            r["messages"],
+            json!([
+                {"session": id, "sid": "conv", "at": first.len(),
+                 "id": "a1", "ts": crate::search::ts_ms("2026-11-12T10:00:05Z"),
+                 "role": "assistant", "text": "El código está en src/", "hits": [[3, 9]]},
+                {"session": id, "sid": "conv", "at": 0, "id": "u1",
+                 "ts": crate::search::ts_ms("2026-11-12T10:00:00Z"),
+                 "role": "user", "text": "¿Dónde está el CÓDIGO?", "hits": [[15, 21]]},
+            ])
+        );
+        // `limit`, y las sesiones por su nombre, carpeta o directorio.
+        let (code, r) = get_json(addr, "/api/v1/search?q=C%C3%B3digo&limit=1").await;
+        assert_eq!(code, 200);
+        assert_eq!(r["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(r["messages"][0]["id"], "a1");
+        let (_, r) = get_json(addr, "/api/v1/search?q=TRAB").await;
+        assert_eq!(
+            (r["sessions"].clone(), r["messages"].clone()),
+            (json!([id]), json!([]))
+        );
+        let (_, r) = get_json(addr, "/api/v1/search?q=web").await;
+        assert_eq!(r["sessions"], json!([id]));
+        // Un `limit` que no es un número: 400.
+        let (code, _) = get_json(addr, "/api/v1/search?q=codigo&limit=x").await;
+        assert_eq!(code, 400);
     }
 
     #[tokio::test(flavor = "multi_thread")]

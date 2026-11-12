@@ -1040,6 +1040,182 @@ pub fn read_around(path: &Path, at: u64, before: usize, after: usize) -> io::Res
     Ok(w)
 }
 
+/// Algo que dijiste tú o Claude, solo el texto: lo que se busca (`search`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Said {
+    /// Dónde empieza su línea (el `at` del mensaje en el chat).
+    pub at: u64,
+    /// El `id` del mensaje en el chat.
+    pub id: String,
+    pub ts: Option<String>,
+    /// Tuyo (si no, de Claude).
+    pub user: bool,
+    pub text: String,
+}
+
+/// Lo poco que hace falta de una línea para `said`: lo demás (resultados de herramientas de
+/// megas, peticiones a la API…) se salta sin copiarlo.
+#[derive(serde::Deserialize)]
+struct Head<'a> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "isSidechain", borrow, default)]
+    sidechain: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "isMeta", borrow, default)]
+    meta: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "isCompactSummary", borrow, default)]
+    compact: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "isApiErrorMessage", borrow, default)]
+    api_error: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    error: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    uuid: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    timestamp: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    message: Option<Body<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct Body<'a> {
+    #[serde(borrow, default)]
+    content: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    model: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(serde::Deserialize)]
+struct Block<'a> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    text: Option<&'a serde_json::value::RawValue>,
+}
+
+fn raw_is(r: Option<&serde_json::value::RawValue>, json: &str) -> bool {
+    r.is_some_and(|r| r.get() == json)
+}
+
+fn raw_string(r: Option<&serde_json::value::RawValue>) -> Option<String> {
+    serde_json::from_str(r?.get()).ok()
+}
+
+/// Lo que se ve en el chat como mensaje tuyo o de Claude en una línea de la transcripción (que
+/// empieza en `at`), solo su texto, con el mismo criterio que la vista chat (`Parser`): fuera
+/// herramientas y sus resultados, órdenes, avisos, subagentes (`isSidechain`), mensajes
+/// internos (`isMeta`), el resumen al compactar y los mensajes que pone Claude Code en nombre
+/// de Claude (`<synthetic>`, errores de la API, el límite de uso), y los mensajes sin texto
+/// (solo imágenes). Mucho más rápido que `Parser`: no construye la línea entera.
+pub fn said(line: &[u8], at: u64) -> Vec<Said> {
+    let text = String::from_utf8_lossy(line);
+    let Ok(h) = serde_json::from_str::<Head>(&text) else {
+        return Vec::new();
+    };
+    let kind = h.kind.map(|k| k.get());
+    let shown = |user: bool, id: String, text: String| Said {
+        at,
+        id,
+        ts: raw_string(h.timestamp),
+        user,
+        text,
+    };
+    if kind == Some("\"attachment\"") {
+        if !text.contains("queued_command") {
+            return Vec::new();
+        }
+        let Ok(d) = serde_json::from_str::<Value>(&text) else {
+            return Vec::new();
+        };
+        return match queued_prompt(&d, at) {
+            Some(ChatItem::User { id, ts, text, .. }) if !text.is_empty() => vec![Said {
+                at,
+                id,
+                ts,
+                user: true,
+                text,
+            }],
+            _ => Vec::new(),
+        };
+    }
+    let user = match kind {
+        Some("\"user\"") => true,
+        Some("\"assistant\"") => false,
+        _ => return Vec::new(),
+    };
+    if raw_is(h.sidechain, "true") || (user && raw_is(h.compact, "true")) {
+        return Vec::new();
+    }
+    let Some(body) = &h.message else {
+        return Vec::new();
+    };
+    let Some(content) = body.content.map(|c| c.get().trim_start()) else {
+        return Vec::new();
+    };
+    let id = raw_string(h.uuid).unwrap_or_default();
+    if user {
+        if raw_is(h.meta, "true") {
+            return Vec::new();
+        }
+        let text = if content.starts_with('"') {
+            let Ok(s) = serde_json::from_str::<String>(content) else {
+                return Vec::new();
+            };
+            let text = strip_reminders(&s);
+            if !user_text_shown(&text) {
+                return Vec::new();
+            }
+            text
+        } else if content.starts_with('[') {
+            let Ok(blocks) = serde_json::from_str::<Vec<Block>>(content) else {
+                return Vec::new();
+            };
+            let texts: Vec<String> = blocks
+                .iter()
+                .filter(|b| raw_is(b.kind, "\"text\""))
+                .filter_map(|b| raw_string(b.text))
+                .map(|t| strip_reminders(&t))
+                .collect();
+            let text = texts.join("\n").trim().to_owned();
+            if text.starts_with("[Request interrupted") {
+                return Vec::new();
+            }
+            text
+        } else {
+            return Vec::new();
+        };
+        if text.is_empty() || text.starts_with("<task-notification>") {
+            return Vec::new();
+        }
+        return vec![shown(true, id, text)];
+    }
+    // De Claude, salvo lo que pone Claude Code en su nombre.
+    let synthetic = body.model.is_some_and(|m| m.get().starts_with("\"<"));
+    if raw_is(h.error, "\"rate_limit\"") || raw_is(h.api_error, "true") || synthetic {
+        return Vec::new();
+    }
+    if !content.starts_with('[') {
+        return Vec::new();
+    }
+    let Ok(blocks) = serde_json::from_str::<Vec<Block>>(content) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| raw_is(b.kind, "\"text\""))
+        .filter_map(|(n, b)| {
+            let text = raw_string(b.text)?.trim().to_owned();
+            let bid = if n == 0 {
+                id.clone()
+            } else {
+                format!("{id}:{n}")
+            };
+            (!text.is_empty()).then(|| shown(false, bid, text))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1603,6 +1779,85 @@ mod tests {
         assert_eq!(w.results.len(), 1);
         assert_eq!(w.results[0].tool_id, "t0");
         assert_eq!(w.results[0].result, "salida 0");
+    }
+
+    /// Lo que se busca es justo lo que el chat enseña como tuyo o de Claude, con el mismo `at` e
+    /// `id`, salvo lo que pone Claude Code en nombre de Claude.
+    #[test]
+    fn said_is_what_the_chat_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user","uuid":"u1","timestamp":"2026-11-12T10:00:00.000Z","message":{"content":"Hola <system-reminder>interno</system-reminder>"}}),
+            serde_json::json!({"type":"assistant","uuid":"a1","timestamp":"t","message":{"model":"claude-opus-5-5","content":[
+                {"type":"thinking","thinking":"pienso"},
+                {"type":"text","text":"  Voy a mirar.  "},
+                {"type":"tool_use","id":"t-1","name":"Bash","input":{"command":"ls","text":"no"}},
+                {"type":"text","text":"Y esto también."}]}}),
+            serde_json::json!({"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"t-1","content":[{"type":"text","text":"salida"}]}]}}),
+            serde_json::json!({"type":"user","uuid":"u3","isMeta":true,"message":{"content":"interno"}}),
+            serde_json::json!({"type":"user","uuid":"u3b","isMeta":true,"message":{"content":[{"type":"text","text":"interno"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"s1","isSidechain":true,"message":{"content":[{"type":"text","text":"subagente"}]}}),
+            serde_json::json!({"type":"user","uuid":"s2","isSidechain":true,"message":{"content":"al subagente"}}),
+            serde_json::json!({"type":"user","uuid":"c1","message":{"content":"<command-name>/model</command-name>"}}),
+            serde_json::json!({"type":"user","uuid":"c2","message":{"content":"<local-command-stdout>ok</local-command-stdout>"}}),
+            serde_json::json!({"type":"user","uuid":"c3","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}),
+            serde_json::json!({"type":"user","uuid":"n1","message":{"content":"<task-notification><status>completed</status><summary>hecho</summary></task-notification>"}}),
+            serde_json::json!({"type":"user","uuid":"k1","isCompactSummary":true,"message":{"content":"resumen"}}),
+            serde_json::json!({"type":"assistant","uuid":"l1","error":"rate_limit","isApiErrorMessage":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your limit"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"x1","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}),
+            serde_json::json!({"type":"assistant","uuid":"x2","error":"authentication_failed","isApiErrorMessage":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"Not logged in"}]}}),
+            serde_json::json!({"type":"user","uuid":"i1","message":{"content":[{"type":"text","text":"mira esto"},{"type":"image","source":{}}]}}),
+            serde_json::json!({"type":"user","uuid":"i2","message":{"content":[{"type":"image","source":{}}]}}),
+            serde_json::json!({"type":"attachment","uuid":"q1","attachment":{"type":"queued_command","prompt":"y en móvil","origin":{"kind":"human"},"timestamp":"t9"}}),
+            serde_json::json!({"type":"attachment","uuid":"q2","attachment":{"type":"queued_command","prompt":"automático","origin":{"kind":"hook"}}}),
+            serde_json::json!({"type":"api-request","uuid":"r","message":{"content":"no es un mensaje"}}),
+            serde_json::json!({"type":"user","uuid":"e1","message":{"content":"Código \u{1F600} ñ \"comillas\""}}),
+        ];
+        let mut text = String::new();
+        let mut said_all = Vec::new();
+        for l in lines {
+            let l = line(l);
+            said_all.extend(said(l.trim_end().as_bytes(), text.len() as u64));
+            text += &l;
+        }
+        // Lo que no se entiende, fuera.
+        assert!(said(b"{no es json", 0).is_empty());
+        std::fs::write(&path, &text).unwrap();
+        let chat: Vec<Said> = read_chunk(&path, 0, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .filter_map(|i| match i {
+                ChatItem::User {
+                    id, at, ts, text, ..
+                } if !text.is_empty() => Some(Said {
+                    at,
+                    id,
+                    ts,
+                    user: true,
+                    text,
+                }),
+                ChatItem::Assistant { id, at, ts, text } => Some(Said {
+                    at,
+                    id,
+                    ts,
+                    user: false,
+                    text,
+                }),
+                _ => None,
+            })
+            .filter(|s| !matches!(s.id.as_str(), "x1" | "x2"))
+            .collect();
+        assert_eq!(said_all, chat);
+        assert_eq!(
+            said_all.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["u1", "a1:1", "a1:3", "i1", "q1", "e1"]
+        );
+        assert_eq!(said_all[0].text, "Hola");
+        assert_eq!(said_all[0].ts.as_deref(), Some("2026-11-12T10:00:00.000Z"));
+        assert_eq!(said_all[1].text, "Voy a mirar.");
+        assert_eq!(said_all[5].text, "Código \u{1F600} ñ \"comillas\"");
     }
 
     #[test]
