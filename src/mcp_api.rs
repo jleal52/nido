@@ -3179,22 +3179,26 @@ mod tests {
         let items = vec![
             ChatItem::User {
                 id: "u".into(),
+                at: 0,
                 ts: None,
                 text: "mira esto".into(),
                 images: 2,
             },
             ChatItem::Assistant {
                 id: "a".into(),
+                at: 0,
                 ts: None,
                 text: "  Vale.\n".into(),
             },
             ChatItem::Assistant {
                 id: "b".into(),
+                at: 0,
                 ts: None,
                 text: "  ".into(),
             },
             ChatItem::Tool {
                 id: "t".into(),
+                at: 0,
                 ts: None,
                 tool_id: "t1".into(),
                 name: "Bash".into(),
@@ -3208,6 +3212,7 @@ mod tests {
             },
             ChatItem::Notice {
                 id: "n".into(),
+                at: 0,
                 ts: None,
                 text: "terminó".into(),
                 status: None,

@@ -23,12 +23,16 @@ const MAX_SUMMARY: usize = 40_000;
 pub enum ChatItem {
     User {
         id: String,
+        /// Dónde empieza su línea en la transcripción (bytes): la identifica (`around`, búsqueda).
+        at: u64,
         ts: Option<String>,
         text: String,
         images: usize,
     },
     Assistant {
         id: String,
+        /// Dónde empieza su línea en la transcripción (bytes): la identifica (`around`, búsqueda).
+        at: u64,
         ts: Option<String>,
         text: String,
     },
@@ -36,6 +40,8 @@ pub enum ChatItem {
     /// llega como un mensaje tuyo, pero no lo es.
     Notice {
         id: String,
+        /// Dónde empieza su línea en la transcripción (bytes): la identifica (`around`, búsqueda).
+        at: u64,
         ts: Option<String>,
         text: String,
         /// `completed`, `failed`, `killed`…
@@ -45,6 +51,8 @@ pub enum ChatItem {
     },
     Tool {
         id: String,
+        /// Dónde empieza su línea en la transcripción (bytes): la identifica (`around`, búsqueda).
+        at: u64,
         ts: Option<String>,
         tool_id: String,
         name: String,
@@ -63,6 +71,18 @@ pub enum ChatItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         answers: Option<Value>,
     },
+}
+
+impl ChatItem {
+    /// Dónde empieza su línea en la transcripción.
+    pub fn at(&self) -> u64 {
+        match self {
+            ChatItem::User { at, .. }
+            | ChatItem::Assistant { at, .. }
+            | ChatItem::Notice { at, .. }
+            | ChatItem::Tool { at, .. } => *at,
+        }
+    }
 }
 
 /// El resultado de una herramienta que llegó en un trozo posterior a la llamada.
@@ -136,7 +156,7 @@ fn tag<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 /// `<task-notification>…</task-notification>` → el aviso con su resumen.
-fn task_notice(text: &str, id: &str, ts: &Option<String>) -> Option<ChatItem> {
+fn task_notice(text: &str, id: &str, ts: &Option<String>, at: u64) -> Option<ChatItem> {
     if !text.starts_with("<task-notification>") {
         return None;
     }
@@ -149,6 +169,7 @@ fn task_notice(text: &str, id: &str, ts: &Option<String>) -> Option<ChatItem> {
     });
     Some(ChatItem::Notice {
         id: id.to_owned(),
+        at,
         ts: ts.clone(),
         text: clip(&summary, 500),
         status,
@@ -245,7 +266,7 @@ fn result_text(content: &Value) -> String {
     clip(&strip_reminders(&text), MAX_RESULT)
 }
 
-fn queued_prompt(d: &Value) -> Option<ChatItem> {
+fn queued_prompt(d: &Value, at: u64) -> Option<ChatItem> {
     let att = d.get("attachment")?;
     if att.get("type")?.as_str()? != "queued_command"
         || att.pointer("/origin/kind").and_then(Value::as_str) != Some("human")
@@ -275,6 +296,7 @@ fn queued_prompt(d: &Value) -> Option<ChatItem> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        at,
         ts: att
             .get("timestamp")
             .or_else(|| d.get("timestamp"))
@@ -285,31 +307,44 @@ fn queued_prompt(d: &Value) -> Option<ChatItem> {
     })
 }
 
-/// Convierte líneas de la transcripción en mensajes. `tools` acumula dónde está cada llamada
-/// para enganchar su resultado, aunque llegue en otro trozo.
-fn parse_lines<'a>(
-    lines: impl Iterator<Item = &'a str>,
-    items: &mut Vec<ChatItem>,
-    results: &mut Vec<ToolResult>,
-) {
-    let mut tools: HashMap<String, usize> = HashMap::new();
-    for line in lines {
+/// Lo que no es tuyo aunque llegue como un mensaje tuyo: órdenes (`/model`…), su salida, avisos
+/// de interrupción y de tareas en segundo plano. Recibe el texto ya sin los `<system-reminder>`.
+fn user_text_shown(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with("<local-command")
+        && !text.starts_with("<command-")
+        && !text.starts_with("[Request interrupted")
+}
+
+/// Convierte líneas de la transcripción en mensajes, de una en una. `tools` acumula dónde está
+/// cada llamada para enganchar su resultado, aunque llegue en otra línea o en otro trozo.
+#[derive(Default)]
+struct Parser {
+    tools: HashMap<String, usize>,
+    items: Vec<ChatItem>,
+    results: Vec<ToolResult>,
+}
+
+impl Parser {
+    /// Una línea, que empieza en `at` (bytes) en el fichero.
+    fn line(&mut self, at: u64, line: &str) {
         let Ok(d) = serde_json::from_str::<Value>(line) else {
-            continue;
+            return;
         };
+        let (items, results, tools) = (&mut self.items, &mut self.results, &mut self.tools);
         let kind = d.get("type").and_then(Value::as_str);
         // Lo que escribes mientras Claude trabaja llega como un adjunto «queued_command».
         if kind == Some("attachment") {
-            if let Some(item) = queued_prompt(&d) {
+            if let Some(item) = queued_prompt(&d, at) {
                 items.push(item);
             }
-            continue;
+            return;
         }
         if !matches!(kind, Some("user" | "assistant")) {
-            continue;
+            return;
         }
         if d.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
+            return;
         }
         let id = d
             .get("uuid")
@@ -333,26 +368,24 @@ fn parse_lines<'a>(
             };
             items.push(ChatItem::Notice {
                 id,
+                at,
                 ts,
                 text: "Claude resumió la conversación para seguir (se le acababa el contexto)"
                     .into(),
                 status: Some("compact".into()),
                 result: Some(clip(text.trim(), MAX_SUMMARY)),
             });
-            continue;
+            return;
         }
         match (kind, content) {
             (Some("user"), Some(Value::String(s))) if !meta => {
                 let text = strip_reminders(s);
-                if let Some(notice) = task_notice(&text, &id, &ts) {
+                if let Some(notice) = task_notice(&text, &id, &ts, at) {
                     items.push(notice);
-                } else if !text.is_empty()
-                    && !text.starts_with("<local-command")
-                    && !text.starts_with("<command-")
-                    && !text.starts_with("[Request interrupted")
-                {
+                } else if user_text_shown(&text) {
                     items.push(ChatItem::User {
                         id,
+                        at,
                         ts,
                         text,
                         images: 0,
@@ -410,11 +443,12 @@ fn parse_lines<'a>(
                 } else {
                     text
                 };
-                if let Some(notice) = task_notice(&text, &id, &ts) {
+                if let Some(notice) = task_notice(&text, &id, &ts, at) {
                     items.push(notice);
                 } else if !text.is_empty() || images > 0 {
                     items.push(ChatItem::User {
                         id,
+                        at,
                         ts,
                         text,
                         images,
@@ -440,6 +474,7 @@ fn parse_lines<'a>(
                                 // «You've hit your weekly limit · resets…»: no lo dice Claude.
                                 items.push(ChatItem::Notice {
                                     id: bid,
+                                    at,
                                     ts: ts.clone(),
                                     text: text.to_owned(),
                                     status: Some("limit".into()),
@@ -448,6 +483,7 @@ fn parse_lines<'a>(
                             } else {
                                 items.push(ChatItem::Assistant {
                                     id: bid,
+                                    at,
                                     ts: ts.clone(),
                                     text: text.to_owned(),
                                 });
@@ -479,6 +515,7 @@ fn parse_lines<'a>(
                                 .flatten();
                             items.push(ChatItem::Tool {
                                 id: bid,
+                                at,
                                 ts: ts.clone(),
                                 tool_id,
                                 summary: tool_summary(&name, &input),
@@ -811,6 +848,25 @@ fn summary(path: &Path) -> (Option<String>, Option<String>, bool) {
     )
 }
 
+/// Las líneas enteras de `buf` (que está en `base` en el fichero), cada una con dónde empieza:
+/// sobre los bytes, para que las posiciones sean las del fichero aunque haya bytes que no sean
+/// UTF-8 o finales `\r\n`.
+fn lines_at(buf: &[u8], base: u64) -> impl Iterator<Item = (u64, &[u8])> {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        if at >= buf.len() {
+            return None;
+        }
+        let end = buf[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| at + i);
+        let line = (base + at as u64, &buf[at..end]);
+        at = end + 1;
+        Some(line)
+    })
+}
+
 /// Lee desde `offset` hasta la última línea completa (Claude puede estar escribiendo la
 /// siguiente). Si se lee desde el principio (`offset = 0`, o el fichero se rehízo), con `limit`
 /// devuelve solo los últimos `limit` mensajes.
@@ -824,13 +880,17 @@ pub fn read_chunk(path: &Path, offset: u64, limit: Option<usize>) -> io::Result<
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     let complete = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    let text = String::from_utf8_lossy(&buf[..complete]);
+    let mut p = Parser::default();
+    for (at, line) in lines_at(&buf[..complete], offset) {
+        p.line(at, &String::from_utf8_lossy(line));
+    }
     let mut chunk = Chunk {
         offset: offset + complete as u64,
         reset,
+        items: p.items,
+        results: p.results,
         ..Default::default()
     };
-    parse_lines(text.lines(), &mut chunk.items, &mut chunk.results);
     // El límite vale al leer desde el principio (también si el fichero se rehízo).
     if let Some(limit) = limit.filter(|_| offset == 0)
         && chunk.items.len() > limit
@@ -951,8 +1011,13 @@ mod tests {
             serde_json::json!({"type":"attachment","uuid":"q1","attachment":{"type":"queued_command","prompt":"y en móvil","origin":{"kind":"human"},"timestamp":"t9"}}),
             serde_json::json!({"type":"attachment","uuid":"q2","attachment":{"type":"queued_command","prompt":"automático","origin":{"kind":"hook"}}}),
         ];
+        let mut starts = Vec::new();
+        let mut pos = 0;
         for l in lines {
-            f.write_all(line(l).as_bytes()).unwrap();
+            let l = line(l);
+            starts.push(pos as u64);
+            pos += l.len();
+            f.write_all(l.as_bytes()).unwrap();
         }
         // Una línea a medio escribir no se lee todavía.
         f.write_all(b"{\"type\":\"assistant\",\"uuid\":\"a2\"")
@@ -965,6 +1030,7 @@ mod tests {
             c.items[4],
             ChatItem::User {
                 id: "q1".into(),
+                at: starts[7],
                 ts: Some("t9".into()),
                 text: "y en móvil".into(),
                 images: 0
@@ -974,12 +1040,18 @@ mod tests {
             c.items[0],
             ChatItem::User {
                 id: "u1".into(),
+                at: 0,
                 ts: Some("t1".into()),
                 text: "hola".into(),
                 images: 0
             }
         );
         assert!(matches!(&c.items[1], ChatItem::Assistant { text, .. } if text == "Voy a mirar."));
+        // Cada mensaje, con dónde empieza su línea; los de una misma línea, con la misma.
+        assert_eq!(
+            c.items.iter().map(ChatItem::at).collect::<Vec<_>>(),
+            [starts[0], starts[1], starts[1], starts[6], starts[7]]
+        );
         match &c.items[2] {
             ChatItem::Tool {
                 name,
@@ -1008,6 +1080,7 @@ mod tests {
         drop(f);
         let next = read_chunk(&path, c.offset, None).unwrap();
         assert!(matches!(&next.items[0], ChatItem::Tool { summary, .. } if summary == "/a/b.rs"));
+        assert_eq!(next.items[0].at(), c.offset);
         assert_eq!(
             next.results,
             [ToolResult {
@@ -1202,6 +1275,7 @@ mod tests {
             c.items,
             vec![ChatItem::Notice {
                 id: "n1".into(),
+                at: 0,
                 ts: Some("t1".into()),
                 text: "Background command \"Esperar CI\" completed (exit code 0)".into(),
                 status: Some("completed".into()),
