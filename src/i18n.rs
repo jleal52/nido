@@ -744,6 +744,10 @@ const TABLE: &[(&str, &str)] = &[
         "there is already something written in Claude's input box",
     ),
     (
+        "Claude está esperando una respuesta en un menú: contéstala primero",
+        "Claude is waiting for an answer in a menu: answer it first",
+    ),
+    (
         "el mensaje solo tiene caracteres de control",
         "the message only has control characters",
     ),
@@ -1231,6 +1235,10 @@ mod tests {
     /// Los de contestar en nombre del usuario (el agente de voz).
     #[test]
     fn answer_refusals() {
+        assert_eq!(
+            english("Claude está esperando una respuesta en un menú: contéstala primero"),
+            "Claude is waiting for an answer in a menu: answer it first"
+        );
         assert_eq!(
             english("el mensaje solo tiene caracteres de control"),
             "the message only has control characters"

@@ -323,7 +323,10 @@ string with the lines as the terminal wrapped them, without their common indenta
 in its input box: it pastes the text (as a bracketed paste, so several lines don't go one by one)
 and presses Enter. Control characters other than newlines and tabs are removed first, so the text
 can neither end the paste nor turn into keystrokes (Esc, shift+tab, ctrl+c…); `409` if nothing but
-control characters is left.
+control characters is left. While a menu, a question, a permission request or an MCP server's form
+is on screen it sends nothing and answers `409` ("Claude is waiting for an answer in a menu: answer
+it first"): the text and the Enter would go to the menu. Answer the menu first (`option`,
+`questions`, or `option` "No" plus `text` to tell Claude what to do instead).
 
 In a question whose options have previews (the box Claude draws to the right of the options), each
 option of that `menu` has `preview`: its preview text, as given to AskUserQuestion in the

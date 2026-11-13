@@ -1815,6 +1815,17 @@ const MODEL_DIALOG: &str =
 
 const ONLY_CONTROL: &str = "el mensaje solo tiene caracteres de control";
 
+const MENU_WAITING: &str = "Claude está esperando una respuesta en un menú: contéstala primero";
+
+/// Error si en pantalla hay un menú (una pregunta, un permiso, el plan…) o un formulario: lo que
+/// se pegue y el Enter irían a él (p. ej. aprobarían el permiso).
+fn no_menu(screen: &str) -> Result<(), String> {
+    if parse(screen).is_some() || form(screen).is_some() {
+        return Err(MENU_WAITING.into());
+    }
+    Ok(())
+}
+
 /// El texto que se pega, sin caracteres de control (C0 y C1) salvo los saltos de línea y los
 /// tabuladores: dentro de un pegado, `ESC[201~` lo terminaría y lo de detrás serían teclas
 /// (shift+tab cambia el modo, Esc interrumpe, ctrl+c sale). Los saltos de línea, con `\n`.
@@ -1837,13 +1848,15 @@ fn bracketed(text: &str) -> Vec<u8> {
 
 /// Manda un mensaje a Claude: lo pega, espera a que la caja se quede quieta (con adjuntos,
 /// Claude tarda en cambiar las rutas por «[Image #1]»; un Enter que llega antes se pierde) y
-/// pulsa Enter; si la caja no se vacía, lo vuelve a pulsar.
+/// pulsa Enter; si la caja no se vacía, lo vuelve a pulsar. Con un menú en pantalla no hace
+/// nada: falla con [`MENU_WAITING`].
 pub async fn send_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     text: &str,
 ) -> Result<(), String> {
     let screen = scr.read().await?;
     not_in_model_dialog(&screen)?;
+    no_menu(&screen)?;
     let clean = paste_text(text);
     // Solo caracteres de control: no es un Enter suelto.
     if clean.trim().is_empty() && !text.trim().is_empty() {
@@ -1856,6 +1869,7 @@ pub async fn send_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let mut written = false;
         for _ in 0..2 {
             let screen = scr.read().await?;
+            no_menu(&screen)?;
             if input_box(&screen).is_some_and(|t| !t.is_empty()) {
                 return Err("en la caja de Claude ya hay algo escrito".into());
             }
@@ -4962,6 +4976,16 @@ Compound command contains cd with write operation - manual approval required to 
 
     // ---------- Mensajes y respuestas en nombre del usuario (el agente de voz) ----------
 
+    fn fixture(name: &str) -> String {
+        let path = format!("{}/tests/pantallas/{name}.txt", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    fn fixed(name: &str) -> Arc<Mutex<fake::Claude>> {
+        let screen = fixture(name);
+        claude(|c| c.raw = Some(screen))
+    }
+
     /// Lo pegado llega sin caracteres de control: ni el final del pegado (`ESC[201~`), que
     /// convertiría lo de detrás en teclas (shift+tab, Esc, ctrl+c), ni otros. Los saltos de línea
     /// y los tabuladores siguen.
@@ -5014,6 +5038,53 @@ Compound command contains cd with write operation - manual approval required to 
         let mut scr = fake::screen_of(&c);
         assert!(send_message(&mut scr, "\x1b\x03\r\n").await.is_err());
         assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+    }
+
+    /// Con un menú en pantalla (un permiso, el plan, una pregunta, confiar en la carpeta, un
+    /// formulario) no se pega nada ni se pulsa Enter: caería en el menú.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_is_not_written_into_a_menu() {
+        let mut setups = vec![claude(|c| c.permission = true)];
+        for name in [
+            "permiso",
+            "permiso_contexto",
+            "plan",
+            "pregunta_sola",
+            "pregunta_multiple",
+            "confianza",
+            "repaso",
+            "formulario",
+        ] {
+            setups.push(fixed(name));
+        }
+        for c in setups {
+            for text in ["hola", ""] {
+                c.lock().unwrap().keys.clear();
+                let mut scr = fake::screen_of(&c);
+                assert_eq!(send_message(&mut scr, text).await, Err(MENU_WAITING.into()));
+                let req = Request {
+                    message: Some(text.into()),
+                    ..Default::default()
+                };
+                assert_eq!(answer(&mut scr, &req).await, Err(MENU_WAITING.into()));
+                assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+            }
+        }
+    }
+
+    /// Con mensajes en cola (Claude trabajando) sí: van a la cola, como siempre.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_while_working_with_a_queue_is_sent() {
+        let c = claude(|c| {
+            c.working = true;
+            c.queue = vec!["primero".into()];
+        });
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(send_message(&mut scr, "segundo").await, Ok(()));
+        assert_eq!(
+            c.lock().unwrap().log.last().map(String::as_str),
+            Some("❯ segundo")
+        );
     }
 }
 
