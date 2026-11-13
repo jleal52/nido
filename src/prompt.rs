@@ -1582,7 +1582,8 @@ pub struct Request {
     /// que se le manda a Claude después, como un mensaje.
     pub text: Option<String>,
     /// Lo que se confirmó (p. ej. qué permiso), para no contestar otra cosa si la pantalla ha
-    /// cambiado entre medias: con `option` y con `questions` (en estas, solo el tipo).
+    /// cambiado entre medias: solo con `option` y con `questions` (en estas, solo el tipo); con
+    /// lo demás es un error (ver [`Request::check_expect`]).
     pub expect: Option<Expect>,
 }
 
@@ -1597,6 +1598,22 @@ pub struct Expect {
 }
 
 const NOT_CONFIRMED: &str = "en pantalla ya no está lo que se confirmó";
+
+/// `expect` con lo que no es contestar un menú (un mensaje, una propuesta, un formulario).
+pub const EXPECT_ONLY: &str = "expect solo vale con option o questions";
+
+impl Request {
+    /// Error si trae `expect` con algo que no es `option` ni `questions` (o con eso y además un
+    /// mensaje, que va antes): un mensaje, una propuesta o un formulario no son un menú con el
+    /// que comparar, y no se contesta como si se hubiera comprobado.
+    pub fn check_expect(&self) -> Result<(), &'static str> {
+        let other = self.suggestion.is_some() || self.message.is_some() || self.form.is_some();
+        if self.expect.is_some() && other {
+            return Err(EXPECT_ONLY);
+        }
+        Ok(())
+    }
+}
 
 impl Expect {
     /// Error si `m` (el menú de la pantalla) no es el que se confirmó: otro tipo, ninguno, o (con
@@ -2898,6 +2915,7 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     req: &Request,
 ) -> Result<(), String> {
+    req.check_expect()?;
     // Ni un número ni Enter en el menú de `/model`: lo guardaría por defecto.
     not_in_model_dialog(&scr.read().await?)?;
     if !req.questions.is_empty() {
@@ -2922,12 +2940,9 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         e.check(m.as_ref(), true)?;
     }
     let m = m.ok_or("no hay ningún menú en pantalla")?;
-    // En un permiso confirmado, la etiqueta entera: ni su principio ni su número.
-    let whole = req
-        .expect
-        .as_ref()
-        .is_some_and(|e| e.kind == Kind::Permission.name());
-    let i = if whole {
+    // En un menú confirmado, la etiqueta entera: ni su principio ni su número («Yes» no es «Yes,
+    // and don't ask again…» ni, en el plan, «Yes, and use auto mode»).
+    let i = if req.expect.is_some() {
         m.find_whole(want)
     } else {
         want.parse::<u32>()
@@ -5506,6 +5521,89 @@ Compound command contains cd with write operation - manual approval required to 
             assert_ne!(r, Err(NOT_CONFIRMED.into()));
             assert_eq!(keys(&c), [key.to_vec()], "{want}");
         }
+    }
+
+    /// Con `expect`, cualquier opción ha de ser una etiqueta entera, no solo en un permiso: en
+    /// el plan, «Yes» no es «Yes, and use auto mode».
+    #[tokio::test(start_paused = true)]
+    async fn an_expected_option_is_always_a_whole_label() {
+        for want in ["Yes", "1", "Yes, manually"] {
+            let c = fixed("plan");
+            let mut scr = fake::screen_of(&c);
+            let r = answer(&mut scr, &pick(want, expect("plan", None))).await;
+            assert_eq!(r, Err(format!("en pantalla no está la opción «{want}»")));
+            assert!(keys(&c).is_empty(), "{want}: {:?}", keys(&c));
+        }
+        let c = fixed("plan");
+        let mut scr = fake::screen_of(&c);
+        let r = answer(
+            &mut scr,
+            &pick("Yes, manually approve edits", expect("plan", None)),
+        )
+        .await;
+        assert_ne!(r, Err(NOT_CONFIRMED.into()));
+        assert_eq!(keys(&c), [b"2".to_vec()]);
+    }
+
+    /// `expect` solo con `option` o `questions`: con un mensaje, una propuesta o un formulario
+    /// no hay menú con el que comparar, y no se hace como si se hubiera comprobado.
+    #[tokio::test(start_paused = true)]
+    async fn expect_without_a_menu_answer_is_refused() {
+        let reqs = [
+            Request {
+                message: Some("hola".into()),
+                ..Default::default()
+            },
+            Request {
+                suggestion: Some("sigue".into()),
+                ..Default::default()
+            },
+            Request {
+                form: Some(FormAnswer {
+                    accept: true,
+                    values: Default::default(),
+                }),
+                ..Default::default()
+            },
+            // Con `option` también, pero el mensaje va primero.
+            Request {
+                option: Some("Yes".into()),
+                message: Some("hola".into()),
+                ..Default::default()
+            },
+        ];
+        for mut req in reqs {
+            assert_eq!(req.check_expect(), Ok(()));
+            req.expect = expect("permission", None);
+            assert_eq!(req.check_expect(), Err(EXPECT_ONLY));
+            let c = claude(|_| {});
+            let mut scr = fake::screen_of(&c);
+            assert_eq!(answer(&mut scr, &req).await, Err(EXPECT_ONLY.into()));
+            assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+        }
+        assert_eq!(
+            pick("Yes", expect("permission", None)).check_expect(),
+            Ok(())
+        );
+    }
+
+    /// Un permiso confirmado sin contexto (la web manda `""`) no vale para uno que sí lo tiene:
+    /// `""` es «no tenía», no «no lo mires» (eso es no mandarlo).
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_context_is_a_permission_without_context() {
+        assert_eq!(context_key(""), "");
+        let c = claude(|c| c.permission = true);
+        let mut scr = fake::screen_of(&c);
+        let r = answer(&mut scr, &pick("Yes", expect("permission", Some("")))).await;
+        assert_eq!(r, Err(NOT_CONFIRMED.into()));
+        assert!(keys(&c).is_empty() && c.lock().unwrap().permission);
+        // Uno sin contexto en pantalla sí casa con `""`.
+        let mut m = parse(&c.lock().unwrap().screen()).unwrap();
+        m.context = None;
+        let e = expect("permission", Some("")).unwrap();
+        assert_eq!(e.check(Some(&m), true), Ok(()));
+        m.context = Some("Bash command".into());
+        assert_eq!(e.check(Some(&m), true), Err(NOT_CONFIRMED.into()));
     }
 
     /// En las preguntas, solo el tipo.

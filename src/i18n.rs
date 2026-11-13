@@ -756,6 +756,10 @@ const TABLE: &[(&str, &str)] = &[
         "what was confirmed is no longer on screen",
     ),
     (
+        "expect solo vale con option o questions",
+        "expect only works with option or questions",
+    ),
+    (
         "Claude no ha cogido el texto (¿está arrancando?)",
         "Claude did not take the text (is it starting up?)",
     ),

@@ -288,14 +288,14 @@ computer in the group (the web app's "Sign out").
 
 `POST /api/v1/voice/token`: a short-lived token for voice calls, so the web app or the phone app
 can talk to the sessions with a live voice model. nido asks its hub for it and returns what the
-hub gives: `{"token", "expires", "project", "location", "host", "model"}`, where `expires` is
-the number of seconds the token has left. The audio goes
-straight from the browser or the app to the voice model's provider (Google's Gemini Live): it
-goes through neither nido nor the hub, which only hands out the token. Only a paired phone or
-browser can ask for it (`403` with the token in `~/.config/nido/token`). Errors: `503` if nido is
-not connected to a hub (or the connection drops while asking), `501` if the hub does not offer voice (an older hub that doesn't answer
-counts as that, after 30 seconds), `429` if this computer reached the hub's voice limit, `502`
-for any other error from the hub. An older nido, without this endpoint, answers `404`.
+hub gives: `{"token", "expires", "project", "location", "host", "model"}`, where `expires` is the
+number of seconds the token has left. The audio goes straight from the browser or the app to the
+voice model's provider (Google's Gemini Live): it goes through neither nido nor the hub, which
+only hands out the token. Only a paired phone or browser can ask for it (`403` with the token in
+`~/.config/nido/token`). Errors: `503` if nido is not connected to a hub (or the connection drops
+while asking), `501` if the hub does not offer voice (an older hub that doesn't answer counts as
+that, after 30 seconds), `429` if this computer reached the hub's voice limit, `502` for any
+other error from the hub. An older nido, without this endpoint, answers `404`.
 
 `POST /api/v1/pair` (body `{"days": 30}` optional, for a reusable code) creates a pairing code and
 returns `{"uri": "nido://pair?…", "expires", "reusable", "direct",
@@ -326,8 +326,12 @@ and presses Enter. Control characters other than newlines and tabs are removed f
 can neither end the paste nor turn into keystrokes (Esc, shift+tab, ctrl+c…); `409` if nothing but
 control characters is left. While a menu, a question, a permission request or an MCP server's form
 is on screen it sends nothing and answers `409` ("Claude is waiting for an answer in a menu: answer
-it first"): the text and the Enter would go to the menu. Answer the menu first (`option`,
-`questions`, or `option` "No" plus `text` to tell Claude what to do instead).
+it first"): the text and the Enter would go to the menu. It checks the screen again right before
+each Enter: if a menu showed up after the paste, it does not press it, the text stays in the input
+box and it answers that same `409`. Answer the menu first (`option`, `questions`, or `option` "No"
+plus `text` to tell Claude what to do instead; if another menu shows up before that text is sent,
+the option is still chosen and nido answers `409` "the option was chosen, but Claude is waiting
+in another menu: the text was not sent").
 
 An answer with `option` or `questions` can carry `expect`, what the client confirmed with the user,
 so that nothing else gets answered if the screen changed in between:
@@ -342,15 +346,20 @@ so that nothing else gets answered if the screen changed in between:
   It is compared after normalizing both sides like the web app does: each warning block (from a
   line starting with `⚠` up to the next blank line) becomes one line without digits and with its
   whitespace collapsed, since Claude's countdown changes every second; every other line must be
-  the same. An already normalized `context` works too.
+  the same. An already normalized `context` works too. `""` means the menu had no `context`, and
+  only matches a menu that still has none; leaving `context` out (or `null`) means it is not
+  checked.
 
-With the screen read once, under the same lock as the keys pressed, nido answers `409` ("what was
+nido reads the screen once and checks it right before pressing the keys (a window of a few
+milliseconds remains between that read and the keys reaching Claude). It answers `409` ("what was
 confirmed is no longer on screen") without pressing anything if there is no menu, its `kind` is
 another, or `context` is given and differs. With `questions` only `kind` is checked (each question
-is checked by its text anyway). When `kind` is `"permission"`, `option` must be one of the
-labels, whole (the label plus the line below it if the terminal wrapped it): neither the beginning
-of one nor an option number (`"Yes"` never picks "Yes, and don't ask again…"). Without `expect`
-nothing changes. An older nido ignores `expect`.
+is checked by its text anyway). With `expect`, `option` must be one of the labels, whole (the
+label plus the line below it if the terminal wrapped it): neither the beginning of one nor an
+option number (`"Yes"` never picks "Yes, and don't ask again…", nor "Yes, and use auto mode" in
+a plan). `expect` together with `message`, `suggestion` or `form` is rejected with `400` ("expect
+only works with option or questions"): those don't answer a menu, so there is nothing to check
+it against. Without `expect` nothing changes. An older nido ignores `expect`.
 
 In a question whose options have previews (the box Claude draws to the right of the options), each
 option of that `menu` has `preview`: its preview text, as given to AskUserQuestion in the

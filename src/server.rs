@@ -2940,6 +2940,9 @@ async fn api_answer(
     Path(id): Path<String>,
     Json(req): Json<prompt::Request>,
 ) -> Response {
+    if let Err(e) = req.check_expect() {
+        return error(StatusCode::BAD_REQUEST, e);
+    }
     let s = match find_session(&st, &id).await {
         Ok(s) => s,
         Err(r) => return r,
@@ -4318,6 +4321,33 @@ mod tests {
         // Si se cae la conexión, otra vez sin enlace.
         st.hub.status.send_modify(|s| s.connected = false);
         assert!(pair_reply(&st, None).await.get("link").is_none());
+    }
+
+    /// `expect` con un mensaje (o una propuesta, o un formulario): 400, sin buscar la sesión.
+    #[tokio::test]
+    async fn an_answer_with_expect_and_a_message_is_a_bad_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, None, true).unwrap();
+        let req: prompt::Request = serde_json::from_value(json!({
+            "message": "hola", "expect": {"kind": "permission"}
+        }))
+        .unwrap();
+        let r = api_answer(State(st.clone()), Path("no-existe".into()), Json(req)).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "expect only works with option or questions");
     }
 
     // ---------- El token de voz ----------
