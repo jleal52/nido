@@ -845,6 +845,27 @@ const TABLE: &[(&str, &str)] = &[
         "Claude no ha dicho que cambió el modelo",
         "Claude did not confirm the model change",
     ),
+    // prompt.rs: la cola de Claude
+    (
+        "Claude no tiene mensajes en cola",
+        "Claude has no queued messages",
+    ),
+    (
+        "la cola sigue en la pantalla de Claude",
+        "the queued messages are still on Claude's screen",
+    ),
+    (
+        "hay algo escrito en la caja de Claude",
+        "there is text in Claude's input box",
+    ),
+    (
+        "Claude no ha sacado la cola a la caja",
+        "Claude did not move the queued messages to its input box",
+    ),
+    (
+        "no se pudo vaciar la caja de Claude: el texto de la cola sigue en ella (se ve en la terminal)",
+        "could not empty Claude's input box: the queued text is still in it (it can be seen in the terminal)",
+    ),
     ("falta el modo", "the mode is missing"),
     ("modo desconocido: «{}»", "unknown mode: “{0}”"),
     ("falta el modelo", "the model is missing"),
@@ -1059,6 +1080,10 @@ mod tests {
             "“Gemini” is not in the /model menu"
         );
         assert_eq!(english("modo desconocido: «x»"), "unknown mode: “x”");
+        assert_eq!(
+            english("Claude no tiene mensajes en cola"),
+            "Claude has no queued messages"
+        );
     }
 
     #[test]

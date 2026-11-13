@@ -2014,6 +2014,162 @@ const NO_MODE: &str = "no se entiende el modo en el pie de Claude";
 const PLAN_WORKING: &str =
     "Claude está trabajando en modo plan: espera a que termine para cambiar de modo";
 
+/// Lo que pone Claude, una sola vez, debajo de los mensajes en cola.
+const SEND_NOW: &str = "ctrl+x ctrl+s to send now";
+/// ctrl+x ctrl+s: los mensajes en cola, a Claude ya (sin esperar a que acabe el turno).
+const CTRL_X: &[u8] = b"\x18";
+const CTRL_S: &[u8] = b"\x13";
+const BACKSPACE: &[u8] = b"\x7f";
+
+/// Claude tiene mensajes en cola: encima de su caja, cada uno como `❯ texto` (las líneas que
+/// siguen, sangradas) y, debajo de todos, una vez, «ctrl+x ctrl+s to send now». Cuántos son no se
+/// cuenta aquí (un mensaje puede tener varias líneas): eso lo dice la transcripción.
+pub fn queue_shown(screen: &str) -> bool {
+    let plain: Vec<String> = screen.lines().map(strip_sgr).collect();
+    let Some(at) = plain.iter().rposition(|l| l.trim().starts_with(SEND_NOW)) else {
+        return false;
+    };
+    // Justo encima, los mensajes: líneas sangradas (o en blanco) hasta la primera, `❯ …`. Una
+    // respuesta de Claude que dijera lo mismo empezaría por `⏺`.
+    let Some(first) = plain[..at]
+        .iter()
+        .rposition(|l| !l.is_empty() && !l.starts_with([' ', '\u{a0}']))
+    else {
+        return false;
+    };
+    if !plain[first].starts_with('❯') {
+        return false;
+    }
+    // Debajo, hasta la caja, nada más de la conversación (ni de Claude ni tuyo).
+    let edge = |l: &str| l.trim_start().starts_with("──────");
+    plain[at + 1..]
+        .iter()
+        .take_while(|l| !edge(l))
+        .all(|l| !l.trim_start().starts_with(['❯', '⏺', '●']))
+}
+
+const NO_QUEUE: &str = "Claude no tiene mensajes en cola";
+const MENU_OPEN: &str = "hay un menú o una pregunta en pantalla";
+
+/// La pantalla de ahora, si se puede tocar la cola: con la cola a la vista y sin ningún menú,
+/// pregunta ni formulario (ahí las teclas harían otra cosa).
+async fn queue_screen<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+) -> Result<String, String> {
+    let text = scr.read().await?;
+    if something_open(&text) {
+        return Err(MENU_OPEN.into());
+    }
+    if !queue_shown(&text) {
+        return Err(NO_QUEUE.into());
+    }
+    Ok(text)
+}
+
+/// Manda ya a Claude los mensajes en cola, como ctrl+x ctrl+s en la terminal (sin esperar a que
+/// acabe lo que está haciendo), y espera a que la cola desaparezca de la pantalla.
+pub async fn send_queue<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+) -> Result<(), String> {
+    queue_screen(scr).await?;
+    scr.keys(CTRL_X).await?;
+    tokio::time::sleep(STEP).await;
+    scr.keys(CTRL_S).await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        tokio::time::sleep(STEP).await;
+        if !queue_shown(&scr.read().await?) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("la cola sigue en la pantalla de Claude".into());
+        }
+    }
+}
+
+/// La ayuda de la caja con mensajes en cola. Va atenuada (no cuenta como escrito: `input_box`),
+/// pero por si se ve sin colores.
+const QUEUE_HINT: &str = "Press up to edit queued messages";
+
+const STILL_IN_BOX: &str =
+    "no se pudo vaciar la caja de Claude: el texto de la cola sigue en ella (se ve en la terminal)";
+
+/// Saca de la cola los mensajes para editarlos: con la caja de Claude vacía, ↑ los pasa todos a
+/// la caja (uno por línea) y vacía la cola; luego se borran de la caja con retroceso (el cursor
+/// queda al final), tantos como caracteres y otra vez si no queda vacía. Devuelve el texto, los
+/// mensajes unidos con saltos de línea, tal como los apuntó la transcripción: lo que ↑ sacó
+/// (`popped`, que se mira después de pulsarla), o si no aparece, lo que había en cola antes
+/// (`queued`); si tampoco, lo que se vio en la caja.
+pub async fn edit_queue<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    scr: &mut Screen<R, W>,
+    queued: &[String],
+    popped: impl Fn() -> Vec<String>,
+) -> Result<String, String> {
+    let text = queue_screen(scr).await?;
+    match input_box(&text) {
+        None => return Err("no se ve la caja de escribir de Claude".into()),
+        Some(t) if !t.is_empty() && t != QUEUE_HINT => {
+            return Err("hay algo escrito en la caja de Claude".into());
+        }
+        Some(_) => {}
+    }
+    scr.keys(UP).await?;
+    // Hasta que el texto esté en la caja y la cola se haya ido.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let boxed = loop {
+        tokio::time::sleep(STEP).await;
+        let text = scr.read().await?;
+        if something_open(&text) {
+            return Err(STILL_IN_BOX.into());
+        }
+        match input_box(&text) {
+            Some(t) if !t.is_empty() && t != QUEUE_HINT && !queue_shown(&text) => break t,
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Claude no ha sacado la cola a la caja".into());
+        }
+    };
+    // Lo que apuntó la transcripción al sacarlos (puede llegar un poco después que la pantalla).
+    let mut msgs = popped();
+    for _ in 0..5 {
+        if !msgs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(STEP).await;
+        msgs = popped();
+    }
+    if msgs.is_empty() {
+        msgs = queued.to_vec();
+    }
+    let out = if msgs.is_empty() {
+        boxed
+    } else {
+        msgs.join("\n")
+    };
+    let n = out.chars().count();
+    for _ in 0..2 {
+        for _ in 0..n {
+            scr.keys(BACKSPACE).await?;
+        }
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            tokio::time::sleep(STEP).await;
+            let text = scr.read().await?;
+            if something_open(&text) {
+                return Err(STILL_IN_BOX.into());
+            }
+            if input_box(&text).as_deref() == Some("") {
+                return Ok(out);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    Err(STILL_IN_BOX.into())
+}
+
 /// Cambia el modelo de Claude solo para esta sesión: escribe `/model` en la caja vacía, Enter,
 /// lleva el cursor del menú a la opción de `want` (solo con ↑/↓: ←/→ cambian el esfuerzo) y pulsa
 /// `s` («s to use this session only»). Nunca Enter dentro del menú: lo guardaría como el modelo
@@ -3131,6 +3287,45 @@ mod tests {
     }
 
     #[test]
+    fn the_queue_on_screen() {
+        let real = std::fs::read_to_string(format!(
+            "{}/tests/pantallas/cola.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert!(queue_shown(&real));
+        assert!(!something_open(&real));
+        // (Sin colores: la ayuda atenuada se ve como texto.)
+        assert_eq!(input_box(&real).as_deref(), Some(QUEUE_HINT));
+        // Sin la cola, nada.
+        let none = real.replace(SEND_NOW, "");
+        assert!(!queue_shown(&none));
+        assert!(!queue_shown(
+            &std::fs::read_to_string(format!(
+                "{}/tests/pantallas/normal.txt",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        ));
+        // Dos mensajes, uno de dos líneas, con colores; y Claude trabajando debajo.
+        let rule = "────────────────────────────────────────";
+        let two = format!(
+            "⏺ Mirando los ficheros.\n\n\x1b[2m❯\u{a0}primero\x1b[22m\n\x1b[2m❯\u{a0}segundo, que\x1b[22m\n\x1b[2m  sigue aquí\x1b[22m\n\x1b[2m  ctrl+x ctrl+s to send now\x1b[22m\n\n✶ Pensando… (12s)\n\n{rule}\n❯\u{a0}\x1b[2mPress up to edit queued messages\x1b[22m\n{rule}\n  ⏵⏵ auto mode on · esc to interrupt"
+        );
+        assert!(queue_shown(&two));
+        // Lo mismo dicho por Claude en una respuesta no es la cola.
+        let said = format!(
+            "⏺ Verás esto:\n  ctrl+x ctrl+s to send now\n\n{rule}\n❯\u{a0}\n{rule}\n  ⏵⏵ auto mode on"
+        );
+        assert!(!queue_shown(&said));
+        // Ni lo que quedó más arriba, con la conversación ya debajo.
+        let old = format!(
+            "❯ primero\n  ctrl+x ctrl+s to send now\n❯ primero\n\n⏺ Hecho.\n\n{rule}\n❯\u{a0}\n{rule}\n  ⏵⏵ auto mode on"
+        );
+        assert!(!queue_shown(&old));
+    }
+
+    #[test]
     fn what_is_written_in_the_box() {
         let rule = "────────────────────────";
         let b = |inner: &str| {
@@ -3590,6 +3785,143 @@ mod tests {
         let mut scr3 = fake::screen_of(&c3);
         assert!(set_mode(&mut scr3, Mode::Plan).await.is_err());
         assert!(keys(&c3).is_empty());
+    }
+
+    fn queued(c: &mut fake::Claude) {
+        c.working = true;
+        c.queue = vec!["primero".into(), "segundo\ncon dos líneas".into()];
+    }
+
+    fn texts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_the_queue_now() {
+        let c = claude(queued);
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(send_queue(&mut scr).await, Ok(()));
+        assert_eq!(keys(&c), vec![CTRL_X.to_vec(), CTRL_S.to_vec()]);
+        let c = c.lock().unwrap();
+        assert!(c.queue.is_empty());
+        assert_eq!(c.sent_now, ["primero", "segundo\ncon dos líneas"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_the_queue_needs_a_queue_and_no_menu() {
+        // Sin cola.
+        let c = claude(|c| c.working = true);
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(send_queue(&mut scr).await, Err(NO_QUEUE.into()));
+        assert!(keys(&c).is_empty());
+        // Con un permiso en pantalla.
+        let c = claude(|c| {
+            queued(c);
+            c.permission = true;
+        });
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(send_queue(&mut scr).await, Err(MENU_OPEN.into()));
+        assert!(keys(&c).is_empty());
+        // Claude no la manda: sigue ahí.
+        let c = claude(|c| {
+            queued(c);
+            c.send_now_ignored = true;
+        });
+        let mut scr = fake::screen_of(&c);
+        let e = send_queue(&mut scr).await.unwrap_err();
+        assert!(e.contains("sigue"), "{e}");
+        assert_eq!(c.lock().unwrap().queue.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn edit_the_queue() {
+        let c = claude(queued);
+        let mut scr = fake::screen_of(&c);
+        // Lo que dice la transcripción tras ↑ manda.
+        let got = edit_queue(&mut scr, &texts(&["viejo"]), || {
+            texts(&["primero", "segundo\ncon dos líneas"])
+        })
+        .await;
+        let want = "primero\nsegundo\ncon dos líneas";
+        assert_eq!(got.as_deref(), Ok(want));
+        let k = keys(&c);
+        assert_eq!(k[0], UP.to_vec());
+        assert_eq!(k.len(), 1 + want.chars().count());
+        assert!(k[1..].iter().all(|k| k == BACKSPACE));
+        let c = c.lock().unwrap();
+        assert!(c.queue.is_empty() && c.input.is_empty());
+        assert!(c.sent_now.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn edit_the_queue_without_the_transcript() {
+        // Sin lo de después de ↑: lo que había en cola.
+        let c = claude(queued);
+        let mut scr = fake::screen_of(&c);
+        let got = edit_queue(
+            &mut scr,
+            &texts(&["primero", "segundo\ncon dos líneas"]),
+            Vec::new,
+        )
+        .await;
+        assert_eq!(got.as_deref(), Ok("primero\nsegundo\ncon dos líneas"));
+        assert!(c.lock().unwrap().input.is_empty());
+        // Sin nada: lo que se vio en la caja.
+        let c = claude(queued);
+        let mut scr = fake::screen_of(&c);
+        let got = edit_queue(&mut scr, &[], Vec::new).await;
+        assert_eq!(got.as_deref(), Ok("primero segundo con dos líneas"));
+        assert!(c.lock().unwrap().input.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn edit_the_queue_touches_nothing_with_a_draft_or_a_menu() {
+        let c = claude(|c| {
+            queued(c);
+            c.input = "a medio".into();
+        });
+        let mut scr = fake::screen_of(&c);
+        let e = edit_queue(&mut scr, &[], Vec::new).await.unwrap_err();
+        assert!(e.contains("escrito"), "{e}");
+        assert!(keys(&c).is_empty());
+        let c = claude(|c| {
+            queued(c);
+            c.permission = true;
+        });
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            edit_queue(&mut scr, &[], Vec::new).await,
+            Err(MENU_OPEN.into())
+        );
+        assert!(keys(&c).is_empty());
+        let c = claude(|c| c.working = true);
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            edit_queue(&mut scr, &[], Vec::new).await,
+            Err(NO_QUEUE.into())
+        );
+        assert!(keys(&c).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn edit_the_queue_says_when_the_text_stays_in_the_box() {
+        let c = claude(|c| {
+            queued(c);
+            c.deaf_backspace = true;
+        });
+        let mut scr = fake::screen_of(&c);
+        let e = edit_queue(
+            &mut scr,
+            &texts(&["primero", "segundo\ncon dos líneas"]),
+            Vec::new,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, STILL_IN_BOX);
+        // Dos vueltas de retroceso.
+        let n = "primero\nsegundo\ncon dos líneas".chars().count();
+        assert_eq!(keys(&c).len(), 1 + 2 * n);
+        assert_eq!(c.lock().unwrap().input, "primero\nsegundo\ncon dos líneas");
     }
 
     #[tokio::test(start_paused = true)]
@@ -4121,6 +4453,16 @@ pub(crate) mod fake {
         pub narrow: bool,
         /// El menú de `/model` se pinta sin su título («Select model»).
         pub no_title: bool,
+        /// Los mensajes en cola (encima de la caja, con «ctrl+x ctrl+s to send now»).
+        pub queue: Vec<String>,
+        /// Ha llegado ctrl+x: ctrl+s manda la cola.
+        chord: bool,
+        /// ctrl+x ctrl+s no hace nada.
+        pub send_now_ignored: bool,
+        /// El retroceso no borra nada de la caja.
+        pub deaf_backspace: bool,
+        /// Lo que se ha mandado a Claude con ctrl+x ctrl+s.
+        pub sent_now: Vec<String>,
     }
 
     impl Default for Claude {
@@ -4171,6 +4513,11 @@ pub(crate) mod fake {
                 s_silent: false,
                 narrow: false,
                 no_title: false,
+                queue: Vec::new(),
+                chord: false,
+                send_now_ignored: false,
+                deaf_backspace: false,
+                sent_now: Vec::new(),
             }
         }
     }
@@ -4228,6 +4575,13 @@ pub(crate) mod fake {
             let mut out: Vec<String> = self.log.clone();
             if self.ticker {
                 out.push(format!("  ✻ {}s", self.reads));
+            }
+            if !self.queue.is_empty() {
+                out.push(String::new());
+                for m in &self.queue {
+                    out.push(format!("❯ {}", m.replace('\n', "\n  ")));
+                }
+                out.push(format!("  {SEND_NOW}"));
             }
             out.push(String::new());
             if self.other {
@@ -4289,7 +4643,10 @@ pub(crate) mod fake {
                 out.push(RULE.into());
                 match self.dim_suffix.filter(|_| self.input == "/model") {
                     Some(d) => out.push(format!("❯ {}\x1b[2m{d}\x1b[22m", self.input)),
-                    None => out.push(format!("❯ {}", self.input)),
+                    None if self.input.is_empty() && !self.queue.is_empty() => {
+                        out.push("❯\u{a0}\x1b[2mPress up to edit queued messages\x1b[22m".into())
+                    }
+                    None => out.push(format!("❯ {}", self.input.replace('\n', "\n  "))),
                 }
                 out.push(RULE.into());
                 let foot = if self.odd_footer {
@@ -4319,7 +4676,25 @@ pub(crate) mod fake {
             if self.stall_after == Some(k) {
                 self.stall_next = true;
             }
+            let chord = std::mem::take(&mut self.chord);
             match k {
+                b"\x18" => self.chord = true,
+                b"\x13" => {
+                    if chord && !self.send_now_ignored {
+                        for m in std::mem::take(&mut self.queue) {
+                            self.log.push(format!("❯ {m}"));
+                            self.sent_now.push(m);
+                        }
+                    }
+                }
+                b"\x1b[A"
+                    if self.menu.is_none()
+                        && !self.permission
+                        && self.input.is_empty()
+                        && !self.queue.is_empty() =>
+                {
+                    self.input = std::mem::take(&mut self.queue).join("\n");
+                }
                 b"\x1b[Z" => {
                     if self.permission || self.menu.is_some() {
                         self.shift_tab_in_menu = true;
@@ -4397,7 +4772,9 @@ pub(crate) mod fake {
                             (c, Some(_)) if c.is_ascii_digit() => self.digit_in_menu = true,
                             (_, Some(_)) => {}
                             ('\x7f', None) => {
-                                self.input.pop();
+                                if !self.deaf_backspace {
+                                    self.input.pop();
+                                }
                             }
                             (c, None) => self.input.push(c),
                         }
