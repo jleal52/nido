@@ -5229,10 +5229,11 @@ Compound command contains cd with write operation - manual approval required to 
         );
         let k = keys(&c);
         assert!(!k.contains(&b"\r".to_vec()), "{k:?}");
-        let c = c.lock().unwrap();
-        assert!(c.permission && c.picked.is_none());
-        assert_eq!(c.input, "hola");
-        drop(c);
+        {
+            let c = c.lock().unwrap();
+            assert!(c.permission && c.picked.is_none());
+            assert_eq!(c.input, "hola");
+        }
         // Un Enter suelto: el permiso sale en la lectura de justo antes de pulsarlo.
         let c = claude(|c| c.menu_at_read = Some(2));
         let mut scr = fake::screen_of(&c);
