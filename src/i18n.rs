@@ -786,6 +786,10 @@ const TABLE: &[(&str, &str)] = &[
         "the option was chosen, but the text could not be sent",
     ),
     (
+        "eligió la opción, pero Claude espera en otro menú: no se mandó el texto",
+        "the option was chosen, but Claude is waiting in another menu: the text was not sent",
+    ),
+    (
         "en pantalla no está la pregunta «{}»",
         "the question “{0}” is not on screen",
     ),
@@ -1250,6 +1254,10 @@ mod tests {
         assert_eq!(
             english("el mensaje solo tiene caracteres de control"),
             "the message only has control characters"
+        );
+        assert_eq!(
+            english("eligió la opción, pero Claude espera en otro menú: no se mandó el texto"),
+            "the option was chosen, but Claude is waiting in another menu: the text was not sent"
         );
     }
 

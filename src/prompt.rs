@@ -1918,6 +1918,10 @@ const ONLY_CONTROL: &str = "el mensaje solo tiene caracteres de control";
 
 const MENU_WAITING: &str = "Claude está esperando una respuesta en un menú: contéstala primero";
 
+/// Tras «No», otro menú antes de mandar el texto: la opción sí se eligió.
+const TEXT_NOT_SENT: &str =
+    "eligió la opción, pero Claude espera en otro menú: no se mandó el texto";
+
 /// Error si en pantalla hay un menú (una pregunta, un permiso, el plan…) o un formulario: lo que
 /// se pegue y el Enter irían a él (p. ej. aprobarían el permiso).
 fn no_menu(screen: &str) -> Result<(), String> {
@@ -1950,7 +1954,8 @@ fn bracketed(text: &str) -> Vec<u8> {
 /// Manda un mensaje a Claude: lo pega, espera a que la caja se quede quieta (con adjuntos,
 /// Claude tarda en cambiar las rutas por «[Image #1]»; un Enter que llega antes se pierde) y
 /// pulsa Enter; si la caja no se vacía, lo vuelve a pulsar. Con un menú en pantalla no hace
-/// nada: falla con [`MENU_WAITING`].
+/// nada: falla con [`MENU_WAITING`]. Se mira antes de pegar y otra vez justo antes de cada Enter
+/// (si sale entonces, el texto se queda en la caja).
 pub async fn send_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     text: &str,
@@ -2005,6 +2010,9 @@ pub async fn send_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     }
     for _ in 0..3 {
+        // Un menú (un permiso) que haya salido mientras tanto se llevaría el Enter: lo aprobaría.
+        // Se mira justo antes de pulsarlo; el texto se queda en la caja.
+        no_menu(&scr.read().await?)?;
         scr.keys(b"\r").await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -2955,9 +2963,13 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if !gone {
             return Err("eligió la opción, pero no se pudo mandar el texto".into());
         }
+        // Si entre medias sale otro menú, ni el pegado (un número elegiría una opción) ni el
+        // Enter: irían a él.
         tokio::time::sleep(Duration::from_millis(200)).await;
+        no_menu(&scr.read().await?).map_err(|_| TEXT_NOT_SENT)?;
         scr.keys(&bracketed(text)).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
+        no_menu(&scr.read().await?).map_err(|_| TEXT_NOT_SENT)?;
         scr.keys(b"\r").await?;
     }
     Ok(())
@@ -5189,6 +5201,63 @@ Compound command contains cd with write operation - manual approval required to 
         }
     }
 
+    /// Un permiso que sale entre que el texto se queda quieto en la caja y el Enter: no se pulsa
+    /// Enter (lo aprobaría), y el texto se queda en la caja.
+    #[tokio::test(start_paused = true)]
+    async fn a_menu_that_appears_before_the_enter_gets_no_enter() {
+        // Dos lecturas para ver el texto quieto; en la tercera, el permiso.
+        let c = claude(|c| c.menu_after = Some((b"\x1b[200~", 3)));
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            send_message(&mut scr, "hola").await,
+            Err(MENU_WAITING.into())
+        );
+        let k = keys(&c);
+        assert!(!k.contains(&b"\r".to_vec()), "{k:?}");
+        let c = c.lock().unwrap();
+        assert!(c.permission && c.picked.is_none());
+        assert_eq!(c.input, "hola");
+        drop(c);
+        // Un Enter suelto: el permiso sale en la lectura de justo antes de pulsarlo.
+        let c = claude(|c| c.menu_at_read = Some(2));
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(send_message(&mut scr, "").await, Err(MENU_WAITING.into()));
+        assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+    }
+
+    /// Lo mismo con el texto tras «No»: si sale otro permiso antes de pegarlo o antes del
+    /// Enter, ni se pega ni se pulsa Enter.
+    #[tokio::test(start_paused = true)]
+    async fn the_text_after_no_is_not_sent_into_a_new_menu() {
+        let req = Request {
+            option: Some("No".into()),
+            text: Some("mejor así".into()),
+            ..Default::default()
+        };
+        // Antes del Enter: en la primera lectura tras pegarlo.
+        let c = claude(|c| {
+            c.permission = true;
+            c.menu_after = Some((b"\x1b[200~", 1));
+        });
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(answer(&mut scr, &req).await, Err(TEXT_NOT_SENT.into()));
+        let k = keys(&c);
+        assert_eq!(k.len(), 2, "{k:?}");
+        assert_eq!(
+            (k[0].as_slice(), k[1].starts_with(b"\x1b[200~")),
+            (&b"2"[..], true)
+        );
+        assert!(c.lock().unwrap().permission);
+        // Antes de pegarlo: «2», ya no hay menú (dos lecturas) y, en la siguiente, otro.
+        let c = claude(|c| {
+            c.permission = true;
+            c.menu_after = Some((b"2", 3));
+        });
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(answer(&mut scr, &req).await, Err(TEXT_NOT_SENT.into()));
+        assert_eq!(keys(&c), [b"2".to_vec()]);
+    }
+
     /// Con mensajes en cola (Claude trabajando) sí: van a la cola, como siempre.
     #[tokio::test(start_paused = true)]
     async fn a_message_while_working_with_a_queue_is_sent() {
@@ -5578,6 +5647,12 @@ pub(crate) mod fake {
         pub after_paste: Vec<Vec<u8>>,
         /// La opción que se eligió en el permiso (con su número).
         pub picked: Option<char>,
+        /// Tras una tecla que empieza así, el permiso sale a las tantas lecturas (en la última,
+        /// ya se ve): un menú que aparece justo antes de que nido pulse lo siguiente.
+        pub menu_after: Option<(&'static [u8], u32)>,
+        menu_in: Option<u32>,
+        /// El permiso sale en esta lectura (contando desde la primera).
+        pub menu_at_read: Option<u32>,
     }
 
     impl Default for Claude {
@@ -5636,6 +5711,9 @@ pub(crate) mod fake {
                 raw: None,
                 after_paste: Vec::new(),
                 picked: None,
+                menu_after: None,
+                menu_in: None,
+                menu_at_read: None,
             }
         }
     }
@@ -5645,6 +5723,16 @@ pub(crate) mod fake {
         /// reloj, el menú que se pinta poco a poco).
         pub fn read(&mut self) -> String {
             self.reads += 1;
+            if self.menu_at_read == Some(self.reads) {
+                self.permission = true;
+            }
+            if let Some(n) = self.menu_in.as_mut() {
+                *n -= 1;
+                if *n == 0 {
+                    self.menu_in = None;
+                    self.permission = true;
+                }
+            }
             let mut fire = 0;
             self.pending_esc.retain_mut(|n| {
                 *n = n.saturating_sub(1);
@@ -5795,6 +5883,12 @@ pub(crate) mod fake {
 
         fn key(&mut self, k: &[u8]) {
             self.keys.push(k.to_vec());
+            if let Some((prefix, n)) = self.menu_after
+                && k.starts_with(prefix)
+            {
+                self.menu_after = None;
+                self.menu_in = Some(n);
+            }
             if self.stall_after == Some(k) {
                 self.stall_next = true;
             }
