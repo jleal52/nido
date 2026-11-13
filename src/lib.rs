@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod mcp_api;
 pub mod oauth;
 pub mod outbox;
+pub mod plan;
 pub mod prompt;
 pub mod proto;
 pub mod registry;
