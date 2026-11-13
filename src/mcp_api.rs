@@ -2431,6 +2431,7 @@ async fn tool_answer(st: &AppState, me: &Machine, caller: &Caller, args: Value) 
         message: None,
         form: None,
         text: a.text,
+        expect: None,
     };
     prompt::answer(&mut scr, &req)
         .await

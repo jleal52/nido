@@ -328,6 +328,29 @@ is on screen it sends nothing and answers `409` ("Claude is waiting for an answe
 it first"): the text and the Enter would go to the menu. Answer the menu first (`option`,
 `questions`, or `option` "No" plus `text` to tell Claude what to do instead).
 
+An answer with `option` or `questions` can carry `expect`, what the client confirmed with the user,
+so that nothing else gets answered if the screen changed in between:
+
+```json
+{"option": "Yes", "expect": {"kind": "permission", "context": "Bash command\n\n  rm -rf build"}}
+```
+
+- `kind`: the `kind` of the menu as the `menu` of `/live` gives it: `"question"`, `"review"`,
+  `"permission"`, `"plan"`, `"limit"` or `"menu"` (anything else matches no menu).
+- `context` (optional, only checked with `option`): the menu's `context` as it was shown.
+  It is compared after normalizing both sides like the web app does: each warning block (from a
+  line starting with `⚠` up to the next blank line) becomes one line without digits and with its
+  whitespace collapsed, since Claude's countdown changes every second; every other line must be
+  the same. An already normalized `context` works too.
+
+With the screen read once, under the same lock as the keys pressed, nido answers `409` ("what was
+confirmed is no longer on screen") without pressing anything if there is no menu, its `kind` is
+another, or `context` is given and differs. With `questions` only `kind` is checked (each question
+is checked by its text anyway). When `kind` is `"permission"`, `option` must be one of the
+labels, whole (the label plus the line below it if the terminal wrapped it): neither the beginning
+of one nor an option number (`"Yes"` never picks "Yes, and don't ask again…"). Without `expect`
+nothing changes. An older nido ignores `expect`.
+
 In a question whose options have previews (the box Claude draws to the right of the options), each
 option of that `menu` has `preview`: its preview text, as given to AskUserQuestion in the
 transcript (the screen only shows the one of the option under the cursor; that one is used if the

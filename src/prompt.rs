@@ -29,6 +29,20 @@ pub enum Kind {
     Menu,
 }
 
+impl Kind {
+    /// Como sale en JSON (`"permission"`, `"plan"`…): lo que trae `expect.kind`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Question => "question",
+            Kind::Review => "review",
+            Kind::Permission => "permission",
+            Kind::Plan => "plan",
+            Kind::Limit => "limit",
+            Kind::Menu => "menu",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Opt {
     /// La tecla que la elige; `None` en los menús sin números (se llega con las flechas).
@@ -129,6 +143,21 @@ impl Menu {
                             .is_none_or(|c| !c.is_alphanumeric())
                 })
             })
+    }
+
+    /// La opción cuya etiqueta es entera la que se quiere (con lo que lleva debajo, si viene
+    /// partida en varias líneas), sin conformarse con el principio.
+    pub fn find_whole(&self, want: &str) -> Option<usize> {
+        let w = norm(want);
+        if w.is_empty() {
+            return None;
+        }
+        self.options.iter().position(|o| {
+            norm(&o.label) == w
+                || o.detail
+                    .as_deref()
+                    .is_some_and(|d| norm(&format!("{} {d}", o.label)) == w)
+        })
     }
 
     fn input(&self) -> Option<usize> {
@@ -1552,6 +1581,78 @@ pub struct Request {
     /// Con un campo de texto, lo que se escribe; con otra opción (p. ej. «No» en un permiso), lo
     /// que se le manda a Claude después, como un mensaje.
     pub text: Option<String>,
+    /// Lo que se confirmó (p. ej. qué permiso), para no contestar otra cosa si la pantalla ha
+    /// cambiado entre medias: con `option` y con `questions` (en estas, solo el tipo).
+    pub expect: Option<Expect>,
+}
+
+/// El menú que tiene que estar en pantalla para contestar.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Expect {
+    /// Su tipo, como sale en JSON (`"permission"`, `"plan"`, `"question"`…; ver [`Kind::name`]).
+    /// Un texto y no un [`Kind`]: uno que no existe no es un cuerpo mal hecho, sino otro menú.
+    pub kind: String,
+    /// Su `context` (lo que se aprueba en un permiso), comparado con [`context_key`].
+    pub context: Option<String>,
+}
+
+const NOT_CONFIRMED: &str = "en pantalla ya no está lo que se confirmó";
+
+impl Expect {
+    /// Error si `m` (el menú de la pantalla) no es el que se confirmó: otro tipo, ninguno, o (con
+    /// `context`, si `with_context`) otro contexto.
+    fn check(&self, m: Option<&Menu>, with_context: bool) -> Result<(), String> {
+        let Some(m) = m.filter(|m| m.kind.name() == self.kind) else {
+            return Err(NOT_CONFIRMED.into());
+        };
+        if with_context
+            && let Some(want) = &self.context
+            && context_key(want) != context_key(m.context.as_deref().unwrap_or(""))
+        {
+            return Err(NOT_CONFIRMED.into());
+        }
+        Ok(())
+    }
+}
+
+/// El espacio en blanco de JavaScript (`\s`, `trim`): el de Unicode sin NEL (U+0085) y con
+/// U+FEFF.
+fn js_space(c: char) -> bool {
+    c == '\u{feff}' || (c.is_whitespace() && c != '\u{85}')
+}
+
+/// Lo del contexto de un permiso que cuenta para saber si es el mismo, como `contextKey` de la
+/// web (permission.js): los avisos («⚠ … will automatically block this request in 1:30», hasta la
+/// siguiente línea en blanco), en una línea, sin números y con los espacios juntos (la cuenta atrás
+/// cambia cada segundo, y en una terminal estrecha puede partirse de otra forma); lo demás, tal
+/// cual. Aplicarla dos veces da lo mismo que una.
+pub fn context_key(context: &str) -> String {
+    fn flush(warn: &mut Option<String>, out: &mut Vec<String>) {
+        if let Some(w) = warn.take() {
+            let w: String = w.chars().filter(|c| !c.is_ascii_digit()).collect();
+            let words: Vec<&str> = w.split(js_space).filter(|p| !p.is_empty()).collect();
+            out.push(words.join(" "));
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut warn: Option<String> = None;
+    for l in context.split('\n') {
+        if l.trim_start_matches(js_space).starts_with('⚠') {
+            flush(&mut warn, &mut out);
+            warn = Some(l.to_owned());
+        } else if let Some(w) = warn
+            .as_mut()
+            .filter(|_| !l.trim_matches(js_space).is_empty())
+        {
+            w.push(' ');
+            w.push_str(l);
+        } else {
+            flush(&mut warn, &mut out);
+            out.push(l.to_owned());
+        }
+    }
+    flush(&mut warn, &mut out);
+    out.join("\n")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2792,6 +2893,9 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // Ni un número ni Enter en el menú de `/model`: lo guardaría por defecto.
     not_in_model_dialog(&scr.read().await?)?;
     if !req.questions.is_empty() {
+        if let Some(e) = &req.expect {
+            e.check(scr.menu().await?.as_ref(), false)?;
+        }
         return questions(scr, &req.questions).await;
     }
     if let Some(s) = &req.suggestion {
@@ -2804,13 +2908,26 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         return answer_form(scr, f).await;
     }
     let want = req.option.as_deref().ok_or("falta qué opción")?;
-    let m = scr.menu().await?.ok_or("no hay ningún menú en pantalla")?;
-    let i = want
-        .parse::<u32>()
-        .ok()
-        .and_then(|n| m.options.iter().position(|o| o.n == Some(n)))
-        .or_else(|| m.find(want))
-        .ok_or_else(|| format!("en pantalla no está la opción «{want}»"))?;
+    // Lo que se comprueba es lo mismo que luego se pulsa (una sola lectura).
+    let m = scr.menu().await?;
+    if let Some(e) = &req.expect {
+        e.check(m.as_ref(), true)?;
+    }
+    let m = m.ok_or("no hay ningún menú en pantalla")?;
+    // En un permiso confirmado, la etiqueta entera: ni su principio ni su número.
+    let whole = req
+        .expect
+        .as_ref()
+        .is_some_and(|e| e.kind == Kind::Permission.name());
+    let i = if whole {
+        m.find_whole(want)
+    } else {
+        want.parse::<u32>()
+            .ok()
+            .and_then(|n| m.options.iter().position(|o| o.n == Some(n)))
+            .or_else(|| m.find(want))
+    }
+    .ok_or_else(|| format!("en pantalla no está la opción «{want}»"))?;
     let before = m.clone();
     if m.options[i].input {
         let row = m.row_of(i).ok_or("opción sin fila")?;
@@ -5085,6 +5202,281 @@ Compound command contains cd with write operation - manual approval required to 
             c.lock().unwrap().log.last().map(String::as_str),
             Some("❯ segundo")
         );
+    }
+
+    const CTX: &str = "Bash command\nGenerate old/new SQL pairs\n\n  cd /tmp/x && node gen.js\n\n⚠ Claude Code will automatically block this request in 1:30, to avoid holding up an unattended session";
+
+    /// Las mismas pruebas que `contextKey` en la web (test/permission.test.mjs).
+    #[test]
+    fn the_countdown_does_not_change_the_context_key() {
+        let later = CTX.replace("1:30", "1:29");
+        assert_ne!(later, CTX);
+        assert_eq!(context_key(&later), context_key(CTX));
+        assert_ne!(
+            context_key(&CTX.replace("gen.js", "otro.js")),
+            context_key(CTX)
+        );
+        // Los números de la orden cuentan.
+        assert_ne!(
+            context_key("Bash command\nsleep 10"),
+            context_key("Bash command\nsleep 20")
+        );
+        assert_eq!(context_key(""), "");
+    }
+
+    #[test]
+    fn a_countdown_wrapped_differently_has_the_same_context_key() {
+        let at = |t: &str| {
+            format!(
+                "Bash command\n  rm -f cmp/*\n\n⚠ Claude Code will automatically block this request in\n{t}, to avoid holding up an unattended session"
+            )
+        };
+        assert_eq!(context_key(&at("1:30")), context_key(&at("1:29")));
+        assert_eq!(context_key(&at("10:00")), context_key(&at("9:59")));
+        let rewrapped = "Bash command\n  rm -f cmp/*\n\n⚠ Claude Code will automatically block this request\nin 9:59, to avoid holding up an unattended session";
+        assert_eq!(context_key(rewrapped), context_key(&at("10:00")));
+        // Lo de después del aviso (tras una línea en blanco) sí cuenta.
+        assert_ne!(
+            context_key(&format!("{}\n\nsleep 10", at("1:30"))),
+            context_key(&format!("{}\n\nsleep 20", at("1:30")))
+        );
+    }
+
+    /// Lo que da la web: el aviso en una línea, sin números ni espacios de más; las demás
+    /// líneas, tal cual. Aplicarla otra vez no cambia nada (se puede mandar ya normalizado).
+    #[test]
+    fn the_context_key_is_the_one_of_the_web() {
+        assert_eq!(
+            context_key(CTX),
+            "Bash command\nGenerate old/new SQL pairs\n\n  cd /tmp/x && node gen.js\n\n⚠ Claude Code will automatically block this request in :, to avoid holding up an unattended session"
+        );
+        assert_eq!(
+            context_key("  x  \n \u{a0}⚠  a\u{a0} 1\n\tb  \n\nc"),
+            "  x  \n⚠ a b\n\nc"
+        );
+        for s in [CTX, "⚠ a\n1\n\n⚠ b 2\nc", "a\n\n\nb", ""] {
+            assert_eq!(context_key(&context_key(s)), context_key(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn the_expected_kind_is_its_json_name() {
+        for k in [
+            Kind::Question,
+            Kind::Review,
+            Kind::Permission,
+            Kind::Plan,
+            Kind::Limit,
+            Kind::Menu,
+        ] {
+            assert_eq!(serde_json::to_value(k).unwrap(), k.name());
+        }
+    }
+
+    #[test]
+    fn the_answer_body_with_expect() {
+        let r: Request = serde_json::from_value(serde_json::json!({
+            "option": "Yes",
+            "expect": {"kind": "permission", "context": "Bash command\nls"}
+        }))
+        .unwrap();
+        let e = r.expect.unwrap();
+        assert_eq!(e.kind, "permission");
+        assert_eq!(e.context.as_deref(), Some("Bash command\nls"));
+        let r: Request =
+            serde_json::from_value(serde_json::json!({"option": "1", "expect": {"kind": "plan"}}))
+                .unwrap();
+        assert_eq!(r.expect.unwrap().context, None);
+        let r: Request = serde_json::from_value(serde_json::json!({"option": "1"})).unwrap();
+        assert!(r.expect.is_none());
+        // Un tipo que no existe no es un error del cuerpo: no casará con ningún menú (409).
+        let r: Request =
+            serde_json::from_value(serde_json::json!({"option": "1", "expect": {"kind": "otro"}}))
+                .unwrap();
+        assert_eq!(r.expect.unwrap().kind, "otro");
+    }
+
+    fn expect(kind: &str, context: Option<&str>) -> Option<Expect> {
+        Some(Expect {
+            kind: kind.into(),
+            context: context.map(str::to_owned),
+        })
+    }
+
+    fn pick(option: &str, e: Option<Expect>) -> Request {
+        Request {
+            option: Some(option.into()),
+            expect: e,
+            ..Default::default()
+        }
+    }
+
+    /// Lo que se confirmó (un permiso, y cuál) sigue en pantalla: se contesta.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_with_the_expected_menu_is_pressed() {
+        let c = claude(|c| c.permission = true);
+        let shown = parse(&c.lock().unwrap().screen()).unwrap();
+        assert_eq!(
+            (shown.kind, shown.context.as_deref()),
+            (Kind::Permission, Some("Bash command"))
+        );
+        let mut scr = fake::screen_of(&c);
+        let req = pick("Yes", expect("permission", Some("Bash command")));
+        assert_eq!(answer(&mut scr, &req).await, Ok(()));
+        assert_eq!(c.lock().unwrap().picked, Some('1'));
+        // Sin contexto, basta el tipo.
+        let c = claude(|c| c.permission = true);
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            answer(&mut scr, &pick("No", expect("permission", None))).await,
+            Ok(())
+        );
+        assert_eq!(c.lock().unwrap().picked, Some('2'));
+        // La cuenta atrás del aviso ha cambiado (y se manda tal cual o ya normalizado): el mismo.
+        let shown = parse(&fixture("permiso_contexto"))
+            .unwrap()
+            .context
+            .unwrap();
+        assert!(shown.contains("1:30"));
+        for ctx in [shown.replace("1:30", "1:29"), context_key(&shown)] {
+            let c = fixed("permiso_contexto");
+            let mut scr = fake::screen_of(&c);
+            let r = answer(&mut scr, &pick("Yes", expect("permission", Some(&ctx)))).await;
+            // La pantalla es fija: no reacciona, pero se ha pulsado.
+            assert_ne!(r, Err(NOT_CONFIRMED.into()));
+            assert_eq!(keys(&c), [b"1".to_vec()]);
+        }
+    }
+
+    /// Otro menú, u otro permiso: no se pulsa nada.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_with_another_menu_on_screen_is_refused() {
+        let shown = parse(&fixture("permiso_contexto"))
+            .unwrap()
+            .context
+            .unwrap();
+        let cases = [
+            // «Yes» en el plan sería «Yes, and use auto mode».
+            ("plan", pick("Yes", expect("permission", None))),
+            // Y en la de confiar en la carpeta, «Yes, I trust this folder».
+            ("confianza", pick("Yes", expect("permission", None))),
+            ("permiso", pick("Yes", expect("plan", None))),
+            ("permiso", pick("Yes", expect("question", None))),
+            ("permiso", pick("Yes", expect("otro", None))),
+            // Otra orden.
+            (
+                "permiso_contexto",
+                pick(
+                    "Yes",
+                    expect("permission", Some(&shown.replace("gen.js", "otro.js"))),
+                ),
+            ),
+            // Un contexto en un menú que no tiene.
+            ("plan", pick("Yes", expect("plan", Some("Bash command")))),
+            ("normal", pick("1", expect("permission", None))),
+        ];
+        for (name, req) in cases {
+            let c = fixed(name);
+            let mut scr = fake::screen_of(&c);
+            assert_eq!(
+                answer(&mut scr, &req).await,
+                Err(NOT_CONFIRMED.into()),
+                "{name}: {req:?}"
+            );
+            assert!(keys(&c).is_empty(), "{name}: {:?}", keys(&c));
+        }
+        // Con el fake: el permiso de otra orden.
+        let c = claude(|c| c.permission = true);
+        let mut scr = fake::screen_of(&c);
+        let req = pick("Yes", expect("permission", Some("Bash command\nrm -rf x")));
+        assert_eq!(answer(&mut scr, &req).await, Err(NOT_CONFIRMED.into()));
+        assert!(keys(&c).is_empty() && c.lock().unwrap().permission);
+    }
+
+    /// Sin `expect`, como siempre (también el parecido por el principio).
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_without_expect_is_as_before() {
+        let c = fixed("plan");
+        let mut scr = fake::screen_of(&c);
+        let _ = answer(&mut scr, &pick("Yes", None)).await;
+        assert_eq!(keys(&c), [b"1".to_vec()]);
+        let c = claude(|c| c.permission = true);
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(answer(&mut scr, &pick("2", None)).await, Ok(()));
+        assert_eq!(c.lock().unwrap().picked, Some('2'));
+    }
+
+    /// Esperando un permiso, la opción ha de ser una etiqueta entera: ni su principio ni su
+    /// número (el 2 puede ser «Yes, and always allow…»).
+    #[tokio::test(start_paused = true)]
+    async fn a_permission_option_must_be_a_whole_label() {
+        for want in [
+            "Yes, and always allow",
+            "Yes, and switch to auto mode",
+            "1",
+            "4",
+        ] {
+            let c = fixed("permiso");
+            let mut scr = fake::screen_of(&c);
+            let r = answer(&mut scr, &pick(want, expect("permission", None))).await;
+            assert_eq!(r, Err(format!("en pantalla no está la opción «{want}»")));
+            assert!(keys(&c).is_empty(), "{want}: {:?}", keys(&c));
+        }
+        // La etiqueta entera, aunque venga partida en dos líneas, sí.
+        for (want, key) in [
+            ("Yes", b"1"),
+            (
+                "Yes, and always allow access to /home/ana/proyecto from this project",
+                b"2",
+            ),
+            ("no", b"4"),
+        ] {
+            let c = fixed("permiso");
+            let mut scr = fake::screen_of(&c);
+            let r = answer(&mut scr, &pick(want, expect("permission", None))).await;
+            assert_ne!(r, Err(NOT_CONFIRMED.into()));
+            assert_eq!(keys(&c), [key.to_vec()], "{want}");
+        }
+    }
+
+    /// En las preguntas, solo el tipo.
+    #[tokio::test(start_paused = true)]
+    async fn questions_with_expect_check_the_kind() {
+        let m = parse(&fixture("pregunta_sola")).unwrap();
+        let qa = QuestionAnswer {
+            question: m.title.clone().unwrap(),
+            choose: vec![m.options[1].label.clone()],
+            text: None,
+        };
+        let req = |e| Request {
+            questions: vec![qa.clone()],
+            expect: e,
+            ..Default::default()
+        };
+        for e in [expect("permission", None), expect("plan", None)] {
+            let c = fixed("pregunta_sola");
+            let mut scr = fake::screen_of(&c);
+            assert_eq!(answer(&mut scr, &req(e)).await, Err(NOT_CONFIRMED.into()));
+            assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+        }
+        for e in [
+            expect("question", None),
+            expect("question", Some("lo que sea")),
+            None,
+        ] {
+            let c = fixed("pregunta_sola");
+            let mut scr = fake::screen_of(&c);
+            let r = answer(&mut scr, &req(e)).await;
+            assert_ne!(r, Err(NOT_CONFIRMED.into()));
+            assert_eq!(keys(&c), [b"2".to_vec()]);
+        }
+        let c = fixed("permiso");
+        let mut scr = fake::screen_of(&c);
+        assert_eq!(
+            answer(&mut scr, &req(expect("question", None))).await,
+            Err(NOT_CONFIRMED.into())
+        );
+        assert!(keys(&c).is_empty());
     }
 }
 

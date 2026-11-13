@@ -752,6 +752,10 @@ const TABLE: &[(&str, &str)] = &[
         "the message only has control characters",
     ),
     (
+        "en pantalla ya no está lo que se confirmó",
+        "what was confirmed is no longer on screen",
+    ),
+    (
         "Claude no ha cogido el texto (¿está arrancando?)",
         "Claude did not take the text (is it starting up?)",
     ),
@@ -1238,6 +1242,10 @@ mod tests {
         assert_eq!(
             english("Claude está esperando una respuesta en un menú: contéstala primero"),
             "Claude is waiting for an answer in a menu: answer it first"
+        );
+        assert_eq!(
+            english("en pantalla ya no está lo que se confirmó"),
+            "what was confirmed is no longer on screen"
         );
         assert_eq!(
             english("el mensaje solo tiene caracteres de control"),
