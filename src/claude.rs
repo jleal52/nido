@@ -655,9 +655,23 @@ pub fn channels_supported(program: &Path) -> Option<bool> {
         home: None,
         cwd: Some(std::env::temp_dir()),
     };
-    let version = cli
-        .run(None, &["--version"])
-        .ok()
+    // Recién escrito (Claude Code se acaba de actualizar, o en las pruebas), lanzarlo puede dar
+    // «Text file busy» un momento: se reintenta. Y si no se pudo lanzar, no se recuerda: la próxima
+    // vez se vuelve a preguntar (si no, sus sesiones irían sin el MCP de nido hasta que cambiara).
+    let mut ran = cli.run(None, &["--version"]);
+    for _ in 0..20 {
+        match &ran {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                ran = cli.run(None, &["--version"]);
+            }
+            _ => break,
+        }
+    }
+    let Ok(ran) = ran else {
+        return None;
+    };
+    let version = Some(ran)
         .filter(|(ok, _)| *ok)
         .and_then(|(_, text)| parse_version(&text));
     let supported = version.map(|v| v >= CHANNELS_SINCE);
@@ -1522,6 +1536,13 @@ mod tests {
             .unwrap();
         assert_eq!(channels_supported(&old), Some(true));
         assert_eq!(runs("viejo"), 2);
+        // Si no se pudo lanzar, no se recuerda: cuando ya se puede, se pregunta (con la misma
+        // fecha: chmod no la cambia).
+        let locked = fake("cerrado", "2.1.322 (Claude Code)");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(channels_supported(&locked), None);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(channels_supported(&locked), Some(true));
     }
 
     #[test]
