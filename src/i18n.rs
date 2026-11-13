@@ -994,6 +994,11 @@ const TABLE: &[(&str, &str)] = &[
         "estado desconocido \"{}\": vale pending, in_progress, done, skipped, blocked o failed",
         "unknown status \"{0}\": use pending, in_progress, done, skipped, blocked or failed",
     ),
+    // Un estado vacío dentro de `phases` llega a nido (el MCP no mira lo de dentro).
+    (
+        "estado desconocido \"\": vale pending, in_progress, done, skipped, blocked o failed",
+        "unknown status \"\": use pending, in_progress, done, skipped, blocked or failed",
+    ),
     (
         "id no válido \"{}\": de 1 a 64 letras, dígitos, '.', '_' o '-'",
         "invalid id \"{0}\": 1 to 64 letters, digits, '.', '_' or '-'",
@@ -1038,6 +1043,12 @@ const TABLE: &[(&str, &str)] = &[
         "could not delete the plan: {0}",
     ),
     ("esta sesión no tiene plan", "this session has no plan"),
+    // mcp_api.rs: las herramientas del plan
+    ("falta session", "session is missing"),
+    (
+        "ese equipo no tiene planes (su nido es anterior)",
+        "that machine has no plans (its nido is older)",
+    ),
 ];
 
 #[cfg(test)]
@@ -1179,6 +1190,12 @@ mod tests {
                 "estado desconocido \"hecho\": vale pending, in_progress, done, skipped, blocked o failed"
             ),
             "unknown status \"hecho\": use pending, in_progress, done, skipped, blocked or failed"
+        );
+        assert_eq!(
+            english(
+                "estado desconocido \"\": vale pending, in_progress, done, skipped, blocked o failed"
+            ),
+            "unknown status \"\": use pending, in_progress, done, skipped, blocked or failed"
         );
         assert_eq!(
             english("esta sesión no tiene plan"),

@@ -122,6 +122,16 @@ impl Progress {
     }
 }
 
+/// Los estados como los escribe el agente (para el esquema de las herramientas del MCP).
+pub const STATUSES: [&str; 6] = [
+    "pending",
+    "in_progress",
+    "done",
+    "skipped",
+    "blocked",
+    "failed",
+];
+
 pub fn parse_status(s: &str) -> Result<Status, String> {
     Ok(match s {
         "pending" => Status::Pending,
@@ -570,6 +580,14 @@ mod tests {
             by: None,
             started,
             finished,
+        }
+    }
+
+    #[test]
+    fn statuses_are_the_ones_parsed() {
+        for s in STATUSES {
+            let parsed = parse_status(s).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), s);
         }
     }
 

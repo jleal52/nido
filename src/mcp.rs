@@ -206,6 +206,8 @@ struct Arg {
     ty: &'static str,
     required: bool,
     about: &'static str,
+    /// Para un `array`: el esquema de cada elemento.
+    items: Option<fn() -> Value>,
 }
 
 struct Tool {
@@ -222,6 +224,7 @@ const fn req(name: &'static str, ty: &'static str, about: &'static str) -> Arg {
         ty,
         required: true,
         about,
+        items: None,
     }
 }
 
@@ -231,6 +234,7 @@ const fn opt(name: &'static str, ty: &'static str, about: &'static str) -> Arg {
         ty,
         required: false,
         about,
+        items: None,
     }
 }
 
@@ -252,6 +256,46 @@ const TIMEOUT: Arg = opt(
      still working: call `read` with wait to keep waiting.",
 );
 
+/// Las fases de `plan_set`, con sus tareas. Aquí solo se mira que sea un array: lo de dentro lo
+/// comprueba nido entero, y su error vuelve al modelo.
+const PHASES: Arg = Arg {
+    name: "phases",
+    ty: "array",
+    required: true,
+    about: "The phases, in order, each with its tasks in order.",
+    items: Some(phases_items),
+};
+
+/// El esquema de una fase de `plan_set`.
+fn phases_items() -> Value {
+    let task = json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Short id, unique across the whole plan \
+                (phases and tasks): letters, digits, '.', '_' or '-', up to 64."},
+            "name": {"type": "string", "description": "What the task is."},
+            "status": {"type": "string", "enum": crate::plan::STATUSES,
+                "description": "Default pending."},
+            "note": {"type": "string", "description": "A short note, shown under the task."},
+            "by": {"type": "string", "description": "Who does it, if not you: another nido \
+                session (machine/id, as `sessions` gives it) or a short text."},
+        },
+        "required": ["id", "name"],
+        "additionalProperties": false,
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Short id, unique across the whole plan \
+                (phases and tasks)."},
+            "name": {"type": "string", "description": "The phase's name."},
+            "tasks": {"type": "array", "items": task},
+        },
+        "required": ["id", "name"],
+        "additionalProperties": false,
+    })
+}
+
 /// Las herramientas, en el orden en que salen en `tools/list`.
 const TOOLS: &[Tool] = &[
     Tool {
@@ -264,7 +308,9 @@ const TOOLS: &[Tool] = &[
                 name, folder (cwd), state (working, idle, question or stopped), since (when \
                 it started, if running, or stopped, if stopped; ms since 1970; missing if \
                 unknown), opened_by, channel (whether it can receive messages) and mine \
-                (whether this session opened it with `open`; false for this session itself). channel_error, if present, says why it has no \
+                (whether this session opened it with `open`; false for this session itself). \
+                plan, if present, is the progress of its plan (done/total; see plan_get). \
+                channel_error, if present, says why it has no \
                 channel (e.g. blocked by org policy, or its Claude Code predates channels); \
                 delivery_error, if present, says that messages sent to it never showed up in \
                 its conversation (they stay queued). Machines that don't answer are listed in \
@@ -461,6 +507,69 @@ const TOOLS: &[Tool] = &[
             opt("title", "string", "A short title (default: the file name)."),
         ],
     },
+    Tool {
+        any_of: &[],
+        name: "plan_set",
+        about: "Show the user your plan for this work as phases and tasks; the user sees it \
+                live in the nido web and app, with each task's status and times. Use it for \
+                work with several steps. It replaces the whole plan: use it to create it and to \
+                add, remove, rename or reorder phases and tasks (also in earlier phases). Ids \
+                are yours: short and unique across the plan; keep them stable so times are \
+                kept. Then mark each task with plan_task when you start it (in_progress) and \
+                when you finish it (done, or skipped/failed/blocked). `by`: who does the task if \
+                not you: another nido session (machine/id, as `sessions` gives it) or a short \
+                text. Returns the progress: {ok, progress (\"done/total\"), done, total, active, \
+                blocked, failed}.",
+        args: &[
+            opt("title", "string", "A title for the whole plan."),
+            PHASES,
+        ],
+    },
+    Tool {
+        any_of: &[],
+        name: "plan_task",
+        about: "Change one task of your plan: its status and, if given, its note and `by` \
+                (\"\" removes them). Mark a task in_progress when you start it and done when \
+                you finish. Returns the progress, like plan_set.",
+        args: &[
+            req("id", "string", "The task's id."),
+            req(
+                "status",
+                "string",
+                "pending, in_progress, done, skipped, blocked or failed.",
+            ),
+            opt(
+                "note",
+                "string",
+                "A short note on the task (\"\" removes it).",
+            ),
+            opt(
+                "by",
+                "string",
+                "Who does it, if not you: a nido session (machine/id) or a short text (\"\" \
+                 removes it).",
+            ),
+        ],
+    },
+    Tool {
+        any_of: &[],
+        name: "plan_get",
+        about: "Your plan with its status and times (or another session's, read-only, with \
+                session). Returns {plan, progress}, or {plan: null} if there is none. Times are \
+                ms since 1970.",
+        args: &[opt(
+            "session",
+            "string",
+            "Another session, written machine/id as returned by `sessions` (default: this \
+             one).",
+        )],
+    },
+    Tool {
+        any_of: &[],
+        name: "plan_clear",
+        about: "Remove your plan (when the work is over or the plan no longer applies).",
+        args: &[],
+    },
 ];
 
 const INSTRUCTIONS: &str = "nido manages the user's terminal sessions (mostly Claude Code) on \
@@ -490,7 +599,10 @@ never print, cat or read it; pass the path to an option that reads from a file (
 may contain spaces. `clipboard` and `send_file` send the \
 user a text to copy or a file. If what to copy is in a file or comes out of a command, give \
 `clipboard` its `path` or run `<command> | nido clip` (`nido clip <file>` also works): don't \
-copy it into `text`, it would go through the conversation.";
+copy it into `text`, it would go through the conversation.
+
+With plan_set and plan_task you keep a plan of phases and tasks that the user sees live in the \
+nido web and app.";
 
 const OUTSIDE: &str = "This Claude session is not running inside nido: no nido tools here.";
 
@@ -499,14 +611,16 @@ fn schema(tool: &Tool) -> Value {
         .args
         .iter()
         .map(|a| {
-            (
-                a.name.to_owned(),
+            (a.name.to_owned(), {
+                let mut p = json!({"type": a.ty, "description": a.about});
                 if a.ty == "integer" {
-                    json!({"type": a.ty, "description": a.about, "minimum": 0})
-                } else {
-                    json!({"type": a.ty, "description": a.about})
-                },
-            )
+                    p["minimum"] = 0.into();
+                }
+                if let Some(items) = a.items {
+                    p["items"] = items();
+                }
+                p
+            })
         })
         .collect();
     let required: Vec<&str> = tool
@@ -553,6 +667,7 @@ fn bad_value(a: &Arg, v: &Value) -> Option<String> {
         }
         "boolean" if !v.is_boolean() => Some(format!("`{k}` must be a boolean")),
         "integer" if !v.is_u64() => Some(format!("`{k}` must be an integer >= 0")),
+        "array" if !v.is_array() => Some(format!("`{k}` must be an array")),
         _ => None,
     }
 }
@@ -1105,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_the_twelve_tools() {
+    fn lists_the_sixteen_tools() {
         let mut st = State::for_tests(Some("abc12345"));
         let out = handle(
             &mut st,
@@ -1130,7 +1245,11 @@ mod tests {
                 "alert",
                 "secret",
                 "clipboard",
-                "send_file"
+                "send_file",
+                "plan_set",
+                "plan_task",
+                "plan_get",
+                "plan_clear"
             ]
         );
         for t in tools {
@@ -1356,6 +1475,101 @@ mod tests {
         assert_eq!(read["timeout_s"]["minimum"], 0);
         assert_eq!(read["last"]["minimum"], 0);
         assert!(read["session"].get("minimum").is_none());
+    }
+
+    /// Las herramientas del plan, con el esquema de `phases` (fases con sus tareas) entero.
+    #[test]
+    fn the_plan_tools_and_their_schemas() {
+        let mut st = State::for_tests(Some("abc12345"));
+        let out = handle(
+            &mut st,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        );
+        let tools = out[0]["result"]["tools"].as_array().unwrap();
+        let schema = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("falta {name}"))["inputSchema"]
+                .clone()
+        };
+        let set = schema("plan_set");
+        assert_eq!(set["required"], json!(["phases"]));
+        assert_eq!(set["properties"]["title"]["type"], "string");
+        let phases = &set["properties"]["phases"];
+        assert_eq!(phases["type"], "array");
+        let phase = &phases["items"];
+        assert_eq!(phase["type"], "object");
+        assert_eq!(phase["required"], json!(["id", "name"]));
+        assert_eq!(phase["additionalProperties"], false);
+        let tasks = &phase["properties"]["tasks"];
+        assert_eq!(tasks["type"], "array");
+        let task = &tasks["items"];
+        assert_eq!(task["required"], json!(["id", "name"]));
+        assert_eq!(task["additionalProperties"], false);
+        assert_eq!(
+            task["properties"]["status"]["enum"],
+            json!([
+                "pending",
+                "in_progress",
+                "done",
+                "skipped",
+                "blocked",
+                "failed"
+            ])
+        );
+        for k in ["id", "name", "note", "by"] {
+            assert_eq!(task["properties"][k]["type"], "string", "{k}");
+        }
+        let task_tool = schema("plan_task");
+        assert_eq!(task_tool["required"], json!(["id", "status"]));
+        for k in ["note", "by"] {
+            assert_eq!(task_tool["properties"][k]["type"], "string", "{k}");
+        }
+        let get = schema("plan_get");
+        assert_eq!(get["required"], json!([]));
+        assert_eq!(get["properties"]["session"]["type"], "string");
+        assert_eq!(schema("plan_clear")["properties"], json!({}));
+        // Los demás, sin `items`.
+        assert!(set["properties"]["title"].get("items").is_none());
+    }
+
+    /// `phases` tiene que ser un array (lo de dentro lo comprueba nido); `note` y `by` vacíos
+    /// llegan tal cual a nido, que los quita.
+    #[test]
+    fn plan_arguments_are_checked() {
+        let (mut st, f) = with(Ok(json!({"ok": true, "progress": "0/1"})));
+        let r = call(&mut st, "plan_set", json!({"phases": "f1"}));
+        assert_eq!(r["isError"], true);
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("`phases` must be an array"), "{text}");
+        assert!(text.contains("phases (array, required)"), "{text}");
+        assert!(f.calls.lock().unwrap().is_empty());
+        let phases = json!([{"id": "f1", "name": "Uno", "tasks": [{"id": "t1", "name": "x"}]}]);
+        let r = call(&mut st, "plan_set", json!({"phases": phases}));
+        assert_eq!(r["isError"], false, "{r}");
+        let r = call(
+            &mut st,
+            "plan_task",
+            json!({"id": "t1", "status": "done", "note": "", "by": ""}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        let r = call(&mut st, "plan_clear", json!({}));
+        assert_eq!(r["isError"], false, "{r}");
+        assert_eq!(
+            *f.calls.lock().unwrap(),
+            [
+                ("plan_set".to_owned(), json!({"phases": phases})),
+                (
+                    "plan_task".to_owned(),
+                    json!({"id": "t1", "status": "done", "note": "", "by": ""})
+                ),
+                ("plan_clear".to_owned(), json!({})),
+            ]
+        );
+        // Sin estado, no.
+        let r = call(&mut st, "plan_task", json!({"id": "t1"}));
+        assert_eq!(r["isError"], true);
     }
 
     #[test]

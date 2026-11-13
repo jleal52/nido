@@ -11,7 +11,8 @@
 //! /api/v1/mcp/inbox/ack`.
 //!
 //! Las sesiones de otro equipo del grupo piden lo mismo por el canal «peer» (`e2e::MODE_PEER`):
-//! `peer_call` atiende esas peticiones con las mismas herramientas, salvo `alert`. Quien llama es
+//! `peer_call` atiende esas peticiones con las mismas herramientas, salvo las que son solo de la
+//! propia sesión (`alert`, `secret`, `clipboard`, `send_file` y `plan_*`, menos `plan_get`). Quien llama es
 //! un [`Caller`]: una sesión de aquí o una de otro equipo, siempre con su dirección canónica.
 //! Lo que pide una de aquí para una sesión de otro equipo se le pasa a ese equipo por el mismo
 //! canal (`AppState::peer_member`), y `sessions` junta las de todos. Lo que pide una de otro
@@ -39,7 +40,7 @@ use crate::proto::{Hello, Role};
 use crate::registry::{ClaudeLink, Registry, Session, new_id, now, now_ms};
 use crate::server::{self, AppState, SessionView, error};
 use crate::transcript::{self, ChatItem};
-use crate::{auth, claude, e2e, i18n, launch};
+use crate::{auth, claude, e2e, i18n, launch, plan};
 
 /// Lo más que ocupa la respuesta de `read` (el JSON entero): fuera antes los turnos más antiguos.
 pub const MAX_READ: usize = 48 * 1024;
@@ -1066,6 +1067,9 @@ pub struct Entry {
     /// `delivery_error`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_error: Option<String>,
+    /// Cuánto lleva de su plan («3/12»), si tiene uno (entero, con `plan_get`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
 }
 
 /// Lo que se dice de los mensajes de la bandeja de `id` que no llegaron (siguen en ella).
@@ -1106,6 +1110,7 @@ fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: S
         channel: st.inbox.channel(&v.id),
         channel_error: st.inbox.refusal(&v.id).map(inbox::Refusal::code),
         delivery_error: delivery_error(st, &v.id),
+        plan: st.plans.get(&v.id).map(|p| p.progress().text()),
     }
 }
 
@@ -1163,6 +1168,10 @@ pub async fn api_mcp(
         "secret" => crate::deliver::tool_secret(&st, &session, args).await,
         "clipboard" => crate::deliver::tool_clipboard(&st, &session, args).await,
         "send_file" => crate::deliver::tool_send_file(&st, &session, args).await,
+        // El plan: cada sesión escribe solo el suyo.
+        "plan_set" => tool_plan_set(&st, &session, args).await,
+        "plan_task" => tool_plan_task(&st, &session, args).await,
+        "plan_clear" => tool_plan_clear(&st, &session, args).await,
         _ => {
             let caller = Caller::local(&me, &session.id, &session.name);
             run_tool(&st, &me, &caller, &tool, args).await
@@ -1175,10 +1184,12 @@ pub async fn api_mcp(
 }
 
 /// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert`, `secret`,
-/// `clipboard` y `send_file` (van siempre al nido de quien las usa), y, para su nido, `status`
-/// (lo que miran sus esperas) y `alerts` (las de aquí sin leer, para `nido alerts`).
-pub const PEER_TOOLS: [&str; 10] = [
+/// `clipboard`, `send_file`, `plan_set`, `plan_task` y `plan_clear` (van siempre al nido de quien
+/// las usa), y, para su nido, `status` (lo que miran sus esperas) y `alerts` (las de aquí sin
+/// leer, para `nido alerts`).
+pub const PEER_TOOLS: [&str; 11] = [
     "sessions", "send", "read", "open", "answer", "close", "start", "stop", "status", "alerts",
+    "plan_get",
 ];
 
 /// Una herramienta (menos `alert`), para quien llame: de aquí o de otro equipo.
@@ -1193,6 +1204,7 @@ async fn run_tool(st: &AppState, me: &Machine, caller: &Caller, tool: &str, args
         "start" => tool_start(st, me, caller, args).await,
         "stop" => tool_stop(st, me, caller, args).await,
         "status" => tool_status(st, me, caller, args).await,
+        "plan_get" => tool_plan_get(st, me, caller, args).await,
         _ => Err(fail(
             StatusCode::NOT_FOUND,
             format!("no hay ninguna herramienta {tool:?}"),
@@ -2569,6 +2581,132 @@ async fn tool_alert(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply 
     Ok(json!({ "ok": true }))
 }
 
+// ---------- El plan ----------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanGetArgs {
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// Un error de `Plans`: no poder escribir en el disco es de nido (500); lo demás, de lo que se
+/// mandó (400).
+fn plan_fail(e: String) -> Fail {
+    let code = if e.starts_with("no se pudo ") {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    Fail(code, e)
+}
+
+/// `f` con los planes, fuera del hilo de tokio: leer y escribir (con `sync_all`) va al disco.
+async fn with_plans<T: Send + 'static>(
+    st: &AppState,
+    f: impl FnOnce(&plan::Plans) -> Result<T, String> + Send + 'static,
+) -> Result<T, Fail> {
+    let plans = st.plans.clone();
+    tokio::task::spawn_blocking(move || f(&plans))
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(plan_fail)
+}
+
+/// Lo que devuelven `plan_set` y `plan_task`: el progreso, también como texto («3/12»).
+fn progress_reply(p: plan::Progress) -> Reply {
+    let mut out = to_json(&p)?;
+    out["ok"] = true.into();
+    out["progress"] = p.text().into();
+    Ok(out)
+}
+
+/// Solo desde una sesión de aquí y en su plan: no está entre las de `PEER_TOOLS`.
+async fn tool_plan_set(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply {
+    let a: plan::SetArgs = args_of(args)?;
+    let id = caller.id.clone();
+    let p = with_plans(st, move |plans| plans.set(&id, a, now_ms())).await?;
+    server::plan_changed(st);
+    progress_reply(p)
+}
+
+/// Como `plan_set`.
+async fn tool_plan_task(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply {
+    let a: plan::TaskArgs = args_of(args)?;
+    let id = caller.id.clone();
+    let p = with_plans(st, move |plans| plans.update_task(&id, a, now_ms())).await?;
+    server::plan_changed(st);
+    progress_reply(p)
+}
+
+/// Como `plan_set`.
+async fn tool_plan_clear(st: &Arc<AppState>, caller: &Session, args: Value) -> Reply {
+    let NoArgs {} = args_of(args)?;
+    let id = caller.id.clone();
+    with_plans(st, move |plans| plans.clear(&id)).await?;
+    server::plan_changed(st);
+    Ok(json!({ "ok": true }))
+}
+
+/// El plan de quien llama o, con `session`, el de otra sesión (solo leerlo), de aquí o de otro
+/// equipo. La que llama desde otro equipo no tiene plan aquí: tiene que dar `session`.
+async fn tool_plan_get(st: &AppState, me: &Machine, caller: &Caller, args: Value) -> Reply {
+    let a: PlanGetArgs = args_of(args)?;
+    // Vacía, como no dada: el MCP deja pasar los opcionales vacíos.
+    let session = a
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let at = match session {
+        Some(s) => place(me, caller, s)?,
+        None if caller.local => Where::Here(&caller.id),
+        None => return Err(bad_request("falta session".into())),
+    };
+    match at {
+        Where::Here(id) => plan_here(st, id).await,
+        Where::There { machine, id } => {
+            let args = json!({ "session": id });
+            forward(st, me, caller, &machine, "plan_get", args)
+                .await
+                .map_err(|f| {
+                    if predates_plans(&f) {
+                        fail(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "ese equipo no tiene planes (su nido es anterior)",
+                        )
+                    } else {
+                        f
+                    }
+                })
+        }
+    }
+}
+
+/// El otro equipo no sabe de `plan_get`: su nido es de antes de los planes. Lo dice `peer_call`
+/// (no está en sus `PEER_TOOLS`) o, si no, `run_tool` (no la conoce).
+fn predates_plans(f: &Fail) -> bool {
+    f.1 == "«plan_get» no se puede pedir desde otro equipo"
+        || f.1 == "no hay ninguna herramienta \"plan_get\""
+}
+
+/// El plan de la sesión `id` de aquí: `{plan: null}` o `{plan, progress}`.
+async fn plan_here(st: &AppState, id: &str) -> Reply {
+    // A `Plans` solo va un id del registro: es el nombre de una carpeta.
+    let id = st
+        .registry
+        .lock()
+        .await
+        .get(id)
+        .map(|s| s.id.clone())
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "no existe esa sesión"))?;
+    let plan = with_plans(st, move |plans| Ok(plans.get(&id))).await?;
+    Ok(match plan {
+        Some(p) => json!({ "plan": p, "progress": p.progress().text() }),
+        None => json!({ "plan": null }),
+    })
+}
+
 // ---------- La sesión madre ----------
 
 /// Si vive la sesión madre (de otro equipo) de una abierta con `open`, por su dirección, y
@@ -2987,6 +3125,254 @@ mod tests {
         assert!(st.asks.view_for("aaaa1111").is_none());
     }
 
+    // ---------- El plan ----------
+
+    /// Un nido de prueba en `dir` con una sesión de Claude «api» (parada).
+    async fn with_plan_session(dir: &Path) -> (Arc<AppState>, Session) {
+        let paths = crate::launch::Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, crate::launch::Launcher::Detached, None, true).unwrap();
+        let s = Session {
+            id: new_id(),
+            name: "api".into(),
+            cwd: dir.to_owned(),
+            argv: vec!["claude".into()],
+            env: vec![],
+            autostart: false,
+            created: 0,
+            claude: Some(ClaudeLink {
+                session_id: "conv".into(),
+                config_dir: Some(dir.join("claude")),
+                account: None,
+                inside_shell: false,
+            }),
+            folder: None,
+            finished: 0,
+            stopped: 0,
+            seen: 0,
+            opened_by: None,
+            alerts: vec![],
+        };
+        let s = st.registry.lock().await.add(s).unwrap();
+        (st, s)
+    }
+
+    fn two_tasks() -> Value {
+        json!({"title": "Migrar", "phases": [{"id": "f1", "name": "Uno", "tasks": [
+            {"id": "t1", "name": "Leer", "status": "done"},
+            {"id": "t2", "name": "Escribir"}]}]})
+    }
+
+    /// `plan_set`, `plan_task`, `plan_get` y `plan_clear` en el plan de quien llama, con sus
+    /// errores; y `sessions` dice cuánto lleva cada una.
+    #[tokio::test]
+    async fn the_plan_tools() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, s) = with_plan_session(tmp.path()).await;
+        let me = Machine::of(&st);
+        let caller = Caller::local(&me, &s.id, &s.name);
+        let get = |args: Value| tool_plan_get(&st, &me, &caller, args);
+
+        // Sin plan.
+        assert_eq!(get(json!({})).await.unwrap(), json!({"plan": null}));
+        let e = tool_plan_task(&st, &s, json!({"id": "t1", "status": "done"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (e.0, e.1.as_str()),
+            (StatusCode::BAD_REQUEST, "esta sesión no tiene plan")
+        );
+        let list = tool_sessions(&st, &me, &caller, json!({})).await.unwrap();
+        assert!(list["sessions"][0].get("plan").is_none(), "{list}");
+
+        let r = tool_plan_set(&st, &s, two_tasks()).await.unwrap();
+        assert_eq!(
+            r,
+            json!({"ok": true, "progress": "1/2", "done": 1, "total": 2, "active": 0,
+                "blocked": 0, "failed": 0})
+        );
+        let r = tool_plan_task(
+            &st,
+            &s,
+            json!({"id": "t2", "status": "in_progress", "note": "a medias"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!((&r["progress"], &r["active"]), (&json!("1/2"), &json!(1)));
+
+        // El plan, con sus horas: el de quien llama, sin `session` o con la suya.
+        let r = get(json!({})).await.unwrap();
+        assert_eq!(r["progress"], "1/2");
+        assert_eq!(r["plan"]["title"], "Migrar");
+        assert!(r["plan"]["updated"].as_u64().unwrap() > 0);
+        let t2 = &r["plan"]["phases"][0]["tasks"][1];
+        assert_eq!(
+            (&t2["status"], &t2["note"]),
+            (&json!("in_progress"), &json!("a medias"))
+        );
+        assert!(t2["started"].as_u64().unwrap() > 0, "{r}");
+        assert_eq!(get(json!({"session": s.id})).await.unwrap(), r);
+        // Vacía es como no darla (el MCP deja pasar los opcionales vacíos).
+        assert_eq!(get(json!({"session": " "})).await.unwrap(), r);
+
+        // `sessions` dice cuánto lleva.
+        let list = tool_sessions(&st, &me, &caller, json!({})).await.unwrap();
+        assert_eq!(list["sessions"][0]["plan"], "1/2", "{list}");
+
+        // Errores: de forma (serde), de lo que se manda, y una sesión que no existe (ni por el
+        // nombre de una carpeta).
+        let e = tool_plan_set(&st, &s, json!({"phases": "f1"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert!(e.1.starts_with("argumentos no válidos: "), "{}", e.1);
+        let e = tool_plan_set(&st, &s, json!({"phases": [{"id": "f 1", "name": "x"}]}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert!(e.1.starts_with("id no válido \"f 1\""), "{}", e.1);
+        let e = tool_plan_task(&st, &s, json!({"id": "t9", "status": "done"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (e.0, e.1.as_str()),
+            (
+                StatusCode::BAD_REQUEST,
+                "no hay ninguna tarea \"t9\"; las que hay: t1, t2"
+            )
+        );
+        let e = tool_plan_task(&st, &s, json!({"id": "t2", "status": "hecho"}))
+            .await
+            .unwrap_err();
+        assert!(e.1.starts_with("estado desconocido \"hecho\""), "{}", e.1);
+        for bad in ["nadie", "..", "."] {
+            let e = get(json!({"session": bad})).await.unwrap_err();
+            assert_eq!(
+                (e.0, e.1.as_str()),
+                (StatusCode::NOT_FOUND, "no existe esa sesión"),
+                "{bad}"
+            );
+        }
+        // Con los errores, el plan quedó como estaba.
+        assert_eq!(get(json!({})).await.unwrap()["progress"], "1/2");
+
+        // Fuera: ya no hay plan, ni en `sessions`.
+        assert_eq!(
+            tool_plan_clear(&st, &s, json!({})).await.unwrap(),
+            json!({"ok": true})
+        );
+        assert_eq!(get(json!({})).await.unwrap(), json!({"plan": null}));
+        assert!(!st.paths.session_state(&s.id).join("plan.json").exists());
+        let list = tool_sessions(&st, &me, &caller, json!({})).await.unwrap();
+        assert!(list["sessions"][0].get("plan").is_none(), "{list}");
+        // Otra vez: no pasa nada.
+        assert!(tool_plan_clear(&st, &s, json!({})).await.is_ok());
+        let e = tool_plan_clear(&st, &s, json!({"x": 1})).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// Desde otro equipo, `plan_get` lee el plan de una sesión de aquí (hace falta `session`: la
+    /// que llama no es de aquí); los demás `plan_*`, no.
+    #[tokio::test]
+    async fn plan_get_from_another_machine() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, s) = with_plan_session(tmp.path()).await;
+        tool_plan_set(&st, &s, two_tasks()).await.unwrap();
+        let caller = json!({"id": "aaaa1111", "name": "padre"});
+        assert_eq!(
+            peer_call(&st, &mac(), "plan_get", json!({"caller": caller})).await,
+            Err((400, "falta session".to_owned()))
+        );
+        let r = peer_call(
+            &st,
+            &mac(),
+            "plan_get",
+            json!({"session": s.id, "caller": caller}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["progress"], "1/2");
+        assert_eq!(r["plan"]["phases"][0]["tasks"][0]["id"], "t1");
+        for tool in ["plan_set", "plan_task", "plan_clear"] {
+            assert_eq!(
+                peer_call(&st, &mac(), tool, json!({"caller": caller})).await,
+                Err((400, format!("«{tool}» no se puede pedir desde otro equipo"))),
+                "{tool}"
+            );
+        }
+        assert!(PEER_TOOLS.contains(&"plan_get"));
+    }
+
+    /// `plan_get` de una sesión de otro equipo se le pide a ese equipo; si su nido es de antes
+    /// de los planes, se dice así.
+    #[tokio::test]
+    async fn plan_get_of_another_machine() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, s) = with_plan_session(tmp.path()).await;
+        st.group.add_member("mac-id", "bWFj", "Mac");
+        type Asked = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+        let answer: Arc<std::sync::Mutex<e2e::PeerResult>> =
+            Arc::new(std::sync::Mutex::new(Ok(json!({"plan": null}))));
+        let asked: Asked = Default::default();
+        let (a, n) = (answer.clone(), asked.clone());
+        assert!(st.set_peer_link(Box::new(move |_, method, params| {
+            n.lock().unwrap().push((method, params));
+            let r = a.lock().unwrap().clone();
+            Box::pin(async move { r })
+        })));
+        let me = Machine::of(&st);
+        let caller = Caller::local(&me, &s.id, &s.name);
+        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+            .await
+            .unwrap();
+        assert_eq!(r, json!({"plan": null}));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [(
+                "plan_get".to_owned(),
+                json!({"session": "abcd1234", "caller": {"id": s.id, "name": "api"}})
+            )]
+        );
+        let plan = json!({"plan": {"phases": [], "updated": 1}, "progress": "0/0"});
+        *answer.lock().unwrap() = Ok(plan.clone());
+        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+            .await
+            .unwrap();
+        assert_eq!(r, plan);
+        // Un nido de antes: no la deja pedir desde otro equipo (o no la conoce).
+        for old in [
+            (
+                400,
+                "«plan_get» no se puede pedir desde otro equipo".to_owned(),
+            ),
+            (404, "no hay ninguna herramienta \"plan_get\"".to_owned()),
+        ] {
+            *answer.lock().unwrap() = Err(old);
+            let e = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.1, "ese equipo no tiene planes (su nido es anterior)");
+        }
+        // Otro error, tal cual.
+        *answer.lock().unwrap() = Err((404, "no existe esa sesión".to_owned()));
+        let e = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (e.0, e.1.as_str()),
+            (StatusCode::NOT_FOUND, "no existe esa sesión")
+        );
+    }
+
     fn remote(id: &str) -> Caller {
         Caller::remote(
             &me(Some("k123")),
@@ -3378,6 +3764,7 @@ mod tests {
             channel: true,
             channel_error: None,
             delivery_error: None,
+            plan: None,
         }
     }
 
@@ -4216,6 +4603,15 @@ mod tests {
         assert_eq!(
             en("respuesta no válida del otro equipo"),
             "invalid reply from the other machine"
+        );
+        assert_eq!(en("falta session"), "session is missing");
+        assert_eq!(
+            en("ese equipo no tiene planes (su nido es anterior)"),
+            "that machine has no plans (its nido is older)"
+        );
+        assert_eq!(
+            en("no hay ninguna tarea \"t9\"; las que hay: t1, t2, …"),
+            "task \"t9\" not found; ids: t1, t2, …"
         );
     }
 }

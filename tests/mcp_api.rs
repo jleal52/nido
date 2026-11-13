@@ -58,6 +58,21 @@ async fn tool_as(
     .unwrap()
 }
 
+/// Un `GET` a la API, como la web o la app (sin `Accept-Language`: en inglés).
+async fn get(addr: SocketAddr, path: &str) -> (u16, Value) {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        Api {
+            addr,
+            token: Some(TOKEN.into()),
+        }
+        .request_with("GET", &path, None, &[], Some(Duration::from_secs(30)))
+        .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
 /// Al acabar (también si la prueba falla), mata los guardianes que queden.
 struct KillHolders(PathBuf);
 
@@ -426,6 +441,66 @@ async fn mcp_api_end_to_end() {
     assert_eq!(alerts[0].text, "listo");
     let (code, _) = tool(addr, me, "alert", json!({"text": "   "})).await;
     assert_eq!(code, 400);
+
+    // El plan: lo pone y lo marca la sesión que llama; la lista de la API lleva su resumen y
+    // `GET …/plan`, el plan entero.
+    let plan_url = format!("/api/v1/sessions/{caller}/plan");
+    let (code, e) = get(addr, &plan_url).await;
+    assert_eq!(
+        (code, &e["error"]),
+        (404, &json!("this session has no plan"))
+    );
+    let (code, r) = tool(
+        addr,
+        me,
+        "plan_set",
+        json!({"title": "Migrar", "phases": [{"id": "f1", "name": "Uno", "tasks": [
+            {"id": "t1", "name": "Leer", "status": "in_progress"},
+            {"id": "t2", "name": "Escribir"}]}]}),
+    )
+    .await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(
+        r,
+        json!({"ok": true, "progress": "0/2", "done": 0, "total": 2, "active": 1,
+            "blocked": 0, "failed": 0})
+    );
+    let (code, r) = tool(addr, me, "plan_task", json!({"id": "t1", "status": "done"})).await;
+    assert_eq!((code, &r["progress"]), (200, &json!("1/2")), "{r}");
+    let (code, e) = tool(addr, me, "plan_task", json!({"id": "t9", "status": "done"})).await;
+    assert_eq!(code, 400);
+    assert_eq!(e["error"], "task \"t9\" not found; ids: t1, t2");
+    let (code, list) = get(addr, "/api/v1/sessions").await;
+    assert_eq!(code, 200);
+    let view = |list: &Value, id: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let summary = &view(&list, &caller)["plan"];
+    assert_eq!(summary["title"], "Migrar", "{list}");
+    assert_eq!([&summary["done"], &summary["total"]], [1, 2]);
+    assert!(summary["rev"].as_u64().unwrap() > 0);
+    assert!(view(&list, &other).get("plan").is_none(), "{list}");
+    let (code, p) = get(addr, &plan_url).await;
+    assert_eq!(code, 200, "{p}");
+    let t1 = &p["phases"][0]["tasks"][0];
+    assert_eq!(t1["status"], "done");
+    assert!(t1["started"].as_u64().unwrap() <= t1["finished"].as_u64().unwrap());
+    let (code, r) = tool(addr, me, "plan_get", json!({})).await;
+    assert_eq!((code, &r["progress"]), (200, &json!("1/2")), "{r}");
+    assert_eq!(r["plan"], p);
+    let (code, r) = tool(addr, me, "plan_get", json!({"session": other})).await;
+    assert_eq!((code, r), (200, json!({"plan": null})));
+    let (code, r) = tool(addr, me, "plan_clear", json!({})).await;
+    assert_eq!((code, r), (200, json!({"ok": true})));
+    let (code, _) = get(addr, &plan_url).await;
+    assert_eq!(code, 404);
+    let (_, list) = get(addr, "/api/v1/sessions").await;
+    assert!(view(&list, &caller).get("plan").is_none(), "{list}");
 
     // `open`: la carpeta tiene que existir.
     let work = tmp.path().join("work");
