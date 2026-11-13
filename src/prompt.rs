@@ -66,6 +66,10 @@ pub struct Menu {
     /// La línea de ayuda de abajo («Esc to cancel · Tab to amend»).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// En un permiso, lo que Claude enseña encima de la pregunta: la herramienta, su descripción,
+    /// la orden y los avisos (ver `permission_context`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     /// Por dónde pasa el cursor, en orden: las opciones y la fila «Next»/«Submit».
     #[serde(skip)]
     rows: Vec<Row>,
@@ -490,6 +494,10 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
     } else {
         Kind::Menu
     };
+    // En un permiso, lo de encima de la pregunta: qué se está aprobando.
+    let context = (kind == Kind::Permission)
+        .then(|| permission_context(&lines[..i]))
+        .flatten();
     let menu = Menu {
         kind,
         title,
@@ -497,10 +505,58 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
         multi: options.iter().any(|o| o.checked.is_some()),
         options,
         hint,
+        context,
         rows,
     };
     // Un menú de verdad tiene el cursor en alguna fila (una lista numerada de Claude, no).
     menu.selected_row().is_some().then_some(menu)
+}
+
+/// Una raya de trazos (`╌╌╌`): dentro del recuadro de un permiso rodea la orden (la de arriba del
+/// recuadro es continua, `───`).
+fn is_dashed_rule(l: &str) -> bool {
+    let t = l.trim();
+    !t.is_empty() && t.chars().all(|c| c == '╌')
+}
+
+/// Como mucho estas líneas en el contexto de un permiso (una orden puede ser muy larga).
+const CONTEXT_MAX: usize = 120;
+
+/// Lo que enseña un permiso encima de la pregunta (`above`: las líneas de la pantalla hasta la
+/// pregunta): desde la raya de arriba del recuadro, la herramienta («Bash command»), lo que hace,
+/// la orden y los avisos, sin los «Tip:» ni las rayas de trazos, sin la sangría común y con los
+/// huecos de varias líneas en blanco dejados en uno. Las líneas van como las partió la terminal.
+/// Si la raya no se ve (el recuadro no cabe en la pantalla), desde arriba del todo.
+fn permission_context(above: &[&str]) -> Option<String> {
+    let start = above
+        .iter()
+        .rposition(|l| is_rule(l) && !is_dashed_rule(l))
+        .map_or(0, |r| r + 1);
+    let mut kept: Vec<&str> = Vec::new();
+    for l in &above[start..] {
+        if is_dashed_rule(l) || l.trim_start().starts_with("Tip:") {
+            continue;
+        }
+        let l = l.trim_end();
+        if l.is_empty() && kept.last().is_none_or(|p| p.is_empty()) {
+            continue;
+        }
+        kept.push(l);
+    }
+    while kept.last().is_some_and(|l| l.is_empty()) {
+        kept.pop();
+    }
+    let cut = kept
+        .iter()
+        .filter(|l| !l.is_empty())
+        .map(|l| indent(l))
+        .min()?;
+    let mut out: Vec<String> = kept.iter().map(|l| l.chars().skip(cut).collect()).collect();
+    if out.len() > CONTEXT_MAX {
+        out.truncate(CONTEXT_MAX);
+        out.push("…".into());
+    }
+    Some(out.join("\n"))
 }
 
 fn is_tabs(l: &str) -> bool {
@@ -588,6 +644,7 @@ fn unnumbered(lines: &[&str]) -> Option<Menu> {
         rows: (0..options.len()).map(Row::Opt).collect(),
         options,
         hint: Some(lines[hint_at].trim().to_owned()),
+        context: None,
     })
 }
 
@@ -2735,6 +2792,84 @@ mod tests {
     }
 
     #[test]
+    fn permission_context() {
+        // Sin el «Tip:» ni las rayas de trazos que rodean la orden.
+        let m = screen("permiso").unwrap();
+        assert_eq!(
+            m.context.as_deref(),
+            Some("Bash command\n\nCreate empty file prueba.txt\ntouch prueba.txt")
+        );
+        // Desde la raya de arriba del recuadro (lo de la conversación no), con la orden sangrada
+        // como la pinta Claude y los avisos.
+        let m = screen("permiso_contexto").unwrap();
+        assert_eq!(m.kind, Kind::Permission);
+        assert_eq!(labels(&m), ["Yes", "No"]);
+        let want = r#"Bash command
+Generate old/new SQL pairs for all cases
+
+  S=/tmp/borrador; cd $S && sed -i '/total_vieja/d' gen.js && node -e '
+  const c=[]; const D="2026-10-13", H="2026-11-12";
+  for (const t of ["alta","baja","cambio"]) c.push({tipo:t, desde:D, hasta:H});
+  require("fs").writeFileSync("casos.json", JSON.stringify(c, null, 2));
+  ' && rm -f cmp/* && node gen.js casos.json cmp 2>&1 | grep -v "^\s*$" | tail -60
+
+Compound command contains cd with write operation - manual approval required to prevent path resolution bypass
+⚠ Claude Code will automatically block this request in 1:30, to avoid holding up an unattended session"#;
+        assert_eq!(m.context.as_deref(), Some(want));
+        // Va en el JSON del menú (y no va si no hay).
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["context"], want);
+        let q = serde_json::to_value(screen("pregunta_sola").unwrap()).unwrap();
+        assert!(q.get("context").is_none());
+    }
+
+    #[test]
+    fn permission_context_edges() {
+        let menu = "\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel";
+        // La raya de arriba con el nombre de la sesión; los huecos en blanco, en uno.
+        let s = format!("● Hecho.\n──────── hija-b ─\n\n Bash command\n\n\n\n   echo hola\n{menu}");
+        let m = parse(&s).unwrap();
+        assert_eq!(m.context.as_deref(), Some("Bash command\n\n  echo hola"));
+        // Sin raya a la vista (el recuadro no cabe): desde arriba del todo.
+        let s = format!(" Bash command\n   echo hola\n{menu}");
+        assert_eq!(
+            parse(&s).unwrap().context.as_deref(),
+            Some("Bash command\n  echo hola")
+        );
+        // Nada encima de la pregunta.
+        assert_eq!(parse(menu).unwrap().context, None);
+        let s = format!("────────\n Tip: algo\n{menu}");
+        assert_eq!(parse(&s).unwrap().context, None);
+        // Una orden muy larga se corta.
+        let long: String = (0..200).map(|n| format!(" línea {n}\n")).collect();
+        let s = format!("────────\n{long}{menu}");
+        let c = parse(&s).unwrap().context.unwrap();
+        let got: Vec<&str> = c.lines().collect();
+        assert_eq!(got.len(), CONTEXT_MAX + 1);
+        assert_eq!(got[0], "línea 0");
+        assert_eq!(got[CONTEXT_MAX - 1], format!("línea {}", CONTEXT_MAX - 1));
+        assert_eq!(got[CONTEXT_MAX], "…");
+    }
+
+    #[test]
+    fn only_permissions_have_context() {
+        let dir = format!("{}/tests/pantallas", env!("CARGO_MANIFEST_DIR"));
+        let mut seen = 0;
+        for e in std::fs::read_dir(dir).unwrap() {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            let name = name.strip_suffix(".txt").unwrap();
+            if let Some(m) = screen(name)
+                && m.kind != Kind::Permission
+            {
+                assert_eq!(m.context, None, "{name}");
+                seen += 1;
+            }
+        }
+        assert!(seen > 5);
+        assert_eq!(screen("plan").unwrap().kind, Kind::Plan);
+    }
+
+    #[test]
     fn review() {
         let m = screen("repaso").unwrap();
         assert_eq!(m.kind, Kind::Review);
@@ -3503,6 +3638,7 @@ mod tests {
         let m = parse(s).unwrap();
         assert_eq!(m.kind, Kind::Permission);
         assert_eq!(labels(&m), ["Yes", "No"]);
+        assert_eq!(m.context, None);
     }
     // ---------- El modo y el modelo ----------
 

@@ -1,0 +1,23 @@
+● Comparo las sumas viejas con las nuevas para todos los casos.
+
+● Bash(node gen.js casos.json cmp)
+  ⎿  Escritos 14 pares en cmp/
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Generate old/new SQL pairs for all cases
+
+   S=/tmp/borrador; cd $S && sed -i '/total_vieja/d' gen.js && node -e '
+   const c=[]; const D="2026-10-13", H="2026-11-12";
+   for (const t of ["alta","baja","cambio"]) c.push({tipo:t, desde:D, hasta:H});
+   require("fs").writeFileSync("casos.json", JSON.stringify(c, null, 2));
+   ' && rm -f cmp/* && node gen.js casos.json cmp 2>&1 | grep -v "^\s*$" | tail -60
+
+ Compound command contains cd with write operation - manual approval required to prevent path resolution bypass
+ ⚠ Claude Code will automatically block this request in 1:30, to avoid holding up an unattended session
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend
