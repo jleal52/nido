@@ -2130,16 +2130,20 @@ pub async fn edit_queue<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             return Err("Claude no ha sacado la cola a la caja".into());
         }
     };
-    // Lo que apuntó la transcripción al sacarlos (puede llegar un poco después que la pantalla).
+    // Lo que apuntó la transcripción al sacarlos: puede llegar un poco después que la pantalla, y
+    // es una línea por mensaje (una lectura a medias daría solo los primeros). Vale cuando dos
+    // lecturas seguidas dicen lo mismo y no son menos de los que había en cola.
     let mut msgs = popped();
     for _ in 0..5 {
-        if !msgs.is_empty() {
+        tokio::time::sleep(STEP).await;
+        let again = popped();
+        let settled = again == msgs && !msgs.is_empty() && msgs.len() >= queued.len();
+        msgs = again;
+        if settled {
             break;
         }
-        tokio::time::sleep(STEP).await;
-        msgs = popped();
     }
-    if msgs.is_empty() {
+    if msgs.is_empty() || msgs.len() < queued.len() {
         msgs = queued.to_vec();
     }
     let out = if msgs.is_empty() {
@@ -3313,6 +3317,13 @@ mod tests {
             "⏺ Mirando los ficheros.\n\n\x1b[2m❯\u{a0}primero\x1b[22m\n\x1b[2m❯\u{a0}segundo, que\x1b[22m\n\x1b[2m  sigue aquí\x1b[22m\n\x1b[2m  ctrl+x ctrl+s to send now\x1b[22m\n\n✶ Pensando… (12s)\n\n{rule}\n❯\u{a0}\x1b[2mPress up to edit queued messages\x1b[22m\n{rule}\n  ⏵⏵ auto mode on · esc to interrupt"
         );
         assert!(queue_shown(&two));
+        // El segundo, una lista numerada: no es un menú.
+        let list = format!(
+            "⏺ Mirando.\n\n❯\u{a0}primero\n❯\u{a0}1. sí\n  2. no\n  3. luego\n  ctrl+x ctrl+s to send now\n\n✶ Pensando… (3s)\n\n{rule}\n❯\u{a0}\x1b[2mPress up to edit queued messages\x1b[22m\n{rule}\n  ⏵⏵ auto mode on · esc to interrupt"
+        );
+        assert!(queue_shown(&list));
+        assert_eq!(parse(&list), None);
+        assert!(!something_open(&list));
         // Lo mismo dicho por Claude en una respuesta no es la cola.
         let said = format!(
             "⏺ Verás esto:\n  ctrl+x ctrl+s to send now\n\n{rule}\n❯\u{a0}\n{rule}\n  ⏵⏵ auto mode on"
@@ -3851,6 +3862,43 @@ mod tests {
         let c = c.lock().unwrap();
         assert!(c.queue.is_empty() && c.input.is_empty());
         assert!(c.sent_now.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn edit_the_queue_waits_for_every_line_of_the_transcript() {
+        // La transcripción tiene primero un popAll y luego el otro.
+        let c = claude(queued);
+        let mut scr = fake::screen_of(&c);
+        let reads = std::cell::Cell::new(0);
+        let got = edit_queue(
+            &mut scr,
+            &texts(&["primero", "segundo\ncon dos líneas"]),
+            || {
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 {
+                    texts(&["primero"])
+                } else {
+                    texts(&["primero", "segundo\ncon dos líneas"])
+                }
+            },
+        )
+        .await;
+        assert_eq!(got.as_deref(), Ok("primero\nsegundo\ncon dos líneas"));
+        // Sin la cola de antes (no se leyó), igual: espera a que no cambie.
+        let c = claude(queued);
+        let mut scr = fake::screen_of(&c);
+        let reads = std::cell::Cell::new(0);
+        let got = edit_queue(&mut scr, &[], || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 {
+                texts(&["primero"])
+            } else {
+                texts(&["primero", "segundo\ncon dos líneas"])
+            }
+        })
+        .await;
+        assert_eq!(got.as_deref(), Ok("primero\nsegundo\ncon dos líneas"));
+        assert!(c.lock().unwrap().input.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
