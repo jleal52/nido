@@ -1110,7 +1110,8 @@ fn entry(st: &AppState, me: &Machine, caller: &Caller, v: &SessionView, state: S
         channel: st.inbox.channel(&v.id),
         channel_error: st.inbox.refusal(&v.id).map(inbox::Refusal::code),
         delivery_error: delivery_error(st, &v.id),
-        plan: st.plans.get(&v.id).map(|p| p.progress().text()),
+        // El de la lista (el plan entero no hace falta, y leerlo aquí tomaría su cerrojo).
+        plan: v.plan.as_ref().map(|p| format!("{}/{}", p.done, p.total)),
     }
 }
 
@@ -2595,6 +2596,8 @@ struct PlanGetArgs {
 fn plan_fail(e: String) -> Fail {
     let code = if e.starts_with("no se pudo ") {
         StatusCode::INTERNAL_SERVER_ERROR
+    } else if e == plan::GONE {
+        StatusCode::NOT_FOUND
     } else {
         StatusCode::BAD_REQUEST
     };

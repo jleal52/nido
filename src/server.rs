@@ -3290,12 +3290,12 @@ pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), Regist
     );
     let id_ = id.to_owned();
     let _ = tokio::task::spawn_blocking(move || {
+        // Antes de borrar la carpeta: espera al plan que se esté guardando, y los cambios que
+        // lleguen después fallan en vez de volver a crearla.
+        plans.forget(&id_);
         let _ = std::fs::remove_dir_all(dir);
         secrets.forget_session(&id_);
         outbox.forget(&id_);
-        // Después de borrar la carpeta: olvidarlo antes dejaría que un resumen pedido entre medias
-        // lo volviera a leer del disco.
-        plans.forget(&id_);
     })
     .await;
     st.refresh.notify_one();
@@ -5285,6 +5285,14 @@ mod tests {
         assert!(!plan_file.exists());
         assert!(st.plans.summary(&id).is_none());
         assert!(st.plans.get(&id).is_none());
+        // Y un plan_set que llegue tarde no lo vuelve a crear.
+        let late: crate::plan::SetArgs =
+            serde_json::from_value(json!({"phases": [{"id": "f1", "name": "Uno"}]})).unwrap();
+        assert_eq!(
+            st.plans.set(&id, late, 2).unwrap_err(),
+            "la sesión ya no existe"
+        );
+        assert!(!st.paths.session_state(&id).exists());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub const MAX_PHASES: usize = 50;
 pub const MAX_TASKS: usize = 500;
@@ -365,9 +365,18 @@ impl Summary {
 }
 
 /// Los planes de las sesiones de este equipo: en memoria y en `<state>/sessions/<id>/plan.json`.
+///
+/// Hay dos cerrojos. `inner`, lo que hay en memoria, se tiene solo un momento: `get` y `summary`
+/// (que pide la lista de sesiones con el registro tomado) no esperan nunca a que se escriba en el
+/// disco. El de cada sesión (`writers`) pone en fila sus cambios: con él se calcula el plan nuevo
+/// (tomando `inner` un momento), se escribe en el disco sin `inner` y se publica (otra vez un
+/// momento). Siempre en ese orden: primero el de la sesión, luego `inner`.
 pub struct Plans {
     state: PathBuf,
     inner: Mutex<Inner>,
+    /// El cerrojo de cada sesión que ha cambiado su plan (uno por sesión, que se quita al
+    /// borrarla: son pocos).
+    writers: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 struct Inner {
@@ -376,6 +385,12 @@ struct Inner {
     next_rev: u64,
     /// Las sesiones que ya se han mirado en el disco (tengan plan o no).
     loaded: HashSet<String>,
+    /// Las que no se pudieron leer y ya se dijo (para no repetirlo en cada lista de sesiones).
+    unreadable: HashSet<String>,
+    /// Las sesiones borradas (`forget`): su plan ya no se lee ni se escribe, para que un cambio
+    /// que llegue tarde no vuelva a crear su carpeta. No se quitan nunca: los ids son aleatorios
+    /// (`registry::new_id`) y una sesión nueva no repite el de otra.
+    gone: HashSet<String>,
 }
 
 impl Inner {
@@ -385,6 +400,9 @@ impl Inner {
         rev
     }
 }
+
+/// El error de cambiar el plan de una sesión borrada.
+pub const GONE: &str = "la sesión ya no existe";
 
 /// Que falte el fichero o su carpeta no es un error: esa sesión no tiene plan.
 fn missing(e: &io::Error) -> bool {
@@ -402,7 +420,10 @@ impl Plans {
                 plans: HashMap::new(),
                 next_rev: crate::oauth::now_ms(),
                 loaded: HashSet::new(),
+                unreadable: HashSet::new(),
+                gone: HashSet::new(),
             }),
+            writers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -415,28 +436,56 @@ impl Plans {
         self.inner.lock().expect("planes")
     }
 
-    /// Trae del disco el plan de `id` la primera vez que se pide. Uno que no se pueda leer o
-    /// entender se aparta como `plan.json.bad`, para no tropezar con él cada vez.
-    fn load(&self, inner: &mut Inner, id: &str) {
-        if !inner.loaded.insert(id.to_string()) {
-            return;
+    /// El cerrojo de los cambios del plan de `id`.
+    fn writer(&self, id: &str) -> Arc<Mutex<()>> {
+        self.writers
+            .lock()
+            .expect("planes: cerrojos")
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Trae del disco el plan de `id` la primera vez que se pide (con `inner` tomado: es una vez
+    /// por sesión, y así nadie escribe el fichero entre leerlo y apartarlo). Uno que no se
+    /// entienda se aparta como `plan.json.bad`, para no tropezar con él cada vez; uno que no se
+    /// pueda leer (permisos, un fallo del disco) se deja donde está y se vuelve a intentar la
+    /// próxima vez: es el error.
+    fn load(&self, inner: &mut Inner, id: &str) -> Result<(), String> {
+        if inner.loaded.contains(id) || inner.gone.contains(id) {
+            return Ok(());
         }
         let path = self.path(id);
-        let read = std::fs::read(&path)
-            .and_then(|b| serde_json::from_slice::<Plan>(&b).map_err(io::Error::other));
-        match read {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => Some(b),
+            Err(e) if missing(&e) => None,
+            Err(e) => {
+                if inner.unreadable.insert(id.to_string()) {
+                    eprintln!("nido: el plan de {id} no se pudo leer ({e}): se volverá a intentar");
+                }
+                return Err(format!("no se pudo leer el plan: {e}"));
+            }
+        };
+        inner.unreadable.remove(id);
+        inner.loaded.insert(id.to_string());
+        let Some(bytes) = bytes else {
+            return Ok(());
+        };
+        match serde_json::from_slice::<Plan>(&bytes) {
             Ok(plan) => {
                 let rev = inner.bump();
                 inner.plans.insert(id.to_string(), (plan, rev));
             }
-            Err(e) if missing(&e) => {}
-            Err(e) => {
-                let _ = std::fs::rename(&path, path.with_extension("json.bad"));
-                eprintln!(
-                    "nido: el plan de {id} no se pudo leer ({e}): apartado como plan.json.bad"
-                );
-            }
+            Err(e) => match std::fs::rename(&path, path.with_extension("json.bad")) {
+                Ok(()) => eprintln!(
+                    "nido: el plan de {id} no se entiende ({e}): apartado como plan.json.bad"
+                ),
+                Err(re) => eprintln!(
+                    "nido: el plan de {id} no se entiende ({e}) y no se pudo apartar ({re})"
+                ),
+            },
         }
+        Ok(())
     }
 
     /// Escribe en un temporal y lo renombra: nunca queda un plan a medias.
@@ -463,11 +512,28 @@ impl Plans {
         written
     }
 
-    /// Guarda `plan` y, solo si se pudo, lo pone en memoria con un `rev` nuevo.
-    fn store(&self, inner: &mut Inner, id: &str, plan: Plan) -> Result<Progress, String> {
+    /// Cambia el plan de `id`: `f` hace el nuevo con el de ahora; se guarda y, solo si se pudo,
+    /// se pone en memoria con un `rev` nuevo. Todo con el cerrojo de la sesión, y el disco sin
+    /// `inner`.
+    fn change(
+        &self,
+        id: &str,
+        f: impl FnOnce(Option<&Plan>) -> Result<Plan, String>,
+    ) -> Result<Progress, String> {
+        let turn = self.writer(id);
+        let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
+        let plan = {
+            let mut inner = self.lock();
+            if inner.gone.contains(id) {
+                return Err(GONE.into());
+            }
+            self.load(&mut inner, id)?;
+            f(inner.plans.get(id).map(|(p, _)| p))?
+        };
         self.write(id, &plan)
             .map_err(|e| format!("no se pudo guardar el plan: {e}"))?;
         let progress = plan.progress();
+        let mut inner = self.lock();
         let rev = inner.bump();
         inner.plans.insert(id.to_string(), (plan, rev));
         Ok(progress)
@@ -475,53 +541,60 @@ impl Plans {
 
     pub fn get(&self, id: &str) -> Option<Plan> {
         let mut inner = self.lock();
-        self.load(&mut inner, id);
+        let _ = self.load(&mut inner, id);
         inner.plans.get(id).map(|(p, _)| p.clone())
     }
 
     pub fn summary(&self, id: &str) -> Option<Summary> {
         let mut inner = self.lock();
-        self.load(&mut inner, id);
+        let _ = self.load(&mut inner, id);
         inner.plans.get(id).map(|(p, rev)| Summary::of(p, *rev))
     }
 
     /// `plan_set`: sustituye el plan entero (con las horas de las tareas que ya estaban).
     pub fn set(&self, id: &str, a: SetArgs, now: u64) -> Result<Progress, String> {
-        let mut inner = self.lock();
-        self.load(&mut inner, id);
-        let plan = Plan::set(inner.plans.get(id).map(|(p, _)| p), a, now)?;
-        self.store(&mut inner, id, plan)
+        self.change(id, |prev| Plan::set(prev, a, now))
     }
 
     /// `plan_task`: cambia una tarea.
     pub fn update_task(&self, id: &str, a: TaskArgs, now: u64) -> Result<Progress, String> {
-        let mut inner = self.lock();
-        self.load(&mut inner, id);
-        let Some((plan, _)) = inner.plans.get(id) else {
-            return Err("esta sesión no tiene plan".into());
-        };
-        let mut plan = plan.clone();
-        plan.update_task(a, now)?;
-        self.store(&mut inner, id, plan)
+        self.change(id, |prev| {
+            let mut plan = prev.ok_or("esta sesión no tiene plan")?.clone();
+            plan.update_task(a, now)?;
+            Ok(plan)
+        })
     }
 
     /// `plan_clear`: lo borra (que no hubiera no es error).
     pub fn clear(&self, id: &str) -> Result<(), String> {
-        let mut inner = self.lock();
+        let turn = self.writer(id);
+        let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.lock().gone.contains(id) {
+            return Err(GONE.into());
+        }
         match std::fs::remove_file(self.path(id)) {
             Err(e) if !missing(&e) => return Err(format!("no se pudo borrar el plan: {e}")),
             _ => {}
         }
+        let mut inner = self.lock();
         inner.plans.remove(id);
         inner.loaded.insert(id.to_string());
         Ok(())
     }
 
-    /// Lo quita de memoria (la carpeta la borra `delete_session`).
+    /// La sesión se borra: su plan sale de memoria y ya no se lee ni se escribe (ver `gone`).
+    /// Espera a que acabe el cambio que se esté guardando, así que hay que llamarlo antes de
+    /// borrar su carpeta: lo que se escribiera antes, se va con ella; lo de después, falla.
     pub fn forget(&self, id: &str) {
+        let turn = self.writer(id);
+        let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
         let mut inner = self.lock();
+        inner.gone.insert(id.to_string());
         inner.plans.remove(id);
         inner.loaded.remove(id);
+        inner.unreadable.remove(id);
+        drop(inner);
+        self.writers.lock().expect("planes: cerrojos").remove(id);
     }
 }
 
@@ -1180,6 +1253,143 @@ mod tests {
         assert!(file.exists());
         std::fs::remove_dir_all(state.join("sessions/s1")).unwrap();
         assert_eq!(plans.get("s1"), None);
+    }
+
+    /// Un plan que no se puede leer (aquí, una carpeta en su sitio) no es uno estropeado: no se
+    /// aparta, se vuelve a intentar la siguiente vez, y mientras tanto no se escribe encima.
+    #[test]
+    fn unreadable_file_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().to_path_buf();
+        let file = plan_file(&state, "s1");
+        std::fs::create_dir_all(&file).unwrap();
+
+        let plans = Plans::new(state.clone());
+        assert_eq!(plans.summary("s1"), None);
+        assert_eq!(plans.get("s1"), None);
+        assert!(file.is_dir());
+        assert!(!file.with_extension("json.bad").exists());
+        let e = plans
+            .set("s1", plan_of(&[("t1", "pending")]), 1)
+            .unwrap_err();
+        assert!(e.starts_with("no se pudo leer el plan: "), "{e}");
+        let e = plans
+            .update_task("s1", task_args("t1", "done"), 1)
+            .unwrap_err();
+        assert!(e.starts_with("no se pudo leer el plan: "), "{e}");
+        assert!(file.is_dir());
+
+        // Cuando se puede leer, se lee.
+        let other = dir.path().join("otro");
+        Plans::new(other.clone())
+            .set("s1", plan_of(&[("t1", "done")]), 1)
+            .unwrap();
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::copy(plan_file(&other, "s1"), &file).unwrap();
+        assert_eq!(plans.summary("s1").unwrap().done, 1);
+        plans
+            .update_task("s1", task_args("t1", "pending"), 2)
+            .unwrap();
+        assert_eq!(Plans::new(state).summary("s1").unwrap().done, 0);
+    }
+
+    /// `f` en otro hilo: si acaba en `secs`, lo que devuelve.
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+    }
+
+    /// Mientras se escribe el plan de una sesión, leerlo (y escribir el de otra) no espera; otro
+    /// cambio de la misma espera su turno.
+    #[test]
+    fn readers_do_not_wait_for_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = std::sync::Arc::new(Plans::new(dir.path().to_path_buf()));
+        plans.set("s1", plan_of(&[("t1", "pending")]), 1).unwrap();
+        let w = plans.writer("s1");
+        let writing = w.lock().unwrap();
+
+        let p = plans.clone();
+        let read = within(5, move || {
+            (
+                p.summary("s1").map(|s| s.done),
+                p.get("s1").is_some(),
+                p.set("s2", plan_of(&[("t1", "done")]), 2).is_ok(),
+            )
+        });
+        assert_eq!(read, Some((Some(0), true, true)));
+
+        let p = plans.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let r = p.update_task("s1", task_args("t1", "done"), 3);
+            let _ = tx.send(());
+            r
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "no esperó su turno"
+        );
+        assert_eq!(plans.summary("s1").unwrap().done, 0);
+        drop(writing);
+        second.join().unwrap().unwrap();
+        assert_eq!(plans.summary("s1").unwrap().done, 1);
+    }
+
+    /// Una sesión borrada no vuelve a tener plan, aunque llegue tarde un cambio: `forget` espera
+    /// al que esté escribiendo y los de después fallan, sin crear nada en el disco.
+    #[test]
+    fn a_forgotten_session_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().to_path_buf();
+        let plans = std::sync::Arc::new(Plans::new(state.clone()));
+        plans.set("s1", plan_of(&[("t1", "pending")]), 1).unwrap();
+
+        // Uno a medias: forget espera a que acabe.
+        let w = plans.writer("s1");
+        let writing = w.lock().unwrap();
+        let p = plans.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let forgetting = std::thread::spawn(move || {
+            p.forget("s1");
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "forget no esperó"
+        );
+        drop(writing);
+        forgetting.join().unwrap();
+
+        // Se borra la carpeta (como `delete_session`): ya no se escribe ni se lee.
+        std::fs::remove_dir_all(state.join("sessions/s1")).unwrap();
+        let gone = "la sesión ya no existe";
+        assert_eq!(
+            plans.set("s1", plan_of(&[("t1", "done")]), 2).unwrap_err(),
+            gone
+        );
+        assert_eq!(
+            plans
+                .update_task("s1", task_args("t1", "done"), 2)
+                .unwrap_err(),
+            gone
+        );
+        assert_eq!(plans.clear("s1").unwrap_err(), gone);
+        assert!(!state.join("sessions/s1").exists());
+        // Ni aunque alguien deje el fichero.
+        Plans::new(state.clone())
+            .set("s1", plan_of(&[("t1", "done")]), 3)
+            .unwrap();
+        assert_eq!(plans.summary("s1"), None);
+        assert_eq!(plans.get("s1"), None);
+        // Las demás, como siempre.
+        plans.set("s2", plan_of(&[("t1", "done")]), 4).unwrap();
+        assert_eq!(plans.summary("s2").unwrap().done, 1);
     }
 
     #[test]

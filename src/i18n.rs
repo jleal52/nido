@@ -1043,6 +1043,11 @@ const TABLE: &[(&str, &str)] = &[
         "could not delete the plan: {0}",
     ),
     ("esta sesión no tiene plan", "this session has no plan"),
+    (
+        "no se pudo leer el plan: {}",
+        "could not read the plan: {0}",
+    ),
+    ("la sesión ya no existe", "the session no longer exists"),
     // mcp_api.rs: las herramientas del plan
     ("falta session", "session is missing"),
     (
@@ -1200,6 +1205,14 @@ mod tests {
         assert_eq!(
             english("esta sesión no tiene plan"),
             "this session has no plan"
+        );
+        assert_eq!(
+            english("no se pudo leer el plan: Is a directory (os error 21)"),
+            "could not read the plan: Is a directory (os error 21)"
+        );
+        assert_eq!(
+            english("la sesión ya no existe"),
+            "the session no longer exists"
         );
     }
 
