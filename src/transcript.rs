@@ -489,6 +489,27 @@ impl Parser {
                                 });
                             }
                         }
+                        // Lo que Claude te va contando mientras trabaja («Aparco esto y miro
+                        // aquello…», con «· summary» en su pantalla) lo apunta como `thinking` con
+                        // `thinkingDisplay: "updates"`; lo que piensa para sí va vacío.
+                        Some("thinking")
+                            if d.get("thinkingDisplay").and_then(Value::as_str)
+                                == Some("updates") =>
+                        {
+                            let text = b
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .trim();
+                            if !text.is_empty() {
+                                items.push(ChatItem::Assistant {
+                                    id: bid,
+                                    at,
+                                    ts: ts.clone(),
+                                    text: text.to_owned(),
+                                });
+                            }
+                        }
                         Some("tool_use") => {
                             let name = b
                                 .get("name")
@@ -1457,6 +1478,46 @@ mod tests {
                 Some(("claude-haiku-5-5".to_owned(), whole)),
                 whole + a.len() as u64
             )
+        );
+    }
+
+    #[test]
+    fn progress_updates_are_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        // Como lo apunta Claude Code 2.1.3xx: lo que piensa para sí, vacío; lo que te cuenta
+        // mientras trabaja, en `thinking` con `thinkingDisplay: "updates"`.
+        let lines = [
+            serde_json::json!({"type":"user","uuid":"u1","message":{"content":"cambia la clave"}}),
+            serde_json::json!({"type":"assistant","uuid":"a1","thinkingDisplay":"updates","message":{"content":[
+                {"type":"thinking","thinking":"","signature":"x"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"a2","thinkingDisplay":"updates","message":{"content":[
+                {"type":"thinking","thinking":"Aparco el revisor y miro la clave.\n\n","signature":"x"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"a3","thinkingDisplay":"updates","message":{"content":[
+                {"type":"tool_use","id":"t-1","name":"Bash","input":{"command":"ls"}}]}}),
+            // Sin `updates` (versiones de antes), lo pensado no se enseña.
+            serde_json::json!({"type":"assistant","uuid":"a4","message":{"content":[
+                {"type":"thinking","thinking":"Pienso en cómo hacerlo."}]}}),
+            serde_json::json!({"type":"assistant","uuid":"a5","thinkingDisplay":"updates","message":{"content":[
+                {"type":"text","text":"Hecho."}]}}),
+        ];
+        std::fs::write(&path, lines.map(line).concat()).unwrap();
+
+        let c = read_chunk(&path, 0, None).unwrap();
+        let said: Vec<_> = c
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ChatItem::Assistant { id, text, .. } => Some((id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("a2", "Aparco el revisor y miro la clave."),
+                ("a5", "Hecho.")
+            ]
         );
     }
 
