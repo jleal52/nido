@@ -634,6 +634,45 @@ pub fn last_model(path: &Path) -> Option<(String, u64)> {
     }
 }
 
+/// Cuánto del final de la transcripción se mira para buscar la última pregunta: la que está en
+/// pantalla se acaba de hacer.
+const LAST_ASK_TAIL: u64 = 4 * 1024 * 1024;
+
+/// La última llamada a AskUserQuestion de la conversación principal (sus `questions`, como en el
+/// chat), en el final de la transcripción. Para quien sigue `/live` desde más allá de ella.
+pub fn last_ask(path: &Path) -> Option<Value> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(LAST_ASK_TAIL);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let mut found = None;
+    for line in buf.split(|&b| b == b'\n') {
+        if !line.windows(15).any(|w| w == b"AskUserQuestion") {
+            continue;
+        }
+        let Ok(d) = serde_json::from_slice::<Value>(line) else {
+            continue; // la primera, cortada
+        };
+        if d.get("type").and_then(Value::as_str) != Some("assistant")
+            || d.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let blocks = d.pointer("/message/content").and_then(Value::as_array);
+        for b in blocks.map(Vec::as_slice).unwrap_or_default() {
+            if b.get("type").and_then(Value::as_str) == Some("tool_use")
+                && b.get("name").and_then(Value::as_str) == Some("AskUserQuestion")
+                && let Some(ask) = b.get("input").and_then(ask_data)
+            {
+                found = Some(ask);
+            }
+        }
+    }
+    found
+}
+
 /// Lo nuevo de la transcripción desde `from` (el principio de una línea): el modelo de la última
 /// respuesta en las líneas ya enteras (y dónde empieza esa línea), y dónde empieza lo que aún no
 /// es una línea entera (de ahí se sigue la próxima vez).
@@ -1108,6 +1147,8 @@ struct Head<'a> {
     compact: Option<&'a serde_json::value::RawValue>,
     #[serde(rename = "isApiErrorMessage", borrow, default)]
     api_error: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "thinkingDisplay", borrow, default)]
+    thinking_display: Option<&'a serde_json::value::RawValue>,
     #[serde(borrow, default)]
     error: Option<&'a serde_json::value::RawValue>,
     #[serde(borrow, default)]
@@ -1132,6 +1173,8 @@ struct Block<'a> {
     kind: Option<&'a serde_json::value::RawValue>,
     #[serde(borrow, default)]
     text: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default)]
+    thinking: Option<&'a serde_json::value::RawValue>,
 }
 
 fn raw_is(r: Option<&serde_json::value::RawValue>, json: &str) -> bool {
@@ -1241,12 +1284,20 @@ pub fn said(line: &[u8], at: u64) -> Vec<Said> {
     let Ok(blocks) = serde_json::from_str::<Vec<Block>>(content) else {
         return Vec::new();
     };
+    // Lo que cuenta mientras trabaja va en `thinking` (ver `Parser`).
+    let updates = raw_is(h.thinking_display, "\"updates\"");
     blocks
         .iter()
         .enumerate()
-        .filter(|(_, b)| raw_is(b.kind, "\"text\""))
         .filter_map(|(n, b)| {
-            let text = raw_string(b.text)?.trim().to_owned();
+            let text = if raw_is(b.kind, "\"text\"") {
+                raw_string(b.text)?
+            } else if updates && raw_is(b.kind, "\"thinking\"") {
+                raw_string(b.thinking)?
+            } else {
+                return None;
+            };
+            let text = text.trim().to_owned();
             let bid = if n == 0 {
                 id.clone()
             } else {
@@ -1479,6 +1530,37 @@ mod tests {
                 whole + a.len() as u64
             )
         );
+    }
+
+    #[test]
+    fn the_last_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let ask = |q: &str| {
+            serde_json::json!({"type":"assistant","uuid":q,"message":{"content":[
+                {"type":"text","text":"Te pregunto."},
+                {"type":"tool_use","id":q,"name":"AskUserQuestion","input":{"questions":[
+                    {"question":q,"header":"h","multiSelect":false,"options":[
+                        {"label":"Sí","description":"","preview":"┌ sí ┐"}]}]}}]}})
+        };
+        let lines = [
+            ask("primera"),
+            ask("segunda"),
+            // La de un subagente no cuenta.
+            serde_json::json!({"type":"assistant","uuid":"s","isSidechain":true,"message":{"content":[
+                {"type":"tool_use","id":"s","name":"AskUserQuestion","input":{"questions":[{"question":"sub"}]}}]}}),
+            serde_json::json!({"type":"user","uuid":"u","message":{"content":"AskUserQuestion"}}),
+        ];
+        std::fs::write(&path, lines.map(line).concat()).unwrap();
+        let a = last_ask(&path).unwrap();
+        assert_eq!(a["questions"][0]["question"], "segunda");
+        assert_eq!(a["questions"][0]["options"][0]["preview"], "┌ sí ┐");
+        std::fs::write(
+            &path,
+            line(serde_json::json!({"type":"user","message":{"content":"hola"}})),
+        )
+        .unwrap();
+        assert!(last_ask(&path).is_none());
     }
 
     #[test]
@@ -2027,6 +2109,12 @@ mod tests {
             serde_json::json!({"type":"attachment","uuid":"q2","attachment":{"type":"queued_command","prompt":"automático","origin":{"kind":"hook"}}}),
             serde_json::json!({"type":"api-request","uuid":"r","message":{"content":"no es un mensaje"}}),
             serde_json::json!({"type":"user","uuid":"e1","message":{"content":"Código \u{1F600} ñ \"comillas\""}}),
+            // Lo que cuenta Claude mientras trabaja (y lo que piensa, vacío, fuera).
+            serde_json::json!({"type":"assistant","uuid":"p1","thinkingDisplay":"updates","message":{"model":"claude-fable-5-2","content":[
+                {"type":"thinking","thinking":"","signature":"x"},
+                {"type":"thinking","thinking":"Aparco esto y miro aquello.\n\n","signature":"x"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"p2","message":{"model":"claude-opus-5-5","content":[
+                {"type":"thinking","thinking":"sin updates no se enseña"}]}}),
         ];
         let mut text = String::new();
         let mut said_all = Vec::new();
@@ -2066,7 +2154,7 @@ mod tests {
         assert_eq!(said_all, chat);
         assert_eq!(
             said_all.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
-            ["u1", "a1:1", "a1:3", "i1", "q1", "e1"]
+            ["u1", "a1:1", "a1:3", "i1", "q1", "e1", "p1:1"]
         );
         assert_eq!(said_all[0].text, "Hola");
         assert_eq!(said_all[0].ts.as_deref(), Some("2026-11-12T10:00:00.000Z"));

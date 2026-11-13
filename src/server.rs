@@ -3916,8 +3916,10 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
     let mut last_screen: Option<String> = None;
     // Lo que había en cola en el último `screen` mandado.
     let mut last_queued: Vec<String> = Vec::new();
-    // La última AskUserQuestion de la transcripción: las vistas previas de sus opciones.
+    // La última AskUserQuestion de la transcripción: las vistas previas de sus opciones. Si se
+    // sigue desde más allá de ella (`offset`), se busca una vez al ver una pregunta (`ask_looked`).
     let mut last_ask: Option<serde_json::Value> = None;
+    let mut ask_looked = false;
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3977,6 +3979,7 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                                 last_len = len;
                                 if reset || chunk.reset {
                                     last_ask = None;
+                                    ask_looked = false;
                                 }
                                 let ask = chunk.items.iter().rev().find_map(|i| match i {
                                     crate::transcript::ChatItem::Tool { name, ask: Some(a), .. }
@@ -4054,6 +4057,17 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                     if last_screen.as_deref() != Some(text.as_str()) {
                         // El menú que haya (preguntas, permisos…), para contestarlo con botones.
                         let mut menu = prompt::parse(&text);
+                        if last_ask.is_none()
+                            && !ask_looked
+                            && menu.as_ref().is_some_and(|m| m.kind == prompt::Kind::Question)
+                            && let Some(p) = path.clone()
+                        {
+                            ask_looked = true;
+                            last_ask = tokio::task::spawn_blocking(move || crate::transcript::last_ask(&p))
+                                .await
+                                .ok()
+                                .flatten();
+                        }
                         if let (Some(m), Some(ask)) = (menu.as_mut(), last_ask.as_ref()) {
                             m.fill_previews(ask);
                         }
@@ -4520,32 +4534,38 @@ mod tests {
                     ]}]}}]}}),
             ],
         );
-        let url = format!("ws://{addr}/api/v1/sessions/{id}/live");
-        let (mut live, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-        // La primera pantalla puede llegar antes de leer la transcripción: hasta que las traiga.
-        let previews = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let v = next_screen(&mut live).await;
-                let p: Vec<_> = v["menu"]["options"]
-                    .as_array()
-                    .map(|o| o.iter().map(|o| o["preview"].clone()).collect())
-                    .unwrap_or_default();
-                if p.len() == 4 && p[1].is_string() {
-                    return p;
+        let end = std::fs::metadata(tmp.path().join("claude/projects/-proyecto/conv.jsonl"))
+            .unwrap()
+            .len();
+        // Desde el principio, y siguiendo desde el final (la app que vuelve con lo que ya tenía).
+        for q in [String::new(), format!("?sid=conv&offset={end}")] {
+            let url = format!("ws://{addr}/api/v1/sessions/{id}/live{q}");
+            let (mut live, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            // La primera pantalla puede llegar antes de leer la transcripción: hasta que las traiga.
+            let previews = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let v = next_screen(&mut live).await;
+                    let p: Vec<_> = v["menu"]["options"]
+                        .as_array()
+                        .map(|o| o.iter().map(|o| o["preview"].clone()).collect())
+                        .unwrap_or_default();
+                    if p.len() == 4 && p[1].is_string() {
+                        return p;
+                    }
                 }
-            }
-        })
-        .await
-        .expect("no llegaron las vistas previas");
-        assert_eq!(
-            previews,
-            [
-                json!("Bandeja: [ ~10 días ]"),
-                json!("Bandeja: [ estimado ]"),
-                json!("Detalle: estimado"),
-                json!("Bandeja: [ 10 días ]")
-            ]
-        );
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no llegaron las vistas previas ({q})"));
+            assert_eq!(
+                previews,
+                [
+                    json!("Bandeja: [ ~10 días ]"),
+                    json!("Bandeja: [ estimado ]"),
+                    json!("Detalle: estimado"),
+                    json!("Bandeja: [ 10 días ]")
+                ]
+            );
+        }
     }
 
     #[cfg(unix)]
