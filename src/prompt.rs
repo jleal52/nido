@@ -1948,6 +1948,15 @@ fn no_menu(screen: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Como [`no_menu`], pero con algo escrito en la caja: lo escrito puede parecer un menú (una
+/// lista numerada), así que solo cuenta si la caja ya no está (un menú de Claude la tapa).
+fn no_menu_over_box(screen: &str) -> Result<(), String> {
+    if input_box(screen).is_some() {
+        return Ok(());
+    }
+    no_menu(screen)
+}
+
 /// El texto que se pega, sin caracteres de control (C0 y C1) salvo los saltos de línea y los
 /// tabuladores: dentro de un pegado, `ESC[201~` lo terminaría y lo de detrás serían teclas
 /// (shift+tab cambia el modo, Esc interrumpe, ctrl+c sale). Los saltos de línea, con `\n`.
@@ -2029,7 +2038,7 @@ pub async fn send_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     for _ in 0..3 {
         // Un menú (un permiso) que haya salido mientras tanto se llevaría el Enter: lo aprobaría.
         // Se mira justo antes de pulsarlo; el texto se queda en la caja.
-        no_menu(&scr.read().await?)?;
+        no_menu_over_box(&scr.read().await?)?;
         scr.keys(b"\r").await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -2981,10 +2990,10 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         // Si entre medias sale otro menú, ni el pegado (un número elegiría una opción) ni el
         // Enter: irían a él.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        no_menu(&scr.read().await?).map_err(|_| TEXT_NOT_SENT)?;
+        no_menu_over_box(&scr.read().await?).map_err(|_| TEXT_NOT_SENT)?;
         scr.keys(&bracketed(text)).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        no_menu(&scr.read().await?).map_err(|_| TEXT_NOT_SENT)?;
+        no_menu_over_box(&scr.read().await?).map_err(|_| TEXT_NOT_SENT)?;
         scr.keys(b"\r").await?;
     }
     Ok(())
@@ -5239,6 +5248,46 @@ Compound command contains cd with write operation - manual approval required to 
         let mut scr = fake::screen_of(&c);
         assert_eq!(send_message(&mut scr, "").await, Err(MENU_WAITING.into()));
         assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+    }
+
+    /// Lo escrito en la caja no es un menú, aunque lo parezca (una lista numerada, una pregunta
+    /// de las de los permisos); y en un menú no hay caja.
+    #[tokio::test(start_paused = true)]
+    async fn the_text_in_the_box_is_not_a_menu() {
+        for text in [
+            "1. uno\n2. dos",
+            "Do you want to proceed?\n❯ 1. Yes\n  2. No",
+        ] {
+            let c = claude(|_| {});
+            let mut scr = fake::screen_of(&c);
+            assert_eq!(send_message(&mut scr, text).await, Ok(()), "{text}");
+            assert!(keys(&c).contains(&b"\r".to_vec()));
+            assert!(c.lock().unwrap().input.is_empty());
+            let c = claude(|c| c.permission = true);
+            let mut scr = fake::screen_of(&c);
+            let req = Request {
+                option: Some("No".into()),
+                text: Some(text.into()),
+                ..Default::default()
+            };
+            assert_eq!(answer(&mut scr, &req).await, Ok(()), "{text}");
+            // Una lectura más, para que al Claude de mentira le haya llegado el Enter.
+            scr.screen().await.unwrap();
+            assert_eq!(keys(&c).last(), Some(&b"\r".to_vec()));
+            assert!(c.lock().unwrap().input.is_empty());
+        }
+        for name in [
+            "permiso",
+            "permiso_contexto",
+            "plan",
+            "pregunta_sola",
+            "pregunta_multiple",
+            "confianza",
+            "repaso",
+            "formulario",
+        ] {
+            assert_eq!(input_box(&fixture(name)), None, "{name}");
+        }
     }
 
     /// Lo mismo con el texto tras «No»: si sale otro permiso antes de pegarlo o antes del
