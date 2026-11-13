@@ -601,7 +601,7 @@ async fn mcp_api_end_to_end() {
     let n = guard.len();
     assert_eq!(argv[1..1 + n], guard, "{argv:?}");
     assert_eq!(
-        &argv[1 + n..12 + n],
+        &argv[1 + n..16 + n],
         [
             "--dangerously-load-development-channels",
             "server:nido",
@@ -613,6 +613,10 @@ async fn mcp_api_end_to_end() {
             "mcp__nido__secret",
             "mcp__nido__clipboard",
             "mcp__nido__send_file",
+            "mcp__nido__plan_set",
+            "mcp__nido__plan_task",
+            "mcp__nido__plan_get",
+            "mcp__nido__plan_clear",
             "--session-id"
         ]
     );

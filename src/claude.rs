@@ -453,11 +453,11 @@ const NIDO_CHANNEL: &str = "server:nido";
 const ALLOWED_OPTS: [&str; 2] = ["--allowedTools", "--allowed-tools"];
 /// Las herramientas de nido que no piden permiso: las que miran y hablan, y las que piden y
 /// mandan cosas al usuario (`secret` lo controla su diálogo; `clipboard` y `send_file` solo le
-/// mandan algo a él). Las que actúan sobre otras sesiones (`open`, `answer`, `close`, `start`,
+/// mandan algo a él), y las del plan de tareas (solo tocan el de la propia sesión). Las que actúan sobre otras sesiones (`open`, `answer`, `close`, `start`,
 /// `stop`) pasan por el permiso de Claude como cualquier otra (en modo auto, lo decide su
 /// clasificador): una sesión engañada (un mensaje con instrucciones metidas) no puede abrir,
 /// parar o arrancar sesiones ni aprobar sus preguntas sin que nadie lo vea.
-pub const NIDO_TOOLS: [&str; 7] = [
+pub const NIDO_TOOLS: [&str; 11] = [
     "mcp__nido__sessions",
     "mcp__nido__read",
     "mcp__nido__send",
@@ -465,6 +465,10 @@ pub const NIDO_TOOLS: [&str; 7] = [
     "mcp__nido__secret",
     "mcp__nido__clipboard",
     "mcp__nido__send_file",
+    "mcp__nido__plan_set",
+    "mcp__nido__plan_task",
+    "mcp__nido__plan_get",
+    "mcp__nido__plan_clear",
 ];
 const DENIED_OPTS: [&str; 2] = ["--disallowedTools", "--disallowed-tools"];
 /// Lo que ponía nido antes: todas sus herramientas sin permiso. Si viene en una orden (de una
@@ -1257,7 +1261,7 @@ mod tests {
     /// Las de nido, como van en la orden: el channel y las herramientas que no piden permiso
     /// (las que miran y hablan, y las que mandan cosas al usuario; `open`, `answer`, `close`,
     /// `start` y `stop` no).
-    const FLAGS: [&str; 10] = [
+    const FLAGS: [&str; 14] = [
         "--dangerously-load-development-channels",
         "server:nido",
         "--allowedTools",
@@ -1268,6 +1272,10 @@ mod tests {
         "mcp__nido__secret",
         "mcp__nido__clipboard",
         "mcp__nido__send_file",
+        "mcp__nido__plan_set",
+        "mcp__nido__plan_task",
+        "mcp__nido__plan_get",
+        "mcp__nido__plan_clear",
     ];
 
     fn flagged(program: &str, rest: &[&str]) -> Vec<String> {
@@ -1335,6 +1343,10 @@ mod tests {
                 "mcp__nido__secret",
                 "mcp__nido__clipboard",
                 "mcp__nido__send_file",
+                "mcp__nido__plan_set",
+                "mcp__nido__plan_task",
+                "mcp__nido__plan_get",
+                "mcp__nido__plan_clear",
                 "--allowedTools=mcp__nido__read",
                 "-c"
             ])
@@ -1353,6 +1365,10 @@ mod tests {
             "mcp__nido__secret",
             "mcp__nido__clipboard",
             "mcp__nido__send_file",
+            "mcp__nido__plan_set",
+            "mcp__nido__plan_task",
+            "mcp__nido__plan_get",
+            "mcp__nido__plan_clear",
         ]);
         assert_eq!(with_nido_mcp(&theirs, true), theirs);
         // Las de una orden de antes (todas sin permiso), fuera: con `=`, sola o con otras.

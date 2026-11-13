@@ -148,7 +148,7 @@ fn guard(paths: &Paths) -> Vec<String> {
 
 /// Las de nido: el channel y solo las herramientas que miran y hablan, o mandan cosas al
 /// usuario, sin pedir permiso.
-const FLAGS: [&str; 10] = [
+const FLAGS: [&str; 14] = [
     "--dangerously-load-development-channels",
     "server:nido",
     "--allowedTools",
@@ -159,6 +159,10 @@ const FLAGS: [&str; 10] = [
     "mcp__nido__secret",
     "mcp__nido__clipboard",
     "mcp__nido__send_file",
+    "mcp__nido__plan_set",
+    "mcp__nido__plan_task",
+    "mcp__nido__plan_get",
+    "mcp__nido__plan_clear",
 ];
 
 fn nido_mcp(home: &Path, on: bool) -> String {
@@ -271,8 +275,8 @@ async fn claude_launches_with_the_nido_channel() {
     let g = guard(&paths);
     let n = g.len();
     assert_eq!(argv[1..1 + n], g, "{argv:?}");
-    assert_eq!(argv[1 + n..11 + n], FLAGS, "{argv:?}");
-    assert_eq!(argv[11 + n], "--session-id");
+    assert_eq!(argv[1 + n..1 + n + FLAGS.len()], FLAGS, "{argv:?}");
+    assert_eq!(argv[1 + n + FLAGS.len()], "--session-id");
     assert!(
         argv.windows(2).any(|w| w == ["--model", "haiku"]),
         "{argv:?}"
