@@ -1358,6 +1358,28 @@ fn queue_notice(text: &str) -> bool {
     text.trim_start().starts_with('<')
 }
 
+/// La etiqueta de un aviso y lo que va tras ella: `<m from="x">hola</m>` → `("m", "hola</m>")`.
+fn notice_parts(text: &str) -> Option<(&str, &str)> {
+    let t = text.trim_start().strip_prefix('<')?;
+    let (tag, rest) = t.split_once('>')?;
+    let name = tag.split(char::is_whitespace).next().unwrap_or(tag);
+    Some((name, rest))
+}
+
+/// Si `a` y `b` son el mismo mensaje de la cola. Claude Code no siempre apunta un aviso igual al
+/// encolarlo que al quitarlo: un mensaje de otra sesión entra con `hop-chain="…"` en la etiqueta y
+/// sale (`remove`, «absorbed_mid_turn») sin él. Si no son iguales, dos avisos valen como el mismo
+/// con la misma etiqueta y lo mismo detrás (los atributos no cuentan); lo demás, solo igual.
+fn same_queued(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if !queue_notice(a) || !queue_notice(b) {
+        return false;
+    }
+    matches!((notice_parts(a), notice_parts(b)), (Some(x), Some(y)) if x == y)
+}
+
 impl Queue {
     /// Aplica una operación. Lo que no se entiende, o quita algo que no está, no hace nada.
     fn apply(&mut self, op: &str, content: Option<String>) {
@@ -1369,7 +1391,10 @@ impl Queue {
                 }
             }
             ("popAll" | "remove", Some(c)) => {
-                if let Some(i) = self.items.iter().position(|x| *x == c) {
+                // El que sea igual; si no hay, el aviso que lo sea salvo los atributos.
+                let i = (self.items.iter().position(|x| *x == c))
+                    .or_else(|| self.items.iter().position(|x| same_queued(x, &c)));
+                if let Some(i) = i {
                     self.items.remove(i);
                 }
             }
@@ -2397,6 +2422,55 @@ mod tests {
         again.read(&path).unwrap();
         assert_eq!(again.shown(), ["cuarto"]);
         assert_eq!(again.offset(), std::fs::metadata(&path).unwrap().len());
+    }
+
+    /// Claude Code apunta un mensaje de otra sesión al encolarlo con un atributo (`hop-chain`)
+    /// que ya no lleva al quitarlo: aun así se quita, y lo siguiente que coge es lo del usuario.
+    #[test]
+    fn a_notice_leaves_the_queue_though_its_tag_changed() {
+        for op in ["remove", "popAll"] {
+            let mut q = Queue::default();
+            let ops = [
+                (
+                    "enqueue",
+                    Some(
+                        "<cross-session-message from=\"x\" hop-chain=\"abc\" from-name=\"otra\">\nhola\n</cross-session-message>",
+                    ),
+                ),
+                (
+                    op,
+                    Some(
+                        "<cross-session-message from=\"x\" from-name=\"otra\">\nhola\n</cross-session-message>",
+                    ),
+                ),
+                ("enqueue", Some("esta clara?")),
+                ("dequeue", None),
+                ("enqueue", Some("Me mandan esto")),
+                ("dequeue", None),
+                ("enqueue", Some("me dicen otra cosa")),
+            ];
+            for (o, c) in ops {
+                q.apply(o, c.map(str::to_owned));
+            }
+            assert_eq!(q.shown(), ["me dicen otra cosa"], "{op}");
+            assert_eq!(q.items.len(), 1, "{op}: {:?}", q.items);
+        }
+    }
+
+    #[test]
+    fn notices_match_by_tag_and_body() {
+        let a = "<m from=\"x\" hop=\"1\">\nhola\n</m>";
+        assert!(same_queued(a, a));
+        assert!(same_queued(a, "<m from=\"x\">\nhola\n</m>"));
+        assert!(same_queued(a, "  <m>\nhola\n</m>"));
+        // Otra etiqueta u otro cuerpo, no.
+        assert!(!same_queued(a, "<n from=\"x\">\nhola\n</m>"));
+        assert!(!same_queued(a, "<mm from=\"x\">\nhola\n</m>"));
+        assert!(!same_queued(a, "<m from=\"x\">\nadiós\n</m>"));
+        // Lo que escribe el usuario, solo igual.
+        assert!(!same_queued("hola>que", "hola>que tal"));
+        assert!(!same_queued("a <b>x", "a <c>x"));
+        assert!(!same_queued(a, "\nhola\n</m>"));
     }
 
     #[test]

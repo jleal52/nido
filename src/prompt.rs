@@ -2248,8 +2248,8 @@ const CTRL_S: &[u8] = b"\x13";
 const BACKSPACE: &[u8] = b"\x7f";
 
 /// Claude tiene mensajes en cola: encima de su caja, cada uno como `❯ texto` (las líneas que
-/// siguen, sangradas) y, debajo de todos, una vez, «ctrl+x ctrl+s to send now». Cuántos son no se
-/// cuenta aquí (un mensaje puede tener varias líneas): eso lo dice la transcripción.
+/// siguen, sangradas) y, debajo de todos, una vez, «ctrl+x ctrl+s to send now». Cuántos son, lo
+/// dice [`queue_count`]; qué dicen, la transcripción.
 pub fn queue_shown(screen: &str) -> bool {
     let plain: Vec<String> = screen.lines().map(strip_sgr).collect();
     let Some(at) = plain.iter().rposition(|l| l.trim().starts_with(SEND_NOW)) else {
@@ -2272,6 +2272,52 @@ pub fn queue_shown(screen: &str) -> bool {
         .iter()
         .take_while(|l| !edge(l))
         .all(|l| !l.trim_start().starts_with(['❯', '⏺', '●']))
+}
+
+/// Cuántos mensajes enseña Claude en cola (ver [`queue_shown`]), si la tiene: los `❯` del bloque
+/// que acaba en «ctrl+x ctrl+s to send now». Se cuentan de abajo arriba: las líneas sangradas
+/// siguen el mensaje de encima, y una en blanco también si debajo tiene una sangrada (un mensaje
+/// con una línea vacía); en blanco justo encima de un `❯`, el bloque empieza ahí (lo de más
+/// arriba es la conversación, que puede acabar en un `❯` tuyo). Si el bloque llega arriba del
+/// todo, `None`: la pantalla no tiene por qué enseñarlo entero.
+pub fn queue_count(screen: &str) -> Option<usize> {
+    if !queue_shown(screen) {
+        return None;
+    }
+    let plain: Vec<String> = screen.lines().map(strip_sgr).collect();
+    let at = plain.iter().rposition(|l| l.trim().starts_with(SEND_NOW))?;
+    let indented = |l: &str| l.starts_with([' ', '\u{a0}']);
+    let mut count = 0;
+    // Lo de debajo de la línea que se mira: si era un `❯`, una en blanco cierra el bloque.
+    let mut below_entry = false;
+    for l in plain[..at].iter().rev() {
+        if l.trim().is_empty() {
+            if below_entry {
+                return (count > 0).then_some(count);
+            }
+        } else if l.starts_with('❯') {
+            count += 1;
+            below_entry = true;
+            continue;
+        } else if !indented(l) {
+            return (count > 0).then_some(count);
+        }
+        below_entry = false;
+    }
+    // Llega arriba del todo sin ver dónde empieza: la cola puede seguir por encima de la
+    // pantalla, y contar de menos escondería mensajes.
+    None
+}
+
+/// Lo que hay en cola según la transcripción (`queued`), con lo que dice la pantalla: si se ven
+/// N, los N últimos (o los que haya, si son menos). Lo que no se haya quitado bien de la
+/// transcripción queda delante y no se enseña.
+pub fn queued_on_screen(screen: &str, mut queued: Vec<String>) -> Vec<String> {
+    if let Some(n) = queue_count(screen) {
+        let extra = queued.len().saturating_sub(n);
+        queued.drain(..extra);
+    }
+    queued
 }
 
 const NO_QUEUE: &str = "Claude no tiene mensajes en cola";
@@ -2332,6 +2378,9 @@ pub async fn edit_queue<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     popped: impl Fn() -> Vec<String>,
 ) -> Result<String, String> {
     let text = queue_screen(scr).await?;
+    // Los que se ven: lo que la transcripción no haya quitado bien no cuenta.
+    let n = queue_count(&text).unwrap_or(queued.len()).min(queued.len());
+    let queued = &queued[queued.len() - n..];
     match input_box(&text) {
         None => return Err("no se ve la caja de escribir de Claude".into()),
         Some(t) if !t.is_empty() && t != QUEUE_HINT => {
@@ -3731,6 +3780,76 @@ Compound command contains cd with write operation - manual approval required to 
             "❯ primero\n  ctrl+x ctrl+s to send now\n❯ primero\n\n⏺ Hecho.\n\n{rule}\n❯\u{a0}\n{rule}\n  ⏵⏵ auto mode on"
         );
         assert!(!queue_shown(&old));
+    }
+
+    #[test]
+    fn how_many_are_queued_on_screen() {
+        let real = std::fs::read_to_string(format!(
+            "{}/tests/pantallas/cola.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        // Uno de cinco líneas.
+        assert_eq!(queue_count(&real), Some(1));
+        assert_eq!(queue_count(&real.replace(SEND_NOW, "")), None);
+        let rule = "────────────────────────────────────────";
+        let tail = format!(
+            "\n\n✶ Pensando… (3s)\n\n{rule}\n❯\u{a0}\x1b[2mPress up to edit queued messages\x1b[22m\n{rule}\n  ⏵⏵ auto mode on · esc to interrupt"
+        );
+        let screen = |queue: &str| {
+            format!("⏺ Mirando los ficheros.\n\n{queue}\n  ctrl+x ctrl+s to send now{tail}")
+        };
+        assert_eq!(queue_count(&screen("❯\u{a0}solo")), Some(1));
+        // Tres, uno de varias líneas (con una en blanco) y con colores.
+        let three = screen(
+            "\x1b[2m❯\u{a0}primero\x1b[22m\n\x1b[2m❯\u{a0}segundo, que\x1b[22m\n\x1b[2m  sigue aquí\x1b[22m\n\n\x1b[2m  y aquí\x1b[22m\n\x1b[2m❯\u{a0}1. tercero\x1b[22m\n\x1b[2m  2. con lista\x1b[22m",
+        );
+        assert!(queue_shown(&three));
+        assert_eq!(queue_count(&three), Some(3));
+        // Lo que dijo el usuario antes (más arriba, separado por una línea en blanco) no cuenta.
+        let after_prompt = format!(
+            "❯ lo de antes\n\n❯\u{a0}primero\n❯\u{a0}segundo\n  ctrl+x ctrl+s to send now{tail}"
+        );
+        assert_eq!(queue_count(&after_prompt), Some(2));
+        // Al principio de la pantalla puede seguir por encima: no se sabe.
+        assert_eq!(
+            queue_count(&format!(
+                "❯\u{a0}primero\n  ctrl+x ctrl+s to send now{tail}"
+            )),
+            None
+        );
+        // Sin cola, nada.
+        assert_eq!(
+            queue_count(&format!(
+                "⏺ Hecho.\n\n{rule}\n❯\u{a0}\n{rule}\n  ⏵⏵ auto mode on"
+            )),
+            None
+        );
+    }
+
+    /// Lo que se enseña en cola: los últimos de la transcripción, tantos como hay en la pantalla.
+    #[test]
+    fn the_queue_is_trimmed_to_the_screen() {
+        let rule = "────────────────────────────────────────";
+        let tail = format!("\n\n{rule}\n❯\u{a0}\n{rule}\n  ⏵⏵ auto mode on");
+        let one = format!("⏺ Mirando.\n\n❯\u{a0}tercero\n  ctrl+x ctrl+s to send now{tail}");
+        let two = format!(
+            "⏺ Mirando.\n\n❯\u{a0}segundo\n❯\u{a0}tercero\n  ctrl+x ctrl+s to send now{tail}"
+        );
+        let q = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let all = q(&["fantasma", "segundo", "tercero"]);
+        assert_eq!(queued_on_screen(&one, all.clone()), q(&["tercero"]));
+        assert_eq!(
+            queued_on_screen(&two, all.clone()),
+            q(&["segundo", "tercero"])
+        );
+        // Menos de los que se ven: los que haya.
+        assert_eq!(queued_on_screen(&two, q(&["tercero"])), q(&["tercero"]));
+        assert_eq!(queued_on_screen(&two, vec![]), Vec::<String>::new());
+        // Sin poder contarlos (aquí, la cola llega arriba de la pantalla), todos.
+        let top = format!("❯\u{a0}segundo\n❯\u{a0}tercero\n  ctrl+x ctrl+s to send now{tail}");
+        assert_eq!(queued_on_screen(&top, all.clone()), all);
+        assert_eq!(queued_on_screen("nada", all.clone()), all);
     }
 
     #[test]

@@ -4022,6 +4022,8 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                         {
                             let st2 = st.clone();
                             let queued = tokio::task::spawn_blocking(move || st2.queue_of(&p).0).await.unwrap_or_default();
+                            // Como se mandó: los que se ven en la pantalla.
+                            let queued = prompt::queued_on_screen(last_screen.as_deref().unwrap_or_default(), queued);
                             if queued != last_queued {
                                 last_screen = None;
                                 screen_due.get_or_insert_with(tokio::time::Instant::now);
@@ -4149,11 +4151,13 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                         // El modo de permisos, según el pie.
                         let mode = prompt::mode(&text);
                         // Lo que hay en cola, si Claude lo enseña (si no, nada: un Esc o algo que
-                        // no se entienda en la transcripción no deja mensajes fantasma).
+                        // no se entienda en la transcripción no deja mensajes fantasma), y no más
+                        // de los que enseña: los últimos.
                         let queued = match path.clone() {
                             Some(p) if prompt::queue_shown(&text) => {
                                 let st2 = st.clone();
-                                tokio::task::spawn_blocking(move || st2.queue_of(&p).0).await.unwrap_or_default()
+                                let queued = tokio::task::spawn_blocking(move || st2.queue_of(&p).0).await.unwrap_or_default();
+                                prompt::queued_on_screen(&text, queued)
                             }
                             _ => Vec::new(),
                         };
