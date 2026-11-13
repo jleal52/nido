@@ -44,6 +44,11 @@ pub struct Opt {
     pub checked: Option<bool>,
     /// Es un campo de texto («Type something», «Tell Claude what to change»).
     pub input: bool,
+    /// En una pregunta con vista previa (el recuadro a la derecha de las opciones): la suya.
+    /// La pantalla solo enseña la de la opción del cursor; las demás las pone `nido serve` desde
+    /// la transcripción.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -136,6 +141,78 @@ impl Menu {
                 let (t, q) = (norm(t), norm(question));
                 !q.is_empty() && (t == q || t.starts_with(&q) || q.starts_with(&t))
             })
+    }
+
+    /// Las vistas previas de todas las opciones, de la llamada a AskUserQuestion (`ask`: sus
+    /// `questions`, como las da la transcripción): la pantalla solo enseña la de la opción del
+    /// cursor, y partida en líneas. La pregunta es la del título (o, si no se reconoce, la que
+    /// tenga todas las opciones de la pantalla); cada opción, la de su etiqueta («Tilde» vale
+    /// para «Tilde (Recommended)»). Lo que no case se queda como estaba.
+    pub fn fill_previews(&mut self, ask: &serde_json::Value) {
+        use serde_json::Value;
+        if self.kind != Kind::Question {
+            return;
+        }
+        let Some(questions) = ask.get("questions").and_then(Value::as_array) else {
+            return;
+        };
+        let options = |q: &Value| -> Vec<(String, Option<String>)> {
+            q.get("options")
+                .and_then(Value::as_array)
+                .map(|o| o.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|o| {
+                    let label = o.get("label").and_then(Value::as_str).unwrap_or_default();
+                    let preview = o
+                        .get("preview")
+                        .and_then(Value::as_str)
+                        .filter(|p| !p.trim().is_empty())
+                        .map(|p| p.trim_end().to_owned());
+                    (norm(label), preview)
+                })
+                .collect()
+        };
+        let find = |opts: &[(String, Option<String>)], o: &Opt| -> Option<usize> {
+            let label = norm(o.label.trim_end_matches('…'));
+            if label.is_empty() {
+                return None;
+            }
+            opts.iter()
+                .position(|(l, _)| *l == label)
+                .or_else(|| opts.iter().position(|(l, _)| l.starts_with(&label)))
+        };
+        let chosen = |o: &&Opt| !o.input && !o.label.starts_with("Chat about this");
+        let q = questions
+            .iter()
+            .find(|q| {
+                q.get("question")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| self.shows_question(t))
+            })
+            .or_else(|| {
+                questions.iter().find(|q| {
+                    let opts = options(q);
+                    self.options.iter().filter(chosen).count() > 0
+                        && self
+                            .options
+                            .iter()
+                            .filter(chosen)
+                            .all(|o| find(&opts, o).is_some())
+                })
+            });
+        let Some(q) = q else {
+            return;
+        };
+        let opts = options(q);
+        for o in self.options.iter_mut() {
+            if !o.input
+                && let Some(i) = find(&opts, o)
+                && let Some(p) = &opts[i].1
+            {
+                o.preview = Some(p.clone());
+            }
+        }
     }
 }
 
@@ -372,6 +449,33 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
     }
     found.reverse();
 
+    // Con vista previa, Claude pinta a la derecha de las opciones un recuadro con la de la opción
+    // del cursor (y debajo, «Notes: press n to add notes»): se quita de las líneas antes de leerlas.
+    let shown = preview_box(lines, found[0]);
+    let cut: Vec<String>;
+    let lines: Vec<&str> = match &shown {
+        Some(b) => {
+            cut = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    if (b.top..b.end).contains(&i) {
+                        l.chars()
+                            .take(b.col)
+                            .collect::<String>()
+                            .trim_end()
+                            .to_owned()
+                    } else {
+                        (*l).to_owned()
+                    }
+                })
+                .collect();
+            cut.iter().map(String::as_str).collect()
+        }
+        None => lines.to_vec(),
+    };
+    let lines = lines.as_slice();
+
     // Cada opción con lo que lleva debajo; la fila «Next»/«Submit»; lo que hay al final.
     let mut options = Vec::new();
     let mut rows = Vec::new();
@@ -419,6 +523,7 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
             detail: (!detail.is_empty()).then(|| detail.join(" ")),
             selected,
             checked,
+            preview: shown.as_ref().filter(|_| selected).map(|b| b.text.clone()),
         });
     }
     // Lo que no esté justo debajo de la última opción: la ayuda.
@@ -510,6 +615,69 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
     };
     // Un menú de verdad tiene el cursor en alguna fila (una lista numerada de Claude, no).
     menu.selected_row().is_some().then_some(menu)
+}
+
+/// El recuadro de la vista previa de una pregunta: su columna, de qué línea a cuál hay que
+/// cortar (`top..end`: hasta la raya de debajo de las opciones, por el «Notes:») y lo de dentro.
+struct PreviewBox {
+    col: usize,
+    top: usize,
+    end: usize,
+    text: String,
+}
+
+/// Busca el recuadro (`┌…┐` / `│…│` / `└…┘`) a la derecha de las opciones, desde la primera
+/// (`first`).
+fn preview_box(lines: &[&str], first: usize) -> Option<PreviewBox> {
+    let (top, col) = lines
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(4)
+        .find_map(|(i, l)| {
+            let col = l.chars().position(|c| c == '┌')?;
+            let before: String = l.chars().take(col).collect();
+            (col > 0 && before.ends_with(' ') && !before.trim().is_empty()).then_some((i, col))
+        })?;
+    let at = |l: &str| l.chars().nth(col);
+    let bottom = (top + 1..lines.len()).find(|&i| at(lines[i]) != Some('│'))?;
+    if at(lines[bottom]) != Some('└') {
+        return None;
+    }
+    let text = lines[top + 1..bottom]
+        .iter()
+        .map(|l| {
+            let inner: String = l.chars().skip(col + 1).collect();
+            let inner = inner.trim_end();
+            let inner = inner.strip_suffix('│').unwrap_or(inner);
+            inner
+                .strip_prefix(' ')
+                .unwrap_or(inner)
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    // Sin la sangría que tengan todas las líneas en común.
+    let common = text
+        .iter()
+        .filter(|l| !l.is_empty())
+        .map(|l| indent(l))
+        .min()
+        .unwrap_or(0);
+    let text = text
+        .iter()
+        .map(|l| l.chars().skip(common).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let end = (bottom + 1..lines.len())
+        .find(|&i| is_rule(lines[i]))
+        .unwrap_or(lines.len());
+    Some(PreviewBox {
+        col,
+        top,
+        end,
+        text,
+    })
 }
 
 /// Una raya de trazos (`╌╌╌`): dentro del recuadro de un permiso rodea la orden (la de arriba del
@@ -628,6 +796,7 @@ fn unnumbered(lines: &[&str]) -> Option<Menu> {
             detail: None,
             selected: i == sel,
             checked: None,
+            preview: None,
             input: false,
         })
         .collect();
@@ -2750,6 +2919,71 @@ mod tests {
     }
 
     #[test]
+    fn question_with_preview_box() {
+        let m = screen("pregunta_vista_previa").unwrap();
+        assert_eq!(m.kind, Kind::Question);
+        assert!(m.title.as_deref().unwrap().ends_with("¿Cómo lo dejo?"));
+        // El recuadro de la derecha no es de las etiquetas, ni «Notes:» una descripción.
+        assert_eq!(
+            labels(&m),
+            [
+                "Tilde en la píldora",
+                "«estimado» en la píldora",
+                "Solo en el detalle",
+                "Dejarlo como está"
+            ]
+        );
+        assert_eq!(m.options[0].detail.as_deref(), Some("(Recommended)"));
+        assert!(m.options[1..].iter().all(|o| o.detail.is_none()), "{m:#?}");
+        assert!(m.options.iter().all(|o| !o.input));
+        // La vista previa que se ve es la de la opción del cursor.
+        assert_eq!(
+            m.options[0].preview.as_deref(),
+            Some(
+                "Bandeja:  [ Caduca en ~10 días ]  Pendiente\n\
+                 Detalle:  Caduca (estimado)  23 nov, 06:35"
+            )
+        );
+        assert!(m.options[1..].iter().all(|o| o.preview.is_none()));
+    }
+
+    #[test]
+    fn previews_from_the_transcript() {
+        let mut m = screen("pregunta_vista_previa").unwrap();
+        let ask = serde_json::json!({"questions": [
+            {"question": "Otra cosa", "options": [{"label": "Tilde en la píldora", "preview": "no"}]},
+            {"question": "Las notificaciones pendientes muestran «Caduca en 10 días · 23 nov, 06:35». Esa fecha es estimada (puesta a disposición + 10 × 24 h), y el README de plazos.json dice que en pantalla el plazo lleva siempre «estimado». La maqueta del cliente no lo pone. ¿Cómo lo dejo?",
+             "options": [
+                {"label": "Tilde en la píldora (Recommended)", "preview": "Bandeja: [ Caduca en ~10 días ]\nDetalle: Caduca (estimado)\n"},
+                {"label": "«estimado» en la píldora", "preview": "Bandeja: [ Caduca (estimado) ]"},
+                {"label": "Solo en el detalle", "preview": ""},
+                {"label": "Dejarlo como está"}]}]});
+        m.fill_previews(&ask);
+        let previews: Vec<_> = m.options.iter().map(|o| o.preview.as_deref()).collect();
+        assert_eq!(
+            previews,
+            [
+                Some("Bandeja: [ Caduca en ~10 días ]\nDetalle: Caduca (estimado)"),
+                Some("Bandeja: [ Caduca (estimado) ]"),
+                None,
+                None
+            ]
+        );
+        // Sin el título, por las opciones.
+        let mut m = screen("pregunta_vista_previa").unwrap();
+        m.title = Some("cortado".into());
+        m.fill_previews(&ask);
+        assert_eq!(
+            m.options[1].preview.as_deref(),
+            Some("Bandeja: [ Caduca (estimado) ]")
+        );
+        // Una pregunta que no es esta: nada.
+        let mut m = screen("pregunta_barra").unwrap();
+        m.fill_previews(&ask);
+        assert!(m.options.iter().all(|o| o.preview.is_none()));
+    }
+
+    #[test]
     fn typed_text_is_still_the_input() {
         let m = screen("pregunta_texto").unwrap();
         assert_eq!(m.options[2].label, "morado claro");
@@ -4647,6 +4881,8 @@ pub(crate) mod fake {
         pub deaf_backspace: bool,
         /// Lo que se ha mandado a Claude con ctrl+x ctrl+s.
         pub sent_now: Vec<String>,
+        /// Una pantalla fija (una de `tests/pantallas`), en vez de la que se pinta.
+        pub raw: Option<String>,
     }
 
     impl Default for Claude {
@@ -4702,6 +4938,7 @@ pub(crate) mod fake {
                 send_now_ignored: false,
                 deaf_backspace: false,
                 sent_now: Vec::new(),
+                raw: None,
             }
         }
     }
@@ -4756,6 +4993,9 @@ pub(crate) mod fake {
         }
 
         pub fn screen(&self) -> String {
+            if let Some(raw) = &self.raw {
+                return raw.clone();
+            }
             let mut out: Vec<String> = self.log.clone();
             if self.ticker {
                 out.push(format!("  ✻ {}s", self.reads));

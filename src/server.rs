@@ -3916,6 +3916,8 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
     let mut last_screen: Option<String> = None;
     // Lo que había en cola en el último `screen` mandado.
     let mut last_queued: Vec<String> = Vec::new();
+    // La última AskUserQuestion de la transcripción: las vistas previas de sus opciones.
+    let mut last_ask: Option<serde_json::Value> = None;
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3973,6 +3975,20 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                             };
                             if let Some(chunk) = chunk {
                                 last_len = len;
+                                if reset || chunk.reset {
+                                    last_ask = None;
+                                }
+                                let ask = chunk.items.iter().rev().find_map(|i| match i {
+                                    crate::transcript::ChatItem::Tool { name, ask: Some(a), .. }
+                                        if name == "AskUserQuestion" => Some(a.clone()),
+                                    _ => None,
+                                });
+                                if ask.is_some() {
+                                    last_ask = ask;
+                                    // La pregunta pudo salir en pantalla antes: otra vez, con ellas.
+                                    last_screen = None;
+                                    screen_due.get_or_insert_with(tokio::time::Instant::now);
+                                }
                                 let send = first || reset || chunk.reset || !chunk.items.is_empty() || !chunk.results.is_empty();
                                 offset = chunk.offset;
                                 if send {
@@ -4037,7 +4053,10 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                     let text = String::from_utf8_lossy(&b).into_owned();
                     if last_screen.as_deref() != Some(text.as_str()) {
                         // El menú que haya (preguntas, permisos…), para contestarlo con botones.
-                        let menu = prompt::parse(&text);
+                        let mut menu = prompt::parse(&text);
+                        if let (Some(m), Some(ask)) = (menu.as_mut(), last_ask.as_ref()) {
+                            m.fill_previews(ask);
+                        }
                         let mut menu_v = serde_json::to_value(&menu).unwrap_or_default();
                         // Para aprobar el plan, el plan en sí (el de la transcripción puede ser viejo).
                         if let Some(plan) = menu.as_ref().and_then(|m| plan_text(&st.paths.home, m)) {
@@ -4474,6 +4493,59 @@ mod tests {
             .await
             .expect("no llegó otra vez la pantalla");
         assert_eq!(v["queued"], json!(["primero", "segundo"]), "{v}");
+    }
+
+    /// En una pregunta con vista previa, cada opción lleva la suya (de la transcripción), no solo
+    /// la del cursor (que es la que se ve).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_live_question_has_the_previews() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (_st, addr, id, claude, _guard) = with_fake_claude(tmp.path()).await;
+        claude.lock().unwrap().raw =
+            Some(include_str!("../tests/pantallas/pregunta_vista_previa.txt").to_owned());
+        let option = |label: &str, preview: &str| json!({"label": label, "description": "", "preview": preview});
+        fake_transcript(
+            tmp.path(),
+            &[
+                json!({"type": "assistant", "uuid": "a1", "message": {"content": [
+                {"type": "tool_use", "id": "t-1", "name": "AskUserQuestion", "input": {"questions": [{
+                    "question": "¿Cómo lo dejo?", "header": "«estimado»", "multiSelect": false,
+                    "options": [
+                        option("Tilde en la píldora (Recommended)", "Bandeja: [ ~10 días ]"),
+                        option("«estimado» en la píldora", "Bandeja: [ estimado ]"),
+                        option("Solo en el detalle", "Detalle: estimado"),
+                        option("Dejarlo como está", "Bandeja: [ 10 días ]"),
+                    ]}]}}]}}),
+            ],
+        );
+        let url = format!("ws://{addr}/api/v1/sessions/{id}/live");
+        let (mut live, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        // La primera pantalla puede llegar antes de leer la transcripción: hasta que las traiga.
+        let previews = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let v = next_screen(&mut live).await;
+                let p: Vec<_> = v["menu"]["options"]
+                    .as_array()
+                    .map(|o| o.iter().map(|o| o["preview"].clone()).collect())
+                    .unwrap_or_default();
+                if p.len() == 4 && p[1].is_string() {
+                    return p;
+                }
+            }
+        })
+        .await
+        .expect("no llegaron las vistas previas");
+        assert_eq!(
+            previews,
+            [
+                json!("Bandeja: [ ~10 días ]"),
+                json!("Bandeja: [ estimado ]"),
+                json!("Detalle: estimado"),
+                json!("Bandeja: [ 10 días ]")
+            ]
+        );
     }
 
     #[cfg(unix)]

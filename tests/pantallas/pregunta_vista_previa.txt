@@ -1,0 +1,20 @@
+  ⎿  Allowed by auto mode
+
+● La fecha es estimada: la ficha usa fecha_limite_estimada (puesta a disposición más 10 × 24 h), y la maqueta de las pendientes debe mostrar «estimado» como exige el README de plazos.json. · summary
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ «estimado»
+
+│ Las notificaciones pendientes muestran «Caduca en 10 días · 23 nov, 06:35». Esa fecha es estimada (puesta a disposición + 10 × 24 h), y el README de plazos.json dice que en pantalla el plazo lleva siempre «estimado». La maqueta del cliente no lo pone. ¿Cómo lo dejo?
+
+❯ 1. Tilde en la píldora      ┌────────────────────────────────────────────┐
+     (Recommended)            │ Bandeja:  [ Caduca en ~10 días ]  Pendiente │
+  2. «estimado» en la píldora │ Detalle:  Caduca (estimado)  23 nov, 06:35  │
+  3. Solo en el detalle       └────────────────────────────────────────────┘
+  4. Dejarlo como está
+                                Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel

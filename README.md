@@ -284,6 +284,11 @@ what one approves: the tool (`Bash command`), what it does, the command and Clau
 string with the lines as the terminal wrapped them, without their common indentation, without
 "Tip:" lines, at most 120 lines (then `…`). It is absent in other menus.
 
+In a question whose options have previews (the box Claude draws to the right of the options), each
+option of that `menu` has `preview`: its preview text, as given to AskUserQuestion in the
+transcript (the screen only shows the one of the option under the cursor; that one is used if the
+transcript does not have it). Options without a preview have no `preview`.
+
 `POST /api/v1/sessions/{id}/mode` `{"mode": "plan"}` changes Claude's permission mode by pressing
 shift+tab and reading the footer after each press, until it shows the mode asked for; it works
 while Claude is working too, and on the way it may briefly go through other modes. Returns
