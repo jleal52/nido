@@ -141,6 +141,17 @@ Cada Claude que lanza nido tiene el servidor MCP de nido (`nido mcp`), con estas
 - `clipboard`: un texto para que lo copies (un recuadro con un botón Copiar en la web y la app),
   y un aviso.
 - `send_file`: una copia de un fichero para abrirla o guardarla desde la web o la app, y un aviso.
+- `plan_set`, `plan_task`, `plan_get` y `plan_clear`: un plan de fases y tareas del trabajo de la
+  sesión, que ves al día en la web y en la app (un anillo con el % en la lista de sesiones y un
+  panel en la conversación). `plan_set` sustituye el plan entero (`{title?, phases: [{id, name,
+  tasks: [{id, name, status?, note?, by?}]}]}`); `plan_task` cambia una tarea (`{id, status,
+  note?, by?}`; `""` quita la nota o `by`). Los estados son `pending`, `in_progress`, `done`,
+  `skipped`, `blocked` y `failed`; las horas (`started`, `finished`) las pone nido. `by` dice quién
+  hace una tarea: otra sesión (`equipo/id`, que la web y la app enlazan) o un texto corto.
+  `plan_get` da el plan con sus horas (el de otra sesión, solo para leer, con `session`);
+  `plan_clear` lo borra. El plan se guarda con la sesión (sigue tras reiniciar y tras `/clear`) y
+  se va con `nido rm`. Ids de hasta 64 letras, dígitos, `.`, `_` o `-`, únicos en el plan; como
+  mucho 50 fases y 500 tareas.
 
 Lo que nido cambia en tu configuración de Claude:
 
@@ -151,11 +162,12 @@ Lo que nido cambia en tu configuración de Claude:
 - Las sesiones de Claude que lanza llevan `--dangerously-load-development-channels server:nido`
   (los channels están en vista previa, y el de nido es un channel de desarrollo) y
   `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert
-  mcp__nido__secret mcp__nido__clipboard mcp__nido__send_file`. Al cargar un channel de
+  mcp__nido__secret mcp__nido__clipboard mcp__nido__send_file mcp__nido__plan_set
+  mcp__nido__plan_task mcp__nido__plan_get mcp__nido__plan_clear`. Al cargar un channel de
   desarrollo, Claude enseña un aviso al arrancar: nido lo acepta por ti, pero solo si la lista es
   exactamente `server:nido`.
-- Solo esas siete herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo a ti
-  (`secret` lo controla su propio diálogo). `open`, `answer`, `close`, `start` y `stop` actúan
+- Solo esas once herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo a ti
+  (`secret` lo controla su propio diálogo), o llevan el plan de la propia sesión. `open`, `answer`, `close`, `start` y `stop` actúan
   sobre otras sesiones, así que pasan por el permiso de siempre de Claude (en modo auto, decide su
   clasificador).
 - También llevan `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,

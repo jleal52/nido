@@ -144,6 +144,17 @@ Each Claude that nido launches gets nido's MCP server (`nido mcp`), with these t
   output, the session runs `<command> | nido clip` (see
   [Secrets, texts and files](#secrets-texts-and-files)).
 - `send_file`: a copy of a file to open or save from the web or the app, and a notification.
+- `plan_set`, `plan_task`, `plan_get` and `plan_clear`: a plan of phases and tasks for the
+  session's work, which you see live in the web and the app (a ring with the % in the session
+  list, and a panel in the conversation). `plan_set` replaces the whole plan (`{title?, phases:
+  [{id, name, tasks: [{id, name, status?, note?, by?}]}]}`); `plan_task` changes one task
+  (`{id, status, note?, by?}`, where `""` removes the note or `by`). The statuses are `pending`,
+  `in_progress`, `done`, `skipped`, `blocked` and `failed`; nido stamps `started` and `finished`.
+  `by` says who does a task: another session (`machine/id`, which the web and the app link to) or
+  a short text. `plan_get` returns the plan with its times (another session's, read-only, with
+  `session`); `plan_clear` removes it. The plan is kept with the session (it survives restarts and
+  `/clear`) and goes with `nido rm`. Ids are up to 64 letters, digits, `.`, `_` or `-`, unique in
+  the plan; at most 50 phases and 500 tasks.
 
 What nido changes in your Claude setup:
 
@@ -154,11 +165,12 @@ What nido changes in your Claude setup:
 - The Claude sessions it launches get `--dangerously-load-development-channels server:nido`
   (channels are a research preview, and nido's is a development channel) and
   `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert
-  mcp__nido__secret mcp__nido__clipboard mcp__nido__send_file`. When it loads a development
+  mcp__nido__secret mcp__nido__clipboard mcp__nido__send_file mcp__nido__plan_set
+  mcp__nido__plan_task mcp__nido__plan_get mcp__nido__plan_clear`. When it loads a development
   channel, Claude shows a warning at startup: nido accepts it for you, but only when the list is
   exactly `server:nido`.
-- Only those seven tools run without asking: they look, talk, or ask and send things to you
-  (`secret` is controlled by its own dialog). `open`, `answer`, `close`, `start` and `stop` act
+- Only those eleven tools run without asking: they look, talk, or ask and send things to you
+  (`secret` is controlled by its own dialog), or keep the session's own plan. `open`, `answer`, `close`, `start` and `stop` act
   on other sessions, so they go through Claude's usual permission prompt (in auto mode, its
   classifier decides).
 - They also get `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
@@ -339,6 +351,14 @@ unread notification. Returns `{"ok": true}`; `404` if the session or the item do
 was already dismissed). Each session in `GET /api/v1/sessions` has `items_rev`, which changes
 whenever its items do (one sent, expired or dismissed; absent until they change after nido
 starts): when it changes, ask for the list again.
+
+The plan a session keeps with the `plan_*` tools: each session in `GET /api/v1/sessions` (and in
+`/api/v1/events`) that has one carries `plan: {title?, done, total, active, blocked, failed,
+current?, rev}` (`done` counts `done` and `skipped`; `current` is the name of the first task
+`in_progress`; `rev` changes with every change, and never repeats across restarts). `GET
+/api/v1/sessions/{id}/plan` returns the whole plan: `{title?, phases: [{id, name, tasks: [{id,
+name, status, note?, by?, started?, finished?}]}], updated}`, with times in milliseconds since
+1970; `404` if the session has no plan. When `rev` changes, ask for it again.
 
 ### Searching conversations
 
