@@ -938,6 +938,10 @@ const TABLE: &[(&str, &str)] = &[
     ("ese envío ha caducado", "that item has expired"),
     ("no existe ese envío", "no such item"),
     (
+        "no se pudo quitar el envío: {}",
+        "could not dismiss the item: {0}",
+    ),
+    (
         "nombre de secreto no válido: {} (letras, números, «.», «_» o «-»; hasta 64)",
         "invalid secret name: {0} (letters, digits, “.”, “_” or “-”; up to 64)",
     ),

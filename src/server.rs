@@ -544,6 +544,10 @@ pub struct SessionView {
     pub opened_by: Option<String>,
     /// Las alertas que mandó y el usuario aún no ha visto.
     pub alerts: Vec<AlertRec>,
+    /// Cuándo cambiaron por última vez sus envíos (ver `Outbox::rev`; 0: no desde que arrancó
+    /// nido): si cambia, la web y la app vuelven a pedirlos.
+    #[serde(skip_serializing_if = "crate::registry::is_zero")]
+    pub items_rev: u64,
     /// El secreto que espera que le den (ver `secrets::Asks`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<crate::secrets::AskView>,
@@ -743,6 +747,7 @@ impl AppState {
                 unread: finished > s.seen,
                 opened_by: s.opened_by.clone(),
                 alerts: unread_alerts(&s.alerts, s.seen),
+                items_rev: self.outbox.rev(&s.id),
                 secret: self.asks.view_for(&s.id),
                 alive,
                 claude: link.map(|l| ClaudeView {
@@ -2298,7 +2303,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/sessions/{id}/items/{item}",
-            get(crate::deliver::api_item),
+            get(crate::deliver::api_item).delete(crate::deliver::api_dismiss_item),
         )
         .route(
             "/api/v1/sessions/{id}/secret",
@@ -4117,6 +4122,7 @@ mod tests {
             unread: false,
             opened_by: None,
             alerts: vec![],
+            items_rev: 0,
             secret: None,
         }
     }
@@ -5513,6 +5519,77 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// `DELETE …/items/{item}`: fuera para todos (de la lista y su contenido) y sus notas; la
+    /// lista de sesiones lo dice con `items_rev`. Ya quitado, o uno que no existe: 404.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_dismiss_item_route() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let line = said_line("user", "u1", "hola", "2026-11-12T10:00:00Z");
+        let (st, addr, id) = with_transcript(tmp.path(), &line).await;
+        let a = st.outbox.add_text(&id, "uno", None, 1).unwrap();
+        let b = st.outbox.add_text(&id, "dos", None, 2).unwrap();
+        st.registry
+            .lock()
+            .await
+            .add_note(
+                &id,
+                "uno",
+                now_ms(),
+                Some(NoteKind::Clipboard),
+                Some(a.id.clone()),
+            )
+            .unwrap();
+        let rev = |l: &serde_json::Value| l[0]["items_rev"].as_u64().unwrap_or(0);
+        let (_, list) = get_json(addr, "/api/v1/sessions").await;
+        let before = rev(&list);
+        assert!(before > 0, "{list}");
+        assert_eq!(list[0]["alerts"][0]["item"], a.id.as_str());
+        let delete = |path: String| async move {
+            tokio::task::spawn_blocking(move || {
+                crate::client::Api { addr, token: None }
+                    .request_with("DELETE", &path, None, &[], None)
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+        };
+        let url = format!("/api/v1/sessions/{id}/items/{}", a.id);
+        assert_eq!(delete(url.clone()).await, (200, json!({"ok": true})));
+        let (code, r) = get_json(addr, &format!("/api/v1/sessions/{id}/items")).await;
+        assert_eq!(code, 200);
+        let ids: Vec<&str> = r["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [b.id.as_str()]);
+        let (code, r) = get_json(addr, &url).await;
+        assert_eq!((code, r["error"].as_str()), (404, Some("no such item")));
+        // Los demás dispositivos lo saben por la lista de sesiones; y su nota ya no sale.
+        let (_, list) = get_json(addr, "/api/v1/sessions").await;
+        assert!(rev(&list) > before, "{list}");
+        assert!(
+            list[0].get("alerts").is_none_or(|a| a == &json!([])),
+            "{list}"
+        );
+        // Otra vez, uno que no existe o de una sesión que no existe: 404.
+        let (code, r) = delete(url.clone()).await;
+        assert_eq!((code, r["error"].as_str()), (404, Some("no such item")));
+        let (code, _) = delete(format!("/api/v1/sessions/{id}/items/0a1b2c3d")).await;
+        assert_eq!(code, 404);
+        let (code, _) = delete(format!("/api/v1/sessions/nadie/items/{}", b.id)).await;
+        assert_eq!(code, 404);
+        // Una ruta que solo se pide (como `…/items/{item}` en un nido de antes): 405. La web y la
+        // app lo esconden entonces solo en ese dispositivo.
+        let (code, _) = delete(format!("/api/v1/sessions/{id}/items")).await;
+        assert_eq!(code, 405);
+        // El otro sigue ahí.
+        let (code, r) = get_json(addr, &format!("/api/v1/sessions/{id}/items/{}", b.id)).await;
+        assert_eq!((code, r), (200, json!("dos")));
     }
 
     fn said_line(kind: &str, uuid: &str, text: &str, ts: &str) -> String {

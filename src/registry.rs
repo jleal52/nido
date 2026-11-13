@@ -301,6 +301,17 @@ impl Registry {
         Ok(())
     }
 
+    /// Quita las notas del envío `item` (el usuario lo quitó): que no sigan sin leer ni saquen
+    /// popup de algo que ya no está. `false` si no tenía ninguna.
+    pub fn drop_item_notes(&mut self, id: &str, item: &str) -> Result<bool, RegistryError> {
+        let has = |s: &Session| s.alerts.iter().any(|a| a.item.as_deref() == Some(item));
+        if !self.get(id).is_some_and(has) {
+            return Ok(false);
+        }
+        self.update(id, |s| s.alerts.retain(|a| a.item.as_deref() != Some(item)))?;
+        Ok(true)
+    }
+
     /// Añade una alerta (una nota sin tipo).
     pub fn add_alert(&mut self, id: &str, text: &str, at: u64) -> Result<(), RegistryError> {
         self.add_note(id, text, at, None, None)
@@ -568,6 +579,14 @@ mod tests {
         );
         let json = serde_json::to_string(&a[0]).unwrap();
         assert!(json.contains(r#""kind":"clipboard""#), "{json}");
+        // Quitado el envío, fuera su nota; las demás se quedan.
+        assert!(r.drop_item_notes(&s.id, "it1").unwrap());
+        assert!(!r.drop_item_notes(&s.id, "it1").unwrap());
+        assert!(!r.drop_item_notes("no-existe", "it1").unwrap());
+        let back = Registry::load(&dir.path().join("s.json")).unwrap();
+        let a = &back.get(&s.id).unwrap().alerts;
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].text, "listo");
     }
 
     #[test]

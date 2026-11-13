@@ -2731,6 +2731,7 @@ mod tests {
             unread: false,
             opened_by: None,
             alerts: vec![],
+            items_rev: 0,
             secret: None,
         };
         let secs = Duration::from_secs;

@@ -206,6 +206,39 @@ pub async fn api_item(
     }
 }
 
+/// `DELETE /api/v1/sessions/{id}/items/{item}`: el usuario lo quita (✕): fuera su copia y de la
+/// lista, para todos sus dispositivos (lo ven por `items_rev` en la lista de sesiones), y sus
+/// notas sin leer. 404: no existe (o ya se quitó).
+pub async fn api_dismiss_item(
+    State(st): State<Arc<AppState>>,
+    UrlPath((id, item)): UrlPath<(String, String)>,
+) -> Response {
+    let s = match server::find_session(&st, &id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    // El índice y la copia, en el disco: fuera del hilo de tokio.
+    let done = {
+        let (st, id, item) = (st.clone(), s.id.clone(), item.clone());
+        tokio::task::spawn_blocking(move || st.outbox.dismiss(&id, &item)).await
+    };
+    match done {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return error(StatusCode::NOT_FOUND, "no existe ese envío"),
+        Ok(Err(e)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("no se pudo quitar el envío: {e}"),
+            );
+        }
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+    // Sus notas, fuera; y la lista de sesiones, otra vez (con el `items_rev` nuevo).
+    let _ = st.registry.lock().await.drop_item_notes(&s.id, &item);
+    st.scan().await;
+    Json(json!({ "ok": true })).into_response()
+}
+
 /// Lo que se lee de una vez al mandar una copia.
 const CHUNK: usize = 64 * 1024;
 

@@ -4,7 +4,8 @@
 //! push solo lleva el título.
 //!
 //! Las copias se borran a los 7 días o al cerrar la sesión, y entre todas no pasan de 256 MB por
-//! equipo: al pasarlo, fuera las más antiguas. Lo borrado sigue en el índice, caducado.
+//! equipo: al pasarlo, fuera las más antiguas. Lo borrado sigue en el índice, caducado. Lo que
+//! quita el usuario (✕, `dismiss`) sale también del índice.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -196,6 +197,9 @@ pub struct Outbox {
     cap: std::sync::atomic::AtomicU64,
     /// Una escritura del índice a la vez.
     lock: std::sync::Mutex<()>,
+    /// La versión de los envíos de cada sesión (ver `rev`) y la última que se dio. Aparte de
+    /// `lock`, que se tiene mientras se toca el disco: el escaneo la lee con el registro cogido.
+    revs: std::sync::Mutex<(std::collections::HashMap<String, u64>, u64)>,
 }
 
 /// Abre `path` para leerlo. En Unix sin esperar: una tubería sin nadie al otro lado no deja a
@@ -288,7 +292,28 @@ impl Outbox {
             secrets,
             cap: CAP.into(),
             lock: std::sync::Mutex::new(()),
+            revs: Default::default(),
         }
+    }
+
+    /// Cuándo cambiaron por última vez (ms, siempre creciente) los envíos de la sesión desde que
+    /// arrancó nido; 0 si no han cambiado. Va en la lista de sesiones (`items_rev`): cuando cambia,
+    /// la web y la app vuelven a pedir la lista de envíos (uno nuevo, uno caducado o uno que se
+    /// quitó desde otro dispositivo).
+    pub fn rev(&self, session: &str) -> u64 {
+        let revs = self.revs.lock().expect("versiones");
+        revs.0.get(session).copied().unwrap_or(0)
+    }
+
+    fn bump(&self, session: &str) {
+        let mut revs = self.revs.lock().expect("versiones");
+        let v = crate::registry::now_ms().max(revs.1 + 1);
+        revs.1 = v;
+        revs.0.insert(session.to_owned(), v);
+    }
+
+    fn forget_rev(&self, session: &str) {
+        self.revs.lock().expect("versiones").0.remove(session);
     }
 
     /// Para las pruebas.
@@ -322,7 +347,9 @@ impl Outbox {
 
     fn save_list(&self, session: &str, list: &[Item]) -> io::Result<()> {
         let json = serde_json::to_vec(list).map_err(io::Error::other)?;
-        crate::secrets::write_private(&self.index(session), &json)
+        crate::secrets::write_private(&self.index(session), &json)?;
+        self.bump(session);
+        Ok(())
     }
 
     /// La carpeta de la sesión, creada y solo para el usuario.
@@ -505,11 +532,28 @@ impl Outbox {
         path.is_file().then_some((item, path))
     }
 
+    /// El usuario lo quitó (✕, desde cualquier dispositivo): fuera su copia y del índice, para
+    /// todos. También uno caducado. `false`: no está (nunca estuvo, o ya se quitó).
+    pub fn dismiss(&self, session: &str, id: &str) -> io::Result<bool> {
+        let _one = self.lock.lock().expect("bandeja de salida");
+        let mut list = self.list(session);
+        let Some(i) = list.iter().position(|x| x.id == id) else {
+            return Ok(false);
+        };
+        let gone = list.remove(i);
+        self.save_list(session, &list)?;
+        // Después del índice: si no se puede borrar (en Windows, abierta mientras se baja), ya no
+        // está en el índice y `prune` la borra luego.
+        let _ = std::fs::remove_file(self.session_dir(session).join(&gone.id));
+        Ok(true)
+    }
+
     /// La sesión se cerró: fuera todo lo suyo.
     pub fn forget(&self, session: &str) {
         if valid_session(session) {
             let _one = self.lock.lock().expect("bandeja de salida");
             let _ = std::fs::remove_dir_all(self.session_dir(session));
+            self.forget_rev(session);
         }
     }
 
@@ -525,6 +569,7 @@ impl Outbox {
             let id = d.file_name().to_string_lossy().into_owned();
             if !live(&id) {
                 let _ = std::fs::remove_dir_all(d.path());
+                self.forget_rev(&id);
                 continue;
             }
             // Si el índice está pero no se puede leer, no se borra nada por él.
@@ -728,6 +773,34 @@ mod tests {
         assert!(o.list("bbbb2222").is_empty());
         o.forget("aaaa1111");
         assert!(o.list("aaaa1111").is_empty());
+    }
+
+    #[test]
+    fn a_dismissed_item_is_gone_for_everyone() {
+        let (tmp, o) = outbox();
+        let a = o.add_text("aaaa1111", "uno", None, 1).unwrap();
+        let b = o.add_text("aaaa1111", "dos", None, 2).unwrap();
+        let before = o.rev("aaaa1111");
+        assert!(before > 0);
+        assert!(o.dismiss("aaaa1111", &a.id).unwrap());
+        // Fuera del índice (no caducado: ya no sale) y su copia, del disco.
+        assert_eq!(o.list("aaaa1111"), std::slice::from_ref(&b));
+        assert!(o.open("aaaa1111", &a.id).is_none());
+        assert!(!tmp.path().join("outbox/aaaa1111").join(&a.id).exists());
+        assert!(o.rev("aaaa1111") > before, "la lista de sesiones lo dice");
+        // Ya quitado, de otra sesión o que nunca existió: no está.
+        assert!(!o.dismiss("aaaa1111", &a.id).unwrap());
+        assert!(!o.dismiss("bbbb2222", &b.id).unwrap());
+        assert!(!o.dismiss("aaaa1111", "0a1b2c3d").unwrap());
+        assert!(!o.dismiss("../x", &b.id).unwrap());
+        // Uno caducado también se quita.
+        o.prune(2 + KEEP_MS + 1, |_| true);
+        assert!(o.list("aaaa1111")[0].expired);
+        assert!(o.dismiss("aaaa1111", &b.id).unwrap());
+        assert!(o.list("aaaa1111").is_empty());
+        // Cerrada la sesión, sin versión.
+        o.forget("aaaa1111");
+        assert_eq!(o.rev("aaaa1111"), 0);
     }
 
     #[test]
