@@ -324,6 +324,17 @@ running, there is no queue on screen, a menu or a question is on screen, somethi
 Claude's input box, or ↑ did not move the queue to the box); if the box could not be emptied
 afterwards, `409` too, and the text stays in Claude's input box (visible in the terminal).
 
+What sessions send with `clipboard` and `send_file`: `GET /api/v1/sessions/{id}/items` lists
+them, oldest first (`{"items": [{"id", "kind": "clipboard" | "file", "title", "name", "size",
+"at", "expired"}, …]}`, expired ones included), and `GET /api/v1/sessions/{id}/items/{item}`
+returns the text or the file, always as an attachment (`410` if it expired, `404` if there is no
+such item). `DELETE /api/v1/sessions/{id}/items/{item}` dismisses one (the web's and the app's ✕)
+for every device: its copy is deleted and it leaves the list, expired or not, along with its
+unread notification. Returns `{"ok": true}`; `404` if the session or the item doesn't exist (or it
+was already dismissed). Each session in `GET /api/v1/sessions` has `items_rev`, which changes
+whenever its items do (one sent, expired or dismissed; absent until they change after nido
+starts): when it changes, ask for the list again.
+
 ### Searching conversations
 
 `GET /api/v1/search?q=<text>&limit=50` searches the current conversation of every Claude session
