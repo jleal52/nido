@@ -92,6 +92,12 @@ nido hub set wss://hub.example   # use a hub; `nido hub off` removes it
 nido hub test                    # test notification to your devices
 ```
 
+When nido is connected to a hub, the QR code of `nido pair` is a link to the hub's web app
+(`https://<hub>/app#nido=…`, the code after the `#`, which the browser doesn't send to the server):
+the phone's camera opens the web app, and the nido app scans it too. Without a hub, the QR code is
+the `nido://pair?…` code, for the app. `nido pair` always prints that code too, to paste it in the
+app or the web app.
+
 How it works:
 
 - **No open ports.** nido opens an outgoing connection to a *hub*, and the phone or browser joins
@@ -279,6 +285,13 @@ come in English, or in Spanish if the request asks for it with `Accept-Language:
 
 `DELETE /api/v1/phones/me`: the paired phone or browser that calls it signs itself out of every
 computer in the group (the web app's "Sign out").
+
+`POST /api/v1/pair` (body `{"days": 30}` optional, for a reusable code) creates a pairing code and
+returns `{"uri": "nido://pair?…", "expires", "reusable", "direct",
+"hub"}`. When nido is connected to the hub it also returns `link`, the hub's web app with the code
+after the `#`: `<hub>/app#nido=<uri encoded like encodeURIComponent>` (e.g.
+`https://hub.example.org/app#nido=nido%3A%2F%2Fpair%3F…`); without a hub there is no `link`.
+`DELETE /api/v1/pair` revokes the reusable code.
 
 Each Claude session in `GET /api/v1/sessions` has, in `claude`, `model` (the display name of the
 model of Claude's last reply, e.g. `"Opus 5.5"`, or the one nido last set; `null` if unknown) and

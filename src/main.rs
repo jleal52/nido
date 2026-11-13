@@ -514,7 +514,7 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             let body = days.map(|d| serde_json::json!({ "days": d }));
             let r = api.call("POST", "/api/v1/pair", body.as_ref())?;
             let uri = r["uri"].as_str().unwrap_or_default();
-            let qr = qrcode::QrCode::new(uri.as_bytes()).map_err(io::Error::other)?;
+            let qr = qrcode::QrCode::new(pair_qr_text(&r).as_bytes()).map_err(io::Error::other)?;
             println!(
                 "{}",
                 qr.render::<qrcode::render::unicode::Dense1x2>()
@@ -522,21 +522,15 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
                     .light_color(qrcode::render::unicode::Dense1x2::Dark)
                     .build()
             );
-            if r["reusable"] == true {
-                let days = (r["expires"].as_u64().unwrap_or(0).saturating_sub(
+            let days = (r["reusable"] == true).then(|| {
+                (r["expires"].as_u64().unwrap_or(0).saturating_sub(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs()),
                 ) + 3_599)
-                    / 86_400;
-                println!(
-                    "Código REUTILIZABLE: vale para cualquier número de dispositivos durante {days} días.\nQuien lo tenga puede manejar este equipo. Retíralo con `nido pair --stop`."
-                );
-            } else {
-                println!(
-                    "Escanéalo con la app de nido (Emparejar). Vale 10 minutos y una sola vez."
-                );
-            }
+                    / 86_400
+            });
+            println!("{}", pair_hint(pair_qr_text(&r) != uri, days));
             let direct: Vec<&str> = r["direct"]
                 .as_array()
                 .into_iter()
@@ -556,7 +550,7 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             println!(
                 "La clave de este nido está en ~/.config/nido/hub.key: si se pierde, hay que volver a emparejar los teléfonos."
             );
-            println!("Sin escáner, pega este código en la app:\n{uri}");
+            println!("Sin escáner, pega este código en la app o en la web:\n{uri}");
         }
         Cmd::Hub { action } => {
             let r = match action {
@@ -1569,6 +1563,39 @@ fn auto_line(v: &serde_json::Value) -> String {
     }
 }
 
+/// Lo que lleva el QR de `nido pair`: el enlace a la web del hub si lo hay (la cámara del móvil
+/// lo abre); si no (sin hub, o un nido de antes), el código `nido://pair?…`.
+fn pair_qr_text(r: &serde_json::Value) -> &str {
+    r["link"]
+        .as_str()
+        .filter(|l| !l.is_empty())
+        .or_else(|| r["uri"].as_str())
+        .unwrap_or_default()
+}
+
+/// Cómo escanear el QR de `nido pair` (`link`: es un enlace a la web) y cuánto vale (`days`: el
+/// código reutilizable).
+fn pair_hint(link: bool, days: Option<u64>) -> String {
+    let scan = if link {
+        "Escanéalo con la cámara del móvil (abre la web de nido) o con la app de nido (Emparejar)."
+    } else {
+        "Escanéalo con la app de nido (Emparejar)."
+    };
+    match days {
+        None => format!("{scan} Vale 10 minutos y una sola vez."),
+        Some(d) => {
+            let reusable = format!(
+                "Código REUTILIZABLE: vale para cualquier número de dispositivos durante {d} días.\nQuien lo tenga puede manejar este equipo. Retíralo con `nido pair --stop`."
+            );
+            if link {
+                format!("{scan}\n{reusable}")
+            } else {
+                reusable
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,6 +1608,40 @@ mod tests {
             hour,
             min,
         }
+    }
+
+    #[test]
+    fn the_pair_qr_is_the_link_if_there_is_one() {
+        let uri = "nido://pair?k=1";
+        let link = "https://hub.example.org/app#nido=nido%3A%2F%2Fpair%3Fk%3D1";
+        let r = serde_json::json!({ "uri": uri, "link": link });
+        assert_eq!(pair_qr_text(&r), link);
+        // Un nido de antes no manda `link`.
+        assert_eq!(pair_qr_text(&serde_json::json!({ "uri": uri })), uri);
+        assert_eq!(
+            pair_qr_text(&serde_json::json!({ "uri": uri, "link": "" })),
+            uri
+        );
+    }
+
+    #[test]
+    fn the_pair_hint_says_how_to_scan_and_how_long() {
+        assert_eq!(
+            pair_hint(false, None),
+            "Escanéalo con la app de nido (Emparejar). Vale 10 minutos y una sola vez."
+        );
+        assert_eq!(
+            pair_hint(true, None),
+            "Escanéalo con la cámara del móvil (abre la web de nido) o con la app de nido (Emparejar). Vale 10 minutos y una sola vez."
+        );
+        let reusable = "Código REUTILIZABLE: vale para cualquier número de dispositivos durante 30 días.\nQuien lo tenga puede manejar este equipo. Retíralo con `nido pair --stop`.";
+        assert_eq!(pair_hint(false, Some(30)), reusable);
+        assert_eq!(
+            pair_hint(true, Some(30)),
+            format!(
+                "Escanéalo con la cámara del móvil (abre la web de nido) o con la app de nido (Emparejar).\n{reusable}"
+            )
+        );
     }
 
     #[test]

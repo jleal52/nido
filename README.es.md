@@ -92,6 +92,12 @@ nido hub set wss://hub.ejemplo   # usar un hub; `nido hub off` lo quita
 nido hub test                    # aviso de prueba a los dispositivos
 ```
 
+Si nido está conectado a un hub, el QR de `nido pair` es un enlace a la web del hub
+(`https://<hub>/app#nido=…`, con el código detrás del `#`, que el navegador no manda al servidor):
+la cámara del móvil abre la web, y la app de nido también lo lee. Sin hub, el QR es el código
+`nido://pair?…`, para la app. `nido pair` escribe siempre también ese código, para pegarlo en la
+app o en la web.
+
 Cómo funciona:
 
 - **Sin puertos abiertos.** nido abre una conexión saliente con un *hub*, y el móvil o el
@@ -265,6 +271,13 @@ van en inglés, o en español si la petición lo pide con `Accept-Language: es`.
 
 `DELETE /api/v1/phones/me`: el teléfono o el navegador emparejado que la llama se da de baja en
 todos los equipos del grupo (el «Cerrar sesión» de la web).
+
+`POST /api/v1/pair` (con `{"days": 30}` opcional, para un código reutilizable) crea un código para
+emparejar y devuelve `{"uri": "nido://pair?…", "expires", "reusable",
+"direct", "hub"}`. Si nido está conectado al hub, también `link`, la web del hub con el código
+detrás del `#`: `<hub>/app#nido=<uri codificado como encodeURIComponent>` (por ejemplo
+`https://hub.example.org/app#nido=nido%3A%2F%2Fpair%3F…`); sin hub, no va `link`.
+`DELETE /api/v1/pair` retira el código reutilizable.
 
 ### Buscar en las conversaciones
 

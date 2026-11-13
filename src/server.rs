@@ -3653,14 +3653,43 @@ async fn api_pair(State(st): State<Arc<AppState>>, body: Option<Json<PairReq>>) 
         },
         None => st.pairing.offer(&st.identity, &direct, hub_ref),
     };
-    Json(serde_json::json!({
+    let link = hub.as_ref().map(|(u, _)| pair_link(u, &offer.uri));
+    let mut r = serde_json::json!({
         "uri": offer.uri,
         "expires": offer.expires,
         "reusable": days.is_some(),
         "direct": direct,
         "hub": hub.map(|(u, _)| u),
-    }))
-    .into_response()
+    });
+    // Solo con hub: sin él no hay web que abra el enlace.
+    if let Some(link) = link {
+        r["link"] = link.into();
+    }
+    Json(r).into_response()
+}
+
+/// El enlace del QR de `nido pair` con hub: la web del hub con el código en el `#` (que el
+/// navegador no manda al servidor). Lo abre la cámara del móvil y lo leen la web y la app.
+fn pair_link(hub: &str, uri: &str) -> String {
+    format!(
+        "{}/app#nido={}",
+        hub.trim_end_matches('/'),
+        encode_uri_component(uri)
+    )
+}
+
+/// Como `encodeURIComponent` de JS: todo menos `A-Za-z0-9-_.!~*'()` va como `%XX` (en UTF-8).
+fn encode_uri_component(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 /// Retira el código reutilizable.
@@ -4173,6 +4202,86 @@ mod tests {
         // Se para sin que nido lo vea (p. ej. mientras se reiniciaba): no se sabe, no la de antes.
         let after = stop_time(t1, false, false, 4_000);
         assert_eq!(since(false, None, after), None);
+    }
+
+    // ---------- El enlace del QR de `nido pair` ----------
+
+    #[test]
+    fn the_pair_code_is_encoded_like_encode_uri_component() {
+        // Lo que no toca `encodeURIComponent` pasa tal cual.
+        let keep = "AZaz09-_.!~*'()";
+        assert_eq!(encode_uri_component(keep), keep);
+        assert_eq!(
+            encode_uri_component("nido://pair?k=a+b/c=&x=1 2#ñ"),
+            "nido%3A%2F%2Fpair%3Fk%3Da%2Bb%2Fc%3D%26x%3D1%202%23%C3%B1"
+        );
+    }
+
+    #[test]
+    fn the_pair_link_goes_to_the_hub_web_with_the_code_after_the_hash() {
+        let uri = "nido://pair?k=a+b";
+        let want = "https://hub.example.org/app#nido=nido%3A%2F%2Fpair%3Fk%3Da%2Bb";
+        assert_eq!(pair_link("https://hub.example.org", uri), want);
+        assert_eq!(pair_link("https://hub.example.org/", uri), want);
+        // Con una ruta, la web cuelga de ella.
+        assert_eq!(
+            pair_link("https://hub.example.org/nido/", uri),
+            "https://hub.example.org/nido/app#nido=nido%3A%2F%2Fpair%3Fk%3Da%2Bb"
+        );
+    }
+
+    /// Lo que contesta `POST /api/v1/pair` (con `days` o sin él).
+    async fn pair_reply(st: &Arc<AppState>, days: Option<u64>) -> serde_json::Value {
+        let body = days.map(|d| Json(PairReq { days: Some(d) }));
+        let r = api_pair(State(st.clone()), body).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pair_gives_a_link_only_with_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, None, true).unwrap();
+
+        // Sin hub: ni `link` ni `hub`.
+        let r = pair_reply(&st, None).await;
+        assert!(r["uri"].as_str().unwrap().starts_with("nido://pair?"));
+        assert!(r.get("link").is_none(), "{r}");
+        assert_eq!(r["hub"], serde_json::Value::Null);
+
+        // Conectado al hub: el enlace a su web, con el código de esta misma respuesta.
+        st.hub.status.send_modify(|s| {
+            s.url = Some("wss://hub.example.org/nido".into());
+            s.id = Some("este".into());
+            s.connected = true;
+        });
+        for days in [None, Some(3)] {
+            let r = pair_reply(&st, days).await;
+            let uri = r["uri"].as_str().unwrap();
+            let link = r["link"].as_str().unwrap();
+            assert_eq!(link, pair_link("https://hub.example.org/nido", uri));
+            assert!(
+                link.starts_with("https://hub.example.org/nido/app#nido=nido%3A%2F%2Fpair%3F"),
+                "{link}"
+            );
+            assert_eq!(r["reusable"], days.is_some());
+        }
+
+        // Si se cae la conexión, otra vez sin enlace.
+        st.hub.status.send_modify(|s| s.connected = false);
+        assert!(pair_reply(&st, None).await.get("link").is_none());
     }
 
     fn view(id: &str) -> SessionView {
