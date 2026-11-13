@@ -295,6 +295,28 @@ the model as the menu shows it; `400` without a model; `409` if it could not (Cl
 menu or a draft on screen, the option not in the menu, no "session only" in the menu…), after
 closing the menu with Esc if it was open.
 
+What is sent to Claude while it works waits in its queue (in the terminal, above its input box,
+with "ctrl+x ctrl+s to send now"). Each `screen` message of `/api/v1/sessions/{id}/live` has
+`queued`: the queued messages, oldest first, as Claude Code wrote them in the current transcript
+(e.g. `["first message", "second\nwith two lines"]`), without its own notices (background task
+notifications); always present, `[]` when there are none. It is `[]` whenever Claude's screen
+does not show the queue, whatever the transcript says.
+
+`POST /api/v1/sessions/{id}/queue/send` sends the queued messages to Claude right away, without
+waiting for it to finish what it is doing, by pressing ctrl+x ctrl+s, and waits until the queue
+is gone from the screen. Returns `{"ok": true}`; `409` if it could not (the session is not
+running, there is no queue on screen, a menu or a question is on screen, or the queue did not go
+away).
+
+`POST /api/v1/sessions/{id}/queue/edit` takes the queued messages back to edit them: with Claude's
+input box empty and the queue on screen, it presses ↑ (Claude moves every queued message into its
+input box, one per line, and empties the queue) and deletes that text from the box with
+backspace. Returns `{"ok": true, "text": "first message\nsecond\nwith two lines"}`: the messages
+joined with newlines, as the transcript recorded them. `409` if it could not (the session is not
+running, there is no queue on screen, a menu or a question is on screen, something is typed in
+Claude's input box, or ↑ did not move the queue to the box); if the box could not be emptied
+afterwards, `409` too, and the text stays in Claude's input box (visible in the terminal).
+
 ### Searching conversations
 
 `GET /api/v1/search?q=<text>&limit=50` searches the current conversation of every Claude session
