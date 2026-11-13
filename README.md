@@ -292,7 +292,7 @@ hub gives: `{"token", "expires", "project", "location", "host", "model"}`. The a
 straight from the browser or the app to the voice model's provider (Google's Gemini Live): it
 goes through neither nido nor the hub, which only hands out the token. Only a paired phone or
 browser can ask for it (`403` with the token in `~/.config/nido/token`). Errors: `503` if nido is
-not connected to a hub, `501` if the hub does not offer voice (an older hub that doesn't answer
+not connected to a hub (or the connection drops while asking), `501` if the hub does not offer voice (an older hub that doesn't answer
 counts as that, after 30 seconds), `429` if this computer reached the hub's voice limit, `502`
 for any other error from the hub. An older nido, without this endpoint, answers `404`.
 
