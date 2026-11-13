@@ -115,6 +115,8 @@ pub struct AppState {
     /// mientras esperan y aprovechan lo hecho; las que se cancelan, ni empiezan). Lo tiene el
     /// hilo que busca: aunque se cancele la petición, la siguiente espera a que acabe.
     searching: Arc<Mutex<()>>,
+    /// La cola de Claude de cada transcripción, leída poco a poco (ver `transcript::Queue`).
+    queues: std::sync::Mutex<std::collections::HashMap<PathBuf, crate::transcript::Queue>>,
 }
 
 /// Los modelos que se ofrecen si nido aún no ha visto el menú de `/model` (también valen como
@@ -644,6 +646,7 @@ impl AppState {
             model_chosen: Default::default(),
             search: Default::default(),
             searching: Default::default(),
+            queues: Default::default(),
         }))
     }
 
@@ -849,6 +852,17 @@ impl AppState {
     }
 
     /// Lo que enseñó el menú de `/model`: se guarda si cambió.
+    /// Lo que hay en la cola de Claude según la transcripción `path` (sin los avisos del
+    /// sistema), y hasta dónde está leída. Lee solo lo nuevo desde la vez anterior; bloquea.
+    fn queue_of(&self, path: &std::path::Path) -> (Vec<String>, u64) {
+        let mut queues = self.queues.lock().expect("colas");
+        let q = queues.entry(path.to_owned()).or_default();
+        if q.read(path).is_err() {
+            *q = Default::default();
+        }
+        (q.shown(), q.offset())
+    }
+
     fn remember_models(&self, models: Vec<String>) {
         let mut cur = self.models.lock().expect("modelos");
         if *cur == models || models.is_empty() {
@@ -2299,6 +2313,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sessions/{id}/answer", post(api_answer))
         .route("/api/v1/sessions/{id}/mode", post(api_mode))
         .route("/api/v1/sessions/{id}/model", post(api_model))
+        .route("/api/v1/sessions/{id}/queue/send", post(api_queue_send))
+        .route("/api/v1/sessions/{id}/queue/edit", post(api_queue_edit))
         .route("/api/v1/sessions/{id}/stop", post(api_stop))
         .route("/api/v1/sessions/{id}/restart", post(api_restart))
         .route("/api/v1/sessions/{id}/history", get(api_history))
@@ -3049,6 +3065,58 @@ async fn api_model(
     .await;
     match done {
         Ok(model) => Json(serde_json::json!({ "ok": true, "model": model })).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// Manda ya a Claude lo que tiene en cola (ctrl+x ctrl+s); ver [`prompt::send_queue`].
+async fn api_queue_send(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let s = match find_session(&st, &id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let done = typing(&st, &s.id, move |_, mut scr| {
+        Box::pin(async move { prompt::send_queue(&mut scr).await })
+    })
+    .await;
+    match done {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// Saca de la cola de Claude lo que tiene (↑) y lo borra de su caja, para editarlo en el chat:
+/// devuelve el texto, tal como lo apuntó la transcripción. Ver [`prompt::edit_queue`].
+async fn api_queue_edit(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let s = match find_session(&st, &id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Some(link) = s.claude.clone() else {
+        return error(StatusCode::CONFLICT, "en esta sesión no hay ningún Claude");
+    };
+    let done = typing(&st, &s.id, move |st, mut scr| {
+        Box::pin(async move {
+            // La cola de ahora y hasta dónde está leída la transcripción: lo que saque ↑ se
+            // apunta después.
+            let (path, queued, from) = tokio::task::spawn_blocking(move || {
+                let path = transcript_of(&st, &link);
+                let (queued, from) = path.as_deref().map(|p| st.queue_of(p)).unwrap_or_default();
+                (path, queued, from)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            let popped = move || {
+                path.as_deref()
+                    .map(|p| crate::transcript::popped_since(p, from))
+                    .unwrap_or_default()
+            };
+            prompt::edit_queue(&mut scr, &queued, popped).await
+        })
+    })
+    .await;
+    match done {
+        Ok(text) => Json(serde_json::json!({ "ok": true, "text": text })).into_response(),
         Err(r) => r,
     }
 }
@@ -3841,6 +3909,8 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
     let mut screen_due: Option<tokio::time::Instant> = Some(tokio::time::Instant::now());
     let mut screen_pending = false;
     let mut last_screen: Option<String> = None;
+    // Lo que había en cola en el último `screen` mandado.
+    let mut last_queued: Vec<String> = Vec::new();
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3871,6 +3941,19 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                             path = crate::transcript::find(&config, &link.session_id);
                         }
                         let len = path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+                        // Con la cola en pantalla, la transcripción puede apuntar lo encolado
+                        // después de pintarlo: si cambia lo que hay en cola, se manda otra vez.
+                        if len != last_len
+                            && let Some(p) = path.clone()
+                            && last_screen.as_deref().is_some_and(prompt::queue_shown)
+                        {
+                            let st2 = st.clone();
+                            let queued = tokio::task::spawn_blocking(move || st2.queue_of(&p).0).await.unwrap_or_default();
+                            if queued != last_queued {
+                                last_screen = None;
+                                screen_due.get_or_insert_with(tokio::time::Instant::now);
+                            }
+                        }
                         if first || reset || len != last_len {
                             let chunk = match &path {
                                 Some(p) => {
@@ -3963,19 +4046,30 @@ async fn live(mut socket: WebSocket, st: Arc<AppState>, id: String, q: LiveQuery
                         let background = prompt::background(&text).map(|b| background_json(&b));
                         // El modo de permisos, según el pie.
                         let mode = prompt::mode(&text);
-                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v, "suggestion": suggestion, "form": form, "background": background, "mode": mode });
+                        // Lo que hay en cola, si Claude lo enseña (si no, nada: un Esc o algo que
+                        // no se entienda en la transcripción no deja mensajes fantasma).
+                        let queued = match path.clone() {
+                            Some(p) if prompt::queue_shown(&text) => {
+                                let st2 = st.clone();
+                                tokio::task::spawn_blocking(move || st2.queue_of(&p).0).await.unwrap_or_default()
+                            }
+                            _ => Vec::new(),
+                        };
+                        let msg = serde_json::json!({ "type": "screen", "text": text, "menu": menu_v, "suggestion": suggestion, "form": form, "background": background, "mode": mode, "queued": queued });
                         if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                             return;
                         }
                         last_screen = Some(text);
+                        last_queued = queued;
                     }
                 }
                 Ok(Some(Frame::Exit(_))) | Ok(None) | Err(_) => {
                     holder = None;
                     screen_pending = false;
-                    let msg = serde_json::json!({ "type": "screen", "text": null, "mode": null });
+                    let msg = serde_json::json!({ "type": "screen", "text": null, "mode": null, "queued": [] });
                     let _ = socket.send(Message::Text(msg.to_string().into())).await;
                     last_screen = None;
+                    last_queued.clear();
                 }
                 Ok(Some(_)) => {}
             },
@@ -4185,6 +4279,195 @@ mod tests {
             (code, r["error"].as_str()),
             (409, Some("the session is not running"))
         );
+    }
+
+    /// La transcripción de la sesión de `with_fake_claude`, con estas líneas.
+    #[cfg(unix)]
+    fn fake_transcript(dir: &std::path::Path, lines: &[serde_json::Value]) {
+        let project = dir.join("claude/projects/-proyecto");
+        std::fs::create_dir_all(&project).unwrap();
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(project.join("conv.jsonl"), text).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn enqueue(content: &str) -> serde_json::Value {
+        json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": "2026-11-13T06:33:48.508Z",
+            "sessionId": "conv",
+            "content": content,
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_queue_routes() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, id, claude, guard) = with_fake_claude(tmp.path()).await;
+        fake_transcript(
+            tmp.path(),
+            &[
+                enqueue("primero"),
+                enqueue("<task-notification>\n<task-id>b1</task-id>\n</task-notification>"),
+                enqueue("segundo\ncon dos líneas"),
+            ],
+        );
+        for what in ["send", "edit"] {
+            let url = format!("/api/v1/sessions/{id}/queue/{what}");
+            // Sesión que no existe: 404.
+            let (code, _) = post(
+                addr,
+                format!("/api/v1/sessions/nadie/queue/{what}"),
+                json!({}),
+            )
+            .await;
+            assert_eq!(code, 404);
+            // Sin cola: 409.
+            let (code, r) = post(addr, url.clone(), json!({})).await;
+            assert_eq!(
+                (code, r["error"].as_str()),
+                (409, Some("Claude has no queued messages"))
+            );
+            // Con un permiso en pantalla: 409.
+            {
+                let mut c = claude.lock().unwrap();
+                c.working = true;
+                c.queue = vec!["primero".into(), "segundo\ncon dos líneas".into()];
+                c.permission = true;
+            }
+            let (code, r) = post(addr, url.clone(), json!({})).await;
+            assert_eq!(code, 409, "{r}");
+            assert!(claude.lock().unwrap().keys.is_empty());
+            let mut c = claude.lock().unwrap();
+            c.permission = false;
+            c.queue.clear();
+        }
+        // Con un borrador en la caja, editar: 409 sin tocar nada.
+        {
+            let mut c = claude.lock().unwrap();
+            c.queue = vec!["primero".into(), "segundo\ncon dos líneas".into()];
+            c.input = "a medio".into();
+        }
+        let (code, r) = post(addr, format!("/api/v1/sessions/{id}/queue/edit"), json!({})).await;
+        assert_eq!(code, 409, "{r}");
+        assert!(claude.lock().unwrap().keys.is_empty());
+        claude.lock().unwrap().input.clear();
+        // Editar: el texto, como lo apuntó la transcripción; la caja y la cola, vacías.
+        let (code, r) = post(addr, format!("/api/v1/sessions/{id}/queue/edit"), json!({})).await;
+        assert_eq!(
+            (code, r.clone()),
+            (
+                200,
+                json!({"ok": true, "text": "primero\nsegundo\ncon dos líneas"})
+            ),
+            "{r}"
+        );
+        {
+            let mut c = claude.lock().unwrap();
+            assert!(c.queue.is_empty() && c.input.is_empty() && c.sent_now.is_empty());
+            // Otra vez en cola, para mandarla ya.
+            c.queue = vec!["tercero".into()];
+            c.keys.clear();
+        }
+        let (code, r) = post(addr, format!("/api/v1/sessions/{id}/queue/send"), json!({})).await;
+        assert_eq!((code, r.clone()), (200, json!({"ok": true})), "{r}");
+        {
+            let c = claude.lock().unwrap();
+            assert_eq!(c.keys, [b"\x18".to_vec(), b"\x13".to_vec()]);
+            assert_eq!(c.sent_now, ["tercero"]);
+        }
+        // Que no se va: 409.
+        {
+            let mut c = claude.lock().unwrap();
+            c.queue = vec!["cuarto".into()];
+            c.send_now_ignored = true;
+        }
+        let (code, r) = post(addr, format!("/api/v1/sessions/{id}/queue/send"), json!({})).await;
+        assert_eq!(code, 409, "{r}");
+        // Parada: 409.
+        guard.abort();
+        let _ = guard.await;
+        std::fs::remove_file(st.paths.socket(&id)).unwrap();
+        let (code, r) = post(addr, format!("/api/v1/sessions/{id}/queue/send"), json!({})).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (409, Some("the session is not running"))
+        );
+    }
+
+    /// El siguiente `screen` de un `/live`.
+    #[cfg(unix)]
+    async fn next_screen(
+        live: &mut (
+                 impl futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin
+             ),
+    ) -> serde_json::Value {
+        use futures_util::StreamExt;
+        loop {
+            let msg = live.next().await.unwrap().unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                if v["type"] == "screen" {
+                    return v;
+                }
+            }
+        }
+    }
+
+    /// Los `screen` de `/live` llevan la cola: la de la transcripción, solo si Claude la enseña.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_live_screen_has_the_queue() {
+        use std::io::Write;
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let (_st, addr, id, claude, _guard) = with_fake_claude(tmp.path()).await;
+        let url = format!("ws://{addr}/api/v1/sessions/{id}/live");
+        // En la transcripción hay uno que Claude no enseña (p. ej. tras un Esc): nada.
+        fake_transcript(tmp.path(), &[enqueue("primero")]);
+        let (mut live, _) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
+        let v = next_screen(&mut live).await;
+        assert_eq!(v["queued"], json!([]), "{v}");
+        drop(live);
+        // Claude enseña dos, pero la transcripción solo ha apuntado el primero.
+        {
+            let mut c = claude.lock().unwrap();
+            c.working = true;
+            c.queue = vec!["primero".into(), "segundo".into()];
+        }
+        let (mut live, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let v = next_screen(&mut live).await;
+        assert_eq!(v["queued"], json!(["primero"]), "{v}");
+        assert!(
+            v["text"]
+                .as_str()
+                .unwrap()
+                .contains("ctrl+x ctrl+s to send now")
+        );
+        // Apunta el segundo (y un aviso del sistema, que no se enseña): llega otra vez la
+        // pantalla, con los dos, aunque no haya cambiado.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp.path().join("claude/projects/-proyecto/conv.jsonl"))
+            .unwrap();
+        for l in [
+            enqueue("<task-notification>\n</task-notification>"),
+            enqueue("segundo"),
+        ] {
+            writeln!(f, "{l}").unwrap();
+        }
+        let v = tokio::time::timeout(Duration::from_secs(20), next_screen(&mut live))
+            .await
+            .expect("no llegó otra vez la pantalla");
+        assert_eq!(v["queued"], json!(["primero", "segundo"]), "{v}");
     }
 
     #[cfg(unix)]

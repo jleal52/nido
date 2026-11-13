@@ -213,6 +213,8 @@ async fn sessions_end_to_end() {
                     Some("chat") => chat_ok = v["session_id"].is_null(),
                     Some("screen") => {
                         assert!(v.get("mode").is_some(), "{v}");
+                        // Sin Claude, nunca hay cola.
+                        assert_eq!(v["queued"], serde_json::json!([]), "{v}");
                         screen_ok |= v["text"].as_str().unwrap_or("").contains("en-vivo-42")
                             && v["mode"] == "plan"
                     }
