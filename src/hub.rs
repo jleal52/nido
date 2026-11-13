@@ -85,6 +85,51 @@ pub enum PushError {
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<(), PushError>>>>;
 
+/// Por qué no hay token de voz.
+#[derive(Debug, PartialEq)]
+pub enum VoiceError {
+    /// No hay conexión con el hub.
+    NoHub,
+    /// El hub no da voz (o no contesta, como uno antiguo, que no sabe qué es `voice`).
+    NotOffered,
+    /// Este nido ya pidió todos los que le tocan por ahora.
+    Limit,
+    Other(String),
+}
+
+impl VoiceError {
+    /// El mensaje para la API (en español; se traduce al responder).
+    pub fn message(&self) -> &str {
+        match self {
+            VoiceError::NoHub => "sin conexión con el hub",
+            VoiceError::NotOffered => VOICE_NOT_OFFERED,
+            VoiceError::Limit => VOICE_LIMIT,
+            VoiceError::Other(e) => e,
+        }
+    }
+
+    /// El error según el texto que manda el hub.
+    fn from_hub(error: &str) -> Self {
+        match error {
+            VOICE_NOT_OFFERED => VoiceError::NotOffered,
+            VOICE_LIMIT => VoiceError::Limit,
+            e => VoiceError::Other(e.to_owned()),
+        }
+    }
+}
+
+/// Lo que dice el hub cuando no tiene voz y cuando se pasa del límite.
+const VOICE_NOT_OFFERED: &str = "el hub no ofrece voz";
+const VOICE_LIMIT: &str = "límite de voz";
+
+/// Cuánto se espera el token: un hub antiguo no contesta nunca.
+#[cfg(not(test))]
+const VOICE_WAIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const VOICE_WAIT: Duration = Duration::from_secs(1);
+
+type VoicePending = Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>;
+
 /// El cliente: se reconecta solo y atiende los móviles que llegan por el hub.
 pub struct Hub {
     pub status: watch::Sender<HubStatus>,
@@ -93,6 +138,8 @@ pub struct Hub {
     /// Lo que va hacia el hub (mientras haya conexión).
     out: Mutex<Option<mpsc::Sender<Message>>>,
     pending: Pending,
+    /// Los pedidos de token de voz que esperan respuesta (lo que vino en `voiced`).
+    voice_pending: VoicePending,
     next_req: AtomicU64,
 }
 
@@ -108,6 +155,7 @@ impl Hub {
             config: watch::Sender::new(config),
             out: Default::default(),
             pending: Default::default(),
+            voice_pending: Default::default(),
             next_req: AtomicU64::new(1),
         })
     }
@@ -176,6 +224,58 @@ impl Hub {
                 self.pending.lock().expect("avisos").remove(&req);
                 Err(PushError::Other("el hub no contestó".into()))
             }
+        }
+    }
+
+    /// Pide al hub un token de voz para que la web o la app hablen con el modelo directamente.
+    /// Devuelve lo que da el hub (`token`, `expires`, `project`, `location`, `host`, `model`).
+    pub async fn voice_token(&self) -> Result<serde_json::Value, VoiceError> {
+        let out = self
+            .out
+            .lock()
+            .expect("hub")
+            .clone()
+            .ok_or(VoiceError::NoHub)?;
+        let req = self.next_req.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.voice_pending.lock().expect("voz").insert(req, tx);
+        let msg = serde_json::json!({ "voice": { "req": req } });
+        if out
+            .send(Message::Text(msg.to_string().into()))
+            .await
+            .is_err()
+        {
+            self.voice_pending.lock().expect("voz").remove(&req);
+            return Err(VoiceError::NoHub);
+        }
+        let mut v = match tokio::time::timeout(VOICE_WAIT, rx).await {
+            Ok(Ok(v)) => v,
+            _ => {
+                self.voice_pending.lock().expect("voz").remove(&req);
+                return Err(VoiceError::NotOffered);
+            }
+        };
+        if v["ok"] != true {
+            return Err(VoiceError::from_hub(
+                v["error"].as_str().unwrap_or_default(),
+            ));
+        }
+        if let Some(o) = v.as_object_mut() {
+            o.remove("req");
+            o.remove("ok");
+        }
+        Ok(v)
+    }
+
+    /// Si es una respuesta `{"voiced":{"req":N,…}}`, se la entrega a quien la espera.
+    fn voiced(&self, t: &str) {
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(t) else {
+            return;
+        };
+        if let Some(req) = v["voiced"]["req"].as_u64()
+            && let Some(waiter) = self.voice_pending.lock().expect("voz").remove(&req)
+        {
+            let _ = waiter.send(v["voiced"].take());
         }
     }
 
@@ -444,6 +544,8 @@ async fn run<H: e2e::Host>(
                             Err(PushError::Other(p.error.unwrap_or_default()))
                         };
                         let _ = waiter.send(r);
+                    } else {
+                        hub.voiced(&t);
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
@@ -491,5 +593,149 @@ mod tests {
             .unwrap();
         assert_eq!(plain, br#"{"title":"proyecto-api"}"#);
         assert!(seal("corta", &serde_json::json!({})).is_none());
+    }
+
+    // ---------- El token de voz ----------
+
+    struct TestHost {
+        id: e2e::Identity,
+        pairing: e2e::Pairing,
+        phones: Mutex<e2e::Phones>,
+    }
+
+    impl e2e::Host for TestHost {
+        fn identity(&self) -> &e2e::Identity {
+            &self.id
+        }
+        fn pairing(&self) -> &e2e::Pairing {
+            &self.pairing
+        }
+        fn phones(&self) -> &Mutex<e2e::Phones> {
+            &self.phones
+        }
+        fn local_addr(&self) -> Option<std::net::SocketAddr> {
+            None
+        }
+        fn host_name(&self) -> String {
+            "equipo".into()
+        }
+    }
+
+    /// Un hub de mentira en `127.0.0.1`: pide la firma, da un id y contesta a cada
+    /// `{"voice":{"req":N}}` con lo que devuelva `answer(N)` (o nada, si da `None`).
+    async fn fake_hub(
+        answer: impl Fn(u64) -> Option<serde_json::Value> + Send + 'static,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let challenge = serde_json::json!({ "challenge": B64.encode([7u8; 32]) });
+            ws.send(Message::Text(challenge.to_string().into()))
+                .await
+                .unwrap();
+            // La firma: aquí no se comprueba.
+            while let Some(Ok(m)) = ws.next().await {
+                if m.is_text() {
+                    break;
+                }
+            }
+            ws.send(Message::Text(r#"{"id":"este"}"#.into()))
+                .await
+                .unwrap();
+            while let Some(Ok(m)) = ws.next().await {
+                let Message::Text(t) = m else { continue };
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if let Some(req) = v["voice"]["req"].as_u64()
+                    && let Some(reply) = answer(req)
+                {
+                    ws.send(Message::Text(reply.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        addr
+    }
+
+    /// Un nido conectado al hub de `addr`.
+    async fn connected(dir: &Path, addr: std::net::SocketAddr) -> Arc<Hub> {
+        let hub = Hub::new(dir.join("hub.json"));
+        hub.set_url(Some(format!("ws://{addr}")), None).unwrap();
+        let host = Arc::new(TestHost {
+            id: e2e::Identity::load_or_create(&dir.join("nido.key")).unwrap(),
+            pairing: e2e::Pairing::default(),
+            phones: Mutex::new(e2e::Phones::load(dir.join("phones.json"))),
+        });
+        spawn(hub.clone(), host);
+        let mut status = hub.status.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .expect("no se conectó al hub")
+            .unwrap();
+        hub
+    }
+
+    #[tokio::test]
+    async fn the_voice_token_comes_from_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let addr = fake_hub(|req| {
+            Some(serde_json::json!({ "voiced": {
+                "req": req, "ok": true, "token": "ya29.prueba", "expires": 1_700_000_000,
+                "project": "proyecto", "location": "eu", "host": "voz.example",
+                "model": "modelo-voz",
+            }}))
+        })
+        .await;
+        let hub = connected(tmp.path(), addr).await;
+        let v = hub.voice_token().await.unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "token": "ya29.prueba", "expires": 1_700_000_000, "project": "proyecto",
+                "location": "eu", "host": "voz.example", "model": "modelo-voz",
+            })
+        );
+        // Cada pedido con su número: un segundo también llega.
+        assert!(hub.voice_token().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_hub_errors_become_voice_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let addr = fake_hub(|req| {
+            let error = match req % 3 {
+                1 => "límite de voz",
+                2 => "el hub no ofrece voz",
+                _ => "invalid_grant",
+            };
+            Some(serde_json::json!({ "voiced": { "req": req, "ok": false, "error": error } }))
+        })
+        .await;
+        let hub = connected(tmp.path(), addr).await;
+        assert_eq!(hub.voice_token().await, Err(VoiceError::Limit));
+        assert_eq!(hub.voice_token().await, Err(VoiceError::NotOffered));
+        assert_eq!(
+            hub.voice_token().await,
+            Err(VoiceError::Other("invalid_grant".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_does_not_answer_does_not_offer_voice() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Un hub antiguo: no sabe qué es `voice` y no contesta.
+        let addr = fake_hub(|_| None).await;
+        let hub = connected(tmp.path(), addr).await;
+        assert_eq!(hub.voice_token().await, Err(VoiceError::NotOffered));
+        assert!(hub.voice_pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_hub_there_is_no_voice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = Hub::new(tmp.path().join("hub.json"));
+        assert_eq!(hub.voice_token().await, Err(VoiceError::NoHub));
     }
 }
