@@ -1,0 +1,21 @@
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Desplegar
+
+│ Ya están hechos y probados los dos arreglos: lo que Claude cuenta mientras trabaja sale en el chat, y las preguntas con recuadro enseñan la vista previa de cada opción. ¿Qué despliego? (Esta pregunta lleva vistas previas a propósito: mientras la ves, guardo tu pantalla
+│ para probar el arreglo con una de verdad.)
+
+❯ 1. Todo (Recommended)           ┌──────────────────────────────────────────────────────────────┐
+  2. nido y web                   │ 1. nido   → WSL (reinicio del servicio; las sesiones siguen) │
+  3. Solo nido en el WSL          │ 2. web    → hub.example.org (remoto)                         │
+                                  │ 3. app    → los dos teléfonos   (por wifi)                   │
+                                  │                                                              │
+                                  │ Mac y Windows siguen con nido 0.4.0                          │
+                                  └──────────────────────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── nido ─

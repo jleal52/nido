@@ -2947,6 +2947,34 @@ mod tests {
         assert!(m.options[1..].iter().all(|o| o.preview.is_none()));
     }
 
+    /// La de verdad (Claude Code 2.1.323): el recuadro, más alto que la lista; «Notes:» debajo,
+    /// tras una línea en blanco; sin descripciones.
+    #[test]
+    fn question_with_preview_box_real() {
+        let m = screen("pregunta_vista_previa_real").unwrap();
+        assert_eq!(m.kind, Kind::Question);
+        assert_eq!(
+            labels(&m),
+            ["Todo (Recommended)", "nido y web", "Solo nido en el WSL"]
+        );
+        assert!(
+            m.options.iter().all(|o| o.detail.is_none() && !o.input),
+            "{m:#?}"
+        );
+        assert_eq!(
+            m.options[0].preview.as_deref(),
+            Some(
+                "1. nido   → WSL (reinicio del servicio; las sesiones siguen)\n\
+                 2. web    → hub.example.org (remoto)\n\
+                 3. app    → los dos teléfonos   (por wifi)\n\
+                 \n\
+                 Mac y Windows siguen con nido 0.4.0"
+            )
+        );
+        assert!(m.options[1..].iter().all(|o| o.preview.is_none()));
+        assert!(m.title.as_deref().unwrap().starts_with("Ya están hechos"));
+    }
+
     #[test]
     fn previews_from_the_transcript() {
         let mut m = screen("pregunta_vista_previa").unwrap();
