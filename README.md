@@ -277,6 +277,13 @@ as requests). `GET /api/v1/info` has `models` too. Each `screen` message of
 `"manual"`, `"acceptEdits"`, `"plan"`, `"bypassPermissions"` or `null` (not shown or not
 understood, e.g. while a menu is open).
 
+The `menu` of each `screen` message of `/api/v1/sessions/{id}/live` (what Claude asks on screen,
+answered with `POST /api/v1/sessions/{id}/answer`) has `context` when Claude asks for permission
+(`"kind": "permission"`): what its dialog shows above "Do you want to proceed?", so that one knows
+what one approves: the tool (`Bash command`), what it does, the command and Claude's warnings, one
+string with the lines as the terminal wrapped them, without their common indentation, without
+"Tip:" lines, at most 120 lines (then `…`). It is absent in other menus.
+
 `POST /api/v1/sessions/{id}/mode` `{"mode": "plan"}` changes Claude's permission mode by pressing
 shift+tab and reading the footer after each press, until it shows the mode asked for; it works
 while Claude is working too, and on the way it may briefly go through other modes. Returns
