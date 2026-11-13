@@ -744,6 +744,10 @@ const TABLE: &[(&str, &str)] = &[
         "there is already something written in Claude's input box",
     ),
     (
+        "el mensaje solo tiene caracteres de control",
+        "the message only has control characters",
+    ),
+    (
         "Claude no ha cogido el texto (¿está arrancando?)",
         "Claude did not take the text (is it starting up?)",
     ),
@@ -1221,6 +1225,15 @@ mod tests {
         assert_eq!(
             english("la sesión ya no existe"),
             "the session no longer exists"
+        );
+    }
+
+    /// Los de contestar en nombre del usuario (el agente de voz).
+    #[test]
+    fn answer_refusals() {
+        assert_eq!(
+            english("el mensaje solo tiene caracteres de control"),
+            "the message only has control characters"
         );
     }
 

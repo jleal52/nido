@@ -1813,6 +1813,28 @@ fn not_in_model_dialog(screen: &str) -> Result<(), String> {
 const MODEL_DIALOG: &str =
     "en pantalla está el menú de /model: ciérralo desde la terminal (Esc), aquí no se contesta";
 
+const ONLY_CONTROL: &str = "el mensaje solo tiene caracteres de control";
+
+/// El texto que se pega, sin caracteres de control (C0 y C1) salvo los saltos de línea y los
+/// tabuladores: dentro de un pegado, `ESC[201~` lo terminaría y lo de detrás serían teclas
+/// (shift+tab cambia el modo, Esc interrumpe, ctrl+c sale). Los saltos de línea, con `\n`.
+fn paste_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// `text` (ya limpio, ver [`paste_text`]) como un pegado: así varias líneas no se mandan una a
+/// una.
+fn bracketed(text: &str) -> Vec<u8> {
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.extend_from_slice(text.as_bytes());
+    paste.extend_from_slice(b"\x1b[201~");
+    paste
+}
+
 /// Manda un mensaje a Claude: lo pega, espera a que la caja se quede quieta (con adjuntos,
 /// Claude tarda en cambiar las rutas por «[Image #1]»; un Enter que llega antes se pierde) y
 /// pulsa Enter; si la caja no se vacía, lo vuelve a pulsar.
@@ -1820,16 +1842,21 @@ pub async fn send_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scr: &mut Screen<R, W>,
     text: &str,
 ) -> Result<(), String> {
-    not_in_model_dialog(&scr.read().await?)?;
-    let text = text.trim();
+    let screen = scr.read().await?;
+    not_in_model_dialog(&screen)?;
+    let clean = paste_text(text);
+    // Solo caracteres de control: no es un Enter suelto.
+    if clean.trim().is_empty() && !text.trim().is_empty() {
+        return Err(ONLY_CONTROL.into());
+    }
+    let text = clean.trim();
     if !text.is_empty() {
-        let mut paste = b"\x1b[200~".to_vec();
-        paste.extend_from_slice(text.replace("\r\n", "\n").as_bytes());
-        paste.extend_from_slice(b"\x1b[201~");
+        let paste = bracketed(text);
         // Si Claude no lo coge (p. ej. aún arrancando), la caja sigue vacía: se pega otra vez.
         let mut written = false;
         for _ in 0..2 {
-            if input_box(&scr.read().await?).is_some_and(|t| !t.is_empty()) {
+            let screen = scr.read().await?;
+            if input_box(&screen).is_some_and(|t| !t.is_empty()) {
                 return Err("en la caja de Claude ya hay algo escrito".into());
             }
             scr.keys(&paste).await?;
@@ -2791,16 +2818,14 @@ pub async fn answer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         return Err("Claude no ha reaccionado a la opción".into());
     }
     // Lo que se escribe tras «No»: un mensaje a Claude, cuando vuelva a la caja de escribir.
-    if let Some(text) = req.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+    let text = req.text.as_deref().map(paste_text);
+    if let Some(text) = text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         let (gone, _) = scr.until(|x| x.is_none()).await?;
         if !gone {
             return Err("eligió la opción, pero no se pudo mandar el texto".into());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let mut paste = b"\x1b[200~".to_vec();
-        paste.extend_from_slice(text.as_bytes());
-        paste.extend_from_slice(b"\x1b[201~");
-        scr.keys(&paste).await?;
+        scr.keys(&bracketed(text)).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         scr.keys(b"\r").await?;
     }
@@ -4934,6 +4959,62 @@ Compound command contains cd with write operation - manual approval required to 
         assert_eq!(keys(&c), [b"/model".to_vec(), b"\r".to_vec()]);
         never_enter_in_the_menu(&c);
     }
+
+    // ---------- Mensajes y respuestas en nombre del usuario (el agente de voz) ----------
+
+    /// Lo pegado llega sin caracteres de control: ni el final del pegado (`ESC[201~`), que
+    /// convertiría lo de detrás en teclas (shift+tab, Esc, ctrl+c), ni otros. Los saltos de línea
+    /// y los tabuladores siguen.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_arrives_without_control_characters() {
+        let c = claude(|_| {});
+        let mut scr = fake::screen_of(&c);
+        let text = "hola\x1b[201~\x1b[Z\x03 mundo\r\nadiós\tya\rfin\u{7f}\u{9b}\u{0}!";
+        assert_eq!(send_message(&mut scr, text).await, Ok(()));
+        let clean = "hola[201~[Z mundo\nadiós\tya\nfin!";
+        let mut want = b"\x1b[200~".to_vec();
+        want.extend_from_slice(clean.as_bytes());
+        want.extend_from_slice(b"\x1b[201~");
+        let k = keys(&c);
+        assert_eq!(k.first(), Some(&want), "{k:?}");
+        let c = c.lock().unwrap();
+        assert!(c.after_paste.is_empty(), "{:?}", c.after_paste);
+        assert_eq!(c.mode, 0, "shift+tab: {k:?}");
+        assert_eq!(
+            c.log.last().map(String::as_str),
+            Some(&*format!("❯ {clean}"))
+        );
+    }
+
+    /// Lo que se escribe tras «No» en un permiso va igual: sin caracteres de control.
+    #[tokio::test(start_paused = true)]
+    async fn the_text_after_no_arrives_without_control_characters() {
+        let c = claude(|c| c.permission = true);
+        let mut scr = fake::screen_of(&c);
+        let req = Request {
+            option: Some("No".into()),
+            text: Some("mejor así\x1b[201~\x1b[Z\x03".into()),
+            ..Default::default()
+        };
+        assert_eq!(answer(&mut scr, &req).await, Ok(()));
+        let k = keys(&c);
+        assert_eq!(k[0], b"2");
+        assert_eq!(
+            k[1],
+            "\x1b[200~mejor así[201~[Z\x1b[201~".as_bytes(),
+            "{k:?}"
+        );
+        assert!(c.lock().unwrap().after_paste.is_empty());
+    }
+
+    /// Solo caracteres de control: no es un mensaje (ni un Enter suelto).
+    #[tokio::test(start_paused = true)]
+    async fn a_message_of_only_control_characters_is_refused() {
+        let c = claude(|_| {});
+        let mut scr = fake::screen_of(&c);
+        assert!(send_message(&mut scr, "\x1b\x03\r\n").await.is_err());
+        assert!(keys(&c).is_empty(), "{:?}", keys(&c));
+    }
 }
 
 /// Un Claude de mentira detrás de un guardián de mentira, para probar las secuencias que
@@ -5030,6 +5111,10 @@ pub(crate) mod fake {
         pub sent_now: Vec<String>,
         /// Una pantalla fija (una de `tests/pantallas`), en vez de la que se pinta.
         pub raw: Option<String>,
+        /// Lo que llegó detrás del final de un pegado, en la misma trama: teclas.
+        pub after_paste: Vec<Vec<u8>>,
+        /// La opción que se eligió en el permiso (con su número).
+        pub picked: Option<char>,
     }
 
     impl Default for Claude {
@@ -5086,6 +5171,8 @@ pub(crate) mod fake {
                 deaf_backspace: false,
                 sent_now: Vec::new(),
                 raw: None,
+                after_paste: Vec::new(),
+                picked: None,
             }
         }
     }
@@ -5165,6 +5252,7 @@ pub(crate) mod fake {
             } else if self.permission {
                 out.push(RULE.into());
                 out.push(" Bash command".into());
+                out.push(String::new());
                 out.push(" Do you want to proceed?".into());
                 out.push(" ❯ 1. Yes".into());
                 out.push("   2. No".into());
@@ -5246,6 +5334,22 @@ pub(crate) mod fake {
             self.keys.push(k.to_vec());
             if self.stall_after == Some(k) {
                 self.stall_next = true;
+            }
+            // Un pegado (bracketed paste): hasta su final, texto tal cual; lo que venga detrás en
+            // la misma trama ya serían teclas.
+            if let Some(body) = k.strip_prefix(b"\x1b[200~".as_slice()) {
+                let end = body.windows(6).position(|w| w == b"\x1b[201~");
+                let (text, rest) = match end {
+                    Some(e) => (&body[..e], &body[e + 6..]),
+                    None => (body, &[][..]),
+                };
+                if self.menu.is_none() && !self.permission && self.raw.is_none() {
+                    self.input.push_str(&String::from_utf8_lossy(text));
+                }
+                if !rest.is_empty() {
+                    self.after_paste.push(rest.to_vec());
+                }
+                return;
             }
             let chord = std::mem::take(&mut self.chord);
             match k {
@@ -5342,6 +5446,12 @@ pub(crate) mod fake {
                             }
                             (c, Some(_)) if c.is_ascii_digit() => self.digit_in_menu = true,
                             (_, Some(_)) => {}
+                            (c, None) if self.permission => {
+                                if c.is_ascii_digit() {
+                                    self.permission = false;
+                                    self.picked = Some(c);
+                                }
+                            }
                             ('\x7f', None) => {
                                 if !self.deaf_backspace {
                                     self.input.pop();

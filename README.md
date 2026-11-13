@@ -319,6 +319,12 @@ what one approves: the tool (`Bash command`), what it does, the command and Clau
 string with the lines as the terminal wrapped them, without their common indentation, without
 "Tip:" lines, at most 120 lines (then `…`). It is absent in other menus.
 
+`POST /api/v1/sessions/{id}/answer` with `{"message": "…"}` sends a message to Claude as if typed
+in its input box: it pastes the text (as a bracketed paste, so several lines don't go one by one)
+and presses Enter. Control characters other than newlines and tabs are removed first, so the text
+can neither end the paste nor turn into keystrokes (Esc, shift+tab, ctrl+c…); `409` if nothing but
+control characters is left.
+
 In a question whose options have previews (the box Claude draws to the right of the options), each
 option of that `menu` has `preview`: its preview text, as given to AskUserQuestion in the
 transcript (the screen only shows the one of the option under the cursor; that one is used if the
