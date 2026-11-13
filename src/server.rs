@@ -96,6 +96,8 @@ pub struct AppState {
     pub asks: crate::secrets::Asks,
     /// Lo que las sesiones mandan al usuario (`clipboard`, `send_file`).
     pub outbox: Arc<crate::outbox::Outbox>,
+    /// El plan de fases y tareas de cada sesión (`plan_*` del MCP).
+    pub plans: Arc<crate::plan::Plans>,
     /// Los modelos que se pueden elegir, como los enseñó el menú de `/model` la última vez que
     /// nido lo abrió (`<state>/models.json`); si nunca, `DEFAULT_MODELS`.
     models: std::sync::Mutex<Vec<String>>,
@@ -551,6 +553,10 @@ pub struct SessionView {
     /// El secreto que espera que le den (ver `secrets::Asks`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<crate::secrets::AskView>,
+    /// El resumen de su plan, si tiene (ver `plan::Summary`): si cambia su `rev`, la web y la app
+    /// vuelven a pedirlo (`GET /api/v1/sessions/{id}/plan`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<crate::plan::Summary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -604,6 +610,7 @@ impl AppState {
             secrets_dir.clone(),
         ));
         let secrets = Arc::new(crate::secrets::Store::new(secrets_dir));
+        let plans = Arc::new(crate::plan::Plans::new(paths.state.clone()));
         let models = load_models(&paths.state.join("models.json"));
         Ok(Arc::new(Self {
             paths,
@@ -643,6 +650,7 @@ impl AppState {
             secrets,
             asks: Default::default(),
             outbox,
+            plans,
             models: std::sync::Mutex::new(models),
             model_seen: Default::default(),
             model_refreshing: Mutex::new(()),
@@ -749,6 +757,7 @@ impl AppState {
                 alerts: unread_alerts(&s.alerts, s.seen),
                 items_rev: self.outbox.rev(&s.id),
                 secret: self.asks.view_for(&s.id),
+                plan: self.plans.summary(&s.id),
                 alive,
                 claude: link.map(|l| ClaudeView {
                     model: self.model_of(&s.id, &l, found.is_some()),
@@ -2301,6 +2310,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/sessions/{id}/items",
             get(crate::deliver::api_items),
         )
+        .route("/api/v1/sessions/{id}/plan", get(api_plan))
         .route(
             "/api/v1/sessions/{id}/items/{item}",
             get(crate::deliver::api_item).delete(crate::deliver::api_dismiss_item),
@@ -3272,20 +3282,45 @@ pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), Regist
     st.inbox.forget(id);
     st.asks.cancel_session(id);
     // Sus ficheros, sus secretos y sus envíos: se cerró. Borrar puede tardar: fuera del hilo.
-    let (dir, secrets, outbox) = (
+    let (dir, secrets, outbox, plans) = (
         st.paths.session_state(id),
         st.secrets.clone(),
         st.outbox.clone(),
+        st.plans.clone(),
     );
     let id_ = id.to_owned();
     let _ = tokio::task::spawn_blocking(move || {
         let _ = std::fs::remove_dir_all(dir);
         secrets.forget_session(&id_);
         outbox.forget(&id_);
+        // Después de borrar la carpeta: olvidarlo antes dejaría que un resumen pedido entre medias
+        // lo volviera a leer del disco.
+        plans.forget(&id_);
     })
     .await;
     st.refresh.notify_one();
     res.map(|_| ())
+}
+
+/// `GET /api/v1/sessions/{id}/plan`: el plan de la sesión, con sus horas (ms desde 1970); 404 si
+/// no tiene.
+async fn api_plan(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let s = match find_session(&st, &id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    // La primera vez se lee del disco: fuera del hilo de tokio.
+    let plan = tokio::task::spawn_blocking(move || st.plans.get(&s.id)).await;
+    match plan {
+        Ok(Some(plan)) => Json(plan).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "esta sesión no tiene plan"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Ha cambiado el plan de una sesión: la lista, otra vez (con el `rev` nuevo de su resumen).
+pub fn plan_changed(st: &AppState) {
+    st.refresh.notify_one();
 }
 
 #[derive(Deserialize)]
@@ -4157,6 +4192,7 @@ mod tests {
             alerts: vec![],
             items_rev: 0,
             secret: None,
+            plan: None,
         }
     }
 
@@ -5093,7 +5129,7 @@ mod tests {
     /// Al borrar una sesión se van su pregunta, sus secretos sin recordar y sus envíos; los
     /// recordados del equipo se quedan.
     #[tokio::test(flavor = "multi_thread")]
-    async fn deleting_a_session_drops_its_secrets_items_and_ask() {
+    async fn deleting_a_session_drops_its_secrets_items_ask_and_plan() {
         let _limit = crate::watchdog::limit(Duration::from_secs(60));
         let tmp = tempfile::tempdir().unwrap();
         let (st, _, _) = with_mac(tmp.path());
@@ -5121,12 +5157,21 @@ mod tests {
             .unwrap();
         st.outbox.add_text(&id, "hola", None, 1).unwrap();
         let (mut waiter, _) = st.asks.join("npm", "x", &id, 1).unwrap();
+        let plan: crate::plan::SetArgs =
+            serde_json::from_value(json!({"phases": [{"id": "f1", "name": "Uno"}]})).unwrap();
+        st.plans.set(&id, plan, 1).unwrap();
+        let plan_file = st.paths.session_state(&id).join("plan.json");
+        assert!(plan_file.exists());
         delete_session(&st, &id).await.unwrap();
         assert_eq!(waiter.wait().await.0, crate::secrets::Outcome::Closed);
         assert!(!own.exists() && !own.parent().unwrap().exists());
         assert!(team.exists());
         assert!(st.outbox.list(&id).is_empty());
         assert!(!st.paths.state.join("outbox").join(&id).exists());
+        // Su plan, fuera: del disco y de memoria.
+        assert!(!plan_file.exists());
+        assert!(st.plans.summary(&id).is_none());
+        assert!(st.plans.get(&id).is_none());
     }
 
     #[test]
@@ -5682,6 +5727,99 @@ mod tests {
         // El otro sigue ahí.
         let (code, r) = get_json(addr, &format!("/api/v1/sessions/{id}/items/{}", b.id)).await;
         assert_eq!((code, r), (200, json!("dos")));
+    }
+
+    // ---------- El plan de la sesión ----------
+
+    /// El resumen del plan va en la lista de sesiones, con un `rev` que sube con cada cambio; el
+    /// plan entero, con sus horas, en `GET …/plan`; y tras reiniciar nido sigue ahí.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_plan_in_the_list_and_its_route() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let line = said_line("user", "u1", "hola", "2026-11-12T10:00:00Z");
+        let (st, addr, id) = with_transcript(tmp.path(), &line).await;
+        // Sin plan: no va el campo, y el plan da 404.
+        let (_, list) = get_json(addr, "/api/v1/sessions").await;
+        assert!(list[0].get("plan").is_none(), "{list}");
+        let url = format!("/api/v1/sessions/{id}/plan");
+        let (code, r) = get_json(addr, &url).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (404, Some("this session has no plan"))
+        );
+        let (code, r) = get_json(addr, "/api/v1/sessions/nadie/plan").await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (404, Some("there is no session \"nadie\""))
+        );
+
+        let args: crate::plan::SetArgs = serde_json::from_value(json!({
+            "title": "Migrar",
+            "phases": [
+                {"id": "f1", "name": "Uno", "tasks": [
+                    {"id": "t1", "name": "Leer", "status": "done"},
+                    {"id": "t2", "name": "Escribir", "status": "in_progress"}]},
+                {"id": "f2", "name": "Dos", "tasks": [{"id": "t3", "name": "Probar"}]}]
+        }))
+        .unwrap();
+        st.plans.set(&id, args, 1000).unwrap();
+        plan_changed(&st);
+        let (_, list) = get_json(addr, "/api/v1/sessions").await;
+        let plan = &list[0]["plan"];
+        assert_eq!(plan["title"], "Migrar", "{list}");
+        assert_eq!(
+            [&plan["done"], &plan["total"], &plan["active"]],
+            [1, 3, 1],
+            "{list}"
+        );
+        assert_eq!([&plan["blocked"], &plan["failed"]], [0, 0]);
+        assert_eq!(plan["current"], "Escribir");
+        let rev = plan["rev"].as_u64().unwrap();
+
+        // Un cambio de una tarea: sube `rev`.
+        let t: crate::plan::TaskArgs =
+            serde_json::from_value(json!({"id": "t2", "status": "done"})).unwrap();
+        st.plans.update_task(&id, t, 2000).unwrap();
+        plan_changed(&st);
+        let (_, list) = get_json(addr, "/api/v1/sessions").await;
+        let plan = &list[0]["plan"];
+        assert!(plan["rev"].as_u64().unwrap() > rev, "{list}");
+        assert_eq!(plan["done"], 2);
+        assert!(plan.get("current").is_none(), "{list}");
+
+        // El plan entero, con horas (ms).
+        let (code, r) = get_json(addr, &url).await;
+        assert_eq!(code, 200, "{r}");
+        assert_eq!(r["title"], "Migrar");
+        assert_eq!(r["updated"], 2000);
+        let t2 = &r["phases"][0]["tasks"][1];
+        assert_eq!(t2["id"], "t2");
+        assert_eq!(t2["status"], "done");
+        assert_eq!(
+            (&t2["started"], &t2["finished"]),
+            (&json!(1000), &json!(2000))
+        );
+        let t3 = &r["phases"][1]["tasks"][0];
+        assert_eq!(t3["status"], "pending");
+        assert!(t3.get("started").is_none() && t3.get("finished").is_none());
+
+        // Como tras reiniciar `nido serve`: otro estado sobre la misma carpeta lo lee del disco.
+        let again = AppState::new(st.paths.clone(), Launcher::Detached, None, true).unwrap();
+        again.scan().await;
+        let v = again
+            .views
+            .borrow()
+            .sessions
+            .iter()
+            .find(|v| v.id == id)
+            .cloned()
+            .unwrap();
+        let p = v.plan.expect("el plan, tras reiniciar");
+        assert_eq!(
+            (p.title.as_deref(), p.done, p.total),
+            (Some("Migrar"), 2, 3)
+        );
     }
 
     fn said_line(kind: &str, uuid: &str, text: &str, ts: &str) -> String {

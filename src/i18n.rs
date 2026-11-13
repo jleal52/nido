@@ -989,6 +989,55 @@ const TABLE: &[(&str, &str)] = &[
         "no hay ningún secreto recordado {}",
         "there is no remembered secret {0}",
     ),
+    // plan.rs: el plan de fases y tareas
+    (
+        "estado desconocido \"{}\": vale pending, in_progress, done, skipped, blocked o failed",
+        "unknown status \"{0}\": use pending, in_progress, done, skipped, blocked or failed",
+    ),
+    (
+        "id no válido \"{}\": de 1 a 64 letras, dígitos, '.', '_' o '-'",
+        "invalid id \"{0}\": 1 to 64 letters, digits, '.', '_' or '-'",
+    ),
+    // Un hueco nunca casa vacío: el id vacío, aparte.
+    (
+        "id no válido \"\": de 1 a 64 letras, dígitos, '.', '_' o '-'",
+        "invalid id \"\": 1 to 64 letters, digits, '.', '_' or '-'",
+    ),
+    (
+        "demasiadas fases ({}): como mucho {}",
+        "too many phases ({0}): at most {1}",
+    ),
+    (
+        "demasiadas tareas ({}): como mucho {}",
+        "too many tasks ({0}): at most {1}",
+    ),
+    ("id repetido \"{}\"", "duplicate id \"{0}\""),
+    (
+        "la fase \"{}\" no tiene nombre",
+        "phase \"{0}\" has no name",
+    ),
+    (
+        "la tarea \"{}\" no tiene nombre",
+        "task \"{0}\" has no name",
+    ),
+    (
+        "no hay ninguna tarea \"{}\"; las que hay: {}",
+        "task \"{0}\" not found; ids: {1}",
+    ),
+    // Un plan sin tareas: la lista, vacía.
+    (
+        "no hay ninguna tarea \"{}\"; las que hay: ",
+        "task \"{0}\" not found; the plan has no tasks",
+    ),
+    (
+        "no se pudo guardar el plan: {}",
+        "could not save the plan: {0}",
+    ),
+    (
+        "no se pudo borrar el plan: {}",
+        "could not delete the plan: {0}",
+    ),
+    ("esta sesión no tiene plan", "this session has no plan"),
 ];
 
 #[cfg(test)]
@@ -1099,6 +1148,41 @@ mod tests {
         assert_eq!(
             english("no se pudo cambiar la cuenta de Claude: Claude tiene ocupado /h/.claude"),
             "could not switch Claude's account: Claude is holding /h/.claude"
+        );
+    }
+
+    /// Los errores del plan, también los que tienen un hueco que puede ir vacío.
+    #[test]
+    fn plan_messages() {
+        assert_eq!(
+            english("no hay ninguna tarea \"t7\"; las que hay: t1, t2, …"),
+            "task \"t7\" not found; ids: t1, t2, …"
+        );
+        assert_eq!(
+            english("no hay ninguna tarea \"t7\"; las que hay: "),
+            "task \"t7\" not found; the plan has no tasks"
+        );
+        assert_eq!(
+            english("id no válido \"\": de 1 a 64 letras, dígitos, '.', '_' o '-'"),
+            "invalid id \"\": 1 to 64 letters, digits, '.', '_' or '-'"
+        );
+        assert_eq!(
+            english("id no válido \"f 1\": de 1 a 64 letras, dígitos, '.', '_' o '-'"),
+            "invalid id \"f 1\": 1 to 64 letters, digits, '.', '_' or '-'"
+        );
+        assert_eq!(
+            english("demasiadas tareas (501): como mucho 500"),
+            "too many tasks (501): at most 500"
+        );
+        assert_eq!(
+            english(
+                "estado desconocido \"hecho\": vale pending, in_progress, done, skipped, blocked o failed"
+            ),
+            "unknown status \"hecho\": use pending, in_progress, done, skipped, blocked or failed"
+        );
+        assert_eq!(
+            english("esta sesión no tiene plan"),
+            "this session has no plan"
         );
     }
 

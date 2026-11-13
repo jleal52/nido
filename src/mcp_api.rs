@@ -2733,6 +2733,7 @@ mod tests {
             alerts: vec![],
             items_rev: 0,
             secret: None,
+            plan: None,
         };
         let secs = Duration::from_secs;
         let quiet = (secs(5), secs(90));
