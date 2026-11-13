@@ -1236,6 +1236,139 @@ pub fn said(line: &[u8], at: u64) -> Vec<Said> {
         .collect()
 }
 
+/// Lo que hay en la cola de Claude (lo mandado mientras trabaja, que espera su turno), rehecho con
+/// las líneas `{"type":"queue-operation","operation":…}` de la transcripción: `enqueue` (con su
+/// `content`) añade al final, `dequeue` (sin `content`) quita el primero, y `popAll` (↑ los saca
+/// todos a la caja: una línea por mensaje) y `remove` quitan el suyo. Se lee poco a poco: cada
+/// vez, solo lo que haya crecido el fichero desde la anterior.
+///
+/// La primera vez solo se leen los últimos `QUEUE_TAIL` bytes: la cola dura lo que un turno de
+/// Claude y las transcripciones llegan a cientos de megas. Lo que diga hay que tomarlo junto con
+/// la pantalla (`prompt::queue_shown`): una operación que no se conozca o un Esc la dejarían mal.
+#[derive(Debug, Default, Clone)]
+pub struct Queue {
+    /// Dónde seguir leyendo (el principio de una línea); `None`: aún no se ha leído.
+    offset: Option<u64>,
+    /// Todo lo que hay en cola, también los avisos del sistema (cuentan para `dequeue`).
+    items: Vec<String>,
+}
+
+/// Lo que se lee de una transcripción la primera vez para rehacer su cola.
+const QUEUE_TAIL: u64 = 8 * 1024 * 1024;
+
+/// Una operación de la cola, si lo es la línea: (operación, texto).
+fn queue_op(line: &[u8]) -> Option<(String, Option<String>)> {
+    // Casi ninguna lo es: las demás ni se analizan.
+    if !line.windows(15).any(|w| w == b"queue-operation") {
+        return None;
+    }
+    let d: Value = serde_json::from_slice(line).ok()?;
+    if d.get("type")?.as_str()? != "queue-operation" {
+        return None;
+    }
+    let op = d.get("operation")?.as_str()?.to_owned();
+    let content = match d.get("content") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(blocks)) => Some(
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    };
+    Some((op, content))
+}
+
+/// Un aviso del sistema que pasa por la cola (`<task-notification>…`): no lo ha escrito nadie.
+fn queue_notice(text: &str) -> bool {
+    text.trim_start().starts_with('<')
+}
+
+impl Queue {
+    /// Aplica una operación. Lo que no se entiende, o quita algo que no está, no hace nada.
+    fn apply(&mut self, op: &str, content: Option<String>) {
+        match (op, content) {
+            ("enqueue", Some(c)) => self.items.push(c),
+            ("dequeue", _) => {
+                if !self.items.is_empty() {
+                    self.items.remove(0);
+                }
+            }
+            ("popAll" | "remove", Some(c)) => {
+                if let Some(i) = self.items.iter().position(|x| *x == c) {
+                    self.items.remove(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Las líneas enteras de `buf`, que está en `from` en el fichero: dónde acaban.
+    fn apply_lines(&mut self, buf: &[u8], from: u64) -> u64 {
+        let complete = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        for (_, line) in lines_at(&buf[..complete], from) {
+            if let Some((op, content)) = queue_op(line) {
+                self.apply(&op, content);
+            }
+        }
+        from + complete as u64
+    }
+
+    /// Pone la cola al día con lo nuevo de la transcripción `path` (desde el final, si es la
+    /// primera vez o el fichero se rehízo).
+    pub fn read(&mut self, path: &Path) -> io::Result<()> {
+        let mut f = std::fs::File::open(path)?;
+        let len = f.metadata()?.len();
+        let from = match self.offset {
+            Some(o) if o <= len => o,
+            _ => {
+                self.items.clear();
+                line_start_from(&mut f, len.saturating_sub(QUEUE_TAIL), len)?
+            }
+        };
+        f.seek(SeekFrom::Start(from))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        self.offset = Some(self.apply_lines(&buf, from));
+        Ok(())
+    }
+
+    /// Hasta dónde se ha leído (el principio de la línea siguiente).
+    pub fn offset(&self) -> u64 {
+        self.offset.unwrap_or(0)
+    }
+
+    /// Lo que se enseña de la cola, en orden: sin los avisos del sistema.
+    pub fn shown(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter(|t| !queue_notice(t))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Lo que ↑ sacó de la cola a la caja de Claude desde `from` (el principio de una línea): el
+/// texto de cada `popAll` de las líneas enteras, en orden, sin los avisos del sistema.
+pub fn popped_since(path: &Path, from: u64) -> Vec<String> {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let complete = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    lines_at(&buf[..complete], from)
+        .filter_map(|(_, l)| queue_op(l))
+        .filter(|(op, _)| op == "popAll")
+        .filter_map(|(_, c)| c)
+        .filter(|c| !queue_notice(c))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2023,6 +2156,112 @@ mod tests {
     fn clips_on_char_boundaries() {
         let s = "ñ".repeat(10);
         assert_eq!(clip(&s, 5), "ññ…");
+    }
+
+    /// Una línea de la cola, como las escribe Claude Code.
+    fn queue_line(op: &str, content: Option<&str>) -> String {
+        let mut v = serde_json::json!({
+            "type": "queue-operation",
+            "operation": op,
+            "timestamp": "2026-11-13T06:33:48.508Z",
+            "sessionId": "00000000-0000-4000-8000-000000000000",
+        });
+        if let Some(c) = content {
+            v["content"] = c.into();
+        }
+        line(v)
+    }
+
+    #[test]
+    fn the_queue_from_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let mut q = Queue::default();
+        let mut add = |text: String, q: &mut Queue| {
+            f.write_all(text.as_bytes()).unwrap();
+            q.read(&path).unwrap();
+            q.shown()
+        };
+        let user = line(serde_json::json!({"type":"user","message":{"content":"hola"}}));
+        assert!(add(user, &mut q).is_empty());
+        // Se encolan dos (y un aviso del sistema entre ellos, que no se enseña).
+        assert_eq!(
+            add(queue_line("enqueue", Some("primero")), &mut q),
+            ["primero"]
+        );
+        add(
+            queue_line(
+                "enqueue",
+                Some("<task-notification>\n<task-id>b1</task-id>\n</task-notification>"),
+            ),
+            &mut q,
+        );
+        assert_eq!(
+            add(
+                queue_line("enqueue", Some("segundo\ncon dos líneas")),
+                &mut q
+            ),
+            ["primero", "segundo\ncon dos líneas"]
+        );
+        // Claude coge el primero.
+        assert_eq!(
+            add(queue_line("dequeue", None), &mut q),
+            ["segundo\ncon dos líneas"]
+        );
+        // Luego el aviso (que no se veía).
+        assert_eq!(
+            add(queue_line("dequeue", None), &mut q),
+            ["segundo\ncon dos líneas"]
+        );
+        // Otro, y ↑ los saca todos (un popAll por mensaje).
+        add(queue_line("enqueue", Some("tercero")), &mut q);
+        let offset = q.offset();
+        let pops = queue_line("popAll", Some("segundo\ncon dos líneas"))
+            + &queue_line("popAll", Some("tercero"));
+        assert!(add(pops, &mut q).is_empty());
+        assert_eq!(
+            popped_since(&path, offset),
+            ["segundo\ncon dos líneas", "tercero"]
+        );
+        // `remove` quita el suyo; lo que no está, o no se entiende, no hace nada.
+        add(queue_line("enqueue", Some("a")), &mut q);
+        add(queue_line("enqueue", Some("b")), &mut q);
+        assert_eq!(add(queue_line("remove", Some("a")), &mut q), ["b"]);
+        assert_eq!(add(queue_line("remove", Some("zzz")), &mut q), ["b"]);
+        assert_eq!(add(queue_line("otra-cosa", Some("x")), &mut q), ["b"]);
+        assert_eq!(
+            add(queue_line("dequeue", None), &mut q),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            add(queue_line("dequeue", None), &mut q),
+            Vec::<String>::new()
+        );
+        // Una línea a medio escribir se lee cuando acaba.
+        let half = queue_line("enqueue", Some("cuarto"));
+        let (a, b) = half.split_at(20);
+        assert!(add(a.to_owned(), &mut q).is_empty());
+        assert_eq!(add(b.to_owned(), &mut q), ["cuarto"]);
+        // Otra lectura desde cero rehace lo mismo.
+        let mut again = Queue::default();
+        again.read(&path).unwrap();
+        assert_eq!(again.shown(), ["cuarto"]);
+        assert_eq!(again.offset(), std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn the_queue_of_a_rewritten_transcript_starts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let lots = queue_line("enqueue", Some("viejo")).repeat(10);
+        std::fs::write(&path, &lots).unwrap();
+        let mut q = Queue::default();
+        q.read(&path).unwrap();
+        assert_eq!(q.shown().len(), 10);
+        std::fs::write(&path, queue_line("enqueue", Some("nuevo"))).unwrap();
+        q.read(&path).unwrap();
+        assert_eq!(q.shown(), ["nuevo"]);
     }
 }
 
