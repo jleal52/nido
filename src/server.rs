@@ -2294,6 +2294,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/hub", get(api_hub).post(api_set_hub))
         .route("/api/v1/push/test", post(api_push_test))
+        .route("/api/v1/voice/token", post(api_voice_token))
         .route("/api/v1/sessions", get(api_list).post(api_create))
         .route("/api/v1/conversations", get(api_conversations))
         .route(
@@ -2535,6 +2536,37 @@ async fn api_push_test(State(st): State<Arc<AppState>>) -> Response {
         .filter(|p| p.handle.is_some())
         .count();
     Json(serde_json::json!({ "phones": phones, "failed": failed })).into_response()
+}
+
+/// `POST /api/v1/voice/token`: un token de corta vida para que la web o la app hablen con el
+/// modelo de voz directamente (el audio no pasa por nido ni por el hub). Lo da el hub; solo lo
+/// pide un dispositivo emparejado, no el token de este equipo, para que cada pedido sea de
+/// alguien.
+async fn api_voice_token(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let paired = crate::auth::bearer(&headers)
+        .and_then(|t| st.phones.lock().expect("teléfonos").id_by_token(t))
+        .is_some();
+    if !paired {
+        return error(
+            StatusCode::FORBIDDEN,
+            "solo un teléfono o una web emparejados pueden llamar",
+        );
+    }
+    match st.hub.voice_token().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => {
+            let status = match e {
+                hub::VoiceError::NoHub => StatusCode::SERVICE_UNAVAILABLE,
+                hub::VoiceError::NotOffered => StatusCode::NOT_IMPLEMENTED,
+                hub::VoiceError::Limit => StatusCode::TOO_MANY_REQUESTS,
+                hub::VoiceError::Other(_) => StatusCode::BAD_GATEWAY,
+            };
+            error(status, e.message())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -4286,6 +4318,57 @@ mod tests {
         // Si se cae la conexión, otra vez sin enlace.
         st.hub.status.send_modify(|s| s.connected = false);
         assert!(pair_reply(&st, None).await.get("link").is_none());
+    }
+
+    // ---------- El token de voz ----------
+
+    /// Lo que contesta `POST /api/v1/voice/token` con ese bearer.
+    async fn voice_reply(st: &Arc<AppState>, bearer: &str) -> (StatusCode, serde_json::Value) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {bearer}").parse().unwrap(),
+        );
+        let r = api_voice_token(State(st.clone()), headers).await;
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn only_a_paired_device_asks_for_a_voice_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, Some("local".into()), true).unwrap();
+
+        // El token de este equipo no vale: cada pedido tiene que ser de un dispositivo.
+        let (status, body) = voice_reply(&st, "local").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["error"],
+            "only a paired phone or browser can make a call"
+        );
+
+        // Un teléfono emparejado sí, pero sin hub no hay token.
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        let (status, body) = voice_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "not connected to the hub");
     }
 
     fn view(id: &str) -> SessionView {

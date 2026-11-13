@@ -279,6 +279,14 @@ const TABLE: &[(&str, &str)] = &[
         "{0}: not connected to the hub",
     ),
     ("{}: el hub no contestó", "{0}: the hub did not answer"),
+    // La voz (`POST /api/v1/voice/token`)
+    ("sin conexión con el hub", "not connected to the hub"),
+    ("el hub no ofrece voz", "the hub does not offer voice"),
+    ("límite de voz", "voice limit reached"),
+    (
+        "solo un teléfono o una web emparejados pueden llamar",
+        "only a paired phone or browser can make a call",
+    ),
     // mcp_api.rs
     (
         "la API del MCP solo va con el token de este equipo",

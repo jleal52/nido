@@ -286,6 +286,16 @@ come in English, or in Spanish if the request asks for it with `Accept-Language:
 `DELETE /api/v1/phones/me`: the paired phone or browser that calls it signs itself out of every
 computer in the group (the web app's "Sign out").
 
+`POST /api/v1/voice/token`: a short-lived token for voice calls, so the web app or the phone app
+can talk to the sessions with a live voice model. nido asks its hub for it and returns what the
+hub gives: `{"token", "expires", "project", "location", "host", "model"}`. The audio goes
+straight from the browser or the app to the voice model's provider (Google's Gemini Live): it
+goes through neither nido nor the hub, which only hands out the token. Only a paired phone or
+browser can ask for it (`403` with the token in `~/.config/nido/token`). Errors: `503` if nido is
+not connected to a hub, `501` if the hub does not offer voice (an older hub that doesn't answer
+counts as that, after 30 seconds), `429` if this computer reached the hub's voice limit, `502`
+for any other error from the hub. An older nido, without this endpoint, answers `404`.
+
 `POST /api/v1/pair` (body `{"days": 30}` optional, for a reusable code) creates a pairing code and
 returns `{"uri": "nido://pair?…", "expires", "reusable", "direct",
 "hub"}`. When nido is connected to the hub it also returns `link`, the hub's web app with the code
