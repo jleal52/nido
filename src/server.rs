@@ -4371,6 +4371,72 @@ mod tests {
         assert_eq!(body["error"], "not connected to the hub");
     }
 
+    /// Con el hub: lo que dé, tal cual (sin `req` ni `ok`), y cada error con su código. Un hub
+    /// que no contesta (uno antiguo) es que no ofrece voz.
+    #[tokio::test]
+    async fn the_voice_token_answers_what_the_hub_says() {
+        use hub::fake::Reply;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, Some("local".into()), true).unwrap();
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        // Los pedidos van numerados desde 1: cada uno, una respuesta.
+        let addr = hub::fake::hub(|req| {
+            let fail = |error: &str| {
+                Reply::Send(json!({ "voiced": { "req": req, "ok": false, "error": error } }))
+            };
+            match req {
+                1 => Reply::Send(json!({ "voiced": {
+                    "req": req, "ok": true, "token": "token-de-prueba", "expires": 3000,
+                    "project": "proyecto", "location": "eu", "host": "voz.example",
+                    "model": "modelo-voz",
+                }})),
+                2 => fail("límite de voz"),
+                3 => fail("invalid_grant"),
+                4 => fail("el hub no ofrece voz"),
+                _ => Reply::Silent,
+            }
+        })
+        .await;
+        hub::fake::connect(&st.hub, st.clone(), addr).await;
+
+        let (status, body) = voice_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "token": "token-de-prueba", "expires": 3000, "project": "proyecto",
+                "location": "eu", "host": "voz.example", "model": "modelo-voz",
+            })
+        );
+        let (status, body) = voice_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "voice limit reached");
+        let (status, body) = voice_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "invalid_grant");
+        let (status, body) = voice_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"], "the hub does not offer voice");
+        // Un hub antiguo no contesta: lo mismo, al acabarse la espera (corta en las pruebas).
+        let (status, body) = voice_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"], "the hub does not offer voice");
+    }
+
     fn view(id: &str) -> SessionView {
         SessionView {
             id: id.into(),

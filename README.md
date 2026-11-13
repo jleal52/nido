@@ -288,7 +288,8 @@ computer in the group (the web app's "Sign out").
 
 `POST /api/v1/voice/token`: a short-lived token for voice calls, so the web app or the phone app
 can talk to the sessions with a live voice model. nido asks its hub for it and returns what the
-hub gives: `{"token", "expires", "project", "location", "host", "model"}`. The audio goes
+hub gives: `{"token", "expires", "project", "location", "host", "model"}`, where `expires` is
+the number of seconds the token has left. The audio goes
 straight from the browser or the app to the voice model's provider (Google's Gemini Live): it
 goes through neither nido nor the hub, which only hands out the token. Only a paired phone or
 browser can ask for it (`403` with the token in `~/.config/nido/token`). Errors: `503` if nido is

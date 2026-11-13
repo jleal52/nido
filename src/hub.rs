@@ -652,7 +652,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let addr = fake::hub(|req| {
             Reply::Send(serde_json::json!({ "voiced": {
-                "req": req, "ok": true, "token": "ya29.prueba", "expires": 1_700_000_000,
+                "req": req, "ok": true, "token": "token-de-prueba", "expires": 3000,
                 "project": "proyecto", "location": "eu", "host": "voz.example",
                 "model": "modelo-voz",
             }}))
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({
-                "token": "ya29.prueba", "expires": 1_700_000_000, "project": "proyecto",
+                "token": "token-de-prueba", "expires": 3000, "project": "proyecto",
                 "location": "eu", "host": "voz.example", "model": "modelo-voz",
             })
         );
