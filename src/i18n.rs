@@ -307,10 +307,6 @@ const TABLE: &[(&str, &str)] = &[
         "invalid call id: 1 to {0} characters from A-Z, a-z, 0-9, '_' and '-'",
     ),
     (
-        "handle no válido: de 1 a {} bytes, sin caracteres de control",
-        "invalid handle: 1 to {0} bytes, no control characters",
-    ),
-    (
         "no se pudo leer la memoria: {}",
         "could not read the memory: {0}",
     ),
@@ -1286,10 +1282,6 @@ mod tests {
         assert_eq!(
             english("id de llamada no válido: de 1 a 64 caracteres entre A-Z, a-z, 0-9, '_' y '-'"),
             "invalid call id: 1 to 64 characters from A-Z, a-z, 0-9, '_' and '-'"
-        );
-        assert_eq!(
-            english("handle no válido: de 1 a 4096 bytes, sin caracteres de control"),
-            "invalid handle: 1 to 4096 bytes, no control characters"
         );
         assert_eq!(
             english("no se pudo leer la memoria: Is a directory (os error 21)"),

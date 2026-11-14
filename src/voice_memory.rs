@@ -1,6 +1,7 @@
 //! La memoria de la voz: las notas que apunta el agente («recuerda que…»), el resumen (o la
-//! bitácora, si el resumen no llega) de las últimas llamadas y el handle para retomar la última
-//! conversación. Se guarda en `voice-memory.json`, en la carpeta de estado, y no sale del equipo.
+//! bitácora, si el resumen no llega) de las últimas llamadas. Se guarda en `voice-memory.json`, en
+//! la carpeta de estado, y no sale del equipo. (El handle para retomar una conversación con
+//! Gemini no está aquí: lo guarda el hub.)
 //!
 //! El fichero es la memoria: cada operación lo lee, lo cambia y lo escribe entero (en un temporal
 //! que se renombra), todo con el cerrojo tomado. Así, borrar el fichero la borra también con nido
@@ -19,8 +20,6 @@ pub const MAX_NOTE: usize = 300;
 pub const MAX_CALLS: usize = 20;
 pub const MAX_CALL_TEXT: usize = 4000;
 pub const MAX_CALL_ID: usize = 64;
-/// En bytes.
-pub const MAX_HANDLE: usize = 4096;
 /// El id más alto de una nota: 2^53 − 1, el entero más grande que JavaScript y Dart (en la web)
 /// guardan exacto.
 pub const MAX_NOTE_ID: u64 = (1 << 53) - 1;
@@ -54,19 +53,11 @@ pub struct Call {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Resume {
-    pub handle: String,
-    /// ms desde 1970.
-    pub at: u64,
-}
-
-/// Lo que se enseña de la memoria (`resume` sale como `null` si no hay).
+/// Lo que se enseña de la memoria.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub notes: Vec<Note>,
     pub calls: Vec<Call>,
-    pub resume: Option<Resume>,
 }
 
 /// El fichero.
@@ -75,7 +66,6 @@ pub struct Snapshot {
 struct Data {
     notes: Vec<Note>,
     calls: Vec<Call>,
-    resume: Option<Resume>,
     /// El id de la próxima nota: los de las borradas no se repiten.
     next_note: u64,
 }
@@ -87,7 +77,6 @@ pub enum MemoryError {
     Full,
     EmptyText,
     BadCallId,
-    BadHandle,
     Read(String),
     Save(String),
 }
@@ -101,10 +90,6 @@ impl fmt::Display for MemoryError {
             MemoryError::BadCallId => write!(
                 f,
                 "id de llamada no válido: de 1 a {MAX_CALL_ID} caracteres entre A-Z, a-z, 0-9, '_' y '-'"
-            ),
-            MemoryError::BadHandle => write!(
-                f,
-                "handle no válido: de 1 a {MAX_HANDLE} bytes, sin caracteres de control"
             ),
             MemoryError::Read(e) => write!(f, "no se pudo leer la memoria: {e}"),
             MemoryError::Save(e) => write!(f, "no se pudo guardar la memoria: {e}"),
@@ -195,19 +180,9 @@ fn check_call_id(id: &str) -> Result<(), MemoryError> {
     }
 }
 
-/// El handle no se limpia: o vale tal cual o no vale.
-fn check_handle(handle: &str) -> Result<(), MemoryError> {
-    if (1..=MAX_HANDLE).contains(&handle.len()) && !handle.chars().any(char::is_control) {
-        Ok(())
-    } else {
-        Err(MemoryError::BadHandle)
-    }
-}
-
 /// Lo que se lee del fichero, con las mismas limpiezas y límites que lo que llega por la API:
-/// uno tocado a mano no saca por `get` textos largos, caracteres de control, ids de nota que la
-/// web no guarda exactos ni handles que no valen. De lo que sobre, se quedan las notas últimas y
-/// las llamadas más nuevas.
+/// uno tocado a mano no saca por `get` textos largos, caracteres de control ni ids de nota que la
+/// web no guarda exactos. De lo que sobre, se quedan las notas últimas y las llamadas más nuevas.
 fn tidy(mut data: Data) -> Data {
     data.notes.retain_mut(|n| {
         n.text = note_text(&n.text);
@@ -224,13 +199,6 @@ fn tidy(mut data: Data) -> Data {
             break;
         };
         data.calls.remove(oldest);
-    }
-    if data
-        .resume
-        .as_ref()
-        .is_some_and(|r| check_handle(&r.handle).is_err())
-    {
-        data.resume = None;
     }
     data
 }
@@ -340,7 +308,6 @@ impl VoiceMemory {
         Ok(Snapshot {
             notes: data.notes,
             calls: data.calls,
-            resume: data.resume,
         })
     }
 
@@ -407,26 +374,6 @@ impl VoiceMemory {
                 data.calls.remove(oldest);
             }
             Ok(((), true))
-        })
-    }
-
-    /// Guarda el handle para retomar la conversación de Gemini, con la hora.
-    pub fn set_resume(&self, handle: &str) -> Result<(), MemoryError> {
-        check_handle(handle)?;
-        self.change(|data, now| {
-            data.resume = Some(Resume {
-                handle: handle.to_string(),
-                at: now,
-            });
-            Ok(((), true))
-        })
-    }
-
-    /// Lo quita (que no hubiera no es error).
-    pub fn clear_resume(&self) -> Result<(), MemoryError> {
-        self.change(|data, _| {
-            let had = data.resume.take().is_some();
-            Ok(((), had))
         })
     }
 }
@@ -769,58 +716,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_handle() {
-        let dir = tempfile::tempdir().unwrap();
-        let (m, clock) = mem(dir.path());
-        set(&clock, 5000);
-        m.set_resume("abc").unwrap();
-        assert_eq!(
-            m.get().unwrap().resume,
-            Some(Resume {
-                handle: "abc".into(),
-                at: 5000
-            })
-        );
-        // Hasta 4096 bytes (no caracteres).
-        m.set_resume(&"a".repeat(MAX_HANDLE)).unwrap();
-        m.set_resume(&"ñ".repeat(MAX_HANDLE / 2)).unwrap();
-        assert_eq!(
-            m.get().unwrap().resume.unwrap().handle,
-            "ñ".repeat(MAX_HANDLE / 2)
-        );
-        let too_long = ["a".repeat(MAX_HANDLE + 1), "ñ".repeat(MAX_HANDLE / 2) + "a"];
-        for bad in too_long
-            .iter()
-            .map(String::as_str)
-            .chain(["", "ab\u{7}", "ab\n", "a\u{9b}b"])
-        {
-            assert_eq!(m.set_resume(bad), Err(MemoryError::BadHandle), "{bad:?}");
-        }
-        assert_eq!(
-            MemoryError::BadHandle.to_string(),
-            "handle no válido: de 1 a 4096 bytes, sin caracteres de control"
-        );
-        assert_eq!(
-            m.get().unwrap().resume.unwrap().handle,
-            "ñ".repeat(MAX_HANDLE / 2)
-        );
-
-        set(&clock, 6000);
-        m.set_resume("otro").unwrap();
-        let (again, _) = mem(dir.path());
-        assert_eq!(
-            again.get().unwrap().resume,
-            Some(Resume {
-                handle: "otro".into(),
-                at: 6000
-            })
-        );
-        m.clear_resume().unwrap();
-        assert_eq!(again.get().unwrap().resume, None);
-        m.clear_resume().unwrap();
-    }
-
-    #[test]
     fn a_broken_file_is_an_empty_memory() {
         for broken in [
             "{ esto no es memoria",
@@ -856,7 +751,6 @@ mod tests {
         let (m, _) = mem(dir.path());
         assert_eq!(texts(&m.get().unwrap()), vec!["siete"]);
         assert_eq!(m.get().unwrap().calls, vec![]);
-        assert_eq!(m.get().unwrap().resume, None);
         assert_eq!(m.add_note("ocho"), Ok(8));
         std::fs::write(
             &file,
@@ -911,9 +805,10 @@ mod tests {
         calls.push(serde_json::json!({"id": "../mal", "at": 99, "kind": "bitacora", "text": "b"}));
         calls
             .push(serde_json::json!({"id": "vacía", "at": 99, "kind": "resumen", "text": "\u{0}"}));
+        // Con algo que ya no se guarda (el handle para retomar, ahora en el hub): se ignora.
         let raw = serde_json::json!({
             "notes": notes, "calls": calls,
-            "resume": {"handle": "con\u{7}control", "at": 1},
+            "resume": {"handle": "h", "at": 1},
         });
         std::fs::write(&file, raw.to_string()).unwrap();
         let (m, _) = mem(dir.path());
@@ -931,7 +826,12 @@ mod tests {
         assert_eq!(newest.id, "c25");
         assert_eq!(newest.text.chars().count(), MAX_CALL_TEXT);
         assert!(newest.text.ends_with("xfin"));
-        assert_eq!(s.resume, None);
+        assert!(serde_json::to_value(&s).unwrap().get("resume").is_none());
+        // Y el primer cambio lo reescribe sin ello.
+        m.delete_note(11).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert!(raw.get("resume").is_none(), "{raw}");
     }
 
     #[test]
@@ -961,7 +861,6 @@ mod tests {
         let (m, _) = mem(dir.path());
         m.add_note("una").unwrap();
         m.put_call("c1", CallKind::Resumen, "r").unwrap();
-        m.set_resume("h").unwrap();
         std::fs::remove_file(dir.path().join(FILE)).unwrap();
         assert_eq!(m.get().unwrap(), Snapshot::default());
         assert_eq!(m.add_note("otra"), Ok(1));
@@ -974,12 +873,11 @@ mod tests {
         let (m, _) = mem(dir.path());
         assert_eq!(
             serde_json::to_value(m.get().unwrap()).unwrap(),
-            serde_json::json!({"notes": [], "calls": [], "resume": null})
+            serde_json::json!({"notes": [], "calls": []})
         );
         m.add_note("n").unwrap();
         m.put_call("c1", CallKind::Bitacora, "b").unwrap();
         m.put_call("c2", CallKind::Resumen, "r").unwrap();
-        m.set_resume("h").unwrap();
         assert_eq!(
             serde_json::to_value(m.get().unwrap()).unwrap(),
             serde_json::json!({
@@ -988,7 +886,6 @@ mod tests {
                     {"id": "c1", "at": 1000, "kind": "bitácora", "text": "b"},
                     {"id": "c2", "at": 1000, "kind": "resumen", "text": "r"},
                 ],
-                "resume": {"handle": "h", "at": 1000},
             })
         );
         let raw: serde_json::Value =
@@ -1010,10 +907,6 @@ mod tests {
         m.put_call("c1", CallKind::Bitacora, "b").unwrap();
         assert_eq!(files(&state), only);
         m.put_call("c1", CallKind::Resumen, "r").unwrap();
-        assert_eq!(files(&state), only);
-        m.set_resume("h").unwrap();
-        assert_eq!(files(&state), only);
-        m.clear_resume().unwrap();
         assert_eq!(files(&state), only);
         let _ = m.add_note("");
         let _ = m.put_call("x.y", CallKind::Resumen, "r");
@@ -1043,7 +936,6 @@ mod tests {
         for e in [
             m.add_note("una").unwrap_err(),
             m.put_call("c1", CallKind::Resumen, "r").unwrap_err(),
-            m.set_resume("h").unwrap_err(),
         ] {
             assert!(matches!(e, MemoryError::Save(_)), "{e:?}");
             assert!(
@@ -1053,7 +945,6 @@ mod tests {
         }
         // Lo que no cambia nada no escribe (ni falla).
         assert_eq!(m.delete_note(1), Ok(false));
-        assert_eq!(m.clear_resume(), Ok(()));
         assert_eq!(
             std::fs::read_to_string(&state).unwrap(),
             "no soy una carpeta"
@@ -1085,7 +976,6 @@ mod tests {
             MemoryError::Full,
             MemoryError::EmptyText,
             MemoryError::BadCallId,
-            MemoryError::BadHandle,
             MemoryError::Read("e".into()),
             MemoryError::Save("e".into()),
         ] {

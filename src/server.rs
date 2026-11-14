@@ -2312,12 +2312,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/voice/memory/calls",
             post(api_voice_call_put).layer(DefaultBodyLimit::max(MEMORY_BODY)),
         )
-        .route(
-            "/api/v1/voice/memory/resume",
-            axum::routing::put(api_voice_resume_set)
-                .delete(api_voice_resume_clear)
-                .layer(DefaultBodyLimit::max(MEMORY_BODY)),
-        )
         .route("/api/v1/sessions", get(api_list).post(api_create))
         .route("/api/v1/conversations", get(api_conversations))
         .route(
@@ -2609,7 +2603,7 @@ const BAD_CALL_KIND: &str = "kind tiene que ser «resumen» o «bitácora»";
 fn memory_status(e: &crate::voice_memory::MemoryError) -> StatusCode {
     use crate::voice_memory::MemoryError as E;
     match e {
-        E::EmptyNote | E::EmptyText | E::BadCallId | E::BadHandle => StatusCode::BAD_REQUEST,
+        E::EmptyNote | E::EmptyText | E::BadCallId => StatusCode::BAD_REQUEST,
         E::Full => StatusCode::CONFLICT,
         E::Read(_) | E::Save(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -2631,7 +2625,7 @@ async fn with_memory<T: Send + 'static>(
     }
 }
 
-/// `GET /api/v1/voice/memory`: `{notes, calls, resume}` (ver `voice_memory::Snapshot`).
+/// `GET /api/v1/voice/memory`: `{notes, calls}` (ver `voice_memory::Snapshot`).
 async fn api_voice_memory(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -2716,45 +2710,6 @@ async fn api_voice_call_put(
         return error(StatusCode::BAD_REQUEST, BAD_CALL_KIND);
     };
     match with_memory(&st, move |m| m.put_call(&req.id, kind, &req.text)).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(r) => r,
-    }
-}
-
-#[derive(Deserialize)]
-struct ResumeReq {
-    handle: String,
-}
-
-/// `PUT /api/v1/voice/memory/resume` `{handle}`: el handle para retomar la última conversación
-/// (204).
-async fn api_voice_resume_set(
-    State(st): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> Response {
-    if !paired_device(&st, &headers) {
-        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
-    }
-    let req: ResumeReq = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => return bad_body(&e),
-    };
-    match with_memory(&st, move |m| m.set_resume(&req.handle)).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(r) => r,
-    }
-}
-
-/// `DELETE /api/v1/voice/memory/resume`: lo quita (204, aunque no hubiera).
-async fn api_voice_resume_clear(
-    State(st): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-) -> Response {
-    if !paired_device(&st, &headers) {
-        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
-    }
-    match with_memory(&st, |m| m.clear_resume()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(r) => r,
     }
@@ -4759,12 +4714,6 @@ mod tests {
                 "/api/v1/voice/memory/calls",
                 Some(json!({"id": "c1", "kind": "resumen", "text": "hola"})),
             ),
-            (
-                "PUT",
-                "/api/v1/voice/memory/resume",
-                Some(json!({"handle": "h"})),
-            ),
-            ("DELETE", "/api/v1/voice/memory/resume", None),
         ]
     }
 
@@ -4803,14 +4752,10 @@ mod tests {
         const MEMORY: &str = "/api/v1/voice/memory";
         const NOTES: &str = "/api/v1/voice/memory/notes";
         const CALLS: &str = "/api/v1/voice/memory/calls";
-        const RESUME: &str = "/api/v1/voice/memory/resume";
 
-        // Vacía: `resume` sale como null.
+        // Vacía.
         let (code, r) = call("GET", MEMORY, None).await;
-        assert_eq!(
-            (code, r),
-            (200, json!({"notes": [], "calls": [], "resume": null}))
-        );
+        assert_eq!((code, r), (200, json!({"notes": [], "calls": []})));
 
         // Las notas.
         let (code, r) = call("POST", NOTES, Some(json!({"text": "  hola  "}))).await;
@@ -4898,20 +4843,6 @@ mod tests {
             (400, Some("the text is empty"))
         );
 
-        // Retomar.
-        let (code, _) = call("PUT", RESUME, Some(json!({"handle": "h-1"}))).await;
-        assert_eq!(code, 204);
-        for handle in ["", "con\nsalto"] {
-            let (code, r) = call("PUT", RESUME, Some(json!({ "handle": handle }))).await;
-            assert_eq!(code, 400, "{handle:?}");
-            assert!(
-                r["error"].as_str().unwrap().starts_with("invalid handle"),
-                "{r}"
-            );
-        }
-        let (code, _) = call("PUT", RESUME, Some(json!({}))).await;
-        assert_eq!(code, 400);
-
         // Todo junto, sin nada de más (ni `next_note`).
         let (code, r) = call("GET", MEMORY, None).await;
         assert_eq!(code, 200);
@@ -4920,25 +4851,19 @@ mod tests {
             json!({
                 "notes": [{"id": 2, "text": "segunda", "at": 0}],
                 "calls": [{"id": "c1", "at": 0, "kind": "resumen", "text": "el resumen"}],
-                "resume": {"handle": "h-1", "at": 0},
             })
         );
 
-        // Quitar el handle, aunque ya no haya.
-        for _ in 0..2 {
-            let (code, _) = call("DELETE", RESUME, None).await;
-            assert_eq!(code, 204);
+        // El handle para retomar lo guarda el hub, no nido: esa ruta no existe.
+        for method in ["PUT", "DELETE", "GET"] {
+            let (code, _) = call(method, "/api/v1/voice/memory/resume", None).await;
+            assert_eq!(code, 404, "{method}");
         }
-        let (_, r) = call("GET", MEMORY, None).await;
-        assert_eq!(r["resume"], serde_json::Value::Null);
 
         // Borrar el fichero la borra, ya.
         std::fs::remove_file(st.paths.state.join("voice-memory.json")).unwrap();
         let (code, r) = call("GET", MEMORY, None).await;
-        assert_eq!(
-            (code, r),
-            (200, json!({"notes": [], "calls": [], "resume": null}))
-        );
+        assert_eq!((code, r), (200, json!({"notes": [], "calls": []})));
     }
 
     /// Un cuerpo enorme ni se lee (413); el de un texto de llamada largo y escapado, sí.
@@ -4957,11 +4882,6 @@ mod tests {
                 "POST",
                 "/api/v1/voice/memory/calls",
                 json!({"id": "c1", "kind": "resumen", "text": huge}),
-            ),
-            (
-                "PUT",
-                "/api/v1/voice/memory/resume",
-                json!({ "handle": huge }),
             ),
         ] {
             let (code, _) = memory_call(addr, &phone, method, path, Some(body)).await;
