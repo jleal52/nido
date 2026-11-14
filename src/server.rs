@@ -2639,7 +2639,7 @@ async fn api_voice_memory(
     if !paired_device(&st, &headers) {
         return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
     }
-    match with_memory(&st, |m| Ok(m.get())).await {
+    match with_memory(&st, |m| m.get()).await {
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(r) => r,
     }
@@ -2711,10 +2711,9 @@ async fn api_voice_call_put(
         Ok(r) => r,
         Err(e) => return bad_body(&e),
     };
-    let kind = match req.kind.as_str() {
-        "resumen" => CallKind::Resumen,
-        "bitácora" => CallKind::Bitacora,
-        _ => return error(StatusCode::BAD_REQUEST, BAD_CALL_KIND),
+    // Como en el fichero: «resumen» o «bitácora» (también sin tilde).
+    let Ok(kind) = serde_json::from_value::<CallKind>(serde_json::Value::String(req.kind)) else {
+        return error(StatusCode::BAD_REQUEST, BAD_CALL_KIND);
     };
     match with_memory(&st, move |m| m.put_call(&req.id, kind, &req.text)).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -4860,8 +4859,11 @@ mod tests {
         assert_eq!(code, 204);
         let (code, _) = call("POST", CALLS, put("bitácora", "tarde")).await;
         assert_eq!(code, 204);
+        // Sin tilde también vale (y tampoco lo pisa).
+        let (code, _) = call("POST", CALLS, put("bitacora", "más tarde")).await;
+        assert_eq!(code, 204);
         let unknown = "kind must be “resumen” or “bitácora”";
-        for kind in ["otro", "", "Resumen", "bitacora"] {
+        for kind in ["otro", "", "Resumen", "BITÁCORA"] {
             let (code, r) = call("POST", CALLS, put(kind, "x")).await;
             assert_eq!((code, r["error"].as_str()), (400, Some(unknown)), "{kind}");
         }
@@ -5004,8 +5006,7 @@ mod tests {
         assert_eq!((code, r), (200, json!({"id": 51})));
     }
 
-    /// Un fichero que no se puede leer: los cambios dan 500 con el error (y no lo pisan); `GET`,
-    /// la memoria vacía.
+    /// Un fichero que no se puede leer: 500 con el error, también `GET` (y no se pisa).
     #[tokio::test(flavor = "multi_thread")]
     async fn the_voice_memory_says_when_it_cannot_read_its_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5030,9 +5031,13 @@ mod tests {
         );
         assert!(file.is_dir());
         let (code, r) = memory_call(addr, &phone, "GET", "/api/v1/voice/memory", None).await;
-        assert_eq!(
-            (code, r),
-            (200, json!({"notes": [], "calls": [], "resume": null}))
+        assert_eq!(code, 500);
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not read the memory: "),
+            "{r}"
         );
     }
 

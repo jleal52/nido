@@ -294,7 +294,9 @@ vale al momento, también con nido en marcha.
 - `PUT /api/v1/voice/memory/resume` `{"handle"}` → `204`; `DELETE` lo quita (`204`).
 
 Lo que no vale (un texto vacío, un `kind` desconocido, un id de llamada o un handle mal) da `400`,
-y un fichero de memoria que nido no puede leer o escribir, `500`. Un nido anterior contesta `404`.
+y un fichero de memoria que nido no puede leer o escribir, `500`. Uno que nido no entiende (por
+ejemplo, tocado a mano y mal) se aparta como `voice-memory.json.bad` y la memoria empieza vacía.
+Un nido anterior contesta `404`.
 
 `POST /api/v1/pair` (con `{"days": 30}` opcional, para un código reutilizable) crea un código para
 emparejar y devuelve `{"uri": "nido://pair?…", "expires", "reusable",

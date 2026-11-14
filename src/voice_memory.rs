@@ -4,8 +4,9 @@
 //!
 //! El fichero es la memoria: cada operación lo lee, lo cambia y lo escribe entero (en un temporal
 //! que se renombra), todo con el cerrojo tomado. Así, borrar el fichero la borra también con nido
-//! en marcha. Uno que falte o no se entienda es una memoria vacía, y el primer cambio lo
-//! reescribe.
+//! en marcha. Uno que falte es una memoria vacía; uno que no se entienda se aparta como
+//! `voice-memory.json.bad` y la memoria empieza vacía. Lo que se lee pasa por las mismas
+//! limpiezas y límites que lo que llega por la API.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -20,6 +21,9 @@ pub const MAX_CALL_TEXT: usize = 4000;
 pub const MAX_CALL_ID: usize = 64;
 /// En bytes.
 pub const MAX_HANDLE: usize = 4096;
+/// El id más alto de una nota: 2^53 − 1, el entero más grande que JavaScript y Dart (en la web)
+/// guardan exacto.
+pub const MAX_NOTE_ID: u64 = (1 << 53) - 1;
 
 const FILE: &str = "voice-memory.json";
 
@@ -37,7 +41,7 @@ pub enum CallKind {
     #[serde(rename = "resumen")]
     Resumen,
     /// La de respaldo: lo que se dijo y se hizo, apuntado por la web o la app durante la llamada.
-    #[serde(rename = "bitácora")]
+    #[serde(rename = "bitácora", alias = "bitacora")]
     Bitacora,
 }
 
@@ -127,13 +131,21 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// Los últimos `max` caracteres de `s`.
+/// Los últimos `max` caracteres de `s`, desde el principio de una línea: si el corte cae a
+/// media línea, lo que queda de ella se tira (si hay otra detrás). Sin espacios al principio.
 fn tail(s: &str, max: usize) -> &str {
     let skip = s.chars().count().saturating_sub(max);
-    match s.char_indices().nth(skip) {
-        Some((at, _)) => &s[at..],
-        None => "",
+    if skip == 0 {
+        return s;
     }
+    let at = s.char_indices().nth(skip).map_or(s.len(), |(at, _)| at);
+    let mut rest = &s[at..];
+    if !s[..at].ends_with('\n')
+        && let Some(nl) = rest.find('\n')
+    {
+        rest = &rest[nl + 1..];
+    }
+    rest.trim_start()
 }
 
 /// Una nota es una línea: los saltos de línea y los tabuladores pasan a espacios, y el resto de
@@ -155,15 +167,16 @@ fn note_text(text: &str) -> String {
 }
 
 /// El texto de una llamada (la bitácora tiene varias líneas): sin caracteres de control salvo
-/// los saltos de línea, que quedan como `\n`. Si pasa de [`MAX_CALL_TEXT`], el final: en la
-/// bitácora, lo último es lo que importa.
+/// los saltos de línea, que quedan como `\n`, y los demás espacios (tabuladores, U+0085), que
+/// pasan a espacios. Si pasa de [`MAX_CALL_TEXT`], el final: en la bitácora, lo último es lo que
+/// importa.
 fn call_text(text: &str) -> String {
     let clean: String = text
         .replace("\r\n", "\n")
         .chars()
         .filter_map(|c| match c {
             '\n' | '\r' | '\u{2028}' | '\u{2029}' => Some('\n'),
-            c if c.is_control() => None,
+            c if c.is_control() => c.is_whitespace().then_some(' '),
             c => Some(c),
         })
         .collect();
@@ -191,12 +204,45 @@ fn check_handle(handle: &str) -> Result<(), MemoryError> {
     }
 }
 
+/// Lo que se lee del fichero, con las mismas limpiezas y límites que lo que llega por la API:
+/// uno tocado a mano no saca por `get` textos largos, caracteres de control, ids de nota que la
+/// web no guarda exactos ni handles que no valen. De lo que sobre, se quedan las notas últimas y
+/// las llamadas más nuevas.
+fn tidy(mut data: Data) -> Data {
+    data.notes.retain_mut(|n| {
+        n.text = note_text(&n.text);
+        !n.text.is_empty() && n.id <= MAX_NOTE_ID
+    });
+    let extra = data.notes.len().saturating_sub(MAX_NOTES);
+    data.notes.drain(..extra);
+    data.calls.retain_mut(|c| {
+        c.text = call_text(&c.text);
+        !c.text.is_empty() && check_call_id(&c.id).is_ok()
+    });
+    while data.calls.len() > MAX_CALLS {
+        let Some((oldest, _)) = data.calls.iter().enumerate().min_by_key(|(_, c)| c.at) else {
+            break;
+        };
+        data.calls.remove(oldest);
+    }
+    if data
+        .resume
+        .as_ref()
+        .is_some_and(|r| check_handle(&r.handle).is_err())
+    {
+        data.resume = None;
+    }
+    data
+}
+
+/// La memoria de la voz de una carpeta de estado. Tiene que haber una sola por carpeta (la de
+/// `AppState`, en un `Arc`): el cerrojo es de la instancia, así que dos (o dos procesos con la
+/// misma carpeta) podrían pisarse los cambios, como los planes (`plan.rs`).
 pub struct VoiceMemory {
     path: PathBuf,
     now: Box<dyn Fn() -> u64 + Send + Sync>,
-    /// Pone en fila las operaciones. Dentro, si ya se avisó de que el fichero no se entiende
-    /// (para no repetirlo en cada lectura).
-    lock: Mutex<bool>,
+    /// Pone en fila las operaciones.
+    lock: Mutex<()>,
 }
 
 impl VoiceMemory {
@@ -209,13 +255,14 @@ impl VoiceMemory {
         VoiceMemory {
             path: state_dir.join(FILE),
             now: Box::new(now),
-            lock: Mutex::new(false),
+            lock: Mutex::new(()),
         }
     }
 
-    /// Lee el fichero (con el cerrojo tomado). Si falta, o no se entiende, la memoria está vacía;
-    /// si no se puede leer (permisos, un fallo del disco), es el error: así no se pisa.
-    fn load(&self, warned: &mut bool) -> Result<Data, String> {
+    /// Lee el fichero (con el cerrojo tomado). Si falta, la memoria está vacía; si no se
+    /// entiende, se aparta como `voice-memory.json.bad` (para mirarlo) y está vacía; si no se
+    /// puede leer (permisos, un fallo del disco), es el error: así no se pisa.
+    fn load(&self) -> Result<Data, String> {
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => Some(b),
             Err(e) if missing(&e) => None,
@@ -223,17 +270,17 @@ impl VoiceMemory {
         };
         let parsed = bytes.map(|b| serde_json::from_slice::<Data>(&b));
         let mut data = match parsed.unwrap_or_else(|| Ok(Data::default())) {
-            Ok(d) => {
-                *warned = false;
-                d
-            }
+            Ok(d) => tidy(d),
             Err(e) => {
-                if !*warned {
-                    *warned = true;
-                    eprintln!(
-                        "nido: la memoria de la voz no se entiende ({e}): se empieza vacía y se \
-                         reescribirá al primer cambio"
-                    );
+                match std::fs::rename(&self.path, self.path.with_extension("json.bad")) {
+                    Ok(()) => eprintln!(
+                        "nido: la memoria de la voz no se entiende ({e}): apartada como \
+                         {FILE}.bad; se empieza vacía"
+                    ),
+                    Err(re) => eprintln!(
+                        "nido: la memoria de la voz no se entiende ({e}) y no se pudo apartar \
+                         ({re}); se empieza vacía"
+                    ),
                 }
                 Data::default()
             }
@@ -259,9 +306,7 @@ impl VoiceMemory {
         let written = (|| {
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-            let mut f = opts.open(&tmp)?;
+            let mut f = crate::sys::private(&mut opts).open(&tmp)?;
             f.write_all(&body)?;
             f.sync_all()?;
             std::fs::rename(&tmp, &self.path)
@@ -278,8 +323,8 @@ impl VoiceMemory {
         &self,
         f: impl FnOnce(&mut Data, u64) -> Result<(T, bool), MemoryError>,
     ) -> Result<T, MemoryError> {
-        let mut warned = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut data = self.load(&mut warned).map_err(MemoryError::Read)?;
+        let _one = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut data = self.load().map_err(MemoryError::Read)?;
         let (out, changed) = f(&mut data, (self.now)())?;
         if changed {
             self.write(&data)
@@ -288,21 +333,19 @@ impl VoiceMemory {
         Ok(out)
     }
 
-    /// Lo que hay. Si el fichero no se puede leer, vacía (y se dice en el registro).
-    pub fn get(&self) -> Snapshot {
-        let mut warned = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let data = self.load(&mut warned).unwrap_or_else(|e| {
-            eprintln!("nido: la memoria de la voz no se pudo leer ({e})");
-            Data::default()
-        });
-        Snapshot {
+    /// Lo que hay (`Read` si el fichero no se puede leer).
+    pub fn get(&self) -> Result<Snapshot, MemoryError> {
+        let _one = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let data = self.load().map_err(MemoryError::Read)?;
+        Ok(Snapshot {
             notes: data.notes,
             calls: data.calls,
             resume: data.resume,
-        }
+        })
     }
 
-    /// Apunta una nota: el id que le toca.
+    /// Apunta una nota: el id que le toca. Si ya no quedan ids exactos para la web (pasaría de
+    /// [`MAX_NOTE_ID`], solo con un fichero tocado a mano), `Full`.
     pub fn add_note(&self, text: &str) -> Result<u64, MemoryError> {
         let text = note_text(text);
         if text.is_empty() {
@@ -313,7 +356,10 @@ impl VoiceMemory {
                 return Err(MemoryError::Full);
             }
             let id = data.next_note;
-            data.next_note = id.saturating_add(1);
+            if id > MAX_NOTE_ID {
+                return Err(MemoryError::Full);
+            }
+            data.next_note = id + 1;
             data.notes.push(Note { id, text, at: now });
             Ok((id, true))
         })
@@ -423,7 +469,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         let (m, _) = mem(&state);
-        assert_eq!(m.get(), Snapshot::default());
+        assert_eq!(m.get().unwrap(), Snapshot::default());
         // Leer no crea nada.
         assert!(!state.exists());
     }
@@ -436,7 +482,7 @@ mod tests {
         assert_eq!(m.add_note("la reunión es el jueves"), Ok(1));
         set(&clock, 2000);
         assert_eq!(m.add_note("el proyecto nuevo va en ~/obra"), Ok(2));
-        let s = m.get();
+        let s = m.get().unwrap();
         assert_eq!(
             s.notes,
             vec![
@@ -462,11 +508,11 @@ mod tests {
         // Como tras reiniciar.
         let (again, _) = mem(&state);
         assert_eq!(
-            texts(&again.get()),
+            texts(&again.get().unwrap()),
             vec!["el proyecto nuevo va en ~/obra", "otra"]
         );
         assert_eq!(again.add_note("y otra"), Ok(4));
-        assert_eq!(m.get().notes.len(), 3);
+        assert_eq!(m.get().unwrap().notes.len(), 3);
     }
 
     #[test]
@@ -476,7 +522,7 @@ mod tests {
         let id = m
             .add_note("  hola\r\nmundo\nya\tvale\u{1b}[201~\u{9b}x\u{7f}\u{85}fin  ")
             .unwrap();
-        let s = m.get();
+        let s = m.get().unwrap();
         let n = s.notes.iter().find(|n| n.id == id).unwrap();
         assert_eq!(n.text, "hola mundo ya vale[201~x fin");
 
@@ -484,7 +530,7 @@ mod tests {
             assert_eq!(m.add_note(empty), Err(MemoryError::EmptyNote), "{empty:?}");
         }
         assert_eq!(MemoryError::EmptyNote.to_string(), "la nota está vacía");
-        assert_eq!(m.get().notes.len(), 1);
+        assert_eq!(m.get().unwrap().notes.len(), 1);
     }
 
     #[test]
@@ -496,7 +542,7 @@ mod tests {
         m.add_note(&"ñ".repeat(300)).unwrap();
         // Lo que queda al cortar, sin espacios al final.
         m.add_note(&format!("{} b", "a".repeat(299))).unwrap();
-        let s = m.get();
+        let s = m.get().unwrap();
         assert_eq!(s.notes[0].text, "ñ".repeat(300));
         assert_eq!(s.notes[1].text, "ñ".repeat(300));
         assert_eq!(s.notes[2].text, "a".repeat(299));
@@ -511,7 +557,7 @@ mod tests {
         }
         assert_eq!(m.add_note("una más"), Err(MemoryError::Full));
         assert_eq!(MemoryError::Full.to_string(), "hay 50 notas: olvida alguna");
-        assert_eq!(m.get().notes.len(), MAX_NOTES);
+        assert_eq!(m.get().unwrap().notes.len(), MAX_NOTES);
         // Vacía sigue siendo vacía, aunque esté llena.
         assert_eq!(m.add_note(" "), Err(MemoryError::EmptyNote));
 
@@ -542,7 +588,7 @@ mod tests {
         let max = "Z".repeat(MAX_CALL_ID);
         m.put_call(&max, CallKind::Resumen, "uno").unwrap();
         m.put_call("aZ09_-", CallKind::Resumen, "dos").unwrap();
-        let ids: Vec<String> = m.get().calls.into_iter().map(|c| c.id).collect();
+        let ids: Vec<String> = m.get().unwrap().calls.into_iter().map(|c| c.id).collect();
         assert_eq!(ids, vec![max, "aZ09_-".to_string()]);
     }
 
@@ -556,11 +602,12 @@ mod tests {
             "  10:00 hola\r\n10:01 escribe\rya\u{1b}[201~\t\u{9b}\u{85}fin\n\n  ",
         )
         .unwrap();
+        // El tabulador y U+0085, espacios; el resto de caracteres de control, fuera.
         assert_eq!(
-            m.get().calls[0].text,
-            "10:00 hola\n10:01 escribe\nya[201~fin"
+            m.get().unwrap().calls[0].text,
+            "10:00 hola\n10:01 escribe\nya[201~  fin"
         );
-        assert_eq!(m.get().calls[0].at, 1000);
+        assert_eq!(m.get().unwrap().calls[0].at, 1000);
 
         // Si pasa de 4000 caracteres, se queda el final (por caracteres, no por bytes).
         set(&clock, 2000);
@@ -568,13 +615,52 @@ mod tests {
         let end = "ñ".repeat(MAX_CALL_TEXT - 4) + "\nfin";
         m.put_call("c2", CallKind::Bitacora, &format!("{head}{end}"))
             .unwrap();
-        let c = m.get().calls.into_iter().find(|c| c.id == "c2").unwrap();
+        let c = m
+            .get()
+            .unwrap()
+            .calls
+            .into_iter()
+            .find(|c| c.id == "c2")
+            .unwrap();
         assert_eq!(c.text.chars().count(), MAX_CALL_TEXT);
         assert_eq!(c.text, end);
+        // Si el corte cae a media línea, desde la siguiente.
+        let line = "y".repeat(MAX_CALL_TEXT - 10);
+        m.put_call(
+            "c5",
+            CallKind::Bitacora,
+            &format!("{}\n   {line}", "x".repeat(100)),
+        )
+        .unwrap();
+        let c = m
+            .get()
+            .unwrap()
+            .calls
+            .into_iter()
+            .find(|c| c.id == "c5")
+            .unwrap();
+        assert_eq!(c.text, line);
+        // Sin otra línea detrás, lo que quede de esa.
+        m.put_call("c6", CallKind::Bitacora, &"z".repeat(MAX_CALL_TEXT + 7))
+            .unwrap();
+        let c = m
+            .get()
+            .unwrap()
+            .calls
+            .into_iter()
+            .find(|c| c.id == "c6")
+            .unwrap();
+        assert_eq!(c.text, "z".repeat(MAX_CALL_TEXT));
         // Justo 4000, entero.
         let exact = "x".repeat(MAX_CALL_TEXT);
         m.put_call("c3", CallKind::Resumen, &exact).unwrap();
-        let c = m.get().calls.into_iter().find(|c| c.id == "c3").unwrap();
+        let c = m
+            .get()
+            .unwrap()
+            .calls
+            .into_iter()
+            .find(|c| c.id == "c3")
+            .unwrap();
         assert_eq!(c.text, exact);
 
         for empty in ["", "  \n ", "\u{1b}\u{7}"] {
@@ -584,7 +670,7 @@ mod tests {
                 "{empty:?}"
             );
         }
-        assert_eq!(m.get().calls.len(), 3);
+        assert_eq!(m.get().unwrap().calls.len(), 5);
     }
 
     #[test]
@@ -599,7 +685,7 @@ mod tests {
         set(&clock, 2000);
         assert_eq!(m.put_call("c1", CallKind::Bitacora, "la bitácora"), Ok(()));
         assert_eq!(
-            m.get().calls,
+            m.get().unwrap().calls,
             vec![Call {
                 id: "c1".into(),
                 at: 1000,
@@ -624,7 +710,7 @@ mod tests {
         set(&clock, 3000);
         m.put_call("c1", CallKind::Resumen, "se habló de todo")
             .unwrap();
-        let calls = m.get().calls;
+        let calls = m.get().unwrap().calls;
         assert_eq!(calls.len(), 2);
         let c1 = calls.iter().find(|c| c.id == "c1").unwrap();
         assert_eq!(
@@ -640,7 +726,7 @@ mod tests {
         set(&clock, 4000);
         m.put_call("c1", CallKind::Resumen, "mejor resumen")
             .unwrap();
-        let calls = m.get().calls;
+        let calls = m.get().unwrap().calls;
         assert_eq!(calls.len(), 2);
         let c1 = calls.iter().find(|c| c.id == "c1").unwrap();
         assert_eq!((c1.at, c1.text.as_str()), (4000, "mejor resumen"));
@@ -660,14 +746,14 @@ mod tests {
         // Sustituir una que ya está no tira ninguna (y la pone al día).
         set(&clock, 2000);
         m.put_call("c0", CallKind::Resumen, "r2").unwrap();
-        let calls = m.get().calls;
+        let calls = m.get().unwrap().calls;
         assert_eq!(calls.len(), MAX_CALLS);
         assert!(calls.iter().any(|c| c.id == "c0" && c.at == 2000));
 
         // La 21: se va la más vieja por la hora (c1), no la primera que entró (c0).
         set(&clock, 3000);
         m.put_call("nueva", CallKind::Bitacora, "b").unwrap();
-        let calls = m.get().calls;
+        let calls = m.get().unwrap().calls;
         assert_eq!(calls.len(), MAX_CALLS);
         assert!(!calls.iter().any(|c| c.id == "c1"));
         assert!(calls.iter().any(|c| c.id == "c0"));
@@ -676,7 +762,7 @@ mod tests {
         // Aunque el reloj vaya hacia atrás, la que se acaba de guardar se queda.
         set(&clock, 1);
         m.put_call("atrasada", CallKind::Resumen, "r").unwrap();
-        let calls = m.get().calls;
+        let calls = m.get().unwrap().calls;
         assert_eq!(calls.len(), MAX_CALLS);
         assert!(calls.iter().any(|c| c.id == "atrasada"));
         assert!(!calls.iter().any(|c| c.id == "c2"));
@@ -689,7 +775,7 @@ mod tests {
         set(&clock, 5000);
         m.set_resume("abc").unwrap();
         assert_eq!(
-            m.get().resume,
+            m.get().unwrap().resume,
             Some(Resume {
                 handle: "abc".into(),
                 at: 5000
@@ -698,7 +784,10 @@ mod tests {
         // Hasta 4096 bytes (no caracteres).
         m.set_resume(&"a".repeat(MAX_HANDLE)).unwrap();
         m.set_resume(&"ñ".repeat(MAX_HANDLE / 2)).unwrap();
-        assert_eq!(m.get().resume.unwrap().handle, "ñ".repeat(MAX_HANDLE / 2));
+        assert_eq!(
+            m.get().unwrap().resume.unwrap().handle,
+            "ñ".repeat(MAX_HANDLE / 2)
+        );
         let too_long = ["a".repeat(MAX_HANDLE + 1), "ñ".repeat(MAX_HANDLE / 2) + "a"];
         for bad in too_long
             .iter()
@@ -711,20 +800,23 @@ mod tests {
             MemoryError::BadHandle.to_string(),
             "handle no válido: de 1 a 4096 bytes, sin caracteres de control"
         );
-        assert_eq!(m.get().resume.unwrap().handle, "ñ".repeat(MAX_HANDLE / 2));
+        assert_eq!(
+            m.get().unwrap().resume.unwrap().handle,
+            "ñ".repeat(MAX_HANDLE / 2)
+        );
 
         set(&clock, 6000);
         m.set_resume("otro").unwrap();
         let (again, _) = mem(dir.path());
         assert_eq!(
-            again.get().resume,
+            again.get().unwrap().resume,
             Some(Resume {
                 handle: "otro".into(),
                 at: 6000
             })
         );
         m.clear_resume().unwrap();
-        assert_eq!(again.get().resume, None);
+        assert_eq!(again.get().unwrap().resume, None);
         m.clear_resume().unwrap();
     }
 
@@ -734,20 +826,24 @@ mod tests {
             "{ esto no es memoria",
             "",
             "{\"notes\": 5}",
-            "[]",
+            "[1]",
             "\u{0}\u{1}",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join(FILE);
             std::fs::write(&file, broken).unwrap();
             let (m, _) = mem(dir.path());
-            assert_eq!(m.get(), Snapshot::default(), "{broken:?}");
+            assert_eq!(m.get().unwrap(), Snapshot::default(), "{broken:?}");
+            // Apartado, tal cual, para mirarlo.
+            let bad = dir.path().join(format!("{FILE}.bad"));
+            assert_eq!(std::fs::read_to_string(&bad).unwrap(), broken);
+            assert!(!file.exists());
             // El primer cambio lo reescribe, entero y bien.
             assert_eq!(m.add_note("nueva"), Ok(1));
             let data: Data = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
             assert_eq!(data.notes.len(), 1);
             let (again, _) = mem(dir.path());
-            assert_eq!(texts(&again.get()), vec!["nueva"]);
+            assert_eq!(texts(&again.get().unwrap()), vec!["nueva"]);
         }
     }
 
@@ -758,9 +854,9 @@ mod tests {
         // Sin `next_note` (o con uno que se quedó atrás): el id sigue al más alto.
         std::fs::write(&file, r#"{"notes": [{"id": 7, "text": "siete", "at": 1}]}"#).unwrap();
         let (m, _) = mem(dir.path());
-        assert_eq!(texts(&m.get()), vec!["siete"]);
-        assert_eq!(m.get().calls, vec![]);
-        assert_eq!(m.get().resume, None);
+        assert_eq!(texts(&m.get().unwrap()), vec!["siete"]);
+        assert_eq!(m.get().unwrap().calls, vec![]);
+        assert_eq!(m.get().unwrap().resume, None);
         assert_eq!(m.add_note("ocho"), Ok(8));
         std::fs::write(
             &file,
@@ -770,21 +866,93 @@ mod tests {
         assert_eq!(m.add_note("ocho"), Ok(8));
     }
 
-    /// Un fichero tocado a mano con ids enormes no hace saltar nada.
+    /// Los ids de las notas no pasan de 2^53 − 1 (la web los guarda exactos), ni con un fichero
+    /// tocado a mano; con ids enormes, nada salta.
     #[test]
-    fn huge_ids_do_not_panic() {
+    fn note_ids_stay_exact_for_the_web() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(FILE);
+        let last = MAX_NOTE_ID - 1;
+        std::fs::write(
+            &file,
+            format!(r#"{{"notes": [{{"id": {last}, "text": "x", "at": 1}}]}}"#),
+        )
+        .unwrap();
+        let (m, _) = mem(dir.path());
+        assert_eq!(m.add_note("y"), Ok(MAX_NOTE_ID));
+        assert_eq!(m.add_note("z"), Err(MemoryError::Full));
+        assert_eq!(m.get().unwrap().notes.len(), 2);
+
         let max = u64::MAX;
         std::fs::write(
             &file,
             format!(r#"{{"notes": [{{"id": {max}, "text": "x", "at": 1}}], "next_note": {max}}}"#),
         )
         .unwrap();
+        // La de un id que la web no guarda exacto no sale.
+        assert_eq!(m.get().unwrap().notes, vec![]);
+        assert_eq!(m.add_note("y"), Err(MemoryError::Full));
+    }
+
+    /// Un fichero tocado a mano pasa por lo mismo que lo que llega por la API.
+    #[test]
+    fn what_is_read_is_cleaned_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE);
+        let mut notes: Vec<serde_json::Value> = (1..=60u64)
+            .map(|i| serde_json::json!({"id": i, "text": format!("nota {i}"), "at": i}))
+            .collect();
+        notes[59]["text"] = format!("a\u{1b}[2J\nb{}", "c".repeat(400)).into();
+        notes.push(serde_json::json!({"id": 61, "text": " \u{7} ", "at": 61}));
+        let mut calls: Vec<serde_json::Value> = (1..=25u64)
+            .map(|i| serde_json::json!({"id": format!("c{i}"), "at": i, "kind": "resumen", "text": "r"}))
+            .collect();
+        calls[24]["text"] = format!("{}\u{9b}fin", "x".repeat(5000)).into();
+        calls.push(serde_json::json!({"id": "../mal", "at": 99, "kind": "bitacora", "text": "b"}));
+        calls
+            .push(serde_json::json!({"id": "vacía", "at": 99, "kind": "resumen", "text": "\u{0}"}));
+        let raw = serde_json::json!({
+            "notes": notes, "calls": calls,
+            "resume": {"handle": "con\u{7}control", "at": 1},
+        });
+        std::fs::write(&file, raw.to_string()).unwrap();
         let (m, _) = mem(dir.path());
-        assert_eq!(m.add_note("y"), Ok(max));
-        assert_eq!(m.add_note("z"), Ok(max));
-        assert_eq!(m.get().notes.len(), 3);
+        let s = m.get().unwrap();
+        // Las 50 últimas, limpias y recortadas.
+        assert_eq!(s.notes.len(), MAX_NOTES);
+        assert_eq!(s.notes[0].id, 11);
+        let last = &s.notes[MAX_NOTES - 1];
+        assert_eq!(last.id, 60);
+        assert_eq!(last.text, format!("a[2J b{}", "c".repeat(MAX_NOTE - 6)));
+        // Las 20 más nuevas, con su texto recortado por el final.
+        assert_eq!(s.calls.len(), MAX_CALLS);
+        assert_eq!(s.calls[0].id, "c6");
+        let newest = &s.calls[MAX_CALLS - 1];
+        assert_eq!(newest.id, "c25");
+        assert_eq!(newest.text.chars().count(), MAX_CALL_TEXT);
+        assert!(newest.text.ends_with("xfin"));
+        assert_eq!(s.resume, None);
+    }
+
+    #[test]
+    fn the_unaccented_kind_is_accepted_too() {
+        let kind: CallKind = serde_json::from_str("\"bitacora\"").unwrap();
+        assert_eq!(kind, CallKind::Bitacora);
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"bitácora\"");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = mem(dir.path());
+        m.add_note("una").unwrap();
+        let before = std::fs::read(dir.path().join(FILE)).unwrap();
+        // El temporal no se puede crear: el cambio falla y el fichero bueno sigue intacto.
+        std::fs::create_dir(dir.path().join(format!("{FILE}.tmp"))).unwrap();
+        let e = m.add_note("dos").unwrap_err();
+        assert!(matches!(e, MemoryError::Save(_)), "{e:?}");
+        assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), before);
+        assert_eq!(texts(&m.get().unwrap()), vec!["una"]);
     }
 
     #[test]
@@ -795,9 +963,9 @@ mod tests {
         m.put_call("c1", CallKind::Resumen, "r").unwrap();
         m.set_resume("h").unwrap();
         std::fs::remove_file(dir.path().join(FILE)).unwrap();
-        assert_eq!(m.get(), Snapshot::default());
+        assert_eq!(m.get().unwrap(), Snapshot::default());
         assert_eq!(m.add_note("otra"), Ok(1));
-        assert_eq!(texts(&m.get()), vec!["otra"]);
+        assert_eq!(texts(&m.get().unwrap()), vec!["otra"]);
     }
 
     #[test]
@@ -805,7 +973,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (m, _) = mem(dir.path());
         assert_eq!(
-            serde_json::to_value(m.get()).unwrap(),
+            serde_json::to_value(m.get().unwrap()).unwrap(),
             serde_json::json!({"notes": [], "calls": [], "resume": null})
         );
         m.add_note("n").unwrap();
@@ -813,7 +981,7 @@ mod tests {
         m.put_call("c2", CallKind::Resumen, "r").unwrap();
         m.set_resume("h").unwrap();
         assert_eq!(
-            serde_json::to_value(m.get()).unwrap(),
+            serde_json::to_value(m.get().unwrap()).unwrap(),
             serde_json::json!({
                 "notes": [{"id": 1, "text": "n", "at": 1000}],
                 "calls": [
@@ -871,7 +1039,7 @@ mod tests {
         let (m, _) = mem(&state);
         // La carpeta de estado es un fichero: no se puede escribir dentro.
         std::fs::write(&state, "no soy una carpeta").unwrap();
-        assert_eq!(m.get(), Snapshot::default());
+        assert_eq!(m.get().unwrap(), Snapshot::default());
         for e in [
             m.add_note("una").unwrap_err(),
             m.put_call("c1", CallKind::Resumen, "r").unwrap_err(),
@@ -898,7 +1066,8 @@ mod tests {
         // El fichero es una carpeta: leerlo falla (no es que falte ni que esté roto).
         std::fs::create_dir(dir.path().join(FILE)).unwrap();
         let (m, _) = mem(dir.path());
-        assert_eq!(m.get(), Snapshot::default());
+        let e = m.get().unwrap_err();
+        assert!(matches!(e, MemoryError::Read(_)), "{e:?}");
         let e = m.add_note("una").unwrap_err();
         assert!(matches!(e, MemoryError::Read(_)), "{e:?}");
         assert!(

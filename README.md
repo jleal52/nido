@@ -319,7 +319,9 @@ nido is running.
 - `PUT /api/v1/voice/memory/resume` `{"handle"}` → `204`; `DELETE` removes it (`204`).
 
 Invalid input (an empty text, an unknown `kind`, a bad call id or handle) is a `400`, and a
-memory file nido can't read or write is a `500`. An older nido answers `404`.
+memory file nido can't read or write is a `500`. A file nido doesn't understand (say, a bad
+hand edit) is set aside as `voice-memory.json.bad` and the memory starts empty. An older nido
+answers `404`.
 
 `POST /api/v1/pair` (body `{"days": 30}` optional, for a reusable code) creates a pairing code and
 returns `{"uri": "nido://pair?…", "expires", "reusable", "direct",
