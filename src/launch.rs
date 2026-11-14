@@ -80,7 +80,29 @@ impl Paths {
     pub fn history(&self, id: &str) -> PathBuf {
         self.session_state(id).join("history.ans")
     }
+
+    /// La carpeta de la sesión «consultas» de la voz, absoluta (no la crea).
+    pub fn consultas(&self) -> PathBuf {
+        let dir = self.state.join(CONSULTAS_DIR);
+        std::path::absolute(&dir).unwrap_or(dir)
+    }
+
+    /// ¿Es `cwd` la carpeta de «consultas»? Por la ruta, no por el nombre de la sesión: una que
+    /// se llame así en otra carpeta es como cualquier otra. Escrita de otra forma (con un enlace
+    /// por medio), también.
+    pub fn is_consultas(&self, cwd: &Path) -> bool {
+        let dir = self.consultas();
+        let abs = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_owned());
+        abs == dir
+            || matches!(
+                (std::fs::canonicalize(&abs), std::fs::canonicalize(&dir)),
+                (Ok(a), Ok(b)) if a == b
+            )
+    }
 }
+
+/// La carpeta de la sesión «consultas» de la voz, debajo de `<state>`.
+const CONSULTAS_DIR: &str = "consultas";
 
 /// Con qué dirección hablan las sesiones de un `nido serve` que escucha en `bind`: siempre de
 /// loopback (la API del MCP solo atiende ahí): la suya, o la de loopback si escucha en todas.
@@ -430,6 +452,13 @@ pub fn set_mcp(paths: &Paths, on: bool) -> io::Result<()> {
 /// La configuración con la que arranca el guardián de esta sesión: la orden tal cual, o, si
 /// dentro hay un Claude con conversación, retomarla (directamente o escribiéndolo en la shell).
 /// Si la orden es `claude` y el MCP está encendido, con el channel de nido (`channel`).
+///
+/// El Claude de la carpeta de «consultas» de la voz (`Paths::is_consultas`) va aislado de la
+/// configuración del usuario (`claude::with_isolation`) y sin el MCP de nido: lo que lee o hace
+/// vuelve al modelo de voz, y nido no lo necesita para esa sesión (lo que termina se sabe por el
+/// estado de Claude, y las respuestas y el modo se escriben en su terminal). Se decide aquí, en
+/// cada arranque (nueva, retomada, al reiniciarla o al arrancar el equipo), sin guardarlo en la
+/// orden.
 pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> HolderConfig {
     let mut argv = session.argv.clone();
     let mut env = session.env.clone();
@@ -437,6 +466,7 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
     // Ningún Claude que lance nido lee ni toca los secretos (ver `secrets.rs`), lleve o no el
     // MCP de nido.
     let rules = claude::secrets_rules(&paths.state.join("secrets"));
+    let isolated = paths.is_consultas(&session.cwd);
     if let Some(link) = &session.claude {
         let config_dir = link
             .config_dir
@@ -445,7 +475,7 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
         if transcript_exists(&config_dir, &link.session_id) {
             if link.inside_shell {
                 initial_input =
-                    Some(format!("{}\r", claude::resume_line(link, &rules)).into_bytes());
+                    Some(format!("{}\r", claude::resume_line(link, &rules, isolated)).into_bytes());
             } else {
                 let (mut resume, resume_env) = claude::resume_argv(link);
                 // Las opciones propias con las que se lanzó (`--model`, `--mcp-config`…), también.
@@ -457,9 +487,12 @@ pub fn holder_config(paths: &Paths, session: &Session, cols: u16, rows: u16) -> 
     }
     // Un Claude escrito en una shell va sin él: `NIDO_CHANNEL` se quedaría en la shell, y otro
     // `claude` lanzado luego en ella recogería la bandeja sin channel.
-    let channel = channel_launch(paths, &argv) == ChannelLaunch::Yes;
+    let channel = !isolated && channel_launch(paths, &argv) == ChannelLaunch::Yes;
     if channel {
         argv = claude::with_nido_mcp(&argv, true);
+    }
+    if isolated {
+        argv = claude::with_isolation(&argv);
     }
     argv = claude::with_secrets_guard(&argv, &rules);
     HolderConfig {
@@ -636,6 +669,139 @@ mod tests {
         let cfg = holder_config(&p, &claude_session(true), 80, 24);
         assert!(!cfg.channel);
         assert!(cfg.argv.ends_with(&["bash".to_string()]));
+    }
+
+    /// La sesión «consultas» de la voz, como la crea la web: en su carpeta y sin orden.
+    fn consultas_session(p: &Paths, inside_shell: bool) -> Session {
+        let mut s = claude_session(inside_shell);
+        s.name = "consultas".into();
+        if !inside_shell {
+            s.argv = claude::new_argv("consultas", "sid-1");
+        }
+        s.cwd = p.consultas();
+        s
+    }
+
+    fn has_any(argv: &[String], opts: &[&str]) -> bool {
+        argv.iter().any(|a| {
+            opts.iter()
+                .any(|o| a == o || a.starts_with(&format!("{o}=")))
+        })
+    }
+
+    /// Las opciones que aíslan a Claude, o las del MCP de nido.
+    const ISOLATION_OPTS: [&str; 3] = [
+        "--setting-sources",
+        "--permission-mode",
+        "--strict-mcp-config",
+    ];
+    const NIDO_MCP_OPTS: [&str; 3] = [
+        "--dangerously-load-development-channels",
+        "--allowedTools",
+        "--mcp-config",
+    ];
+
+    #[test]
+    fn the_voice_consultas_session_runs_apart_from_the_user_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let s = consultas_session(&p, false);
+        let rules = claude::secrets_rules(&p.state.join("secrets"));
+        // Sin leer los secretos, aislada y sin el MCP de nido (ni channel).
+        let want = |rest: &[&str]| {
+            let mut out = vec!["claude".to_owned(), "--disallowedTools".to_owned()];
+            out.extend(rules.iter().cloned());
+            out.extend(claude::ISOLATION.map(str::to_owned));
+            out.extend(rest.iter().map(|a| a.to_string()));
+            out
+        };
+        let cfg = holder_config(&p, &s, 80, 24);
+        let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
+        assert_eq!(
+            cfg.argv[at..],
+            want(&["--session-id", "sid-1", "-n", "consultas"])
+        );
+        assert!(!cfg.channel);
+        assert!(!has_any(&cfg.argv, &NIDO_MCP_OPTS), "{:?}", cfg.argv);
+
+        // Al reiniciarla (parada y arrancada, o al arrancar el equipo) se retoma su conversación:
+        // igual de aislada, aunque la orden guardada diga otra cosa.
+        let proj = p.home.join(".claude/projects/consultas");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("sid-1.jsonl"), "{}").unwrap();
+        let cfg = holder_config(&p, &s, 80, 24);
+        let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
+        assert_eq!(cfg.argv[at..], want(&["--resume", "sid-1"]));
+        assert!(!cfg.channel);
+        let mut own = s.clone();
+        own.argv.extend(
+            [
+                "--permission-mode",
+                "auto",
+                "--mcp-config",
+                "x.json",
+                "--model",
+                "haiku",
+            ]
+            .map(str::to_owned),
+        );
+        let cfg = holder_config(&p, &own, 80, 24);
+        let at = cfg.argv.iter().position(|a| a == "claude").unwrap();
+        assert_eq!(
+            cfg.argv[at..],
+            want(&["--resume", "sid-1", "--model", "haiku"])
+        );
+
+        // Escrito en una shell, también.
+        let cfg = holder_config(&p, &consultas_session(&p, true), 80, 24);
+        let line = String::from_utf8(cfg.initial_input.unwrap()).unwrap();
+        assert!(
+            line.contains(
+                " --setting-sources 'project,local' --permission-mode default \
+                           --strict-mcp-config --resume sid-1\r"
+            ),
+            "{line:?}"
+        );
+        assert!(!cfg.channel);
+    }
+
+    #[test]
+    fn only_the_consultas_folder_isolates_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        // Una sesión que se llama «consultas» en otra carpeta, como cualquier otra.
+        let mut s = consultas_session(&p, false);
+        for cwd in [
+            PathBuf::from("/w"),
+            p.state.clone(),
+            p.consultas().join("sub"),
+        ] {
+            s.cwd = cwd;
+            let cfg = holder_config(&p, &s, 80, 24);
+            assert!(!has_any(&cfg.argv, &ISOLATION_OPTS), "{:?}", cfg.argv);
+            assert!(cfg.channel, "{:?}", s.cwd);
+        }
+        // Su carpeta escrita de otra forma, sí.
+        assert!(p.is_consultas(&p.consultas()));
+        assert!(p.is_consultas(&p.consultas().join(".")));
+        assert!(p.is_consultas(&p.state.join("consultas/")));
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(p.consultas()).unwrap();
+            let link = tmp.path().join("enlace");
+            std::os::unix::fs::symlink(&p.state, &link).unwrap();
+            s.cwd = link.join("consultas");
+            let cfg = holder_config(&p, &s, 80, 24);
+            assert!(has_any(&cfg.argv, &ISOLATION_OPTS), "{:?}", cfg.argv);
+            assert!(!cfg.channel);
+        }
+        // Y otro programa en ella, tal cual.
+        s.cwd = p.consultas();
+        s.argv = vec!["bash".into()];
+        s.claude = None;
+        let cfg = holder_config(&p, &s, 80, 24);
+        assert!(cfg.argv.ends_with(&["bash".to_string()]));
+        assert!(!has_any(&cfg.argv, &ISOLATION_OPTS));
     }
 
     #[cfg(unix)]

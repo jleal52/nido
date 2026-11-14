@@ -2718,15 +2718,12 @@ async fn api_voice_call_put(
     }
 }
 
-/// La carpeta de la sesión «consultas» de la voz, debajo de `<state>`.
-const CONSULTAS_DIR: &str = "consultas";
-
-/// Crea, si falta, la carpeta vacía de «consultas» en `state` (0700) y devuelve su ruta
+/// Crea, si falta, la carpeta vacía de «consultas» (`Paths::consultas`, 0700) y devuelve su ruta
 /// absoluta. Lo que ya esté ahí y no sea una carpeta (un fichero, o un enlace, aunque lleve a
 /// una carpeta) es un error y se queda como está: con un enlace a `~`, Claude leería lo de
-/// fuera.
-fn consultas_dir(state: &std::path::Path) -> std::io::Result<PathBuf> {
-    let dir = std::path::absolute(state.join(CONSULTAS_DIR))?;
+/// fuera. El Claude que se lance en ella va aislado (ver `launch::holder_config`).
+fn consultas_dir(paths: &Paths) -> std::io::Result<PathBuf> {
+    let dir = paths.consultas();
     crate::sys::create_private_dir_all(&dir)?;
     if !std::fs::symlink_metadata(&dir)?.is_dir() {
         return Err(std::io::Error::other(format!(
@@ -2747,8 +2744,8 @@ async fn api_voice_consultas(
     if !paired_device(&st, &headers) {
         return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
     }
-    let state = st.paths.state.clone();
-    match tokio::task::spawn_blocking(move || consultas_dir(&state)).await {
+    let paths = st.paths.clone();
+    match tokio::task::spawn_blocking(move || consultas_dir(&paths)).await {
         Ok(Ok(dir)) => Json(serde_json::json!({ "cwd": dir })).into_response(),
         Ok(Err(e)) => error(
             StatusCode::INTERNAL_SERVER_ERROR,

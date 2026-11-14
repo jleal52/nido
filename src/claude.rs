@@ -625,6 +625,79 @@ pub fn with_secrets_guard(argv: &[String], rules: &[String]) -> Vec<String> {
     insert_opts(argv, add)
 }
 
+/// Las opciones que aíslan de la configuración del usuario a la sesión «consultas» de la voz (lo
+/// que lee o hace vuelve al modelo de voz):
+/// - `--setting-sources project,local`: sin `~/.claude/settings.json` (ni sus carpetas de más,
+///   `additionalDirectories`, ni su modo por defecto, ni sus permisos, hooks o plugins). La
+///   cuenta no está ahí (está en `~/.claude/.credentials.json` y `~/.claude.json`): sigue igual.
+/// - `--permission-mode default`: arranca en modo manual. `claude --help` lo llama `manual`, pero
+///   también acepta `default`, que es lo que entienden los Claude Code de antes.
+/// - `--strict-mcp-config` sin `--mcp-config`: sin servidores MCP (ni los del usuario ni el de
+///   nido; ver `launch::holder_config`).
+pub const ISOLATION: [&str; 5] = [
+    "--setting-sources",
+    "project,local",
+    "--permission-mode",
+    "default",
+    "--strict-mcp-config",
+];
+
+/// Lo que iría contra el aislamiento si lo llevara la orden (sus opciones van detrás de las de
+/// nido, y la última gana): fuera.
+const UNISOLATED: [&str; 6] = [
+    "--setting-sources",
+    "--permission-mode",
+    "--mcp-config",
+    "--strict-mcp-config",
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+];
+
+/// `argv` aislada de la configuración del usuario (`ISOLATION`), delante de la primera opción, y
+/// sin lo que iría en contra (`UNISOLATED`). Si ya lo estaba, igual.
+pub fn with_isolation(argv: &[String]) -> Vec<String> {
+    if !is_claude(argv) {
+        return argv.to_vec();
+    }
+    let argv = without_opts(argv, &UNISOLATED);
+    insert_opts(&argv, ISOLATION.map(str::to_owned).to_vec())
+}
+
+/// `argv` sin las opciones `names` ni sus valores (con `=` o detrás, como los lee Claude). Lo que
+/// va tras un `--` no se toca.
+fn without_opts(argv: &[String], names: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if i > 0 && a == "--" {
+            out.extend_from_slice(&argv[i..]);
+            break;
+        }
+        if i > 0
+            && a.split_once('=')
+                .is_some_and(|(opt, _)| names.contains(&opt))
+        {
+            i += 1;
+            continue;
+        }
+        if i > 0 && names.contains(&a) {
+            let (many, one) = (variadic(a), takes_value(a));
+            while (many || one) && argv.get(i + 1).is_some_and(|v| !v.starts_with('-')) {
+                i += 1;
+                if !many {
+                    break;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        out.push(a.to_owned());
+        i += 1;
+    }
+    out
+}
+
 /// La primera versión de Claude Code con channels (`--channels` y
 /// `--dangerously-load-development-channels`, en vista previa). No sale en `claude --help`
 /// (están ocultas mientras dure la vista previa), así que se mira la versión. Un Claude más
@@ -1099,9 +1172,12 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// La línea que se escribe en la shell para retomar el Claude que corría dentro, sin leer los
-/// secretos (`rules`, de `secrets_rules`).
-pub fn resume_line(link: &ClaudeLink, rules: &[String]) -> String {
-    let (argv, env) = resume_argv(link);
+/// secretos (`rules`, de `secrets_rules`) y, si `isolated`, aislado (`with_isolation`).
+pub fn resume_line(link: &ClaudeLink, rules: &[String], isolated: bool) -> String {
+    let (mut argv, env) = resume_argv(link);
+    if isolated {
+        argv = with_isolation(&argv);
+    }
     let argv = with_secrets_guard(&argv, rules);
     let mut parts: Vec<String> = env
         .iter()
@@ -1458,6 +1534,63 @@ mod tests {
             secrets_rules(&by_real),
             [rule("Read", &by_real), rule("Edit", &by_real)]
         );
+    }
+
+    #[test]
+    fn the_isolated_claude_ignores_the_user_settings_and_mcp_servers() {
+        let iso = |rest: &[&str]| {
+            let mut out = v(&["claude"]);
+            out.extend(v(&ISOLATION));
+            out.extend(v(rest));
+            out
+        };
+        // Nueva y retomada: delante de la primera opción.
+        assert_eq!(
+            with_isolation(&new_argv("consultas", "u-1")),
+            iso(&["--session-id", "u-1", "-n", "consultas"])
+        );
+        let resumed = v(&["claude", "--resume", "u-1"]);
+        assert_eq!(with_isolation(&resumed), iso(&["--resume", "u-1"]));
+        // Una vez, aunque ya las lleve.
+        let once = with_isolation(&resumed);
+        assert_eq!(with_isolation(&once), once);
+        // Lo que iría contra ellas sale (con valor aparte o con `=`): las de la orden irían
+        // detrás y ganarían.
+        let own = v(&[
+            "claude",
+            "--permission-mode",
+            "auto",
+            "--setting-sources=user,project,local",
+            "--mcp-config",
+            "a.json",
+            "b.json",
+            "--strict-mcp-config",
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+            "--permission-mode=bypassPermissions",
+            "--setting-sources",
+            "user",
+            "--mcp-config={}",
+            "--model",
+            "haiku",
+            "--resume",
+            "u-1",
+        ]);
+        assert_eq!(
+            with_isolation(&own),
+            iso(&["--model", "haiku", "--resume", "u-1"])
+        );
+        // Un mensaje sin opciones: delante y con `--`; y lo que va tras un `--` no se toca.
+        assert_eq!(
+            with_isolation(&v(&["claude", "hola"])),
+            iso(&["--", "hola"])
+        );
+        assert_eq!(
+            with_isolation(&v(&["claude", "-c", "--", "--permission-mode"])),
+            iso(&["-c", "--", "--permission-mode"])
+        );
+        // Otro programa, tal cual.
+        assert_eq!(with_isolation(&v(&["bash"])), v(&["bash"]));
     }
 
     #[test]
@@ -1980,7 +2113,7 @@ mod tests {
             )]
         );
         assert_eq!(
-            resume_line(&link, &[]),
+            resume_line(&link, &[], false),
             "CLAUDE_CONFIG_DIR='/perfil con espacio' claude --resume u-1"
         );
         let with_acct = ClaudeLink {
@@ -1988,11 +2121,17 @@ mod tests {
             ..link
         };
         assert_eq!(resume_argv(&with_acct).1, []);
-        assert_eq!(resume_line(&with_acct, &[]), "claude --resume u-1");
+        assert_eq!(resume_line(&with_acct, &[], false), "claude --resume u-1");
         // Sin leer los secretos.
         assert_eq!(
-            resume_line(&with_acct, &["Read(//r/secrets/**)".to_owned()]),
+            resume_line(&with_acct, &["Read(//r/secrets/**)".to_owned()], false),
             "claude --disallowedTools 'Read(//r/secrets/**)' --resume u-1"
+        );
+        // Aislado (la sesión «consultas» de la voz).
+        assert_eq!(
+            resume_line(&with_acct, &["Read(//r/secrets/**)".to_owned()], true),
+            "claude --disallowedTools 'Read(//r/secrets/**)' --setting-sources 'project,local' \
+             --permission-mode default --strict-mcp-config --resume u-1"
         );
     }
 }
