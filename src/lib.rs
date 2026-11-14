@@ -34,5 +34,6 @@ pub mod server;
 pub mod sys;
 pub mod transcript;
 pub mod upload;
+pub mod voice_memory;
 #[doc(hidden)]
 pub mod watchdog;

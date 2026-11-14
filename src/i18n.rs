@@ -287,6 +287,28 @@ const TABLE: &[(&str, &str)] = &[
         "solo un teléfono o una web emparejados pueden llamar",
         "only a paired phone or browser can make a call",
     ),
+    // La memoria de la voz (voice_memory.rs)
+    ("la nota está vacía", "the note is empty"),
+    (
+        "hay {} notas: olvida alguna",
+        "there are {0} notes: forget one",
+    ),
+    (
+        "id de llamada no válido: de 1 a {} caracteres entre A-Z, a-z, 0-9, '_' y '-'",
+        "invalid call id: 1 to {0} characters from A-Z, a-z, 0-9, '_' and '-'",
+    ),
+    (
+        "handle no válido: de 1 a {} bytes, sin caracteres de control",
+        "invalid handle: 1 to {0} bytes, no control characters",
+    ),
+    (
+        "no se pudo leer la memoria: {}",
+        "could not read the memory: {0}",
+    ),
+    (
+        "no se pudo guardar la memoria: {}",
+        "could not save the memory: {0}",
+    ),
     // mcp_api.rs
     (
         "la API del MCP solo va con el token de este equipo",
@@ -1241,6 +1263,32 @@ mod tests {
         assert_eq!(
             english("la sesión ya no existe"),
             "the session no longer exists"
+        );
+    }
+
+    /// Los de la memoria de la voz.
+    #[test]
+    fn voice_memory_messages() {
+        assert_eq!(english("la nota está vacía"), "the note is empty");
+        assert_eq!(
+            english("hay 50 notas: olvida alguna"),
+            "there are 50 notes: forget one"
+        );
+        assert_eq!(
+            english("id de llamada no válido: de 1 a 64 caracteres entre A-Z, a-z, 0-9, '_' y '-'"),
+            "invalid call id: 1 to 64 characters from A-Z, a-z, 0-9, '_' and '-'"
+        );
+        assert_eq!(
+            english("handle no válido: de 1 a 4096 bytes, sin caracteres de control"),
+            "invalid handle: 1 to 4096 bytes, no control characters"
+        );
+        assert_eq!(
+            english("no se pudo leer la memoria: Is a directory (os error 21)"),
+            "could not read the memory: Is a directory (os error 21)"
+        );
+        assert_eq!(
+            english("no se pudo guardar la memoria: disco lleno"),
+            "could not save the memory: disco lleno"
         );
     }
 
