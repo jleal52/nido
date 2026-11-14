@@ -297,6 +297,30 @@ while asking), `501` if the hub does not offer voice (an older hub that doesn't 
 that, after 30 seconds), `429` if this computer reached the hub's voice limit, `502` for any
 other error from the hub. An older nido, without this endpoint, answers `404`.
 
+The voice memory, so that a call can pick up from earlier ones: the notes the voice agent takes
+when you ask it to remember something (up to 50, of up to 300 characters each), the summary of
+each of the last 20 calls (or, if the summary didn't arrive, a log of what was said and done,
+up to 4000 characters) and the handle to resume the last conversation with the voice model. It
+is kept in `<state>/voice-memory.json` (`<state>` as in "Secrets, texts and files": usually
+`~/.local/state/nido`), readable only by your user, on the computer the phone or browser is
+paired with; it doesn't go to the hub or to other computers in the group. Only a paired phone or
+browser can read or change it (`403` with the token in `~/.config/nido/token`). To wipe it,
+delete that file: nido reads it on every request, so it takes effect immediately, even while
+nido is running.
+
+- `GET /api/v1/voice/memory` → `{"notes": [{"id", "text", "at"}], "calls": [{"id", "at",
+  "kind": "resumen" | "bitácora", "text"}], "resume": {"handle", "at"} | null}` (`at` in ms since
+  1970).
+- `POST /api/v1/voice/memory/notes` `{"text"}` → `{"id"}`; `409` if there are already 50 notes.
+  `DELETE /api/v1/voice/memory/notes/{id}` → `204`, or `404` if there is no such note.
+- `POST /api/v1/voice/memory/calls` `{"id", "kind", "text"}` → `204`: saves the summary
+  (`"resumen"`) or the log (`"bitácora"`) of call `id`, replacing the one with that id (a log
+  never replaces a summary).
+- `PUT /api/v1/voice/memory/resume` `{"handle"}` → `204`; `DELETE` removes it (`204`).
+
+Invalid input (an empty text, an unknown `kind`, a bad call id or handle) is a `400`, and a
+memory file nido can't read or write is a `500`. An older nido answers `404`.
+
 `POST /api/v1/pair` (body `{"days": 30}` optional, for a reusable code) creates a pairing code and
 returns `{"uri": "nido://pair?…", "expires", "reusable", "direct",
 "hub"}`. When nido is connected to the hub it also returns `link`, the hub's web app with the code

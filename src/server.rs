@@ -98,6 +98,8 @@ pub struct AppState {
     pub outbox: Arc<crate::outbox::Outbox>,
     /// El plan de fases y tareas de cada sesión (`plan_*` del MCP).
     pub plans: Arc<crate::plan::Plans>,
+    /// La memoria de la voz (`/api/v1/voice/memory`), en `<state>/voice-memory.json`.
+    pub voice_memory: Arc<crate::voice_memory::VoiceMemory>,
     /// Los modelos que se pueden elegir, como los enseñó el menú de `/model` la última vez que
     /// nido lo abrió (`<state>/models.json`); si nunca, `DEFAULT_MODELS`.
     models: std::sync::Mutex<Vec<String>>,
@@ -611,6 +613,7 @@ impl AppState {
         ));
         let secrets = Arc::new(crate::secrets::Store::new(secrets_dir));
         let plans = Arc::new(crate::plan::Plans::new(paths.state.clone()));
+        let voice_memory = Arc::new(crate::voice_memory::VoiceMemory::new(paths.state.clone()));
         let models = load_models(&paths.state.join("models.json"));
         Ok(Arc::new(Self {
             paths,
@@ -651,6 +654,7 @@ impl AppState {
             asks: Default::default(),
             outbox,
             plans,
+            voice_memory,
             models: std::sync::Mutex::new(models),
             model_seen: Default::default(),
             model_refreshing: Mutex::new(()),
@@ -2295,6 +2299,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/hub", get(api_hub).post(api_set_hub))
         .route("/api/v1/push/test", post(api_push_test))
         .route("/api/v1/voice/token", post(api_voice_token))
+        .route("/api/v1/voice/memory", get(api_voice_memory))
+        .route(
+            "/api/v1/voice/memory/notes",
+            post(api_voice_note_add).layer(DefaultBodyLimit::max(MEMORY_BODY)),
+        )
+        .route(
+            "/api/v1/voice/memory/notes/{id}",
+            axum::routing::delete(api_voice_note_delete),
+        )
+        .route(
+            "/api/v1/voice/memory/calls",
+            post(api_voice_call_put).layer(DefaultBodyLimit::max(MEMORY_BODY)),
+        )
+        .route(
+            "/api/v1/voice/memory/resume",
+            axum::routing::put(api_voice_resume_set)
+                .delete(api_voice_resume_clear)
+                .layer(DefaultBodyLimit::max(MEMORY_BODY)),
+        )
         .route("/api/v1/sessions", get(api_list).post(api_create))
         .route("/api/v1/conversations", get(api_conversations))
         .route(
@@ -2546,10 +2569,7 @@ async fn api_voice_token(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let paired = crate::auth::bearer(&headers)
-        .and_then(|t| st.phones.lock().expect("teléfonos").id_by_token(t))
-        .is_some();
-    if !paired {
+    if !paired_device(&st, &headers) {
         return error(
             StatusCode::FORBIDDEN,
             "solo un teléfono o una web emparejados pueden llamar",
@@ -2566,6 +2586,178 @@ async fn api_voice_token(
             };
             error(status, e.message())
         }
+    }
+}
+
+/// Si pide un dispositivo emparejado (con su token), no el token de este equipo.
+fn paired_device(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    crate::auth::bearer(headers)
+        .and_then(|t| st.phones.lock().expect("teléfonos").id_by_token(t))
+        .is_some()
+}
+
+/// La memoria de la voz es de quien habla: solo de los dispositivos emparejados.
+const MEMORY_DENIED: &str =
+    "solo un teléfono o una web emparejados pueden usar la memoria de la voz";
+const NO_SUCH_NOTE: &str = "no hay esa nota";
+/// Lo más que cabe en una petición de la memoria: un texto de llamada (4000 caracteres, hasta
+/// 4 bytes cada uno, o 6 escapado en JSON) y algo más; lo demás, 413 sin leerlo entero.
+const MEMORY_BODY: usize = 64 * 1024;
+const BAD_CALL_KIND: &str = "kind tiene que ser «resumen» o «bitácora»";
+
+/// El código HTTP de un error de la memoria de la voz.
+fn memory_status(e: &crate::voice_memory::MemoryError) -> StatusCode {
+    use crate::voice_memory::MemoryError as E;
+    match e {
+        E::EmptyNote | E::EmptyText | E::BadCallId | E::BadHandle => StatusCode::BAD_REQUEST,
+        E::Full => StatusCode::CONFLICT,
+        E::Read(_) | E::Save(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Una operación de la memoria de la voz, que lee y escribe su fichero: fuera del runtime. El
+/// error se traduce aquí, en la tarea de la petición (la de `spawn_blocking` no sabe el idioma).
+async fn with_memory<T: Send + 'static>(
+    st: &Arc<AppState>,
+    f: impl FnOnce(&crate::voice_memory::VoiceMemory) -> Result<T, crate::voice_memory::MemoryError>
+    + Send
+    + 'static,
+) -> Result<T, Response> {
+    let memory = st.voice_memory.clone();
+    match tokio::task::spawn_blocking(move || f(&memory)).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(error(memory_status(&e), e.to_string())),
+        Err(e) => Err(error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// `GET /api/v1/voice/memory`: `{notes, calls, resume}` (ver `voice_memory::Snapshot`).
+async fn api_voice_memory(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !paired_device(&st, &headers) {
+        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
+    }
+    match with_memory(&st, |m| Ok(m.get())).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+struct NoteReq {
+    text: String,
+}
+
+/// `POST /api/v1/voice/memory/notes` `{text}`: `{id}`; con las notas llenas, 409.
+async fn api_voice_note_add(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !paired_device(&st, &headers) {
+        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
+    }
+    let req: NoteReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_body(&e),
+    };
+    match with_memory(&st, move |m| m.add_note(&req.text)).await {
+        Ok(id) => Json(serde_json::json!({ "id": id })).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `DELETE /api/v1/voice/memory/notes/{id}`: 204, o 404 si no hay esa nota (tampoco si el id no
+/// es un número: no hay ninguna así).
+async fn api_voice_note_delete(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !paired_device(&st, &headers) {
+        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
+    }
+    let Ok(id) = id.parse::<u64>() else {
+        return error(StatusCode::NOT_FOUND, NO_SUCH_NOTE);
+    };
+    match with_memory(&st, move |m| m.delete_note(id)).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, NO_SUCH_NOTE),
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+struct CallReq {
+    id: String,
+    kind: String,
+    text: String,
+}
+
+/// `POST /api/v1/voice/memory/calls` `{id, kind, text}`: guarda el resumen o la bitácora de una
+/// llamada (204).
+async fn api_voice_call_put(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    use crate::voice_memory::CallKind;
+    if !paired_device(&st, &headers) {
+        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
+    }
+    let req: CallReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_body(&e),
+    };
+    let kind = match req.kind.as_str() {
+        "resumen" => CallKind::Resumen,
+        "bitácora" => CallKind::Bitacora,
+        _ => return error(StatusCode::BAD_REQUEST, BAD_CALL_KIND),
+    };
+    match with_memory(&st, move |m| m.put_call(&req.id, kind, &req.text)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+struct ResumeReq {
+    handle: String,
+}
+
+/// `PUT /api/v1/voice/memory/resume` `{handle}`: el handle para retomar la última conversación
+/// (204).
+async fn api_voice_resume_set(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !paired_device(&st, &headers) {
+        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
+    }
+    let req: ResumeReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_body(&e),
+    };
+    match with_memory(&st, move |m| m.set_resume(&req.handle)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `DELETE /api/v1/voice/memory/resume`: lo quita (204, aunque no hubiera).
+async fn api_voice_resume_clear(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !paired_device(&st, &headers) {
+        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
+    }
+    match with_memory(&st, |m| m.clear_resume()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(r) => r,
     }
 }
 
@@ -4465,6 +4657,383 @@ mod tests {
         let (status, body) = voice_reply(&st, &phone.token).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(body["error"], "the hub does not offer voice");
+    }
+
+    // ---------- La memoria de la voz ----------
+
+    /// Un nido con la API escuchando en loopback, como la escucha interna a la que van los flujos
+    /// del túnel cifrado, y un teléfono emparejado (su token).
+    async fn memory_server(dir: &std::path::Path) -> (Arc<AppState>, std::net::SocketAddr, String) {
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, Some("local".into()), true).unwrap();
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(st.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (st, addr, phone.token)
+    }
+
+    /// Una petición con ese bearer (sin `Accept-Language`: en inglés, salvo `lang`).
+    async fn memory_call(
+        addr: std::net::SocketAddr,
+        bearer: &str,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        memory_call_in(addr, bearer, method, path, body, None).await
+    }
+
+    async fn memory_call_in(
+        addr: std::net::SocketAddr,
+        bearer: &str,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+        lang: Option<&'static str>,
+    ) -> (u16, serde_json::Value) {
+        let (bearer, method, path) = (bearer.to_owned(), method.to_owned(), path.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let headers: Vec<(&str, &str)> =
+                lang.map(|l| ("Accept-Language", l)).into_iter().collect();
+            crate::client::Api {
+                addr,
+                token: Some(bearer),
+            }
+            .request_with(
+                &method,
+                &path,
+                body.as_ref(),
+                &headers,
+                Some(Duration::from_secs(30)),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Las horas (`at`) a 0, tras ver que son números: lo demás se compara tal cual.
+    fn without_times(mut v: serde_json::Value) -> serde_json::Value {
+        fn walk(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if let Some(at) = m.get_mut("at") {
+                        assert!(at.is_u64(), "{at}");
+                        *at = json!(0);
+                    }
+                    m.values_mut().for_each(walk);
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(walk),
+                _ => {}
+            }
+        }
+        walk(&mut v);
+        v
+    }
+
+    /// Las rutas de la memoria, con un cuerpo que valdría.
+    fn memory_routes() -> Vec<(&'static str, &'static str, Option<serde_json::Value>)> {
+        vec![
+            ("GET", "/api/v1/voice/memory", None),
+            (
+                "POST",
+                "/api/v1/voice/memory/notes",
+                Some(json!({"text": "hola"})),
+            ),
+            ("DELETE", "/api/v1/voice/memory/notes/1", None),
+            (
+                "POST",
+                "/api/v1/voice/memory/calls",
+                Some(json!({"id": "c1", "kind": "resumen", "text": "hola"})),
+            ),
+            (
+                "PUT",
+                "/api/v1/voice/memory/resume",
+                Some(json!({"handle": "h"})),
+            ),
+            ("DELETE", "/api/v1/voice/memory/resume", None),
+        ]
+    }
+
+    /// Como el token de voz: el token de este equipo no vale, ni con un cuerpo que no se entiende
+    /// (se mira quién pide antes que lo que pide), y no se escribe nada.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_paired_device_uses_the_voice_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, _) = memory_server(tmp.path()).await;
+        let denied = "only a paired phone or browser can use the voice memory";
+        for (method, path, body) in memory_routes() {
+            for body in [body.clone(), Some(json!("no es lo que se espera"))] {
+                let (code, r) = memory_call(addr, "local", method, path, body).await;
+                assert_eq!(
+                    (code, r["error"].as_str()),
+                    (403, Some(denied)),
+                    "{method} {path}"
+                );
+            }
+        }
+        // Sin token, ni llega: el guardián.
+        let (code, _) = memory_call(addr, "", "GET", "/api/v1/voice/memory", None).await;
+        assert_eq!(code, 401);
+        assert!(!st.paths.state.join("voice-memory.json").exists());
+    }
+
+    /// Cada ruta, con sus códigos, y lo que enseña `GET`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_voice_memory_api() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, phone) = memory_server(tmp.path()).await;
+        let call = |method: &'static str, path: &'static str, body: Option<serde_json::Value>| {
+            let phone = phone.clone();
+            async move { memory_call(addr, &phone, method, path, body).await }
+        };
+        const MEMORY: &str = "/api/v1/voice/memory";
+        const NOTES: &str = "/api/v1/voice/memory/notes";
+        const CALLS: &str = "/api/v1/voice/memory/calls";
+        const RESUME: &str = "/api/v1/voice/memory/resume";
+
+        // Vacía: `resume` sale como null.
+        let (code, r) = call("GET", MEMORY, None).await;
+        assert_eq!(
+            (code, r),
+            (200, json!({"notes": [], "calls": [], "resume": null}))
+        );
+
+        // Las notas.
+        let (code, r) = call("POST", NOTES, Some(json!({"text": "  hola  "}))).await;
+        assert_eq!((code, r), (200, json!({"id": 1})));
+        let (code, r) = call("POST", NOTES, Some(json!({"text": "segunda"}))).await;
+        assert_eq!((code, r), (200, json!({"id": 2})));
+        let (code, r) = call("POST", NOTES, Some(json!({"text": " \n "}))).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (400, Some("the note is empty"))
+        );
+        for body in [json!({}), json!({"text": 3}), json!("hola")] {
+            let (code, r) = call("POST", NOTES, Some(body.clone())).await;
+            assert_eq!(code, 400, "{body}: {r}");
+            assert!(r["error"].as_str().is_some(), "{r}");
+        }
+        let (code, _) = call("DELETE", "/api/v1/voice/memory/notes/1", None).await;
+        assert_eq!(code, 204);
+        for gone in ["1", "99", "abc", "-1"] {
+            let path = format!("{NOTES}/{gone}");
+            let (code, r) = memory_call(addr, &phone, "DELETE", &path, None).await;
+            assert_eq!(
+                (code, r["error"].as_str()),
+                (404, Some("no such note")),
+                "{gone}"
+            );
+        }
+        // En español, si se pide.
+        let (code, r) = memory_call_in(
+            addr,
+            &phone,
+            "DELETE",
+            "/api/v1/voice/memory/notes/1",
+            None,
+            Some("es"),
+        )
+        .await;
+        assert_eq!((code, r["error"].as_str()), (404, Some("no hay esa nota")));
+
+        // Las llamadas: la bitácora, el resumen que la sustituye y la bitácora tardía que no lo
+        // pisa.
+        let put = |kind: &str, text: &str| Some(json!({"id": "c1", "kind": kind, "text": text}));
+        let (code, _) = call("POST", CALLS, put("bitácora", "dijo hola")).await;
+        assert_eq!(code, 204);
+        let (code, _) = call("POST", CALLS, put("resumen", "el resumen")).await;
+        assert_eq!(code, 204);
+        let (code, _) = call("POST", CALLS, put("bitácora", "tarde")).await;
+        assert_eq!(code, 204);
+        let unknown = "kind must be “resumen” or “bitácora”";
+        for kind in ["otro", "", "Resumen", "bitacora"] {
+            let (code, r) = call("POST", CALLS, put(kind, "x")).await;
+            assert_eq!((code, r["error"].as_str()), (400, Some(unknown)), "{kind}");
+        }
+        for body in [
+            json!({"id": "c2", "text": "x"}),
+            json!({"id": "c2", "kind": 1, "text": "x"}),
+            json!({"kind": "resumen", "text": "x"}),
+            json!({"id": "c2", "kind": "resumen"}),
+        ] {
+            let (code, r) = call("POST", CALLS, Some(body.clone())).await;
+            assert_eq!(code, 400, "{body}: {r}");
+        }
+        let (code, r) = call(
+            "POST",
+            CALLS,
+            Some(json!({"id": "mal id", "kind": "resumen", "text": "x"})),
+        )
+        .await;
+        assert_eq!(code, 400);
+        assert!(
+            r["error"].as_str().unwrap().starts_with("invalid call id"),
+            "{r}"
+        );
+        let (code, r) = call(
+            "POST",
+            CALLS,
+            Some(json!({"id": "c2", "kind": "resumen", "text": "  "})),
+        )
+        .await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (400, Some("the text is empty"))
+        );
+
+        // Retomar.
+        let (code, _) = call("PUT", RESUME, Some(json!({"handle": "h-1"}))).await;
+        assert_eq!(code, 204);
+        for handle in ["", "con\nsalto"] {
+            let (code, r) = call("PUT", RESUME, Some(json!({ "handle": handle }))).await;
+            assert_eq!(code, 400, "{handle:?}");
+            assert!(
+                r["error"].as_str().unwrap().starts_with("invalid handle"),
+                "{r}"
+            );
+        }
+        let (code, _) = call("PUT", RESUME, Some(json!({}))).await;
+        assert_eq!(code, 400);
+
+        // Todo junto, sin nada de más (ni `next_note`).
+        let (code, r) = call("GET", MEMORY, None).await;
+        assert_eq!(code, 200);
+        assert_eq!(
+            without_times(r),
+            json!({
+                "notes": [{"id": 2, "text": "segunda", "at": 0}],
+                "calls": [{"id": "c1", "at": 0, "kind": "resumen", "text": "el resumen"}],
+                "resume": {"handle": "h-1", "at": 0},
+            })
+        );
+
+        // Quitar el handle, aunque ya no haya.
+        for _ in 0..2 {
+            let (code, _) = call("DELETE", RESUME, None).await;
+            assert_eq!(code, 204);
+        }
+        let (_, r) = call("GET", MEMORY, None).await;
+        assert_eq!(r["resume"], serde_json::Value::Null);
+
+        // Borrar el fichero la borra, ya.
+        std::fs::remove_file(st.paths.state.join("voice-memory.json")).unwrap();
+        let (code, r) = call("GET", MEMORY, None).await;
+        assert_eq!(
+            (code, r),
+            (200, json!({"notes": [], "calls": [], "resume": null}))
+        );
+    }
+
+    /// Un cuerpo enorme ni se lee (413); el de un texto de llamada largo y escapado, sí.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_bodies_have_a_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_st, addr, phone) = memory_server(tmp.path()).await;
+        let huge = "x".repeat(MEMORY_BODY);
+        for (method, path, body) in [
+            (
+                "POST",
+                "/api/v1/voice/memory/notes",
+                json!({ "text": huge }),
+            ),
+            (
+                "POST",
+                "/api/v1/voice/memory/calls",
+                json!({"id": "c1", "kind": "resumen", "text": huge}),
+            ),
+            (
+                "PUT",
+                "/api/v1/voice/memory/resume",
+                json!({ "handle": huge }),
+            ),
+        ] {
+            let (code, _) = memory_call(addr, &phone, method, path, Some(body)).await;
+            assert_eq!(code, 413, "{method} {path}");
+        }
+        // 4000 letras de dos bytes, cada una tras un carácter de control (6 bytes en JSON).
+        let long = json!({"id": "largo", "kind": "resumen", "text": "\u{1}ñ".repeat(4000)});
+        assert!(long.to_string().len() > 30 * 1024);
+        let (code, r) = memory_call(
+            addr,
+            &phone,
+            "POST",
+            "/api/v1/voice/memory/calls",
+            Some(long),
+        )
+        .await;
+        assert_eq!(code, 204, "{r}");
+        let (_, r) = memory_call(addr, &phone, "GET", "/api/v1/voice/memory", None).await;
+        assert_eq!(r["calls"][0]["text"], "ñ".repeat(4000));
+    }
+
+    /// La nota 51 no cabe (409) hasta que se olvide alguna.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fifty_notes_and_no_more() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_st, addr, phone) = memory_server(tmp.path()).await;
+        const NOTES: &str = "/api/v1/voice/memory/notes";
+        for i in 1..=50u64 {
+            let body = json!({ "text": format!("nota {i}") });
+            let (code, r) = memory_call(addr, &phone, "POST", NOTES, Some(body)).await;
+            assert_eq!((code, r), (200, json!({ "id": i })));
+        }
+        let body = json!({"text": "una más"});
+        let (code, r) = memory_call(addr, &phone, "POST", NOTES, Some(body.clone())).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (409, Some("there are 50 notes: forget one"))
+        );
+        let (code, _) = memory_call(addr, &phone, "DELETE", &format!("{NOTES}/7"), None).await;
+        assert_eq!(code, 204);
+        let (code, r) = memory_call(addr, &phone, "POST", NOTES, Some(body)).await;
+        assert_eq!((code, r), (200, json!({"id": 51})));
+    }
+
+    /// Un fichero que no se puede leer: los cambios dan 500 con el error (y no lo pisan); `GET`,
+    /// la memoria vacía.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_voice_memory_says_when_it_cannot_read_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, phone) = memory_server(tmp.path()).await;
+        let file = st.paths.state.join("voice-memory.json");
+        std::fs::create_dir_all(&file).unwrap();
+        let (code, r) = memory_call(
+            addr,
+            &phone,
+            "POST",
+            "/api/v1/voice/memory/notes",
+            Some(json!({"text": "hola"})),
+        )
+        .await;
+        assert_eq!(code, 500);
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not read the memory: "),
+            "{r}"
+        );
+        assert!(file.is_dir());
+        let (code, r) = memory_call(addr, &phone, "GET", "/api/v1/voice/memory", None).await;
+        assert_eq!(
+            (code, r),
+            (200, json!({"notes": [], "calls": [], "resume": null}))
+        );
     }
 
     fn view(id: &str) -> SessionView {

@@ -287,7 +287,16 @@ const TABLE: &[(&str, &str)] = &[
         "solo un teléfono o una web emparejados pueden llamar",
         "only a paired phone or browser can make a call",
     ),
-    // La memoria de la voz (voice_memory.rs)
+    // La memoria de la voz (voice_memory.rs y `/api/v1/voice/memory`)
+    (
+        "solo un teléfono o una web emparejados pueden usar la memoria de la voz",
+        "only a paired phone or browser can use the voice memory",
+    ),
+    ("no hay esa nota", "no such note"),
+    (
+        "kind tiene que ser «resumen» o «bitácora»",
+        "kind must be “resumen” or “bitácora”",
+    ),
     ("la nota está vacía", "the note is empty"),
     (
         "hay {} notas: olvida alguna",
@@ -1289,6 +1298,15 @@ mod tests {
         assert_eq!(
             english("no se pudo guardar la memoria: disco lleno"),
             "could not save the memory: disco lleno"
+        );
+        assert_eq!(
+            english("solo un teléfono o una web emparejados pueden usar la memoria de la voz"),
+            "only a paired phone or browser can use the voice memory"
+        );
+        assert_eq!(english("no hay esa nota"), "no such note");
+        assert_eq!(
+            english("kind tiene que ser «resumen» o «bitácora»"),
+            "kind must be “resumen” or “bitácora”"
         );
     }
 

@@ -272,6 +272,30 @@ van en inglés, o en español si la petición lo pide con `Accept-Language: es`.
 `DELETE /api/v1/phones/me`: el teléfono o el navegador emparejado que la llama se da de baja en
 todos los equipos del grupo (el «Cerrar sesión» de la web).
 
+La memoria de la voz, para que una llamada siga donde se quedaron las anteriores: las notas que
+apunta el agente de voz cuando le pides que recuerde algo (hasta 50, de hasta 300 caracteres), el
+resumen de cada una de las últimas 20 llamadas (o, si el resumen no llegó, una bitácora de lo que
+se dijo y se hizo, hasta 4000 caracteres) y el handle para retomar la última conversación con el
+modelo de voz. Se guarda en `<state>/voice-memory.json` (`<state>` como en «Secretos, textos y
+ficheros»: normalmente `~/.local/state/nido`), solo legible por tu usuario, en el equipo con el
+que está emparejado el teléfono o el navegador; no va al hub ni a los otros equipos del grupo.
+Solo un teléfono o un navegador emparejado puede leerla o cambiarla (`403` con el token de
+`~/.config/nido/token`). Para borrarla, borra ese fichero: nido lo lee en cada petición, así que
+vale al momento, también con nido en marcha.
+
+- `GET /api/v1/voice/memory` → `{"notes": [{"id", "text", "at"}], "calls": [{"id", "at",
+  "kind": "resumen" | "bitácora", "text"}], "resume": {"handle", "at"} | null}` (`at` en ms desde
+  1970).
+- `POST /api/v1/voice/memory/notes` `{"text"}` → `{"id"}`; `409` si ya hay 50 notas.
+  `DELETE /api/v1/voice/memory/notes/{id}` → `204`, o `404` si no hay esa nota.
+- `POST /api/v1/voice/memory/calls` `{"id", "kind", "text"}` → `204`: guarda el resumen
+  (`"resumen"`) o la bitácora (`"bitácora"`) de la llamada `id`, en lugar de la que tuviera ese id
+  (una bitácora nunca sustituye un resumen).
+- `PUT /api/v1/voice/memory/resume` `{"handle"}` → `204`; `DELETE` lo quita (`204`).
+
+Lo que no vale (un texto vacío, un `kind` desconocido, un id de llamada o un handle mal) da `400`,
+y un fichero de memoria que nido no puede leer o escribir, `500`. Un nido anterior contesta `404`.
+
 `POST /api/v1/pair` (con `{"days": 30}` opcional, para un código reutilizable) crea un código para
 emparejar y devuelve `{"uri": "nido://pair?…", "expires", "reusable",
 "direct", "hub"}`. Si nido está conectado al hub, también `link`, la web del hub con el código
