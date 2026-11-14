@@ -2314,6 +2314,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/voice/memory/calls",
             post(api_voice_call_put).layer(DefaultBodyLimit::max(MEMORY_BODY)),
         )
+        .route("/api/v1/voice/consultas", post(api_voice_consultas))
         .route("/api/v1/sessions", get(api_list).post(api_create))
         .route("/api/v1/conversations", get(api_conversations))
         .route(
@@ -2714,6 +2715,46 @@ async fn api_voice_call_put(
     match with_memory(&st, move |m| m.put_call(&req.id, kind, &req.text)).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(r) => r,
+    }
+}
+
+/// La carpeta de la sesión «consultas» de la voz, debajo de `<state>`.
+const CONSULTAS_DIR: &str = "consultas";
+
+/// Crea, si falta, la carpeta vacía de «consultas» en `state` (0700) y devuelve su ruta
+/// absoluta. Lo que ya esté ahí y no sea una carpeta (un fichero, o un enlace, aunque lleve a
+/// una carpeta) es un error y se queda como está: con un enlace a `~`, Claude leería lo de
+/// fuera.
+fn consultas_dir(state: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = std::path::absolute(state.join(CONSULTAS_DIR))?;
+    crate::sys::create_private_dir_all(&dir)?;
+    if !std::fs::symlink_metadata(&dir)?.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} no es una carpeta",
+            dir.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// `POST /api/v1/voice/consultas`: `{cwd}`, la carpeta vacía donde trabaja la sesión de Claude
+/// «consultas» de la voz, para que no lea lo que hay en `~` y se lo pase al modelo de voz. Es
+/// siempre la misma (no se elige) y se crea si falta.
+async fn api_voice_consultas(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !paired_device(&st, &headers) {
+        return error(StatusCode::FORBIDDEN, MEMORY_DENIED);
+    }
+    let state = st.paths.state.clone();
+    match tokio::task::spawn_blocking(move || consultas_dir(&state)).await {
+        Ok(Ok(dir)) => Json(serde_json::json!({ "cwd": dir })).into_response(),
+        Ok(Err(e)) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("no se pudo preparar la carpeta de consultas: {e}"),
+        ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -4716,6 +4757,7 @@ mod tests {
                 "/api/v1/voice/memory/calls",
                 Some(json!({"id": "c1", "kind": "resumen", "text": "hola"})),
             ),
+            ("POST", "/api/v1/voice/consultas", None),
         ]
     }
 
@@ -4964,6 +5006,121 @@ mod tests {
                 .starts_with("could not read the memory: "),
             "{r}"
         );
+    }
+
+    // ---------- La carpeta de «consultas» ----------
+
+    /// La carpeta vacía de la sesión «consultas»: siempre la misma, debajo de `<state>`, creada
+    /// solo para el usuario; lo que pida el cuerpo no cuenta. La segunda vez, igual, sin tocar
+    /// lo que haya dentro.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_consultas_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, phone) = memory_server(tmp.path()).await;
+        const CONSULTAS: &str = "/api/v1/voice/consultas";
+        let dir = std::path::absolute(st.paths.state.join("consultas")).unwrap();
+        assert!(!dir.exists());
+
+        let (code, r) = memory_call(addr, &phone, "POST", CONSULTAS, None).await;
+        assert_eq!((code, &r), (200, &json!({ "cwd": dir })));
+        assert!(std::path::Path::new(r["cwd"].as_str().unwrap()).is_absolute());
+        let meta = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(meta.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        // Vacía: nido no deja nada dentro.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        // Idempotente, y lo que haya dentro se queda.
+        std::fs::write(dir.join("algo.txt"), "de Claude").unwrap();
+        let (code, again) = memory_call(addr, &phone, "POST", CONSULTAS, None).await;
+        assert_eq!((code, &again), (200, &r));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("algo.txt")).unwrap(),
+            "de Claude"
+        );
+
+        // La ruta no la elige quien pide.
+        let elsewhere = tmp.path().join("otra");
+        let body = json!({ "cwd": elsewhere, "path": elsewhere });
+        let (code, other) = memory_call(addr, &phone, "POST", CONSULTAS, Some(body)).await;
+        assert_eq!((code, &other), (200, &r));
+        assert!(!elsewhere.exists());
+    }
+
+    /// Con el token de este equipo, 403 como la memoria, y no se crea nada.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_paired_device_gets_the_consultas_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, _) = memory_server(tmp.path()).await;
+        let (code, r) = memory_call(addr, "local", "POST", "/api/v1/voice/consultas", None).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (
+                403,
+                Some("only a paired phone or browser can use the voice memory")
+            )
+        );
+        assert!(!st.paths.state.join("consultas").exists());
+    }
+
+    /// Lo que haya en esa ruta y no sea una carpeta (un fichero, un enlace, aunque lleve a una
+    /// carpeta): 500, y se queda como estaba.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_consultas_folder_does_not_replace_what_is_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, phone) = memory_server(tmp.path()).await;
+        let path = st.paths.state.join("consultas");
+        std::fs::create_dir_all(&st.paths.state).unwrap();
+        std::fs::write(&path, "no es una carpeta").unwrap();
+        let (code, r) = memory_call(addr, &phone, "POST", "/api/v1/voice/consultas", None).await;
+        assert_eq!(code, 500, "{r}");
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not prepare the consultas folder: "),
+            "{r}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "no es una carpeta");
+        // En español, si se pide.
+        let (code, r) = memory_call_in(
+            addr,
+            &phone,
+            "POST",
+            "/api/v1/voice/consultas",
+            None,
+            Some("es"),
+        )
+        .await;
+        assert_eq!(code, 500);
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("no se pudo preparar la carpeta de consultas: "),
+            "{r}"
+        );
+
+        #[cfg(unix)]
+        {
+            let home = tmp.path().join("casa");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&home, &path).unwrap();
+            let (code, r) =
+                memory_call(addr, &phone, "POST", "/api/v1/voice/consultas", None).await;
+            assert_eq!(code, 500, "{r}");
+            assert!(
+                r["error"].as_str().unwrap().ends_with(" is not a folder"),
+                "{r}"
+            );
+            assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+            assert_eq!(std::fs::read_link(&path).unwrap(), home);
+        }
     }
 
     fn view(id: &str) -> SessionView {

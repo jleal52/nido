@@ -318,6 +318,12 @@ const TABLE: &[(&str, &str)] = &[
         "no se entiende ({}) y no se pudo apartar como {}: {}",
         "it can't be understood ({0}) and could not be set aside as {1}: {2}",
     ),
+    // La carpeta de «consultas» (`POST /api/v1/voice/consultas`)
+    (
+        "no se pudo preparar la carpeta de consultas: {}",
+        "could not prepare the consultas folder: {0}",
+    ),
+    ("{} no es una carpeta", "{0} is not a folder"),
     // mcp_api.rs
     (
         "la API del MCP solo va con el token de este equipo",
