@@ -90,6 +90,9 @@ pub struct AppState {
     /// Las sesiones de las que ya se avisó, en este arranque, que esperan a que el usuario
     /// confíe en su carpeta (ver `trust_waiting`).
     trust_told: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Las sesiones cuya pantalla de arranque tiene ahora la pregunta de confiar en la carpeta
+    /// (ver `AppState::set_trusting`): la lista lo dice (`claude.trusting`).
+    trusting: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Los secretos de este equipo (`secret`).
     pub secrets: Arc<crate::secrets::Store>,
     /// Las preguntas de secretos en curso.
@@ -576,6 +579,9 @@ pub struct ClaudeView {
     pub model: Option<String>,
     /// Los modelos que se pueden elegir (`POST /api/v1/sessions/{id}/model`).
     pub models: Vec<String>,
+    /// Sin arrancar aún, Claude pregunta si confía en la carpeta (eso lo contesta el usuario).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub trusting: bool,
 }
 
 impl AppState {
@@ -650,6 +656,7 @@ impl AppState {
             launched,
             launched_rx: std::sync::Mutex::new(Some(launched_rx)),
             trust_told: Default::default(),
+            trusting: Default::default(),
             secrets,
             asks: Default::default(),
             outbox,
@@ -773,6 +780,7 @@ impl AppState {
                             .get(&s.id)
                             .cloned()
                     }),
+                    trusting: found.is_none() && self.is_trusting(&s.id),
                     session_id: l.session_id,
                     running: found.is_some(),
                     status: found.as_ref().and_then(|f| f.info.status.clone()),
@@ -859,6 +867,7 @@ impl AppState {
         // Lo que se sabía de su channel (rechazo, su Claude, parada) era del arranque anterior.
         self.inbox.relaunched(id);
         self.trust_told.lock().expect("confianza").remove(id);
+        self.set_trusting(id, false);
         let _ = self.launched.send((id.to_owned(), hold));
     }
 }
@@ -1119,10 +1128,26 @@ pub async fn watch_startup(st: &Arc<AppState>, id: &str, window: Duration) -> pr
     watch_held(st, id, window, st.inbox.hold(id)).await
 }
 
+/// Mientras mira un arranque: al irse (por lo que sea), la sesión deja de darse por «confiando»
+/// (ver `AppState::set_trusting`). Sin nadie mirando no se sabe si sigue la pregunta: mejor que la
+/// lista diga «arrancando» que una pregunta que quizá ya no está.
+struct Trusting<'a> {
+    st: &'a AppState,
+    id: &'a str,
+}
+
+impl Drop for Trusting<'_> {
+    fn drop(&mut self) {
+        self.st.set_trusting(self.id, false);
+    }
+}
+
 /// La pantalla de arranque de un Claude sin channel abierto con `open`, como visor: si sale la
 /// pregunta de confiar en la carpeta, se avisa al usuario (`AppState::trust_waiting`). Hasta ver
 /// a Claude esperando peticiones, que se cierre, o `STARTUP_WINDOW` por `STARTUP_CAP`.
 async fn watch_trust(st: &Arc<AppState>, id: &str) {
+    let _trusting = Trusting { st, id };
+    let mut seen = false;
     let until = tokio::time::Instant::now() + STARTUP_WINDOW * STARTUP_CAP;
     let mut scr: Option<HolderScreen> = None;
     while tokio::time::Instant::now() < until {
@@ -1146,11 +1171,16 @@ async fn watch_trust(st: &Arc<AppState>, id: &str) {
         }
         let Some(s) = scr.as_mut() else { return };
         match s.look().await {
+            // Se sigue mirando hasta que se vaya: mientras, la lista lo dice.
             Ok(text) if prompt::trust_screen(&text) => {
-                st.trust_waiting(id).await;
-                return;
+                if !seen {
+                    st.trust_waiting(id).await;
+                }
+                seen = true;
+                st.set_trusting(id, true);
             }
             Ok(text) if prompt::repl(&text) => return,
+            Ok(_) if seen => return,
             Ok(_) => {}
             Err(prompt::Unread::Slow) => scr = None,
             Err(prompt::Unread::Closed) => return,
@@ -1172,6 +1202,7 @@ async fn watch_held(
     // La pregunta de confiar en la carpeta alarga el plazo, hasta este tope.
     let cap = started + window * STARTUP_CAP;
     let mut trusting = false;
+    let _trusting = Trusting { st, id };
     let name = st
         .registry
         .lock()
@@ -1223,6 +1254,7 @@ async fn watch_held(
         };
         // Mientras está, y al irse, el plazo empieza de nuevo.
         let trust = prompt::trust_screen(&text);
+        st.set_trusting(id, trust);
         if trust && !trusting {
             st.trust_waiting(id).await;
         }
@@ -1732,6 +1764,26 @@ impl AppState {
             AlertKind::Requested => return None,
         };
         Some((v.name.clone(), body, badge))
+    }
+
+    /// La sesión `id` tiene (o ya no) en pantalla la pregunta de confiar en la carpeta: si cambia,
+    /// que se vuelva a escanear (la lista lo dice).
+    pub(crate) fn set_trusting(&self, id: &str, on: bool) {
+        let mut t = self.trusting.lock().expect("confiando");
+        let changed = if on {
+            t.insert(id.to_owned())
+        } else {
+            t.remove(id)
+        };
+        drop(t);
+        if changed {
+            self.refresh.notify_one();
+        }
+    }
+
+    /// Si la sesión `id` tiene ahora en pantalla la pregunta de confiar en la carpeta.
+    pub fn is_trusting(&self, id: &str) -> bool {
+        self.trusting.lock().expect("confiando").contains(id)
     }
 
     /// La sesión `id` espera a que el usuario confíe en su carpeta (la pregunta de Claude al
@@ -5580,6 +5632,7 @@ mod tests {
                     account: None,
                     model: None,
                     models: vec![],
+                    trusting: false,
                 }),
                 ..view(&id)
             }],
@@ -5911,6 +5964,7 @@ mod tests {
             account: None,
             model: None,
             models: vec![],
+            trusting: false,
         });
         v
     }

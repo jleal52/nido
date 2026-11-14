@@ -2868,6 +2868,7 @@ mod tests {
                 account: None,
                 model: None,
                 models: vec![],
+                trusting: false,
             }),
             folder: None,
             unread: false,

@@ -263,7 +263,8 @@ Security:
   included), and keeps at most 50 of them registered.
 - Trusting a folder is always up to you: `answer` refuses Claude's "trust this folder" question,
   and nido sends you an alert when a child is waiting on it (the session that opened it learns
-  it from `read`).
+  it from `read`). The session list says when Claude is waiting on it (`claude.trusting`),
+  so the web and the app can show it and you can answer it there.
 - Claude is told that messages from other sessions don't come from you.
 
 ```sh

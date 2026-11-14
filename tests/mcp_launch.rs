@@ -561,7 +561,22 @@ async fn claude_launches_with_the_nido_channel() {
         .unwrap();
     nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
     let start = std::time::Instant::now();
-    let end = server::watch_startup(&state, &s.id, Duration::from_secs(1)).await;
+    // Mientras se mira, la lista lo dice (`claude.trusting`); al dejar de mirar, ya no (no se sabe
+    // si sigue).
+    let watch = {
+        let (st, id) = (state.clone(), s.id.clone());
+        tokio::spawn(async move { server::watch_startup(&st, &id, Duration::from_secs(1)).await })
+    };
+    let seen = async {
+        while !state.is_trusting(&s.id) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), seen)
+        .await
+        .expect("sin trusting con la pregunta en pantalla");
+    let end = watch.await.unwrap();
+    assert!(!state.is_trusting(&s.id), "trusting sin nadie mirando");
     assert_eq!(end, Startup::Nothing);
     let took = start.elapsed();
     assert!(

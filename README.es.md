@@ -249,7 +249,8 @@ Seguridad:
   (él incluido), y apuntadas como mucho 50.
 - Confiar en una carpeta lo decides siempre tú: `answer` no contesta la pregunta de Claude de si
   confías en la carpeta, y nido te manda una alerta cuando una hija la está esperando (la sesión
-  que la abrió lo sabe por `read`).
+  que la abrió lo sabe por `read`). La lista de sesiones dice cuándo Claude la está esperando
+  (`claude.trusting`), para que la web y la app lo enseñen y la contestes desde ahí.
 - A Claude se le dice que los mensajes de otras sesiones no son tuyos.
 
 ```sh
