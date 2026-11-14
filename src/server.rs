@@ -1128,17 +1128,31 @@ pub async fn watch_startup(st: &Arc<AppState>, id: &str, window: Duration) -> pr
     watch_held(st, id, window, st.inbox.hold(id)).await
 }
 
-/// Mientras mira un arranque: al irse (por lo que sea), la sesión deja de darse por «confiando»
-/// (ver `AppState::set_trusting`). Sin nadie mirando no se sabe si sigue la pregunta: mejor que la
-/// lista diga «arrancando» que una pregunta que quizá ya no está.
-struct Trusting<'a> {
-    st: &'a AppState,
-    id: &'a str,
+/// Lo lleva quien mira un arranque: dice si la sesión tiene en pantalla la pregunta de confiar en
+/// la carpeta (ver `AppState::set_trusting`) y, al irse (por lo que sea), lo quita: sin nadie
+/// mirando no se sabe si sigue, y mejor que la lista diga «arrancando» que una pregunta que quizá
+/// ya no está. Si sigue mirando `keep_held`, se le pasa (así la lista no parpadea).
+struct Trusting {
+    st: Arc<AppState>,
+    id: String,
 }
 
-impl Drop for Trusting<'_> {
+impl Trusting {
+    fn new(st: &Arc<AppState>, id: &str) -> Self {
+        Self {
+            st: st.clone(),
+            id: id.to_owned(),
+        }
+    }
+
+    fn set(&self, on: bool) {
+        self.st.set_trusting(&self.id, on);
+    }
+}
+
+impl Drop for Trusting {
     fn drop(&mut self) {
-        self.st.set_trusting(self.id, false);
+        self.st.set_trusting(&self.id, false);
     }
 }
 
@@ -1146,7 +1160,7 @@ impl Drop for Trusting<'_> {
 /// pregunta de confiar en la carpeta, se avisa al usuario (`AppState::trust_waiting`). Hasta ver
 /// a Claude esperando peticiones, que se cierre, o `STARTUP_WINDOW` por `STARTUP_CAP`.
 async fn watch_trust(st: &Arc<AppState>, id: &str) {
-    let _trusting = Trusting { st, id };
+    let trusting = Trusting::new(st, id);
     let mut seen = false;
     let until = tokio::time::Instant::now() + STARTUP_WINDOW * STARTUP_CAP;
     let mut scr: Option<HolderScreen> = None;
@@ -1177,7 +1191,7 @@ async fn watch_trust(st: &Arc<AppState>, id: &str) {
                     st.trust_waiting(id).await;
                 }
                 seen = true;
-                st.set_trusting(id, true);
+                trusting.set(true);
             }
             Ok(text) if prompt::repl(&text) => return,
             Ok(_) if seen => return,
@@ -1201,8 +1215,8 @@ async fn watch_held(
     let mut deadline = started + window;
     // La pregunta de confiar en la carpeta alarga el plazo, hasta este tope.
     let cap = started + window * STARTUP_CAP;
-    let mut trusting = false;
-    let _trusting = Trusting { st, id };
+    let mut was_trust = false;
+    let mut trusting = Some(Trusting::new(st, id));
     let name = st
         .registry
         .lock()
@@ -1254,16 +1268,18 @@ async fn watch_held(
         };
         // Mientras está, y al irse, el plazo empieza de nuevo.
         let trust = prompt::trust_screen(&text);
-        st.set_trusting(id, trust);
-        if trust && !trusting {
+        if let Some(t) = &trusting {
+            t.set(trust);
+        }
+        if trust && !was_trust {
             st.trust_waiting(id).await;
         }
-        if trust || trusting {
+        if trust || was_trust {
             deadline = (tokio::time::Instant::now() + window)
                 .min(cap)
                 .max(deadline);
         }
-        trusting = trust;
+        was_trust = trust;
         match prompt::startup(&text) {
             Startup::Accept if !accepted => {
                 // De uno en uno, y mirando otra vez ya con el turno: otro que mire la misma
@@ -1304,6 +1320,7 @@ async fn watch_held(
                         h,
                         name.clone(),
                         id.to_owned(),
+                        trusting.take(),
                     ));
                 }
                 return Startup::Foreign(list);
@@ -1344,6 +1361,7 @@ async fn watch_held(
             h,
             name,
             id.to_owned(),
+            trusting.take(),
         ));
     }
     if accepted {
@@ -1501,7 +1519,8 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
 /// channel hasta que se vuelva a lanzar, y se deja de mirar. Si su guardián lleva mucho sin
 /// contestar, se dice una vez. Mira cada vez menos (ver `keep_pace`; su Claude, cada
 /// `CLAUDE_EVERY`). Es de un arranque (`holder`: su guardián, si se sabe): si la sesión se
-/// reinicia, acaba sin tocar nada.
+/// reinicia, acaba sin tocar nada. Con `trusting` (de `watch_held`), sigue diciendo si está la
+/// pregunta de confiar en la carpeta.
 async fn keep_held(
     paths: Paths,
     mut holder: Option<launch::HolderId>,
@@ -1509,6 +1528,7 @@ async fn keep_held(
     hold: crate::inbox::Hold,
     name: String,
     id: String,
+    trusting: Option<Trusting>,
 ) {
     use prompt::Startup;
     let socket = paths.socket(&id);
@@ -1560,6 +1580,9 @@ async fn keep_held(
             }
             Err(prompt::Unread::Closed) => return,
         };
+        if let Some(t) = &trusting {
+            t.set(prompt::trust_screen(&text));
+        }
         let r = match prompt::startup(&text) {
             r @ (Startup::NoServer | Startup::Blocked) => r,
             _ => match ready(s, &text, &mut since).await {
@@ -6313,6 +6336,7 @@ mod tests {
             inbox.hold(id),
             "s".into(),
             id.into(),
+            None,
         ));
         // Que vea su Claude.
         tokio::time::sleep(Duration::from_millis(2500)).await;

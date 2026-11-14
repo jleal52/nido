@@ -561,8 +561,8 @@ async fn claude_launches_with_the_nido_channel() {
         .unwrap();
     nido::launch::start(&paths, Launcher::Detached, &s.id).unwrap();
     let start = std::time::Instant::now();
-    // Mientras se mira, la lista lo dice (`claude.trusting`); al dejar de mirar, ya no (no se sabe
-    // si sigue).
+    // Mientras se mira, la lista lo dice (`claude.trusting`), también pasado el plazo (sigue
+    // mirando `keep_held`); al pararla, ya no.
     let watch = {
         let (st, id) = (state.clone(), s.id.clone());
         tokio::spawn(async move { server::watch_startup(&st, &id, Duration::from_secs(1)).await })
@@ -576,7 +576,10 @@ async fn claude_launches_with_the_nido_channel() {
         .await
         .expect("sin trusting con la pregunta en pantalla");
     let end = watch.await.unwrap();
-    assert!(!state.is_trusting(&s.id), "trusting sin nadie mirando");
+    assert!(
+        state.is_trusting(&s.id),
+        "sin trusting al pasar a keep_held"
+    );
     assert_eq!(end, Startup::Nothing);
     let took = start.elapsed();
     assert!(
@@ -591,6 +594,7 @@ async fn claude_launches_with_the_nido_channel() {
     );
     nido::launch::stop(&paths, Launcher::Detached, &s.id).unwrap();
     assert!(released(&state, &s.id).await, "no se soltó al pararla");
+    assert!(!state.is_trusting(&s.id), "trusting con la sesión parada");
     // No la abrió nadie con `open`: no hay alerta (el usuario la tiene delante).
     let alerts = |id: &str| {
         let id = id.to_owned();
