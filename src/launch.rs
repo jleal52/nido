@@ -89,12 +89,16 @@ impl Paths {
 
     /// ¿Es `cwd` la carpeta de «consultas»? Por la ruta, no por el nombre de la sesión: una que
     /// se llame así en otra carpeta es como cualquier otra. Escrita de otra forma (con un enlace
-    /// por medio), también.
+    /// por medio), también; pero si la de «consultas» es ella misma un enlace (la API no la da),
+    /// la carpeta a la que lleva no lo es.
     pub fn is_consultas(&self, cwd: &Path) -> bool {
         let dir = self.consultas();
         let abs = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_owned());
-        abs == dir
-            || matches!(
+        if abs == dir {
+            return true;
+        }
+        std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir())
+            && matches!(
                 (std::fs::canonicalize(&abs), std::fs::canonicalize(&dir)),
                 (Ok(a), Ok(b)) if a == b
             )
@@ -794,6 +798,19 @@ mod tests {
             let cfg = holder_config(&p, &s, 80, 24);
             assert!(has_any(&cfg.argv, &ISOLATION_OPTS), "{:?}", cfg.argv);
             assert!(!cfg.channel);
+        }
+        // Si la de «consultas» es un enlace (la API no la da: contesta 500), lo de la carpeta a
+        // la que lleva es como cualquier otra cosa.
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let p = paths(tmp.path());
+            let other = tmp.path().join("proyecto");
+            std::fs::create_dir_all(&other).unwrap();
+            std::fs::create_dir_all(&p.state).unwrap();
+            std::os::unix::fs::symlink(&other, p.consultas()).unwrap();
+            assert!(!p.is_consultas(&other));
+            assert!(p.is_consultas(&p.consultas()));
         }
         // Y otro programa en ella, tal cual.
         s.cwd = p.consultas();

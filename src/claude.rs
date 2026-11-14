@@ -631,7 +631,8 @@ pub fn with_secrets_guard(argv: &[String], rules: &[String]) -> Vec<String> {
 ///   `additionalDirectories`, ni su modo por defecto, ni sus permisos, hooks o plugins). La
 ///   cuenta no está ahí (está en `~/.claude/.credentials.json` y `~/.claude.json`): sigue igual.
 /// - `--permission-mode default`: arranca en modo manual. `claude --help` lo llama `manual`, pero
-///   también acepta `default`, que es lo que entienden los Claude Code de antes.
+///   también acepta `default` (su nombre por dentro, al que traduce `manual`); se usa ese porque,
+///   según parece, es el único de los dos que conocen los Claude Code anteriores.
 /// - `--strict-mcp-config` sin `--mcp-config`: sin servidores MCP (ni los del usuario ni el de
 ///   nido; ver `launch::holder_config`).
 pub const ISOLATION: [&str; 5] = [
