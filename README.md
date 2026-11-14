@@ -324,6 +324,16 @@ When reading it, a file nido doesn't understand (say, a bad hand edit) is set as
 memory starts empty; if it can't be set aside, that is a `500` too, so nothing overwrites it. An
 older nido answers `404`.
 
+`POST /api/v1/voice/consultas` → `{"cwd": "<absolute path>"}`: the empty folder where the voice
+agent's Claude session for general questions works, so that it doesn't read what is in your home
+folder (in manual mode Claude reads the files in its folder without asking, and what it reads
+goes back to the voice model). It is always `<state>/consultas`, created if missing and readable
+only by your user (`0700`); the request can't choose another one, and nido puts nothing in it.
+Like the memory, only a paired phone or browser can ask for it (`403` with the token in
+`~/.config/nido/token`). If something that isn't a folder is already at that path (a file, or a
+link, even one to a folder), or the folder can't be created, it answers `500` and leaves what is
+there untouched. An older nido answers `404`.
+
 `POST /api/v1/pair` (body `{"days": 30}` optional, for a reusable code) creates a pairing code and
 returns `{"uri": "nido://pair?…", "expires", "reusable", "direct",
 "hub"}`. When nido is connected to the hub it also returns `link`, the hub's web app with the code

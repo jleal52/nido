@@ -311,6 +311,16 @@ mal) se aparta como `voice-memory.json.bad` (o `voice-memory.json.bad.<ms>`, si 
 memoria empieza vacía; si no se puede apartar, también `500`, para que nada lo pise. Un nido
 anterior contesta `404`.
 
+`POST /api/v1/voice/consultas` → `{"cwd": "<ruta absoluta>"}`: la carpeta vacía donde trabaja la
+sesión de Claude del agente de voz para las preguntas generales, para que no lea lo que hay en tu
+carpeta personal (en modo manual Claude lee sin preguntar los ficheros de su carpeta, y lo que lee
+vuelve al modelo de voz). Es siempre `<state>/consultas`, se crea si falta y solo es legible por tu
+usuario (`0700`); la petición no puede elegir otra, y nido no pone nada dentro. Como la memoria,
+solo puede pedirla un teléfono o un navegador emparejado (`403` con el token de
+`~/.config/nido/token`). Si en esa ruta ya hay algo que no es una carpeta (un fichero, o un
+enlace, aunque lleve a una carpeta), o la carpeta no se puede crear, contesta `500` y deja lo que
+haya como está. Un nido anterior contesta `404`.
+
 `POST /api/v1/pair` (con `{"days": 30}` opcional, para un código reutilizable) crea un código para
 emparejar y devuelve `{"uri": "nido://pair?…", "expires", "reusable",
 "direct", "hub"}`. Si nido está conectado al hub, también `link`, la web del hub con el código
