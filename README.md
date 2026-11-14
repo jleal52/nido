@@ -298,15 +298,16 @@ that, after 30 seconds), `429` if this computer reached the hub's voice limit, `
 other error from the hub. An older nido, without this endpoint, answers `404`.
 
 The voice memory, so that a call can pick up from earlier ones: the notes the voice agent takes
-when you ask it to remember something (up to 50, of up to 300 characters each), the summary of
-each of the last 20 calls (or, if the summary didn't arrive, a log of what was said and done,
-up to 4000 characters). It doesn't keep the handle to resume a conversation with the voice
-model: that is the hub's. It is kept in `<state>/voice-memory.json` (`<state>` as in "Secrets, texts and files": usually
-`~/.local/state/nido`), readable only by your user, on the computer the phone or browser is
-paired with; it doesn't go to the hub or to other computers in the group. Only a paired phone or
-browser can read or change it (`403` with the token in `~/.config/nido/token`). To wipe it,
-delete that file: nido reads it on every request, so it takes effect immediately, even while
-nido is running.
+when you ask it to remember something (up to 50, of up to 300 characters each; a longer note is
+cut), the summary of each of the last 20 calls (or, if the summary didn't arrive, a log of what was
+said and done, up to 4000 characters; a longer text keeps its end, starting at a whole line). It
+doesn't keep the handle to resume a conversation with the voice model: that is the hub's. It is
+kept in `<state>/voice-memory.json` (`<state>` as in "Secrets, texts and files": usually
+`~/.local/state/nido`), readable only by your user, on the computer that receives the requests
+(the web app and the phone app use their primary computer). Each computer in the group keeps its
+own, and they aren't synced; nor does it go to the hub. Only a paired phone or browser can read or
+change it (`403` with the token in `~/.config/nido/token`). To wipe it, delete that file: nido
+reads it on every request, so it takes effect immediately, even while nido is running.
 
 - `GET /api/v1/voice/memory` → `{"notes": [{"id", "text", "at"}], "calls": [{"id", "at",
   "kind": "resumen" | "bitácora", "text"}]}` (`at` in ms since 1970).
@@ -316,10 +317,12 @@ nido is running.
   (`"resumen"`) or the log (`"bitácora"`) of call `id`, replacing the one with that id (a log
   never replaces a summary).
 
-Invalid input (an empty text, an unknown `kind`, a bad call id) is a `400`, and a
-memory file nido can't read or write is a `500`. A file nido doesn't understand (say, a bad
-hand edit) is set aside as `voice-memory.json.bad` and the memory starts empty. An older nido
-answers `404`.
+Invalid input (an empty text, an unknown `kind`, a bad call id) is a `400`, a body over 64 KiB is
+a `413` (plain text, from the web server), and a memory file nido can't read or write is a `500`.
+When reading it, a file nido doesn't understand (say, a bad hand edit) is set aside as
+`voice-memory.json.bad` (or `voice-memory.json.bad.<ms>` if that one is already there) and the
+memory starts empty; if it can't be set aside, that is a `500` too, so nothing overwrites it. An
+older nido answers `404`.
 
 `POST /api/v1/pair` (body `{"days": 30}` optional, for a reusable code) creates a pairing code and
 returns `{"uri": "nido://pair?…", "expires", "reusable", "direct",
