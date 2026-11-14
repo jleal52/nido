@@ -2299,6 +2299,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/hub", get(api_hub).post(api_set_hub))
         .route("/api/v1/push/test", post(api_push_test))
         .route("/api/v1/voice/token", post(api_voice_token))
+        // La memoria de la voz: cada ruta tiene que mirar `paired_device` antes que nada y estar
+        // en `memory_routes()` de las pruebas, que comprueban que el token de este equipo no vale.
         .route("/api/v1/voice/memory", get(api_voice_memory))
         .route(
             "/api/v1/voice/memory/notes",
@@ -4718,11 +4720,14 @@ mod tests {
     }
 
     /// Como el token de voz: el token de este equipo no vale, ni con un cuerpo que no se entiende
-    /// (se mira quién pide antes que lo que pide), y no se escribe nada.
+    /// (se mira quién pide antes que lo que pide), y no se toca nada: ni la nota 1, que existe.
     #[tokio::test(flavor = "multi_thread")]
     async fn only_a_paired_device_uses_the_voice_memory() {
         let tmp = tempfile::tempdir().unwrap();
         let (st, addr, _) = memory_server(tmp.path()).await;
+        assert_eq!(st.voice_memory.add_note("guardada"), Ok(1));
+        let file = st.paths.state.join("voice-memory.json");
+        let before = std::fs::read(&file).unwrap();
         let denied = "only a paired phone or browser can use the voice memory";
         for (method, path, body) in memory_routes() {
             for body in [body.clone(), Some(json!("no es lo que se espera"))] {
@@ -4737,7 +4742,7 @@ mod tests {
         // Sin token, ni llega: el guardián.
         let (code, _) = memory_call(addr, "", "GET", "/api/v1/voice/memory", None).await;
         assert_eq!(code, 401);
-        assert!(!st.paths.state.join("voice-memory.json").exists());
+        assert_eq!(std::fs::read(&file).unwrap(), before);
     }
 
     /// Cada ruta, con sus códigos, y lo que enseña `GET`.

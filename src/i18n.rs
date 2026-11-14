@@ -314,6 +314,10 @@ const TABLE: &[(&str, &str)] = &[
         "no se pudo guardar la memoria: {}",
         "could not save the memory: {0}",
     ),
+    (
+        "no se entiende ({}) y no se pudo apartar como {}: {}",
+        "it can't be understood ({0}) and could not be set aside as {1}: {2}",
+    ),
     // mcp_api.rs
     (
         "la API del MCP solo va con el token de este equipo",
@@ -1286,6 +1290,16 @@ mod tests {
         assert_eq!(
             english("no se pudo leer la memoria: Is a directory (os error 21)"),
             "could not read the memory: Is a directory (os error 21)"
+        );
+        assert_eq!(
+            english(
+                "no se pudo leer la memoria: no se entiende (EOF while parsing an object at line 1 \
+                 column 6) y no se pudo apartar como voice-memory.json.bad: Is a directory (os \
+                 error 21)"
+            ),
+            "could not read the memory: it can't be understood (EOF while parsing an object at \
+             line 1 column 6) and could not be set aside as voice-memory.json.bad: Is a directory \
+             (os error 21)"
         );
         assert_eq!(
             english("no se pudo guardar la memoria: disco lleno"),

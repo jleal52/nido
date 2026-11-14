@@ -6,10 +6,12 @@
 //! El fichero es la memoria: cada operación lo lee, lo cambia y lo escribe entero (en un temporal
 //! que se renombra), todo con el cerrojo tomado. Así, borrar el fichero la borra también con nido
 //! en marcha. Uno que falte es una memoria vacía; uno que no se entienda se aparta como
-//! `voice-memory.json.bad` y la memoria empieza vacía. Lo que se lee pasa por las mismas
-//! limpiezas y límites que lo que llega por la API.
+//! `voice-memory.json.bad` (o `.bad.<ms>`, si ya hay uno) y la memoria empieza vacía; si no se
+//! puede apartar, es un error, para que nada lo pise. Lo que se lee pasa por las mismas limpiezas
+//! y límites que lo que llega por la API.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -180,20 +182,44 @@ fn check_call_id(id: &str) -> Result<(), MemoryError> {
     }
 }
 
+/// Se queda con los de `v` que digan `keep` (uno por elemento, en orden).
+fn retain_marked<T>(v: &mut Vec<T>, keep: &[bool]) {
+    let mut keep = keep.iter();
+    v.retain(|_| keep.next().copied().unwrap_or(true));
+}
+
 /// Lo que se lee del fichero, con las mismas limpiezas y límites que lo que llega por la API:
-/// uno tocado a mano no saca por `get` textos largos, caracteres de control ni ids de nota que la
-/// web no guarda exactos. De lo que sobre, se quedan las notas últimas y las llamadas más nuevas.
+/// uno tocado a mano no saca por `get` textos largos, caracteres de control, ids de nota que la
+/// web no guarda exactos ni ids repetidos (de una nota, la última; de una llamada, la más nueva y,
+/// a igual hora, la última). De lo que sobre, se quedan las notas últimas y las llamadas más
+/// nuevas.
 fn tidy(mut data: Data) -> Data {
     data.notes.retain_mut(|n| {
         n.text = note_text(&n.text);
         !n.text.is_empty() && n.id <= MAX_NOTE_ID
     });
+    let mut seen = HashSet::new();
+    let mut keep: Vec<bool> = data.notes.iter().rev().map(|n| seen.insert(n.id)).collect();
+    keep.reverse();
+    retain_marked(&mut data.notes, &keep);
     let extra = data.notes.len().saturating_sub(MAX_NOTES);
     data.notes.drain(..extra);
     data.calls.retain_mut(|c| {
         c.text = call_text(&c.text);
         !c.text.is_empty() && check_call_id(&c.id).is_ok()
     });
+    let mut newest: HashMap<&str, usize> = HashMap::new();
+    for (i, c) in data.calls.iter().enumerate() {
+        let best = newest.entry(c.id.as_str()).or_insert(i);
+        if c.at >= data.calls[*best].at {
+            *best = i;
+        }
+    }
+    let mut keep = vec![false; data.calls.len()];
+    for i in newest.into_values() {
+        keep[i] = true;
+    }
+    retain_marked(&mut data.calls, &keep);
     while data.calls.len() > MAX_CALLS {
         let Some((oldest, _)) = data.calls.iter().enumerate().min_by_key(|(_, c)| c.at) else {
             break;
@@ -228,8 +254,9 @@ impl VoiceMemory {
     }
 
     /// Lee el fichero (con el cerrojo tomado). Si falta, la memoria está vacía; si no se
-    /// entiende, se aparta como `voice-memory.json.bad` (para mirarlo) y está vacía; si no se
-    /// puede leer (permisos, un fallo del disco), es el error: así no se pisa.
+    /// entiende, se aparta como `voice-memory.json.bad` (o `.bad.<ms>`, si ya hay uno: no se
+    /// pisa) para mirarlo, y está vacía. Si no se puede leer (permisos, un fallo del disco) o no
+    /// se puede apartar, es el error: así no se pisa.
     fn load(&self) -> Result<Data, String> {
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => Some(b),
@@ -240,28 +267,52 @@ impl VoiceMemory {
         let mut data = match parsed.unwrap_or_else(|| Ok(Data::default())) {
             Ok(d) => tidy(d),
             Err(e) => {
-                match std::fs::rename(&self.path, self.path.with_extension("json.bad")) {
-                    Ok(()) => eprintln!(
-                        "nido: la memoria de la voz no se entiende ({e}): apartada como \
-                         {FILE}.bad; se empieza vacía"
-                    ),
-                    Err(re) => eprintln!(
-                        "nido: la memoria de la voz no se entiende ({e}) y no se pudo apartar \
-                         ({re}); se empieza vacía"
-                    ),
+                let aside = self.set_aside();
+                let name = aside.0.file_name().unwrap_or_default().to_string_lossy();
+                if let Err(re) = aside.1 {
+                    return Err(format!(
+                        "no se entiende ({e}) y no se pudo apartar como {name}: {re}"
+                    ));
                 }
+                eprintln!(
+                    "nido: la memoria de la voz no se entiende ({e}): apartada como {name}; se \
+                     empieza vacía"
+                );
                 Data::default()
             }
         };
-        // Un fichero sin `next_note`, o con uno que se quedó atrás: los ids no se repiten.
+        // Un fichero sin `next_note`, o con uno que se quedó atrás: los ids no se repiten. Uno que
+        // pasa de los ids que hay (tocado a mano) dejaría la memoria llena para siempre: vuelve a
+        // seguir al más alto.
         let after_max = data
             .notes
             .iter()
             .map(|n| n.id.saturating_add(1))
             .max()
             .unwrap_or(1);
+        if data.next_note > MAX_NOTE_ID + 1 {
+            data.next_note = after_max;
+        }
         data.next_note = data.next_note.max(after_max).max(1);
         Ok(data)
+    }
+
+    /// Aparta el fichero que no se entiende: como `voice-memory.json.bad` o, si ya hay uno,
+    /// `voice-memory.json.bad.<ms>`. Si ese también está (o no se puede mirar), no se pisa: error.
+    fn set_aside(&self) -> (PathBuf, io::Result<()>) {
+        let taken = |p: &PathBuf| !matches!(std::fs::symlink_metadata(p), Err(e) if missing(&e));
+        let mut bad = self.path.with_extension("json.bad");
+        if taken(&bad) {
+            bad = self
+                .path
+                .with_extension(format!("json.bad.{}", (self.now)()));
+        }
+        let moved = if taken(&bad) {
+            Err(io::Error::from(io::ErrorKind::AlreadyExists))
+        } else {
+            std::fs::rename(&self.path, &bad)
+        };
+        (bad, moved)
     }
 
     /// Escribe en un temporal y lo renombra: nunca queda una memoria a medias.
@@ -311,7 +362,7 @@ impl VoiceMemory {
         })
     }
 
-    /// Apunta una nota: el id que le toca. Si ya no quedan ids exactos para la web (pasaría de
+    /// Apunta una nota: el id que le toca. Si ya no quedan ids exactos para la web (se gastó
     /// [`MAX_NOTE_ID`], solo con un fichero tocado a mano), `Full`.
     pub fn add_note(&self, text: &str) -> Result<u64, MemoryError> {
         let text = note_text(text);
@@ -742,6 +793,130 @@ mod tests {
         }
     }
 
+    /// Si ya hay un `.bad` (de otra vez), no se pisa: el nuevo va con la hora.
+    #[test]
+    fn an_older_bad_file_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE);
+        let bad = dir.path().join(format!("{FILE}.bad"));
+        std::fs::write(&bad, "el de antes").unwrap();
+        std::fs::write(&file, "{ roto").unwrap();
+        let (m, _) = mem(dir.path());
+        assert_eq!(m.get().unwrap(), Snapshot::default());
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "el de antes");
+        let stamped = dir.path().join(format!("{FILE}.bad.1000"));
+        assert_eq!(std::fs::read_to_string(&stamped).unwrap(), "{ roto");
+        assert!(!file.exists());
+        assert_eq!(m.add_note("nueva"), Ok(1));
+    }
+
+    /// Uno que no se entiende y no se puede apartar es un error (500 en la API), no una memoria
+    /// vacía: si no, el primer cambio lo pisaría sin que nadie lo hubiera mirado.
+    #[test]
+    fn a_broken_file_that_cannot_be_set_aside_is_an_error() {
+        for stamped_is_dir in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join(FILE);
+            let bad = dir.path().join(format!("{FILE}.bad"));
+            let stamped = dir.path().join(format!("{FILE}.bad.1000"));
+            std::fs::write(&file, "{ roto").unwrap();
+            std::fs::write(&bad, "el de antes").unwrap();
+            // Donde iría ya hay algo (una carpeta, o un fichero que no se pisa).
+            if stamped_is_dir {
+                std::fs::create_dir(&stamped).unwrap();
+            } else {
+                std::fs::write(&stamped, "el otro").unwrap();
+            }
+            let (m, _) = mem(dir.path());
+            for e in [
+                m.get().unwrap_err(),
+                m.add_note("una").unwrap_err(),
+                m.delete_note(1).unwrap_err(),
+                m.put_call("c1", CallKind::Resumen, "r").unwrap_err(),
+            ] {
+                assert!(matches!(e, MemoryError::Read(_)), "{e:?}");
+                let en = crate::i18n::english(&e.to_string());
+                assert!(
+                    en.starts_with("could not read the memory: it can't be understood ("),
+                    "{en}"
+                );
+                assert!(
+                    en.contains(") and could not be set aside as voice-memory.json.bad.1000: "),
+                    "{en}"
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ roto");
+            assert_eq!(std::fs::read_to_string(&bad).unwrap(), "el de antes");
+            if stamped_is_dir {
+                assert_eq!(std::fs::read_dir(&stamped).unwrap().count(), 0);
+            } else {
+                assert_eq!(std::fs::read_to_string(&stamped).unwrap(), "el otro");
+            }
+        }
+    }
+
+    /// Con ids repetidos (un fichero tocado a mano): de cada nota, la última; de cada llamada, la
+    /// más nueva (a igual hora, la última). Se mira después de limpiar, y antes de los límites.
+    #[test]
+    fn repeated_ids_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE);
+        let raw = serde_json::json!({
+            "notes": [
+                {"id": 1, "text": "uno", "at": 1},
+                {"id": 2, "text": "dos", "at": 2},
+                {"id": 1, "text": "uno bis", "at": 3},
+                {"id": 3, "text": " ", "at": 4},
+                {"id": 3, "text": "tres", "at": 5},
+                {"id": 2, "text": "\u{7}", "at": 6},
+            ],
+            "calls": [
+                {"id": "c1", "at": 5, "kind": "resumen", "text": "nueva"},
+                {"id": "c1", "at": 3, "kind": "resumen", "text": "vieja"},
+                {"id": "c2", "at": 4, "kind": "resumen", "text": "a"},
+                {"id": "c2", "at": 4, "kind": "bitacora", "text": "b"},
+                {"id": "c3", "at": 1, "kind": "resumen", "text": "x"},
+                {"id": "c3", "at": 9, "kind": "resumen", "text": ""},
+            ],
+        });
+        std::fs::write(&file, raw.to_string()).unwrap();
+        let (m, _) = mem(dir.path());
+        let s = m.get().unwrap();
+        let notes: Vec<(u64, &str)> = s.notes.iter().map(|n| (n.id, n.text.as_str())).collect();
+        assert_eq!(notes, vec![(2, "dos"), (1, "uno bis"), (3, "tres")]);
+        let calls: Vec<(&str, u64, &str)> = s
+            .calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.at, c.text.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![("c1", 5, "nueva"), ("c2", 4, "b"), ("c3", 1, "x")]
+        );
+
+        // Los repetidos no se comen el sitio de los demás.
+        let notes: Vec<serde_json::Value> = (0..2 * MAX_NOTES)
+            .map(|i| serde_json::json!({"id": i % MAX_NOTES + 1, "text": format!("n{i}"), "at": i}))
+            .collect();
+        let calls: Vec<serde_json::Value> = (0..2 * MAX_CALLS)
+            .map(|i| serde_json::json!({"id": format!("c{}", i % MAX_CALLS), "at": i, "kind": "resumen", "text": "r"}))
+            .collect();
+        std::fs::write(
+            &file,
+            serde_json::json!({"notes": notes, "calls": calls}).to_string(),
+        )
+        .unwrap();
+        let s = m.get().unwrap();
+        assert_eq!(s.notes.len(), MAX_NOTES);
+        assert!(
+            s.notes
+                .iter()
+                .all(|n| n.text == format!("n{}", n.id - 1 + MAX_NOTES as u64))
+        );
+        assert_eq!(s.calls.len(), MAX_CALLS);
+        assert!(s.calls.iter().all(|c| c.at >= MAX_CALLS as u64));
+    }
+
     #[test]
     fn a_partial_file_keeps_what_it_has() {
         let dir = tempfile::tempdir().unwrap();
@@ -776,6 +951,9 @@ mod tests {
         assert_eq!(m.add_note("y"), Ok(MAX_NOTE_ID));
         assert_eq!(m.add_note("z"), Err(MemoryError::Full));
         assert_eq!(m.get().unwrap().notes.len(), 2);
+        // Gastado el último id de verdad, sigue así tras reiniciar.
+        let (again, _) = mem(dir.path());
+        assert_eq!(again.add_note("z"), Err(MemoryError::Full));
 
         let max = u64::MAX;
         std::fs::write(
@@ -783,9 +961,20 @@ mod tests {
             format!(r#"{{"notes": [{{"id": {max}, "text": "x", "at": 1}}], "next_note": {max}}}"#),
         )
         .unwrap();
-        // La de un id que la web no guarda exacto no sale.
+        // La de un id que la web no guarda exacto no sale, y un `next_note` imposible (tocado a
+        // mano) no la deja llena para siempre: vuelve a seguir al más alto que queda.
         assert_eq!(m.get().unwrap().notes, vec![]);
-        assert_eq!(m.add_note("y"), Err(MemoryError::Full));
+        assert_eq!(m.add_note("y"), Ok(1));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(raw["next_note"], 2);
+        let past = MAX_NOTE_ID + 2;
+        std::fs::write(
+            &file,
+            format!(r#"{{"notes": [{{"id": 5, "text": "x", "at": 1}}], "next_note": {past}}}"#),
+        )
+        .unwrap();
+        assert_eq!(m.add_note("y"), Ok(6));
     }
 
     /// Un fichero tocado a mano pasa por lo mismo que lo que llega por la API.
