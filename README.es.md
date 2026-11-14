@@ -290,7 +290,7 @@ una bitácora de lo que se dijo y se hizo, hasta 4000 caracteres; de un texto m�
 final, desde el principio de una línea). No guarda el handle para retomar una conversación con el
 modelo de voz: eso es del hub. Se guarda en `<state>/voice-memory.json` (`<state>` como en
 «Secretos, textos y ficheros»: normalmente `~/.local/state/nido`), solo legible por tu usuario, en
-el equipo que recibe las peticiones (la web y la app usan su equipo principal). Cada equipo del
+el equipo que recibe las peticiones (la web y la app usan el equipo con el que se emparejaron). Cada equipo del
 grupo tiene la suya y no se sincronizan; tampoco va al hub. Solo un teléfono o un navegador
 emparejado puede leerla o cambiarla (`403` con el token de `~/.config/nido/token`). Para borrarla,
 borra ese fichero: nido lo lee en cada petición, así que vale al momento, también con nido en
