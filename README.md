@@ -334,6 +334,14 @@ Like the memory, only a paired phone or browser can ask for it (`403` with the t
 link, even one to a folder), or the folder can't be created, it answers `500` and leaves what is
 there untouched. An older nido answers `404`.
 
+A Claude session whose folder is that one (whatever its name; a session called "consultas"
+elsewhere is like any other) runs apart from your own Claude configuration, every time nido starts
+or resumes it: without your user settings (`--setting-sources project,local`: no extra folders, no
+default mode, permissions, hooks or plugins of yours), in manual mode (`--permission-mode
+default`) and without MCP servers (`--strict-mcp-config`), not even nido's (it can't message, read
+or start other sessions; nido doesn't need it there). Your login isn't in those settings and
+keeps working, unless it depends on them (an `apiKeyHelper`, or a key in their `env`).
+
 `POST /api/v1/pair` (body `{"days": 30}` optional, for a reusable code) creates a pairing code and
 returns `{"uri": "nido://pair?…", "expires", "reusable", "direct",
 "hub"}`. When nido is connected to the hub it also returns `link`, the hub's web app with the code

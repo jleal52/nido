@@ -321,6 +321,15 @@ solo puede pedirla un teléfono o un navegador emparejado (`403` con el token de
 enlace, aunque lleve a una carpeta), o la carpeta no se puede crear, contesta `500` y deja lo que
 haya como está. Un nido anterior contesta `404`.
 
+Una sesión de Claude cuya carpeta es esa (se llame como se llame; una que se llame «consultas» en
+otra carpeta es como cualquier otra) va aparte de tu configuración de Claude, cada vez que nido la
+arranca o la retoma: sin tus ajustes de usuario (`--setting-sources project,local`: ni carpetas de
+más, ni modo por defecto, permisos, hooks o plugins tuyos), en modo manual (`--permission-mode
+default`) y sin servidores MCP (`--strict-mcp-config`), ni siquiera el de nido (no puede mandar
+mensajes a otras sesiones, leerlas ni arrancarlas; nido no lo necesita ahí). Tu cuenta no está en
+esos ajustes y sigue funcionando, salvo que dependa de ellos (un `apiKeyHelper`, o una clave en su
+`env`).
+
 `POST /api/v1/pair` (con `{"days": 30}` opcional, para un código reutilizable) crea un código para
 emparejar y devuelve `{"uri": "nido://pair?…", "expires", "reusable",
 "direct", "hub"}`. Si nido está conectado al hub, también `link`, la web del hub con el código
