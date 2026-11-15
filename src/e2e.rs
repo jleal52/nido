@@ -716,20 +716,18 @@ async fn pair<H: Host>(host: &H, pattern: &'static str, msg1: &[u8], tx: &mpsc::
     let Some(key) = hs.get_remote_static().map(<[u8]>::to_vec) else {
         return;
     };
-    let added = {
+    let (added, old) = {
         let mut phones = host.phones().lock().expect("teléfonos");
         let old = phones.by_key(&key).map(|p| p.id.clone());
-        phones
-            .add(&key, &hello.name, hello.push.filter(|h| valid_handle(h)))
-            .map(|p| (p, old))
+        let added = phones.add(&key, &hello.name, hello.push.filter(|h| valid_handle(h)));
+        (added, old)
     };
+    // El id viejo ha salido de la memoria aunque no se haya podido guardar el nuevo.
+    if let Some(old) = old.filter(|o| !matches!(&added, Ok(p) if p.id == *o)) {
+        host.device_replaced(&old);
+    }
     let phone = match added {
-        Ok((p, old)) => {
-            if let Some(old) = old.filter(|o| *o != p.id) {
-                host.device_replaced(&old);
-            }
-            p
-        }
+        Ok(p) => p,
         Err(e) => {
             eprintln!("nido: no se pudo apuntar el teléfono: {e}");
             return;

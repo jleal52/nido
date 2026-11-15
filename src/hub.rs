@@ -168,6 +168,8 @@ impl SessionError {
 /// Lo que dice el hub cuando no da sesiones y cuando se pasa del freno.
 const SESSION_NOT_OFFERED: &str = "el hub no ofrece sesiones";
 const SESSION_LIMIT: &str = "límite de sesiones";
+/// Un `ok` sin vale.
+const SESSION_NO_GRANT: &str = "el hub no dio el vale";
 
 /// Cuánto se espera el vale de sesión: un hub antiguo no contesta nunca.
 #[cfg(not(test))]
@@ -193,14 +195,19 @@ pub struct Hub {
     config: watch::Sender<HubConfig>,
     /// Lo que va hacia el hub (mientras haya conexión).
     out: Mutex<Option<mpsc::Sender<Message>>>,
+    /// Los textos de control hacia el hub (el grupo, los dispositivos, las bajas, los pedidos
+    /// de voz y de sesión), mientras haya conexión: una cola aparte, sin límite (son pocos y
+    /// pequeños), para que no se pierdan con `out` lleno (los flujos de los móviles pueden
+    /// llenarlo) y salgan en el orden en que se mandaron.
+    control: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pending: Pending,
     /// Los pedidos de token de voz que esperan respuesta (lo que vino en `voiced`).
     voice_pending: Waiters,
     /// Los pedidos de sesión de dispositivo que esperan respuesta (lo que vino en `sessioned`).
     session_pending: Waiters,
-    /// Los ids del grupo mandados por última vez en esta conexión (con `out`: se vacía al
-    /// conectar y al desconectar, así que al reconectar se mandan siempre).
-    group_sent: Mutex<Option<Vec<String>>>,
+    /// Lo mandado en esta conexión (se vacía al conectar y al desconectar, así que al reconectar
+    /// se manda siempre). Va con `control`: se cogen en ese orden.
+    sent: Mutex<Sent>,
     next_req: AtomicU64,
 }
 
@@ -218,7 +225,8 @@ impl Hub {
             pending: Default::default(),
             voice_pending: Default::default(),
             session_pending: Default::default(),
-            group_sent: Default::default(),
+            control: Default::default(),
+            sent: Default::default(),
             next_req: AtomicU64::new(1),
         })
     }
@@ -301,8 +309,8 @@ impl Hub {
         mut body: serde_json::Map<String, serde_json::Value>,
         wait: Duration,
     ) -> Result<serde_json::Value, Unanswered> {
-        let out = self
-            .out
+        let control = self
+            .control
             .lock()
             .expect("hub")
             .clone()
@@ -314,11 +322,7 @@ impl Hub {
         let mut msg = serde_json::Map::new();
         msg.insert(kind.into(), body.into());
         let msg = serde_json::Value::Object(msg);
-        if out
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
+        if control.send(Message::Text(msg.to_string().into())).is_err() {
             waiters.lock().expect("pedidos").remove(&req);
             return Err(Unanswered::NoHub);
         }
@@ -377,6 +381,9 @@ impl Hub {
                 v["error"].as_str().unwrap_or_default(),
             ));
         }
+        if !v["grant"].is_string() {
+            return Err(SessionError::Hub(SESSION_NO_GRANT.into()));
+        }
         strip_reply(&mut v);
         Ok(v)
     }
@@ -388,34 +395,55 @@ impl Hub {
     pub fn send_group(&self, mut ids: Vec<String>) {
         ids.sort();
         ids.dedup();
-        // Con `out` cogido: lo mandado va con la conexión por la que se mandó.
-        let out = self.out.lock().expect("hub");
-        let Some(out) = out.as_ref() else { return };
-        let mut sent = self.group_sent.lock().expect("grupo");
-        if sent.as_ref() == Some(&ids) {
+        // Con `control` cogido: lo apuntado como mandado va con la conexión por la que salió.
+        let control = self.control.lock().expect("hub");
+        let Some(control) = control.as_ref() else {
+            return;
+        };
+        let mut sent = self.sent.lock().expect("hub");
+        if sent.group.as_ref() == Some(&ids) {
             return;
         }
         let msg = serde_json::json!({ "group": { "ids": ids, "at": crate::group::now_ms() } });
-        match out.try_send(Message::Text(msg.to_string().into())) {
-            Ok(()) => *sent = Some(ids),
-            Err(e) => eprintln!("nido: no se pudo mandar el grupo al hub: {e}"),
+        // Solo falla si la conexión ya se acabó: al reconectar se vuelve a mandar.
+        if control.send(Message::Text(msg.to_string().into())).is_ok() {
+            sent.group = Some(ids);
+        }
+    }
+
+    /// Manda al hub, una vez por conexión, los ids de los dispositivos emparejados aquí
+    /// (`{"devices":{"ids":[…]}}`, ordenados): el hub borra las sesiones de los que no estén. Así
+    /// se arregla una baja que no llegó (`unsession` sin conexión). Sin conexión, nada.
+    pub fn send_devices(&self, mut ids: Vec<String>) {
+        ids.sort();
+        ids.dedup();
+        let control = self.control.lock().expect("hub");
+        let Some(control) = control.as_ref() else {
+            return;
+        };
+        let mut sent = self.sent.lock().expect("hub");
+        if sent.devices {
+            return;
+        }
+        let msg = serde_json::json!({ "devices": { "ids": ids } });
+        if control.send(Message::Text(msg.to_string().into())).is_ok() {
+            sent.devices = true;
         }
     }
 
     /// Avisa al hub de que este dispositivo (su id aquí) ya no está emparejado, para que borre
-    /// sus sesiones (`{"unsession":{"device":…}}`). Sin conexión no se manda: la sesión caducará
-    /// sola.
+    /// sus sesiones (`{"unsession":{"device":…}}`). Sin conexión no se manda: la lista de
+    /// dispositivos que va al conectar (`send_devices`) lo arregla.
     pub fn unsession(&self, device: &str) {
-        let out = self.out.lock().expect("hub").clone();
-        let Some(out) = out else { return };
+        let control = self.control.lock().expect("hub").clone();
+        let Some(control) = control else { return };
         let msg = serde_json::json!({ "unsession": { "device": device } });
-        if let Err(e) = out.try_send(Message::Text(msg.to_string().into())) {
-            eprintln!("nido: no se pudo avisar al hub de la baja de un dispositivo: {e}");
-        }
+        let _ = control.send(Message::Text(msg.to_string().into()));
     }
 
     /// Si es una respuesta `{"voiced":{"req":N,…}}`, se la entrega a quien la espera. Devuelve
-    /// si lo era.
+    /// si lo era. Con `get_mut` y no con `v["voiced"]`: el índice mutable de un `Value` mete la
+    /// clave que falta (y entra en pánico si no es un objeto), y por aquí pasan todos los textos.
     fn voiced(&self, v: &mut serde_json::Value) -> bool {
         v.get_mut("voiced")
             .is_some_and(|r| answered(&self.voice_pending, r))
@@ -450,7 +478,11 @@ impl Hub {
     /// un `out` de antes ya no llega a nadie: falla al mandarlo.
     fn disconnected(&self) {
         *self.out.lock().expect("hub") = None;
-        *self.group_sent.lock().expect("grupo") = None;
+        {
+            let mut control = self.control.lock().expect("hub");
+            *self.sent.lock().expect("hub") = Sent::default();
+            *control = None;
+        }
         self.pending.lock().expect("avisos").clear();
         self.voice_pending.lock().expect("pedidos").clear();
         self.session_pending.lock().expect("pedidos").clear();
@@ -459,6 +491,15 @@ impl Hub {
     fn set_status(&self, f: impl FnOnce(&mut HubStatus)) {
         self.status.send_modify(f);
     }
+}
+
+/// Lo mandado al hub en una conexión.
+#[derive(Default)]
+struct Sent {
+    /// Los ids del grupo de la última vez.
+    group: Option<Vec<String>>,
+    /// Si ya se mandó la lista de dispositivos.
+    devices: bool,
 }
 
 /// Le entrega `reply` (lo de dentro de `{"voiced":…}`, `{"sessioned":…}`) a quien espera su
@@ -681,11 +722,14 @@ async fn run<H: e2e::Host>(
     eprintln!("nido: conectado al hub {url} como {id}");
 
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
+    // `control_tx` vive aquí también: la cola no se cierra mientras dure la conexión.
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
+    *hub.out.lock().expect("hub") = Some(out_tx.clone());
     {
-        // Una conexión nueva: los ids del grupo se vuelven a mandar.
-        let mut out = hub.out.lock().expect("hub");
-        *hub.group_sent.lock().expect("grupo") = None;
-        *out = Some(out_tx.clone());
+        // Una conexión nueva: el grupo y los dispositivos se vuelven a mandar.
+        let mut control = hub.control.lock().expect("hub");
+        *hub.sent.lock().expect("hub") = Sent::default();
+        *control = Some(control_tx.clone());
     }
     hub.set_status(|s| {
         s.id = Some(id.clone());
@@ -703,6 +747,9 @@ async fn run<H: e2e::Host>(
             }
             m = out_rx.recv() => {
                 let Some(m) = m else { return Ok(()) };
+                tx.send(m).await.map_err(|e| e.to_string())?;
+            }
+            Some(m) = control_rx.recv() => {
                 tx.send(m).await.map_err(|e| e.to_string())?;
             }
             msg = rx.next() => match msg {
@@ -970,8 +1017,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Sin conexión no se manda (ni cuenta como mandada).
-        hub.send_group(vec!["a".into()]);
         rec.next("pub").await;
         tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
             .await
@@ -1090,24 +1135,66 @@ mod tests {
     #[tokio::test]
     async fn the_hub_errors_become_session_errors() {
         let tmp = tempfile::tempdir().unwrap();
+        // Lo que contesta, según el dispositivo que pide (no según el número del pedido).
         let (hub, _rec) = recorded(tmp.path(), |v| {
             let req = v["session"]["req"].as_u64()?;
-            let error = match req % 3 {
-                1 => "límite de sesiones",
-                2 => "el hub no ofrece sesiones",
-                _ => "error del hub",
+            let reply = match v["session"]["device"].as_str() {
+                Some("freno") => serde_json::json!({ "ok": false, "error": "límite de sesiones" }),
+                Some("sin") => {
+                    serde_json::json!({ "ok": false, "error": "el hub no ofrece sesiones" })
+                }
+                Some("sin-vale") => serde_json::json!({ "ok": true, "expires": 60000 }),
+                Some("vale-raro") => serde_json::json!({ "ok": true, "grant": 7 }),
+                _ => serde_json::json!({ "ok": false, "error": "error del hub" }),
             };
-            Some(Reply::Send(serde_json::json!({
-                "sessioned": { "req": req, "ok": false, "error": error }
-            })))
+            let mut reply = reply;
+            reply["req"] = req.into();
+            Some(Reply::Send(serde_json::json!({ "sessioned": reply })))
         })
         .await;
-        assert_eq!(hub.hub_session(None).await, Err(SessionError::Limit));
-        assert_eq!(hub.hub_session(None).await, Err(SessionError::NotOffered));
+        assert_eq!(
+            hub.hub_session(Some("freno")).await,
+            Err(SessionError::Limit)
+        );
+        assert_eq!(
+            hub.hub_session(Some("sin")).await,
+            Err(SessionError::NotOffered)
+        );
         assert_eq!(
             hub.hub_session(None).await,
             Err(SessionError::Hub("error del hub".into()))
         );
+        // Un `ok` sin vale (o con uno que no es texto) no es un vale.
+        let no_grant = Err(SessionError::Hub("el hub no dio el vale".into()));
+        assert_eq!(hub.hub_session(Some("sin-vale")).await, no_grant);
+        assert_eq!(hub.hub_session(Some("vale-raro")).await, no_grant);
+    }
+
+    /// La lista de dispositivos va una vez por conexión, y otra vez al reconectar.
+    #[tokio::test]
+    async fn the_devices_go_once_per_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        hub.send_devices(vec!["b2".into(), "a1".into()]);
+        assert_eq!(
+            rec.next("devices").await,
+            serde_json::json!({ "ids": ["a1", "b2"] })
+        );
+        hub.send_devices(vec!["a1".into()]);
+        rec.quiet("devices", Duration::from_millis(300)).await;
+        rec.tell(fake::Tell::Hangup);
+        let mut status = hub.status.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        rec.next("pub").await;
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        hub.send_devices(vec![]);
+        assert_eq!(rec.next("devices").await, serde_json::json!({ "ids": [] }));
     }
 
     #[tokio::test]
@@ -1249,6 +1336,22 @@ pub(crate) mod fake {
             tokio::time::timeout(Duration::from_secs(10), wait)
                 .await
                 .unwrap_or_else(|_| panic!("no llegó «{kind}»"))
+        }
+
+        /// El siguiente texto del nido, sea el que sea.
+        pub async fn next_any(&mut self) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(10), self.got.recv())
+                .await
+                .expect("no llegó nada")
+                .expect("el hub de mentira se cerró")
+        }
+
+        /// Que no llegue ningún `{kind: …}` en `wait` (los demás se saltan).
+        pub async fn quiet(&mut self, kind: &str, wait: Duration) {
+            let deadline = tokio::time::Instant::now() + wait;
+            while let Ok(Some(v)) = tokio::time::timeout_at(deadline, self.got.recv()).await {
+                assert!(v.get(kind).is_none(), "no tenía que llegar: {v}");
+            }
         }
 
         pub fn tell(&self, t: Tell) {

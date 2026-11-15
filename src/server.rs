@@ -1998,13 +1998,16 @@ impl AppState {
                 .iter()
                 .find(|p| p.key == key)
                 .map(|p| p.id.clone());
-            if let Ok(true) = phones.remove_by_key(&key) {
-                drop(phones);
+            let removed = phones.remove_by_key(&key);
+            drop(phones);
+            if let Err(e) = &removed {
+                eprintln!("nido: no se pudo guardar la baja de un dispositivo: {e}");
+            }
+            // Aunque no se haya podido guardar: de la memoria ya ha salido.
+            if let (Ok(true) | Err(_), Some(id)) = (removed, id) {
                 eprintln!("nido: un dispositivo quitado en el grupo, quitado aquí");
                 // Sus sesiones del hub, fuera también.
-                if let Some(id) = id {
-                    self.hub.unsession(&id);
-                }
+                self.hub.unsession(&id);
             }
         }
     }
@@ -2172,14 +2175,20 @@ fn spawn_group_hub(st: Arc<AppState>) {
     tokio::spawn(async move {
         let mut status = st.hub.status.subscribe();
         let mut revision = st.group.subscribe();
+        // Lo primero, como si hubiera cambiado la conexión.
+        let mut connection = true;
         loop {
-            let s = status.borrow_and_update().clone();
-            if s.connected
-                && let Some(id) = &s.id
-            {
-                st.group
-                    .set_self(id, &<AppState as e2e::Host>::host_name(&st));
-                st.group_dirty.notify_one();
+            // Apuntarse solo si cambió la conexión: cada cambio del grupo no es una ronda más de
+            // sincronización.
+            if connection {
+                let s = status.borrow_and_update().clone();
+                if s.connected
+                    && let Some(id) = &s.id
+                {
+                    st.group
+                        .set_self(id, &<AppState as e2e::Host>::host_name(&st));
+                    st.group_dirty.notify_one();
+                }
             }
             // Vista la revisión, y el guard suelto antes de leer el grupo.
             let _ = *revision.borrow_and_update();
@@ -2191,10 +2200,20 @@ fn spawn_group_hub(st: Arc<AppState>) {
                 .map(|m| m.id)
                 .collect();
             st.hub.send_group(others);
-            tokio::select! {
-                r = status.changed() => if r.is_err() { return },
-                r = revision.changed() => if r.is_err() { return },
-            }
+            // Después del grupo, y una vez por conexión (lo demás lo descarta `send_devices`).
+            let devices = st
+                .phones
+                .lock()
+                .expect("teléfonos")
+                .list()
+                .iter()
+                .map(|p| p.id.clone())
+                .collect();
+            st.hub.send_devices(devices);
+            connection = tokio::select! {
+                r = status.changed() => if r.is_err() { return } else { true },
+                r = revision.changed() => if r.is_err() { return } else { false },
+            };
         }
     });
 }
@@ -4093,12 +4112,13 @@ fn remove_phone(st: &AppState, id: &str) -> Response {
         st.group_dirty.notify_one();
     }
     let removed = st.phones.lock().expect("teléfonos").remove(id);
+    // Sus sesiones del hub, fuera también; aunque no se haya podido guardar la baja, de la
+    // memoria ya ha salido.
+    if key.is_some() {
+        st.hub.unsession(id);
+    }
     match removed {
-        Ok(true) => {
-            // Sus sesiones del hub, fuera también.
-            st.hub.unsession(id);
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "ese teléfono no está emparejado"),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -4793,14 +4813,111 @@ mod tests {
         hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
         assert_eq!(rec.next("group").await["ids"], json!(["otro"]));
         assert_eq!(st.group.self_id().as_deref(), Some("este"), "apuntado");
-        // Cambios que no tocan los ids (un nombre, un dispositivo): nada.
+        // Apuntarse pidió una sincronización; los cambios del grupo, no (no son de la conexión).
+        tokio::time::timeout(Duration::from_secs(5), st.group_dirty.notified())
+            .await
+            .expect("apuntarse pide sincronizar");
+        // Cambios que no tocan los ids (un nombre, un dispositivo): nada. Cada uno, a su tiempo,
+        // para que el oyente los vea por separado.
         st.group.add_member("otro", "k-otro", "mac nuevo");
+        rec.quiet("group", Duration::from_millis(300)).await;
         st.group.add_device(&[7u8; 32], "Firefox");
+        rec.quiet("group", Duration::from_millis(300)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), st.group_dirty.notified())
+                .await
+                .is_err(),
+            "un cambio del grupo no es una ronda más de sincronización"
+        );
         // Un equipo más, y uno menos.
         st.group.add_member("aaa", "k-aaa", "linux");
         assert_eq!(rec.next("group").await["ids"], json!(["aaa", "otro"]));
         assert!(st.group.remove_member("otro"));
         assert_eq!(rec.next("group").await["ids"], json!(["aaa"]));
+    }
+
+    /// Al conectar, después del grupo, la lista de los dispositivos emparejados; al reconectar,
+    /// otra vez, con lo que cambió mientras tanto y aunque no haya cambiado nada.
+    #[tokio::test]
+    async fn the_group_and_the_devices_go_again_on_reconnect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        st.group.add_member("otro", "k-otro", "mac");
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        let mut rec = hub::fake::recording(|_| None).await;
+        spawn_group_hub(st.clone());
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        // En este orden: el grupo y luego los dispositivos.
+        let mut first = Vec::new();
+        while first.len() < 2 {
+            let v = rec.next_any().await;
+            if v.get("group").is_some() || v.get("devices").is_some() {
+                first.push(v);
+            }
+        }
+        assert_eq!(first[0]["group"]["ids"], json!(["otro"]));
+        assert_eq!(first[1]["devices"], json!({ "ids": [phone.id] }));
+
+        // Sin conexión, un equipo más y un dispositivo menos: al reconectar, lo nuevo.
+        let mut status = st.hub.status.subscribe();
+        rec.tell(hub::fake::Tell::Hangup);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        st.group.add_member("aaa", "k-aaa", "linux");
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        rec.next("pub").await;
+        assert_eq!(rec.next("group").await["ids"], json!(["aaa", "otro"]));
+        assert_eq!(rec.next("devices").await, json!({ "ids": [] }));
+
+        // Y sin cambios, también.
+        rec.tell(hub::fake::Tell::Hangup);
+        rec.next("pub").await;
+        assert_eq!(rec.next("group").await["ids"], json!(["aaa", "otro"]));
+        assert_eq!(rec.next("devices").await, json!({ "ids": [] }));
+    }
+
+    /// Si no se puede guardar la baja, el dispositivo ya ha salido de la memoria: el hub se
+    /// entera igual.
+    #[tokio::test]
+    async fn a_removal_that_cannot_be_saved_still_tells_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let mut rec = hub::fake::recording(|_| None).await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        let web = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[2u8; 32], "web", None)
+            .unwrap();
+        // El fichero temporal de `phones.json` es una carpeta: no se puede guardar.
+        std::fs::create_dir_all(tmp.path().join("data").join("phones.tmp")).unwrap();
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(rec.next("unsession").await, json!({ "device": phone.id }));
+        st.group.add_device(&[2u8; 32], "web");
+        st.group.remove_device(&web.key);
+        st.apply_group();
+        assert_eq!(rec.next("unsession").await, json!({ "device": web.id }));
+        assert!(st.phones.lock().unwrap().list().is_empty());
     }
 
     /// Un dispositivo dado de baja aquí (`nido phones`, «Cerrar sesión») o porque el grupo lo
