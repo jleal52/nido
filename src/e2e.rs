@@ -609,6 +609,10 @@ pub trait Host: Send + Sync + 'static {
     }
     /// El grupo ha cambiado aquí: hay que contárselo a los demás equipos.
     fn group_changed(&self) {}
+    /// Ese dispositivo (su id aquí) ya no está emparejado con ese id: al volver a emparejarse
+    /// con la misma clave tiene otro. Lo que haya a nombre del viejo (sus sesiones del hub),
+    /// fuera.
+    fn device_replaced(&self, _old_id: &str) {}
     /// Lo mismo, pero esperando a que se lo hayan contado (al emparejar: el dispositivo recibe la
     /// lista de equipos y puede ir a cualquiera en el momento).
     fn sync_group_now(
@@ -712,12 +716,20 @@ async fn pair<H: Host>(host: &H, pattern: &'static str, msg1: &[u8], tx: &mpsc::
     let Some(key) = hs.get_remote_static().map(<[u8]>::to_vec) else {
         return;
     };
-    let phone = match host.phones().lock().expect("teléfonos").add(
-        &key,
-        &hello.name,
-        hello.push.filter(|h| valid_handle(h)),
-    ) {
-        Ok(p) => p,
+    let added = {
+        let mut phones = host.phones().lock().expect("teléfonos");
+        let old = phones.by_key(&key).map(|p| p.id.clone());
+        phones
+            .add(&key, &hello.name, hello.push.filter(|h| valid_handle(h)))
+            .map(|p| (p, old))
+    };
+    let phone = match added {
+        Ok((p, old)) => {
+            if let Some(old) = old.filter(|o| *o != p.id) {
+                host.device_replaced(&old);
+            }
+            p
+        }
         Err(e) => {
             eprintln!("nido: no se pudo apuntar el teléfono: {e}");
             return;
@@ -1211,6 +1223,8 @@ mod tests {
         addr: Option<SocketAddr>,
         group: Option<crate::group::Group>,
         replays: PeerReplays,
+        /// Los ids de los dispositivos que se volvieron a emparejar (`device_replaced`).
+        replaced: Mutex<Vec<String>>,
     }
 
     impl Host for TestHost {
@@ -1234,6 +1248,9 @@ mod tests {
         }
         fn peer_replays(&self) -> Option<&PeerReplays> {
             Some(&self.replays)
+        }
+        fn device_replaced(&self, old_id: &str) {
+            self.replaced.lock().unwrap().push(old_id.into());
         }
         /// Devuelve quién y qué pidió; `grande`, una respuesta que no cabe; `falla`, un error.
         fn peer_call<'a>(
@@ -1262,6 +1279,7 @@ mod tests {
             addr,
             group: None,
             replays: PeerReplays::default(),
+            replaced: Default::default(),
         })
     }
 
@@ -1290,6 +1308,7 @@ mod tests {
             addr: None,
             group: Some(g),
             replays: PeerReplays::since(started),
+            replaced: Default::default(),
         })
     }
 
@@ -1440,6 +1459,7 @@ mod tests {
             addr: None,
             group: None,
             replays: PeerReplays::default(),
+            replaced: Default::default(),
         });
         let server_key = host.id.public.to_vec();
         let offer = host
@@ -1471,6 +1491,46 @@ mod tests {
         assert!(!file.exists());
         assert!(Phone::new().pair(&host, &server_key, &psk).await.is_none());
         assert_eq!(host.phones.lock().unwrap().views().len(), 3);
+    }
+
+    /// El mismo dispositivo, emparejado otra vez: tiene otro id, y el viejo se da por quitado (lo
+    /// que haya a su nombre, como sus sesiones del hub, ya no se podría quitar).
+    #[tokio::test]
+    async fn pairing_again_replaces_the_old_id() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let host = test_host(dir.path(), None);
+        let server_key = host.id.public.to_vec();
+        let offer = host
+            .pairing
+            .offer_standing(&host.id, &[], None, 30)
+            .unwrap();
+        let psk = psk_of(&offer.uri);
+        let phone = Phone::new();
+        assert!(phone.pair(&host, &server_key, &psk).await.is_some());
+        let first = host.phones.lock().unwrap().list()[0].id.clone();
+        assert!(
+            host.replaced.lock().unwrap().is_empty(),
+            "el primero no sustituye a nadie"
+        );
+        // Otro dispositivo no toca al primero.
+        assert!(Phone::new().pair(&host, &server_key, &psk).await.is_some());
+        assert!(host.replaced.lock().unwrap().is_empty());
+        assert!(phone.pair(&host, &server_key, &psk).await.is_some());
+        assert_eq!(
+            host.replaced.lock().unwrap().as_slice(),
+            std::slice::from_ref(&first)
+        );
+        let ids: Vec<String> = host
+            .phones
+            .lock()
+            .unwrap()
+            .list()
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(!ids.contains(&first));
     }
 
     #[tokio::test]

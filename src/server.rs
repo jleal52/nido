@@ -269,6 +269,10 @@ impl e2e::Host for AppState {
     fn group_changed(&self) {
         self.group_dirty.notify_one();
     }
+    fn device_replaced(&self, old_id: &str) {
+        // Sus sesiones del hub iban a nombre del id viejo: con el nuevo ya no se podrían quitar.
+        self.hub.unsession(old_id);
+    }
     fn sync_group_now(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
@@ -1988,8 +1992,19 @@ impl AppState {
     /// Lo que el grupo ha dado de baja, fuera también de aquí.
     fn apply_group(&self) {
         for key in self.group.removed_devices() {
-            if let Ok(true) = self.phones.lock().expect("teléfonos").remove_by_key(&key) {
+            let mut phones = self.phones.lock().expect("teléfonos");
+            let id = phones
+                .list()
+                .iter()
+                .find(|p| p.key == key)
+                .map(|p| p.id.clone());
+            if let Ok(true) = phones.remove_by_key(&key) {
+                drop(phones);
                 eprintln!("nido: un dispositivo quitado en el grupo, quitado aquí");
+                // Sus sesiones del hub, fuera también.
+                if let Some(id) = id {
+                    self.hub.unsession(&id);
+                }
             }
         }
     }
@@ -2129,23 +2144,7 @@ impl AppState {
 
 /// El grupo: apuntarse al conectar con el hub y sincronizar cuando cambia algo (y cada 5 min).
 fn spawn_group(state: Arc<AppState>) {
-    let st = state.clone();
-    tokio::spawn(async move {
-        let mut status = st.hub.status.subscribe();
-        loop {
-            let s = status.borrow_and_update().clone();
-            if s.connected
-                && let Some(id) = &s.id
-            {
-                st.group
-                    .set_self(id, &<AppState as e2e::Host>::host_name(&st));
-                st.group_dirty.notify_one();
-            }
-            if status.changed().await.is_err() {
-                return;
-            }
-        }
-    });
+    spawn_group_hub(state.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(300));
         loop {
@@ -2160,6 +2159,41 @@ fn spawn_group(state: Arc<AppState>) {
                 state.sync_group().await;
             } else {
                 state.apply_group();
+            }
+        }
+    });
+}
+
+/// El grupo y el hub: al conectar, apuntarse con el id que da el hub (`set_self`) y mandarle los
+/// ids de los otros equipos del grupo; después, cada vez que cambie el grupo. `send_group` solo
+/// los manda si la lista cambió en esta conexión: la revisión sube también con los dispositivos,
+/// los nombres o las horas.
+fn spawn_group_hub(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut status = st.hub.status.subscribe();
+        let mut revision = st.group.subscribe();
+        loop {
+            let s = status.borrow_and_update().clone();
+            if s.connected
+                && let Some(id) = &s.id
+            {
+                st.group
+                    .set_self(id, &<AppState as e2e::Host>::host_name(&st));
+                st.group_dirty.notify_one();
+            }
+            // Vista la revisión, y el guard suelto antes de leer el grupo.
+            let _ = *revision.borrow_and_update();
+            let others = st
+                .group
+                .members()
+                .into_iter()
+                .filter(|m| !m.me)
+                .map(|m| m.id)
+                .collect();
+            st.hub.send_group(others);
+            tokio::select! {
+                r = status.changed() => if r.is_err() { return },
+                r = revision.changed() => if r.is_err() { return },
             }
         }
     });
@@ -4058,8 +4092,13 @@ fn remove_phone(st: &AppState, id: &str) -> Response {
         st.group.remove_device(k);
         st.group_dirty.notify_one();
     }
-    match st.phones.lock().expect("teléfonos").remove(id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+    let removed = st.phones.lock().expect("teléfonos").remove(id);
+    match removed {
+        Ok(true) => {
+            // Sus sesiones del hub, fuera también.
+            st.hub.unsession(id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => error(StatusCode::NOT_FOUND, "ese teléfono no está emparejado"),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -4726,6 +4765,88 @@ mod tests {
         let (status, body) = voice_reply(&st, &phone.token).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(body["error"], "the hub does not offer voice");
+    }
+
+    // ---------- El grupo, las bajas y el hub ----------
+
+    fn hub_state(dir: &std::path::Path) -> Arc<AppState> {
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        AppState::new(paths, Launcher::Detached, Some("local".into()), true).unwrap()
+    }
+
+    /// Al conectar (tras apuntarse con el id del hub) van los ids de los otros equipos; luego,
+    /// cada vez que cambian, y solo entonces.
+    #[tokio::test]
+    async fn the_group_ids_go_to_the_hub_when_they_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        st.group.add_member("otro", "k-otro", "mac");
+        let mut rec = hub::fake::recording(|_| None).await;
+        spawn_group_hub(st.clone());
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        assert_eq!(rec.next("group").await["ids"], json!(["otro"]));
+        assert_eq!(st.group.self_id().as_deref(), Some("este"), "apuntado");
+        // Cambios que no tocan los ids (un nombre, un dispositivo): nada.
+        st.group.add_member("otro", "k-otro", "mac nuevo");
+        st.group.add_device(&[7u8; 32], "Firefox");
+        // Un equipo más, y uno menos.
+        st.group.add_member("aaa", "k-aaa", "linux");
+        assert_eq!(rec.next("group").await["ids"], json!(["aaa", "otro"]));
+        assert!(st.group.remove_member("otro"));
+        assert_eq!(rec.next("group").await["ids"], json!(["aaa"]));
+    }
+
+    /// Un dispositivo dado de baja aquí (`nido phones`, «Cerrar sesión») o porque el grupo lo
+    /// quitó: el hub se entera, para borrar sus sesiones.
+    #[tokio::test]
+    async fn a_removed_device_loses_its_hub_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let mut rec = hub::fake::recording(|_| None).await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(rec.next("unsession").await, json!({ "device": phone.id }));
+        // El que quita el grupo (en otro equipo), al aplicarlo aquí.
+        let web = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[2u8; 32], "web", None)
+            .unwrap();
+        st.group.add_device(&[2u8; 32], "web");
+        st.group.remove_device(&web.key);
+        st.apply_group();
+        assert_eq!(rec.next("unsession").await, json!({ "device": web.id }));
+        assert!(st.phones.lock().unwrap().list().is_empty());
+        // Lo ya quitado no se vuelve a avisar: lo siguiente que llega es otra baja.
+        st.apply_group();
+        let third = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[3u8; 32], "otro", None)
+            .unwrap();
+        assert_eq!(
+            remove_phone(&st, &third.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(rec.next("unsession").await, json!({ "device": third.id }));
     }
 
     // ---------- La memoria de la voz ----------
