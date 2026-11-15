@@ -263,6 +263,9 @@ impl e2e::Host for AppState {
     fn hub_info(&self) -> Option<(String, String)> {
         self.hub.pair_info()
     }
+    fn account(&self) -> Option<serde_json::Value> {
+        self.hub.status.borrow().account.clone()
+    }
     fn group(&self) -> Option<&crate::group::Group> {
         Some(&self.group)
     }
@@ -2427,6 +2430,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/hub", get(api_hub).post(api_set_hub))
         .route("/api/v1/push/test", post(api_push_test))
         .route("/api/v1/voice/token", post(api_voice_token))
+        .route("/api/v1/hub/session", post(api_hub_session))
         // La memoria de la voz: cada ruta tiene que mirar `paired_device` antes que nada y estar
         // en `memory_routes()` de las pruebas, que comprueban que el token de este equipo no vale.
         .route("/api/v1/voice/memory", get(api_voice_memory))
@@ -2533,6 +2537,8 @@ pub(crate) fn registry_status(e: &RegistryError) -> StatusCode {
 }
 
 async fn api_info(State(st): State<Arc<AppState>>) -> Response {
+    // Copiada, sin quedarse con el estado del hub mientras se arma lo demás.
+    let account = st.hub.status.borrow().account.clone();
     Json(serde_json::json!({
         "name": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
@@ -2546,6 +2552,8 @@ async fn api_info(State(st): State<Arc<AppState>>) -> Response {
         "commands": crate::browse::commands(),
         // Los modelos que se pueden elegir con `POST /api/v1/sessions/{id}/model`.
         "models": st.models(),
+        // La cuenta de este nido en el hub (`{"name","lang"}`), o `null`.
+        "account": account,
     }))
     .into_response()
 }
@@ -2714,11 +2722,42 @@ async fn api_voice_token(
     }
 }
 
+/// `POST /api/v1/hub/session`: un vale de un solo uso (`{"grant","expires"}`) para que la web
+/// entre en la cuenta de este nido en el hub, que lo canjea allí por su cookie. Lo pide nido al
+/// hub a nombre del dispositivo que llama (su id aquí), para que el hub borre sus sesiones
+/// cuando se quite; por eso solo lo pide un dispositivo emparejado, no el token de este equipo.
+async fn api_hub_session(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(device) = paired_device_id(&st, &headers) else {
+        return error(
+            StatusCode::FORBIDDEN,
+            "solo un teléfono o una web emparejados pueden pedir una sesión del hub",
+        );
+    };
+    match st.hub.hub_session(Some(&device)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => {
+            let status = match e {
+                hub::SessionError::NoHub => StatusCode::SERVICE_UNAVAILABLE,
+                hub::SessionError::NotOffered => StatusCode::NOT_IMPLEMENTED,
+                hub::SessionError::Limit => StatusCode::TOO_MANY_REQUESTS,
+                hub::SessionError::Hub(_) => StatusCode::BAD_GATEWAY,
+            };
+            error(status, e.message())
+        }
+    }
+}
+
 /// Si pide un dispositivo emparejado (con su token), no el token de este equipo.
 fn paired_device(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
-    crate::auth::bearer(headers)
-        .and_then(|t| st.phones.lock().expect("teléfonos").id_by_token(t))
-        .is_some()
+    paired_device_id(st, headers).is_some()
+}
+
+/// El id del dispositivo emparejado que pide (por su token); `None` con el token de este equipo.
+fn paired_device_id(st: &AppState, headers: &axum::http::HeaderMap) -> Option<String> {
+    crate::auth::bearer(headers).and_then(|t| st.phones.lock().expect("teléfonos").id_by_token(t))
 }
 
 /// La memoria de la voz es de quien habla: solo de los dispositivos emparejados.
@@ -4150,20 +4189,54 @@ async fn ws_events(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> Res
     ws.on_upgrade(move |socket| events(socket, st))
 }
 
+/// Lo que va por `/api/v1/events`: la lista y la cuenta de este nido en el hub
+/// (`{"name","lang"}`, o `null`). La cuenta va dentro de la lista y no en un mensaje aparte: la
+/// app y la web anteriores leerían cualquier otro mensaje como una lista vacía (y dejarían el
+/// equipo sin sesiones); un campo de más lo ignoran.
+#[derive(Serialize)]
+struct Event<'a> {
+    #[serde(flatten)]
+    listing: &'a Listing,
+    account: Option<&'a serde_json::Value>,
+}
+
 async fn events(mut socket: WebSocket, st: Arc<AppState>) {
     let mut rx = st.views.subscribe();
+    let mut hub = st.hub.status.subscribe();
     st.scan().await;
+    // La cuenta que lleva la última lista mandada: el estado del hub avisa también de otras
+    // cosas (conectado o no, el error), y por eso no se manda otra lista.
+    let mut account = hub.borrow_and_update().account.clone();
     loop {
-        let json = serde_json::to_string(&*rx.borrow_and_update()).unwrap_or_default();
+        let json = {
+            let listing = rx.borrow_and_update();
+            let event = Event {
+                listing: &listing,
+                account: account.as_ref(),
+            };
+            serde_json::to_string(&event).unwrap_or_default()
+        };
         if socket.send(Message::Text(json.into())).await.is_err() {
             return;
         }
-        tokio::select! {
-            r = rx.changed() => if r.is_err() { return },
-            msg = socket.recv() => match msg {
-                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
-                Some(Ok(_)) => {}
-            },
+        loop {
+            tokio::select! {
+                r = rx.changed() => if r.is_err() { return } else { break },
+                r = hub.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    let now = hub.borrow_and_update().account.clone();
+                    if now != account {
+                        account = now;
+                        break;
+                    }
+                }
+                msg = socket.recv() => match msg {
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                    Some(Ok(_)) => break,
+                },
+            }
         }
     }
 }
@@ -4785,6 +4858,226 @@ mod tests {
         let (status, body) = voice_reply(&st, &phone.token).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(body["error"], "the hub does not offer voice");
+    }
+
+    // ---------- La sesión del hub y la cuenta ----------
+
+    /// Lo que contesta `POST /api/v1/hub/session` con ese bearer.
+    async fn session_reply(st: &Arc<AppState>, bearer: &str) -> (StatusCode, serde_json::Value) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {bearer}").parse().unwrap(),
+        );
+        let r = api_hub_session(State(st.clone()), headers).await;
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn only_a_paired_device_asks_for_a_hub_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+
+        // El token de este equipo no vale: la sesión va a nombre de un dispositivo.
+        let (status, body) = session_reply(&st, "local").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["error"],
+            "only a paired phone or browser can ask for a hub session"
+        );
+
+        // Un teléfono emparejado sí, pero sin hub no hay sesión.
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "not connected to the hub");
+    }
+
+    /// Con el hub: el vale, tal cual (sin `req` ni `ok`), pedido a nombre del dispositivo que
+    /// llama; y cada error con su código. Un hub que no contesta (uno antiguo) no las ofrece.
+    #[tokio::test]
+    async fn the_hub_session_answers_what_the_hub_says() {
+        use hub::fake::Reply;
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        // Cada pedido, una respuesta, por orden de llegada.
+        let asked = std::sync::atomic::AtomicU64::new(0);
+        let mut rec = hub::fake::recording(move |v| {
+            let req = v.get("session")?["req"].clone();
+            let fail = |error: &str| {
+                Reply::Send(json!({ "sessioned": { "req": req, "ok": false, "error": error } }))
+            };
+            Some(
+                match asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Reply::Send(json!({ "sessioned": {
+                        "req": req, "ok": true, "grant": "vale-de-prueba", "expires": 60000,
+                    }})),
+                    1 => fail("límite de sesiones"),
+                    2 => fail("algo raro"),
+                    3 => fail("el hub no ofrece sesiones"),
+                    4 => Reply::Send(json!({ "sessioned": { "req": req, "ok": true } })),
+                    _ => Reply::Silent,
+                },
+            )
+        })
+        .await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "grant": "vale-de-prueba", "expires": 60000 }));
+        // A nombre del dispositivo que la pidió.
+        assert_eq!(rec.next("session").await["device"], json!(phone.id));
+
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "session limit reached");
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "algo raro");
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"], "the hub does not offer sessions");
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "the hub did not give the grant");
+        // Un hub antiguo no contesta: lo mismo, al acabarse la espera (corta en las pruebas).
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"], "the hub does not offer sessions");
+    }
+
+    /// `GET /api/v1/info` lleva la cuenta del hub (`null` si no la hay), y la información de
+    /// conexión de los dispositivos sale de lo mismo.
+    #[tokio::test]
+    async fn the_info_has_the_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let info = async || {
+            let r = api_info(State(st.clone())).await;
+            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let v = info().await;
+        assert_eq!(v.get("account"), Some(&serde_json::Value::Null), "{v}");
+        assert_eq!(e2e::Host::account(&*st), None);
+
+        let account = json!({ "name": "mirlo-sereno", "lang": "es" });
+        st.hub
+            .status
+            .send_modify(|s| s.account = Some(account.clone()));
+        assert_eq!(info().await["account"], account);
+        assert_eq!(e2e::Host::account(&*st), Some(account));
+        // Una cuenta anónima (sin nombre ni idioma aún) también es una cuenta.
+        let anonymous = json!({ "name": null, "lang": null });
+        st.hub
+            .status
+            .send_modify(|s| s.account = Some(anonymous.clone()));
+        assert_eq!(info().await["account"], anonymous);
+    }
+
+    /// El siguiente texto de `/api/v1/events`, o `None` si no llega ninguno en `wait`.
+    async fn next_event<S>(ws: &mut S, wait: Duration) -> Option<serde_json::Value>
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        use futures_util::StreamExt;
+        loop {
+            let m = tokio::time::timeout(wait, ws.next()).await.ok()??.unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = m {
+                return Some(serde_json::from_str(t.as_str()).unwrap());
+            }
+        }
+    }
+
+    /// Cada `Listing` de `/api/v1/events` lleva la cuenta (`null` sin ella), y cuando cambia la
+    /// cuenta llega otro; lo demás del estado del hub (conectado o no) no manda nada.
+    #[tokio::test]
+    async fn the_events_carry_the_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, None, true).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(st.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/events"))
+            .await
+            .unwrap();
+        let long = Duration::from_secs(5);
+        let short = Duration::from_millis(300);
+
+        let first = next_event(&mut ws, long).await.expect("la primera lista");
+        assert_eq!(
+            first,
+            json!({ "sessions": [], "folders": [], "account": null })
+        );
+
+        // Llega la cuenta: otra lista, con ella.
+        let account = json!({ "name": "mirlo-sereno", "lang": "es" });
+        st.hub
+            .status
+            .send_modify(|s| s.account = Some(account.clone()));
+        let v = next_event(&mut ws, long).await.expect("con la cuenta");
+        assert_eq!(v["account"], account);
+        assert_eq!(v["sessions"], json!([]));
+
+        // Conectado o no, o la misma cuenta otra vez: nada.
+        st.hub.status.send_modify(|s| s.connected = true);
+        assert_eq!(next_event(&mut ws, short).await, None);
+        st.hub
+            .status
+            .send_modify(|s| s.account = Some(account.clone()));
+        assert_eq!(next_event(&mut ws, short).await, None);
+
+        // Las listas nuevas siguen llevándola.
+        st.views.send_replace(Listing {
+            sessions: vec![],
+            folders: vec!["trabajo".into()],
+        });
+        let v = next_event(&mut ws, long).await.expect("otra lista");
+        assert_eq!(v["folders"], json!(["trabajo"]));
+        assert_eq!(v["account"], account);
+
+        // Otro idioma: otra lista; y otro hub (sin cuenta), `null`.
+        let en = json!({ "name": "mirlo-sereno", "lang": "en" });
+        st.hub.status.send_modify(|s| s.account = Some(en.clone()));
+        assert_eq!(next_event(&mut ws, long).await.unwrap()["account"], en);
+        st.hub.status.send_modify(|s| s.account = None);
+        assert_eq!(
+            next_event(&mut ws, long).await.unwrap()["account"],
+            serde_json::Value::Null
+        );
     }
 
     // ---------- El grupo, las bajas y el hub ----------
