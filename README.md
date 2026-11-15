@@ -137,8 +137,8 @@ the computers that name each other: each nido tells it the hub identifiers of th
 in its group.
 
 About the account, the hub knows its name and language, which computers are in it (by their hub
-identifiers) and the identifiers of the paired devices (numbers from this computer, not their
-names or keys), to end their sessions when they are removed. It does not know what the computers
+identifiers) and the identifiers of the paired devices (random numbers each computer picks, not
+derived from their names or keys), to end their sessions when they are removed. It does not know what the computers
 or the devices are called, nor anything about the sessions. The web app signs in to the account
 with a one-time grant it asks its nido for over the encrypted channel (`POST /api/v1/hub/session`,
 below), which the hub exchanges for a cookie. Each nido gets the name and language of its account

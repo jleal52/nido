@@ -135,8 +135,9 @@ idioma de ese dispositivo y un nombre libre. El hub junta en una cuenta los equi
 el uno al otro: cada nido le dice los identificadores en el hub de los otros equipos de su grupo.
 
 De la cuenta, el hub sabe su nombre y su idioma, qué equipos están en ella (por sus
-identificadores en el hub) y los identificadores de los dispositivos emparejados (unos números
-de este equipo, no su nombre ni su clave), para cerrar sus sesiones cuando se quitan. No sabe
+identificadores en el hub) y los identificadores de los dispositivos emparejados (números al azar
+que pone cada equipo, no sacados de su nombre ni de su clave), para cerrar sus sesiones cuando
+se quitan. No sabe
 cómo se llaman los equipos ni los dispositivos, ni nada de las sesiones. La web entra en la cuenta
 con un vale de un solo uso que pide a su nido por el canal cifrado (`POST /api/v1/hub/session`,
 más abajo), y el hub se lo cambia por una cookie. Cada nido recibe del hub el nombre y el idioma
