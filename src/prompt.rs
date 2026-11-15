@@ -168,7 +168,10 @@ impl Menu {
         self.kind == Kind::Question
             && self.title.as_deref().is_some_and(|t| {
                 let (t, q) = (norm(t), norm(question));
-                !q.is_empty() && (t == q || t.starts_with(&q) || q.starts_with(&t))
+                // La de la pantalla puede ser solo el final, si el principio no cabe (y entonces
+                // la que llega para contestar es la entera, de la transcripción: fill_previews).
+                !q.is_empty()
+                    && (t == q || t.starts_with(&q) || q.starts_with(&t) || q.ends_with(&t))
             })
     }
 
@@ -233,6 +236,13 @@ impl Menu {
         let Some(q) = q else {
             return;
         };
+        // Si de la pregunta solo se ve el final (el principio no cabe en la pantalla), la entera.
+        if let (Some(t), Some(full)) = (&self.title, q.get("question").and_then(Value::as_str)) {
+            let (t, f) = (norm(t), norm(full));
+            if !t.is_empty() && t != f && f.ends_with(&t) {
+                self.title = Some(full.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
         let opts = options(q);
         for o in self.options.iter_mut() {
             if !o.input
@@ -570,12 +580,27 @@ fn numbered(lines: &[&str]) -> Option<Menu> {
     while i > 0 && lines[i - 1].trim().is_empty() {
         i -= 1;
     }
-    while i > 0 && !lines[i - 1].trim().is_empty() && !is_rule(lines[i - 1]) && title.len() < 6 {
+    // Claude pinta la pregunta con una barra a la izquierda («│ ¿Qué…»): no es del texto, pero
+    // dice hasta dónde llega, así que entonces se toma entera (en el móvil, con la pantalla
+    // estrecha, ocupa muchas líneas). Sin barra, como mucho seis.
+    let barred = |l: &str| l.trim_start().starts_with('│');
+    let bar = i > 0 && barred(lines[i - 1]);
+    while i > 0
+        && !lines[i - 1].trim().is_empty()
+        && !is_rule(lines[i - 1])
+        && (if bar {
+            barred(lines[i - 1])
+        } else {
+            title.len() < 6
+        })
+    {
         if is_tabs(lines[i - 1]) {
             break;
         }
-        // Claude pinta la pregunta con una barra a la izquierda («│ ¿Qué…»): no es del texto.
-        title.push(lines[i - 1].trim().trim_start_matches('│').trim_start());
+        let l = lines[i - 1].trim().trim_start_matches('│').trim_start();
+        if !l.is_empty() {
+            title.push(l);
+        }
         i -= 1;
     }
     title.reverse();
@@ -3142,6 +3167,53 @@ mod tests {
             m.hint.as_deref(),
             Some("Enter to select · ↑/↓ to navigate · Esc to cancel")
         );
+    }
+
+    const LONG_QUESTION: &str = "¿Enciendo el login nuevo (paso 6)? Añado GESTION_LOGIN_NUEVO=1 al servicio web y lo \
+        recreo, sin cambiar de imagen: son unos segundos de corte y nadie pierde la sesión. Desde ese momento: la \
+        dirección de siempre lleva a /gestion/login; en el menú «General» aparece «Usuarios y repartidores»; «Cerrar \
+        sesión» lleva a /gestion/login; y /egalle/index.php?login_antiguo=1 queda como acceso de emergencia. Antes \
+        conviene avisar a la oficina: el login cambia de aspecto (es el mismo usuario y contraseña), y después de \
+        entrar siempre se llega a la agenda, no a la página que se estaba abriendo. Si algo falla, se vuelve atrás \
+        quitando la línea, también en segundos.";
+
+    /// Una pregunta larga en una pantalla estrecha (la del móvil): entera, aunque ocupe muchas
+    /// líneas (con la barra a la izquierda se sabe dónde empieza).
+    #[test]
+    fn long_question_with_bar() {
+        let m = screen("pregunta_larga").unwrap();
+        assert_eq!(m.kind, Kind::Question);
+        assert_eq!(m.title.as_deref(), Some(LONG_QUESTION));
+        assert_eq!(labels(&m)[0], "Sí, enciéndelo ya");
+        assert!(m.shows_question(LONG_QUESTION));
+    }
+
+    /// Si el principio de la pregunta no cabe en la pantalla, la de la transcripción, entera; y
+    /// contestar con ella reconoce la pregunta de la pantalla (que es su final).
+    #[test]
+    fn long_question_cut_from_the_transcript() {
+        let path = format!(
+            "{}/tests/pantallas/pregunta_larga.txt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let cut = &text[text.find("│ oficina:").unwrap()..];
+        let mut m = parse(cut).unwrap();
+        let tail = m.title.clone().unwrap();
+        assert!(
+            tail.starts_with("oficina:") && LONG_QUESTION.ends_with(&tail),
+            "{tail}"
+        );
+        assert!(m.shows_question(LONG_QUESTION));
+        m.fill_previews(&serde_json::json!({"questions": [
+            {"question": "Otra", "options": [{"label": "Sí, enciéndelo ya"}]},
+            {"question": LONG_QUESTION, "options": [{"label": "Sí, enciéndelo ya"}, {"label": "Más tarde"}]}]}));
+        assert_eq!(m.title.as_deref(), Some(LONG_QUESTION));
+        // Una pregunta que no acaba así no la cambia.
+        let mut m = parse(cut).unwrap();
+        m.fill_previews(&serde_json::json!({"questions": [
+            {"question": "Otra cosa", "options": [{"label": "Sí, enciéndelo ya"}, {"label": "Más tarde"}]}]}));
+        assert_eq!(m.title.as_deref(), Some(tail.as_str()));
     }
 
     #[test]

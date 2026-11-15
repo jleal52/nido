@@ -1,0 +1,27 @@
+  Read 1 file, ran 2 shell commands
+────────────────────────────────────────────────────────────
+ ☐ Paso 6
+
+│ ¿Enciendo el login nuevo (paso 6)? Añado
+│ GESTION_LOGIN_NUEVO=1 al servicio web y lo recreo, sin
+│ cambiar de imagen: son unos segundos de corte y nadie
+│ pierde la sesión. Desde ese momento: la dirección de
+│ siempre lleva a /gestion/login; en el menú «General»
+│ aparece «Usuarios y repartidores»; «Cerrar sesión» lleva a
+│ /gestion/login; y /egalle/index.php?login_antiguo=1 queda
+│ como acceso de emergencia. Antes conviene avisar a la
+│ oficina: el login cambia de aspecto (es el mismo usuario y
+│ contraseña), y después de entrar siempre se llega a la
+│ agenda, no a la página que se estaba abriendo. Si algo
+│ falla, se vuelve atrás quitando la línea, también en
+│ segundos.
+
+❯ 1. Sí, enciéndelo ya
+     La oficina ya está avisada o no hace falta (es domingo).
+  2. Más tarde
+     Avisaré yo a la oficina y te digo cuándo.
+  3. Type something.
+────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
