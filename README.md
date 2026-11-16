@@ -138,12 +138,13 @@ in its group.
 
 About the account, the hub knows its name and language, which computers are in it (by their hub
 identifiers) and the identifiers of the paired devices (random numbers each computer picks, not
-derived from their names or keys), to end their sessions when they are removed. It does not know what the computers
-or the devices are called, nor anything about the sessions. The web app signs in to the account
-with a one-time grant it asks its nido for over the encrypted channel (`POST /api/v1/hub/session`,
-below), which the hub exchanges for a cookie. Each nido gets the name and language of its account
-from the hub and passes them on to its devices when they connect: that way the mobile app knows
-the language without a cookie.
+derived from their names or keys), to end their sessions when they are removed. It also sees when
+each device uses its session, from which IP and with which language. It does not know what the
+computers or the devices are called, nor anything about the sessions. The web app signs in to the
+account with a one-time grant it asks its nido for over the encrypted channel
+(`POST /api/v1/hub/session`, below), which the hub exchanges for a cookie. Each nido gets the
+name and language of its account from the hub and passes them on to its devices when they
+connect: that way the mobile app knows the language without a cookie.
 
 ## Claude sessions working together (the nido MCP)
 
