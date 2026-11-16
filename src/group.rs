@@ -250,13 +250,20 @@ impl Group {
 
     /// Guarda el estado cambiado. Se llama con el estado bloqueado; la revisión la sube después
     /// quien llama (`bump`), ya sin él.
+    /// Solo para el usuario (0600): lleva el llavero del tablero. Un temporal que quedara de
+    /// antes se quita primero, porque los permisos solo se ponen al crear el fichero.
     fn save(&self, st: &State) {
+        use std::io::Write;
         let tmp = self.path.with_extension("json.tmp");
         let write = || -> std::io::Result<()> {
             if let Some(dir) = self.path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(&tmp, serde_json::to_vec_pretty(st)?)?;
+            let body = serde_json::to_vec_pretty(st)?;
+            let _ = std::fs::remove_file(&tmp);
+            crate::sys::private(std::fs::OpenOptions::new().write(true).create_new(true))
+                .open(&tmp)?
+                .write_all(&body)?;
             std::fs::rename(&tmp, &self.path)
         };
         if let Err(e) = write() {
@@ -1114,6 +1121,29 @@ mod tests {
         let wire = serde_json::to_vec(&st).unwrap().len();
         assert!(wire < 16 * 1024, "el estado ocupa {wire} bytes");
         assert!(wire < crate::e2e::MAX_MSG);
+    }
+
+    /// `group.json` lleva el llavero: solo para el usuario, también si quedó un temporal de antes
+    /// con otros permisos.
+    #[cfg(unix)]
+    #[test]
+    fn the_group_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.json");
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, b"de antes").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let g = Group::load(path.clone(), [1u8; 32]);
+        g.ensure_board_key();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!tmp.exists());
+        // Y un fichero de antes, con otros permisos, también queda solo para el usuario.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        g.rotate_board_key();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     /// La clave es secreta: ni en `Debug` del llavero ni en el del estado.
