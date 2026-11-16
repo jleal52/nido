@@ -844,14 +844,25 @@ async fn group_sync<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) 
     let Some(key) = hs.get_remote_static().map(|k| B64.encode(k)) else {
         return;
     };
-    if !g.snapshot().members.iter().any(|m| m.key == key) {
+    let ours = g.snapshot();
+    if !ours.members.iter().any(|m| m.key == key) {
         return;
     }
-    let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload[..n]) else {
+    // Al que ya está fuera, el llavero del tablero ni se le da ni se le coge: no leería lo que
+    // se cifre después ni podría colar una clave suya como la actual.
+    let live = ours.member_by_key(&key).is_some();
+    let Ok(mut theirs) = serde_json::from_slice::<crate::group::State>(&payload[..n]) else {
         return;
     };
+    if !live {
+        theirs.keys.clear();
+    }
     let changed = g.merge(&theirs);
-    let reply = serde_json::to_vec(&g.snapshot()).unwrap_or_default();
+    let mut ours = g.snapshot();
+    if !live {
+        ours.keys.clear();
+    }
+    let reply = serde_json::to_vec(&ours).unwrap_or_default();
     let mut msg2 = vec![0u8; MAX_MSG];
     if let Ok(n) = hs.write_message(&reply, &mut msg2) {
         msg2.truncate(n);
@@ -2056,6 +2067,67 @@ mod tests {
         // Un error enorme también se sustituye.
         let big_err = peer_reply(Err((500, "e".repeat(70_000))));
         assert!(big_err.len() <= PEER_ROOM);
+    }
+
+    /// Sincroniza `from` con `host` mandando `state`: lo que le devuelve (`None`: nada).
+    async fn sync_with<H: Host>(
+        host: &Arc<H>,
+        from: &Identity,
+        state: &crate::group::State,
+    ) -> Option<crate::group::State> {
+        let body = serde_json::to_vec(state).unwrap();
+        let (dial, first) = Dial::start(from, &host.identity().public, None, &body).unwrap();
+        let reply = exchange_with(host, first).await.ok()?;
+        Some(serde_json::from_slice(&dial.finish(&reply).expect("descifra")).unwrap())
+    }
+
+    /// Un equipo ya sacado del grupo aún sincroniza (para enterarse), pero sin el llavero del
+    /// tablero en ningún sentido: ni se lleva nuestras claves ni nos cuela las suyas.
+    #[tokio::test]
+    async fn a_removed_member_syncs_without_keys() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let g = host.group.as_ref().unwrap();
+        let ours = g.ensure_board_key();
+        let theirs = || crate::group::State {
+            keys: vec![crate::group::BoardKey::generate(now() + 60_000)],
+            ..Default::default()
+        };
+
+        // El quitado se entera de que está fuera, pero sin claves.
+        let sent = theirs();
+        let reply = sync_with(&host, &viejo, &sent).await.expect("contesta");
+        assert!(reply.keys.is_empty(), "al quitado no van las claves");
+        assert!(
+            reply
+                .members
+                .iter()
+                .any(|m| m.id == "viejo-id" && m.removed),
+            "sí se entera de que está fuera"
+        );
+        let ring = g.board_keys();
+        assert_eq!(ring.current(), Some(&ours), "su clave no entra");
+        assert!(ring.keys.iter().all(|k| k.kid != sent.keys[0].kid));
+
+        // Un miembro vivo, en cambio, las recibe y las da.
+        let sent = theirs();
+        let reply = sync_with(&host, &mac, &sent).await.expect("contesta");
+        assert!(reply.keys.iter().any(|k| k.kid == ours.kid));
+        assert!(
+            g.board_keys()
+                .keys
+                .iter()
+                .any(|k| k.kid == sent.keys[0].kid)
+        );
+
+        // Y uno de fuera ni recibe respuesta.
+        let otro = new_identity(dir.path(), "otro");
+        assert_eq!(sync_with(&host, &otro, &theirs()).await, None);
     }
 
     #[tokio::test]

@@ -180,7 +180,12 @@ impl State {
             match keys.get(&k.kid) {
                 Some(cur) if !newer(cur.at, cur.removed, k.at, k.removed) => {}
                 _ => {
-                    keys.insert(k.kid.clone(), k.clone());
+                    let mut k = k.clone();
+                    // Una lápida no guarda el secreto, aunque quien la manda no lo vaciara.
+                    if k.removed {
+                        k.key.clear();
+                    }
+                    keys.insert(k.kid.clone(), k);
                     changed = true;
                 }
             }
@@ -497,7 +502,7 @@ impl Group {
                 .iter_mut()
                 .filter(|k| !k.removed && k.retired.is_none())
             {
-                let t = now_ms().max(k.at + 1);
+                let t = now_ms().max(k.at.saturating_add(1));
                 k.retired = Some(t);
                 k.at = t;
             }
@@ -508,13 +513,15 @@ impl Group {
         new.expect("clave nueva")
     }
 
-    /// Quita una clave del llavero (en todo el grupo). Devuelve si estaba.
+    /// Quita una clave del llavero (en todo el grupo). La lápida se queda sin el secreto: para
+    /// ganar al juntar le bastan `kid`, `at` y `removed`. Devuelve si estaba.
     pub fn drop_board_key(&self, kid: &str) -> bool {
         let mut found = false;
         self.change(|st| {
             for k in st.keys.iter_mut().filter(|k| k.kid == kid && !k.removed) {
                 k.removed = true;
-                k.at = now_ms().max(k.at + 1);
+                k.key.clear();
+                k.at = now_ms().max(k.at.saturating_add(1));
                 found = true;
             }
         });
@@ -614,7 +621,12 @@ pub fn parse_invite(code: &str) -> Result<InviteCode, String> {
 /// La hora de una clave nueva: posterior a la de todas las que hay, para que gane al juntar
 /// aunque algún reloj vaya adelantado.
 fn next_key_at(st: &State) -> u64 {
-    let last = st.keys.iter().map(|k| k.at + 1).max().unwrap_or(0);
+    let last = st
+        .keys
+        .iter()
+        .map(|k| k.at.saturating_add(1))
+        .max()
+        .unwrap_or(0);
     now_ms().max(last)
 }
 
@@ -876,7 +888,12 @@ mod tests {
     fn board_key(kid: &str, at: u64, retired: Option<u64>, removed: bool) -> BoardKey {
         BoardKey {
             kid: kid.into(),
-            key: B64.encode([kid.len() as u8; 32]),
+            // Una lápida, como las de `drop_board_key`, sin el secreto.
+            key: if removed {
+                String::new()
+            } else {
+                B64.encode([kid.len() as u8; 32])
+            },
             at,
             retired,
             removed,
@@ -1144,6 +1161,56 @@ mod tests {
         g.rotate_board_key();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Una clave quitada no deja el secreto en su lápida: ni en el disco ni en lo que viaja. Y la
+    /// lápida gana igual al juntar.
+    #[test]
+    fn a_dropped_key_leaves_no_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.json");
+        let g = Group::load(path.clone(), [1u8; 32]);
+        let k = g.ensure_board_key();
+        let before = g.snapshot();
+        assert!(g.drop_board_key(&k.kid));
+        let wire = serde_json::to_string(&g.snapshot()).unwrap();
+        assert!(!wire.contains(&k.key), "viaja la clave");
+        assert!(wire.contains(&k.kid), "la lápida sí va");
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!disk.contains(&k.key), "la clave sigue en el disco");
+        let tomb = &g.snapshot().keys[0];
+        assert!(tomb.removed && tomb.key.is_empty() && tomb.at > k.at);
+        // Otro equipo con la clave viva recibe la lápida: se queda sin el secreto.
+        let mut other = before.clone();
+        assert!(other.merge(&g.snapshot()));
+        assert!(other.keys[0].removed && other.keys[0].key.is_empty());
+        assert!(!serde_json::to_string(&other).unwrap().contains(&k.key));
+        // Y su copia viva, más vieja, no la resucita.
+        assert!(!g.merge(&before));
+        assert!(g.board_keys().current().is_none());
+        // Una lápida que llegue con la clave (de quien no la vació) tampoco la guarda.
+        let mut leaky = before.clone();
+        leaky.keys[0].removed = true;
+        leaky.keys[0].at = k.at + 1_000_000;
+        let mut st = before.clone();
+        assert!(st.merge(&leaky));
+        assert!(st.keys[0].key.is_empty());
+    }
+
+    /// Un `at` al borde (de un reloj o un equipo raro) no desborda.
+    #[test]
+    fn a_huge_at_does_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        assert!(g.merge(&keys_state(vec![board_key(
+            "aaaaaaaaaaaaaaaa",
+            u64::MAX,
+            None,
+            false
+        )])));
+        let new = g.rotate_board_key();
+        assert_eq!(new.at, u64::MAX);
+        assert!(g.drop_board_key("aaaaaaaaaaaaaaaa"));
     }
 
     /// La clave es secreta: ni en `Debug` del llavero ni en el del estado.
