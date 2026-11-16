@@ -1654,6 +1654,10 @@ mod tests {
         let mut without_group = base.clone();
         without_group["account"] = account(huge.clone());
         assert!(without_group.to_string().len() + MSG2_OVERHEAD <= MAX_MSG);
+        // Un byte menos, justo en el tope: va.
+        let reply = info(account(huge[1..].to_owned()));
+        assert!(reply["account"].is_object(), "no va la cuenta");
+        assert_eq!(reply.to_string().len() + MSG2_OVERHEAD, MAX_MSG);
         let reply = info(account(huge));
         assert!(reply.get("account").is_none(), "va la cuenta");
         assert!(reply["group"].as_array().is_some_and(|g| !g.is_empty()));

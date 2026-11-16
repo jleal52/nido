@@ -232,9 +232,10 @@ struct Forget<'a> {
 
 impl Drop for Forget<'_> {
     fn drop(&mut self) {
-        if let Ok(mut waiters) = self.waiters.lock() {
-            waiters.remove(&self.req);
-        }
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.req);
     }
 }
 
@@ -407,7 +408,8 @@ impl Hub {
     }
 
     /// Si lo que sale de la cola de control todavía hace falta: un pedido, si no ha vencido su
-    /// plazo y alguien espera aún la respuesta; lo demás, siempre.
+    /// plazo y alguien espera aún la respuesta; lo demás, siempre. Solo se mira al sacarlo de la
+    /// cola: si luego se queda atascado al mandarlo (`tx.send(…).await`), puede salir vencido.
     fn wanted(&self, c: &Control) -> bool {
         let Some(a) = &c.ask else { return true };
         tokio::time::Instant::now() < a.deadline
@@ -1426,6 +1428,32 @@ mod tests {
             .ask(Asking::Session, Default::default(), Duration::ZERO)
             .await;
         assert!(matches!(r, Err(Unanswered::Silent)));
+        let sent = sent_before_the_mark(&hub, &mut rec).await;
+        assert!(sent.iter().all(|v| v.get("session").is_none()), "{sent:?}");
+    }
+
+    /// Basta con el plazo: aunque quien lo pidió siga esperando, si venció, no sale.
+    #[tokio::test]
+    async fn an_expired_ask_is_not_sent_even_if_awaited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        let (tx, _rx) = oneshot::channel();
+        hub.session_pending.lock().unwrap().insert(77, tx);
+        let control = hub.control.lock().unwrap().clone().unwrap();
+        let ask = Asked {
+            of: Asking::Session,
+            req: 77,
+            deadline: tokio::time::Instant::now(),
+        };
+        let text = serde_json::json!({ "session": { "req": 77 } }).to_string();
+        assert!(
+            control
+                .send(Control {
+                    text,
+                    ask: Some(ask)
+                })
+                .is_ok()
+        );
         let sent = sent_before_the_mark(&hub, &mut rec).await;
         assert!(sent.iter().all(|v| v.get("session").is_none()), "{sent:?}");
     }
