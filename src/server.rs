@@ -263,11 +263,18 @@ impl e2e::Host for AppState {
     fn hub_info(&self) -> Option<(String, String)> {
         self.hub.pair_info()
     }
+    fn account(&self) -> Option<serde_json::Value> {
+        self.hub.status.borrow().account.clone()
+    }
     fn group(&self) -> Option<&crate::group::Group> {
         Some(&self.group)
     }
     fn group_changed(&self) {
         self.group_dirty.notify_one();
+    }
+    fn device_replaced(&self, old_id: &str) {
+        // Sus sesiones del hub iban a nombre del id viejo: con el nuevo ya no se podrían quitar.
+        self.hub.unsession(old_id);
     }
     fn sync_group_now(
         &self,
@@ -1988,8 +1995,22 @@ impl AppState {
     /// Lo que el grupo ha dado de baja, fuera también de aquí.
     fn apply_group(&self) {
         for key in self.group.removed_devices() {
-            if let Ok(true) = self.phones.lock().expect("teléfonos").remove_by_key(&key) {
+            let mut phones = self.phones.lock().expect("teléfonos");
+            let id = phones
+                .list()
+                .iter()
+                .find(|p| p.key == key)
+                .map(|p| p.id.clone());
+            let removed = phones.remove_by_key(&key);
+            drop(phones);
+            if let Err(e) = &removed {
+                eprintln!("nido: no se pudo guardar la baja de un dispositivo: {e}");
+            }
+            // Aunque no se haya podido guardar: de la memoria ya ha salido.
+            if let (Ok(true) | Err(_), Some(id)) = (removed, id) {
                 eprintln!("nido: un dispositivo quitado en el grupo, quitado aquí");
+                // Sus sesiones del hub, fuera también.
+                self.hub.unsession(&id);
             }
         }
     }
@@ -2129,23 +2150,7 @@ impl AppState {
 
 /// El grupo: apuntarse al conectar con el hub y sincronizar cuando cambia algo (y cada 5 min).
 fn spawn_group(state: Arc<AppState>) {
-    let st = state.clone();
-    tokio::spawn(async move {
-        let mut status = st.hub.status.subscribe();
-        loop {
-            let s = status.borrow_and_update().clone();
-            if s.connected
-                && let Some(id) = &s.id
-            {
-                st.group
-                    .set_self(id, &<AppState as e2e::Host>::host_name(&st));
-                st.group_dirty.notify_one();
-            }
-            if status.changed().await.is_err() {
-                return;
-            }
-        }
-    });
+    spawn_group_hub(state.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(300));
         loop {
@@ -2161,6 +2166,57 @@ fn spawn_group(state: Arc<AppState>) {
             } else {
                 state.apply_group();
             }
+        }
+    });
+}
+
+/// El grupo y el hub: al conectar, apuntarse con el id que da el hub (`set_self`) y mandarle los
+/// ids de los otros equipos del grupo; después, cada vez que cambie el grupo. `send_group` solo
+/// los manda si la lista cambió en esta conexión: la revisión sube también con los dispositivos,
+/// los nombres o las horas.
+fn spawn_group_hub(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut status = st.hub.status.subscribe();
+        let mut revision = st.group.subscribe();
+        // Lo primero, como si hubiera cambiado la conexión.
+        let mut connection = true;
+        loop {
+            // Apuntarse solo si cambió la conexión: cada cambio del grupo no es una ronda más de
+            // sincronización.
+            if connection {
+                let s = status.borrow_and_update().clone();
+                if s.connected
+                    && let Some(id) = &s.id
+                {
+                    st.group
+                        .set_self(id, &<AppState as e2e::Host>::host_name(&st));
+                    st.group_dirty.notify_one();
+                }
+            }
+            // Vista la revisión, y el guard suelto antes de leer el grupo.
+            let _ = *revision.borrow_and_update();
+            let others = st
+                .group
+                .members()
+                .into_iter()
+                .filter(|m| !m.me)
+                .map(|m| m.id)
+                .collect();
+            st.hub.send_group(others);
+            // Después del grupo, y una vez por conexión (lo demás lo descarta `send_devices`).
+            let devices = st
+                .phones
+                .lock()
+                .expect("teléfonos")
+                .list()
+                .iter()
+                .map(|p| p.id.clone())
+                .collect();
+            st.hub.send_devices(devices);
+            connection = tokio::select! {
+                r = status.changed() => if r.is_err() { return } else { true },
+                r = revision.changed() => if r.is_err() { return } else { false },
+            };
         }
     });
 }
@@ -2374,6 +2430,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/hub", get(api_hub).post(api_set_hub))
         .route("/api/v1/push/test", post(api_push_test))
         .route("/api/v1/voice/token", post(api_voice_token))
+        .route("/api/v1/hub/session", post(api_hub_session))
         // La memoria de la voz: cada ruta tiene que mirar `paired_device` antes que nada y estar
         // en `memory_routes()` de las pruebas, que comprueban que el token de este equipo no vale.
         .route("/api/v1/voice/memory", get(api_voice_memory))
@@ -2480,6 +2537,8 @@ pub(crate) fn registry_status(e: &RegistryError) -> StatusCode {
 }
 
 async fn api_info(State(st): State<Arc<AppState>>) -> Response {
+    // Copiada, sin quedarse con el estado del hub mientras se arma lo demás.
+    let account = st.hub.status.borrow().account.clone();
     Json(serde_json::json!({
         "name": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
@@ -2493,6 +2552,8 @@ async fn api_info(State(st): State<Arc<AppState>>) -> Response {
         "commands": crate::browse::commands(),
         // Los modelos que se pueden elegir con `POST /api/v1/sessions/{id}/model`.
         "models": st.models(),
+        // La cuenta de este nido en el hub (`{"name","lang"}`), o `null`.
+        "account": account,
     }))
     .into_response()
 }
@@ -2661,11 +2722,42 @@ async fn api_voice_token(
     }
 }
 
+/// `POST /api/v1/hub/session`: un vale de un solo uso (`{"grant","expires"}`) para que la web
+/// entre en la cuenta de este nido en el hub, que lo canjea allí por su cookie. Lo pide nido al
+/// hub a nombre del dispositivo que llama (su id aquí), para que el hub borre sus sesiones
+/// cuando se quite; por eso solo lo pide un dispositivo emparejado, no el token de este equipo.
+async fn api_hub_session(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(device) = paired_device_id(&st, &headers) else {
+        return error(
+            StatusCode::FORBIDDEN,
+            "solo un teléfono o una web emparejados pueden pedir una sesión del hub",
+        );
+    };
+    match st.hub.hub_session(Some(&device)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => {
+            let status = match e {
+                hub::SessionError::NoHub => StatusCode::SERVICE_UNAVAILABLE,
+                hub::SessionError::NotOffered => StatusCode::NOT_IMPLEMENTED,
+                hub::SessionError::Limit => StatusCode::TOO_MANY_REQUESTS,
+                hub::SessionError::Hub(_) => StatusCode::BAD_GATEWAY,
+            };
+            error(status, e.message())
+        }
+    }
+}
+
 /// Si pide un dispositivo emparejado (con su token), no el token de este equipo.
 fn paired_device(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
-    crate::auth::bearer(headers)
-        .and_then(|t| st.phones.lock().expect("teléfonos").id_by_token(t))
-        .is_some()
+    paired_device_id(st, headers).is_some()
+}
+
+/// El id del dispositivo emparejado que pide (por su token); `None` con el token de este equipo.
+fn paired_device_id(st: &AppState, headers: &axum::http::HeaderMap) -> Option<String> {
+    crate::auth::bearer(headers).and_then(|t| st.phones.lock().expect("teléfonos").id_by_token(t))
 }
 
 /// La memoria de la voz es de quien habla: solo de los dispositivos emparejados.
@@ -4058,7 +4150,13 @@ fn remove_phone(st: &AppState, id: &str) -> Response {
         st.group.remove_device(k);
         st.group_dirty.notify_one();
     }
-    match st.phones.lock().expect("teléfonos").remove(id) {
+    let removed = st.phones.lock().expect("teléfonos").remove(id);
+    // Sus sesiones del hub, fuera también; aunque no se haya podido guardar la baja, de la
+    // memoria ya ha salido.
+    if key.is_some() {
+        st.hub.unsession(id);
+    }
+    match removed {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "ese teléfono no está emparejado"),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -4091,20 +4189,55 @@ async fn ws_events(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> Res
     ws.on_upgrade(move |socket| events(socket, st))
 }
 
+/// Lo que va por `/api/v1/events`: la lista y la cuenta de este nido en el hub
+/// (`{"name","lang"}`, o `null`). La cuenta va dentro de la lista y no en un mensaje aparte: la
+/// app y la web anteriores leerían cualquier otro mensaje como una lista vacía (y dejarían el
+/// equipo sin sesiones); un campo de más lo ignoran.
+#[derive(Serialize)]
+struct Event<'a> {
+    #[serde(flatten)]
+    listing: &'a Listing,
+    account: Option<&'a serde_json::Value>,
+}
+
 async fn events(mut socket: WebSocket, st: Arc<AppState>) {
     let mut rx = st.views.subscribe();
+    let mut hub = st.hub.status.subscribe();
     st.scan().await;
+    // La cuenta que lleva la última lista mandada: el estado del hub avisa también de otras
+    // cosas (conectado o no, el error), y por eso no se manda otra lista.
+    let mut account;
     loop {
-        let json = serde_json::to_string(&*rx.borrow_and_update()).unwrap_or_default();
+        // La de ahora, aunque se mande por la lista: si cambiaron las dos a la vez, una sola.
+        account = hub.borrow_and_update().account.clone();
+        let json = {
+            let listing = rx.borrow_and_update();
+            let event = Event {
+                listing: &listing,
+                account: account.as_ref(),
+            };
+            serde_json::to_string(&event).unwrap_or_default()
+        };
         if socket.send(Message::Text(json.into())).await.is_err() {
             return;
         }
-        tokio::select! {
-            r = rx.changed() => if r.is_err() { return },
-            msg = socket.recv() => match msg {
-                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
-                Some(Ok(_)) => {}
-            },
+        loop {
+            tokio::select! {
+                r = rx.changed() => if r.is_err() { return } else { break },
+                r = hub.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    // Vista (si no, `changed` volvería enseguida); la copia de arriba la relee.
+                    if hub.borrow_and_update().account != account {
+                        break;
+                    }
+                }
+                msg = socket.recv() => match msg {
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                    Some(Ok(_)) => break,
+                },
+            }
         }
     }
 }
@@ -4726,6 +4859,457 @@ mod tests {
         let (status, body) = voice_reply(&st, &phone.token).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(body["error"], "the hub does not offer voice");
+    }
+
+    // ---------- La sesión del hub y la cuenta ----------
+
+    /// Lo que contesta `POST /api/v1/hub/session` con ese bearer.
+    async fn session_reply(st: &Arc<AppState>, bearer: &str) -> (StatusCode, serde_json::Value) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {bearer}").parse().unwrap(),
+        );
+        let r = api_hub_session(State(st.clone()), headers).await;
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn only_a_paired_device_asks_for_a_hub_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+
+        // El token de este equipo no vale: la sesión va a nombre de un dispositivo.
+        let (status, body) = session_reply(&st, "local").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["error"],
+            "only a paired phone or browser can ask for a hub session"
+        );
+
+        // Un teléfono emparejado sí, pero sin hub no hay sesión.
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "not connected to the hub");
+    }
+
+    /// Con el hub: el vale, tal cual (sin `req` ni `ok`), pedido a nombre del dispositivo que
+    /// llama; y cada error con su código. Un hub que no contesta (uno antiguo) no las ofrece.
+    #[tokio::test]
+    async fn the_hub_session_answers_what_the_hub_says() {
+        use hub::fake::Reply;
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        // Cada pedido, una respuesta, por orden de llegada.
+        let asked = std::sync::atomic::AtomicU64::new(0);
+        let mut rec = hub::fake::recording(move |v| {
+            let req = v.get("session")?["req"].clone();
+            let fail = |error: &str| {
+                Reply::Send(json!({ "sessioned": { "req": req, "ok": false, "error": error } }))
+            };
+            Some(
+                match asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Reply::Send(json!({ "sessioned": {
+                        "req": req, "ok": true, "grant": "vale-de-prueba", "expires": 60000,
+                    }})),
+                    1 => fail("límite de sesiones"),
+                    2 => fail("algo raro"),
+                    3 => fail("el hub no ofrece sesiones"),
+                    4 => Reply::Send(json!({ "sessioned": { "req": req, "ok": true } })),
+                    _ => Reply::Silent,
+                },
+            )
+        })
+        .await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "grant": "vale-de-prueba", "expires": 60000 }));
+        // A nombre del dispositivo que la pidió.
+        assert_eq!(rec.next("session").await["device"], json!(phone.id));
+
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "session limit reached");
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "algo raro");
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"], "the hub does not offer sessions");
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "the hub did not give the grant");
+        // Un hub antiguo no contesta: lo mismo, al acabarse la espera (corta en las pruebas).
+        let (status, body) = session_reply(&st, &phone.token).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"], "the hub does not offer sessions");
+    }
+
+    /// `GET /api/v1/info` lleva la cuenta del hub (`null` si no la hay), y la información de
+    /// conexión de los dispositivos sale de lo mismo.
+    #[tokio::test]
+    async fn the_info_has_the_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let info = async || {
+            let r = api_info(State(st.clone())).await;
+            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let v = info().await;
+        assert_eq!(v.get("account"), Some(&serde_json::Value::Null), "{v}");
+        assert_eq!(e2e::Host::account(&*st), None);
+
+        let account = json!({ "name": "mirlo-sereno", "lang": "es" });
+        st.hub
+            .status
+            .send_modify(|s| s.account = Some(account.clone()));
+        assert_eq!(info().await["account"], account);
+        assert_eq!(e2e::Host::account(&*st), Some(account));
+        // Una cuenta anónima (sin nombre ni idioma aún) también es una cuenta.
+        let anonymous = json!({ "name": null, "lang": null });
+        st.hub
+            .status
+            .send_modify(|s| s.account = Some(anonymous.clone()));
+        assert_eq!(info().await["account"], anonymous);
+    }
+
+    /// Por el router: sin token o con uno que no es de nadie, ni llega (401); con el de este
+    /// equipo, 403; y cada dispositivo pide la sesión con su id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hub_session_route_goes_by_each_device() {
+        use hub::fake::Reply;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, first) = memory_server(tmp.path()).await;
+        let second = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[2u8; 32], "otro", None)
+            .unwrap();
+        // El vale lleva el id del dispositivo: así se ve que cada uno va con el suyo.
+        let rec = hub::fake::recording(|v| {
+            let s = v.get("session")?;
+            Some(Reply::Send(json!({ "sessioned": {
+                "req": s["req"], "ok": true,
+                "grant": format!("vale-{}", s["device"].as_str().unwrap_or("nadie")),
+                "expires": 60000,
+            }})))
+        })
+        .await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        const PATH: &str = "/api/v1/hub/session";
+
+        for bearer in ["", "no-es-de-nadie"] {
+            let (code, _) = memory_call(addr, bearer, "POST", PATH, None).await;
+            assert_eq!(code, 401, "«{bearer}»");
+        }
+        let (code, r) = memory_call(addr, "local", "POST", PATH, None).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (
+                403,
+                Some("only a paired phone or browser can ask for a hub session")
+            )
+        );
+        let first_id = st.phones.lock().unwrap().id_by_token(&first).unwrap();
+        for (token, id) in [(&first, &first_id), (&second.token, &second.id)] {
+            let (code, r) = memory_call(addr, token, "POST", PATH, None).await;
+            assert_eq!(
+                (code, r),
+                (
+                    200,
+                    json!({ "grant": format!("vale-{id}"), "expires": 60000 })
+                )
+            );
+        }
+        assert_ne!(first_id, second.id);
+    }
+
+    /// El siguiente texto de `/api/v1/events`, o `None` si no llega ninguno en `wait`.
+    async fn next_event<S>(ws: &mut S, wait: Duration) -> Option<serde_json::Value>
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        use futures_util::StreamExt;
+        loop {
+            let m = tokio::time::timeout(wait, ws.next()).await.ok()??.unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = m {
+                return Some(serde_json::from_str(t.as_str()).unwrap());
+            }
+        }
+    }
+
+    /// Cada `Listing` de `/api/v1/events` lleva la cuenta (`null` sin ella), y cuando cambia la
+    /// cuenta llega otro; lo demás del estado del hub (conectado o no) no manda nada.
+    #[tokio::test]
+    async fn the_events_carry_the_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        let st = AppState::new(paths, Launcher::Detached, None, true).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(st.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/events"))
+            .await
+            .unwrap();
+        let long = Duration::from_secs(5);
+        let short = Duration::from_millis(300);
+
+        let first = next_event(&mut ws, long).await.expect("la primera lista");
+        assert_eq!(
+            first,
+            json!({ "sessions": [], "folders": [], "account": null })
+        );
+
+        // Llega la cuenta: otra lista, con ella.
+        let account = json!({ "name": "mirlo-sereno", "lang": "es" });
+        st.hub
+            .status
+            .send_modify(|s| s.account = Some(account.clone()));
+        let v = next_event(&mut ws, long).await.expect("con la cuenta");
+        assert_eq!(v["account"], account);
+        assert_eq!(v["sessions"], json!([]));
+
+        // Conectado o no, o la misma cuenta otra vez: nada.
+        st.hub.status.send_modify(|s| s.connected = true);
+        assert_eq!(next_event(&mut ws, short).await, None);
+        st.hub
+            .status
+            .send_modify(|s| s.account = Some(account.clone()));
+        assert_eq!(next_event(&mut ws, short).await, None);
+
+        // Las listas nuevas siguen llevándola.
+        st.views.send_replace(Listing {
+            sessions: vec![],
+            folders: vec!["trabajo".into()],
+        });
+        let v = next_event(&mut ws, long).await.expect("otra lista");
+        assert_eq!(v["folders"], json!(["trabajo"]));
+        assert_eq!(v["account"], account);
+
+        // Otro idioma: otra lista; y otro hub (sin cuenta), `null`.
+        let en = json!({ "name": "mirlo-sereno", "lang": "en" });
+        st.hub.status.send_modify(|s| s.account = Some(en.clone()));
+        assert_eq!(next_event(&mut ws, long).await.unwrap()["account"], en);
+        st.hub.status.send_modify(|s| s.account = None);
+        assert_eq!(
+            next_event(&mut ws, long).await.unwrap()["account"],
+            serde_json::Value::Null
+        );
+    }
+
+    // ---------- El grupo, las bajas y el hub ----------
+
+    fn hub_state(dir: &std::path::Path) -> Arc<AppState> {
+        let paths = Paths {
+            runtime: dir.join("run"),
+            data: dir.join("data"),
+            state: dir.join("state"),
+            config: dir.join("config"),
+            home: dir.to_owned(),
+            server: None,
+        };
+        AppState::new(paths, Launcher::Detached, Some("local".into()), true).unwrap()
+    }
+
+    /// Al conectar (tras apuntarse con el id del hub) van los ids de los otros equipos; luego,
+    /// cada vez que cambian, y solo entonces.
+    #[tokio::test]
+    async fn the_group_ids_go_to_the_hub_when_they_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        st.group.add_member("otro", "k-otro", "mac");
+        let mut rec = hub::fake::recording(|_| None).await;
+        spawn_group_hub(st.clone());
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        assert_eq!(rec.next("group").await["ids"], json!(["otro"]));
+        assert_eq!(st.group.self_id().as_deref(), Some("este"), "apuntado");
+        // Apuntarse pidió una sincronización; los cambios del grupo, no (no son de la conexión).
+        tokio::time::timeout(Duration::from_secs(5), st.group_dirty.notified())
+            .await
+            .expect("apuntarse pide sincronizar");
+        // Cambios que no tocan los ids (un nombre, un dispositivo): nada. Cada uno, a su tiempo,
+        // para que el oyente los vea por separado.
+        st.group.add_member("otro", "k-otro", "mac nuevo");
+        rec.quiet("group", Duration::from_millis(300)).await;
+        st.group.add_device(&[7u8; 32], "Firefox");
+        rec.quiet("group", Duration::from_millis(300)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), st.group_dirty.notified())
+                .await
+                .is_err(),
+            "un cambio del grupo no es una ronda más de sincronización"
+        );
+        // Un equipo más, y uno menos.
+        st.group.add_member("aaa", "k-aaa", "linux");
+        assert_eq!(rec.next("group").await["ids"], json!(["aaa", "otro"]));
+        assert!(st.group.remove_member("otro"));
+        assert_eq!(rec.next("group").await["ids"], json!(["aaa"]));
+    }
+
+    /// Al conectar, después del grupo, la lista de los dispositivos emparejados; al reconectar,
+    /// otra vez, con lo que cambió mientras tanto y aunque no haya cambiado nada.
+    #[tokio::test]
+    async fn the_group_and_the_devices_go_again_on_reconnect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        st.group.add_member("otro", "k-otro", "mac");
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        let mut rec = hub::fake::recording(|_| None).await;
+        spawn_group_hub(st.clone());
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        // En este orden: el grupo y luego los dispositivos.
+        let mut first = Vec::new();
+        while first.len() < 2 {
+            let v = rec.next_any().await;
+            if v.get("group").is_some() || v.get("devices").is_some() {
+                first.push(v);
+            }
+        }
+        assert_eq!(first[0]["group"]["ids"], json!(["otro"]));
+        assert_eq!(first[1]["devices"], json!({ "ids": [phone.id] }));
+
+        // Sin conexión, un equipo más y un dispositivo menos: al reconectar, lo nuevo.
+        let mut status = st.hub.status.subscribe();
+        rec.tell(hub::fake::Tell::Hangup);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        st.group.add_member("aaa", "k-aaa", "linux");
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        rec.next("pub").await;
+        assert_eq!(rec.next("group").await["ids"], json!(["aaa", "otro"]));
+        assert_eq!(rec.next("devices").await, json!({ "ids": [] }));
+
+        // Y sin cambios, también.
+        rec.tell(hub::fake::Tell::Hangup);
+        rec.next("pub").await;
+        assert_eq!(rec.next("group").await["ids"], json!(["aaa", "otro"]));
+        assert_eq!(rec.next("devices").await, json!({ "ids": [] }));
+    }
+
+    /// Si no se puede guardar la baja, el dispositivo ya ha salido de la memoria: el hub se
+    /// entera igual.
+    #[tokio::test]
+    async fn a_removal_that_cannot_be_saved_still_tells_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let mut rec = hub::fake::recording(|_| None).await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        let web = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[2u8; 32], "web", None)
+            .unwrap();
+        // El fichero temporal de `phones.json` es una carpeta: no se puede guardar.
+        std::fs::create_dir_all(tmp.path().join("data").join("phones.tmp")).unwrap();
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(rec.next("unsession").await, json!({ "device": phone.id }));
+        st.group.add_device(&[2u8; 32], "web");
+        st.group.remove_device(&web.key);
+        st.apply_group();
+        assert_eq!(rec.next("unsession").await, json!({ "device": web.id }));
+        assert!(st.phones.lock().unwrap().list().is_empty());
+    }
+
+    /// Un dispositivo dado de baja aquí (`nido phones`, «Cerrar sesión») o porque el grupo lo
+    /// quitó: el hub se entera, para borrar sus sesiones.
+    #[tokio::test]
+    async fn a_removed_device_loses_its_hub_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let mut rec = hub::fake::recording(|_| None).await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(rec.next("unsession").await, json!({ "device": phone.id }));
+        // El que quita el grupo (en otro equipo), al aplicarlo aquí.
+        let web = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[2u8; 32], "web", None)
+            .unwrap();
+        st.group.add_device(&[2u8; 32], "web");
+        st.group.remove_device(&web.key);
+        st.apply_group();
+        assert_eq!(rec.next("unsession").await, json!({ "device": web.id }));
+        assert!(st.phones.lock().unwrap().list().is_empty());
+        // Lo ya quitado no se vuelve a avisar: lo siguiente que llega es otra baja.
+        st.apply_group();
+        let third = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[3u8; 32], "otro", None)
+            .unwrap();
+        assert_eq!(
+            remove_phone(&st, &third.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(rec.next("unsession").await, json!({ "device": third.id }));
     }
 
     // ---------- La memoria de la voz ----------

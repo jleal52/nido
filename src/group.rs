@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 const INVITE_LIFE: Duration = Duration::from_secs(600);
 
@@ -125,6 +126,9 @@ pub struct Group {
     pub own_key: String,
     state: Mutex<State>,
     invite: Mutex<Option<Invite>>,
+    /// La revisión: sube cada vez que cambia el estado. La escucha quien quiera enterarse de
+    /// cualquier cambio (venga de este equipo o de otro), aparte de la sincronización.
+    revision: watch::Sender<u64>,
 }
 
 impl Group {
@@ -138,9 +142,17 @@ impl Group {
             own_key: B64.encode(own_key),
             state: Mutex::new(state),
             invite: Mutex::new(None),
+            revision: watch::Sender::new(0),
         }
     }
 
+    /// Avisa de cada cambio del grupo: el valor es la revisión, que solo sube.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    /// Guarda el estado cambiado. Se llama con el estado bloqueado; la revisión la sube después
+    /// quien llama (`bump`), ya sin él.
     fn save(&self, st: &State) {
         let tmp = self.path.with_extension("json.tmp");
         let write = || -> std::io::Result<()> {
@@ -153,6 +165,16 @@ impl Group {
         if let Err(e) = write() {
             eprintln!("nido: no se pudo guardar el grupo: {e}");
         }
+    }
+
+    /// Sube la revisión tras un cambio, aunque no se haya podido guardar (en memoria ya ha
+    /// cambiado). Se llama con el estado ya suelto: `send_modify` espera a que nadie tenga la
+    /// revisión leída (un `Ref` de `borrow`), y quien la tiene puede estar pidiendo el estado;
+    /// con él cogido, se bloquearían el uno al otro. El orden de las revisiones lo pone el cerrojo
+    /// del propio `watch`, y quien reciba el aviso ya ve el estado cambiado. `send_modify` y no
+    /// `send`: sube también sin nadie escuchando.
+    fn bump(&self) {
+        self.revision.send_modify(|r| *r += 1);
     }
 
     pub fn snapshot(&self) -> State {
@@ -179,13 +201,28 @@ impl Group {
             }
             self.save(&st);
         }
+        drop(st);
+        if changed {
+            self.bump();
+        }
         changed
     }
 
+    /// Cambia el estado y, si de verdad cambió, lo guarda.
     fn change(&self, f: impl FnOnce(&mut State)) {
-        let mut st = self.state.lock().expect("grupo");
-        f(&mut st);
-        self.save(&st);
+        let changed = {
+            let mut st = self.state.lock().expect("grupo");
+            let before = st.clone();
+            f(&mut st);
+            let changed = *st != before;
+            if changed {
+                self.save(&st);
+            }
+            changed
+        };
+        if changed {
+            self.bump();
+        }
     }
 
     /// Este equipo, con su id en el hub (se conoce al conectar con él) y su nombre.
@@ -523,5 +560,129 @@ mod tests {
         // Y lo guardado se recupera.
         let again = Group::load(dir.path().join("group.json"), [1u8; 32]);
         assert_eq!(again.self_id().as_deref(), Some("yo"));
+    }
+
+    /// Que saquen a este equipo del grupo también es un cambio: avisa, y una vez.
+    #[test]
+    fn leaving_the_group_bumps_the_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        g.set_self("yo", "wsl");
+        g.add_member("otro", "k-otro", "mac");
+        let mut rx = g.subscribe();
+        let before = *rx.borrow_and_update();
+        let mut st = g.snapshot();
+        for m in st.members.iter_mut().filter(|m| m.id == "yo") {
+            m.removed = true;
+            m.at = now_ms() + 1;
+        }
+        assert!(g.merge(&st));
+        assert!(rx.has_changed().unwrap(), "salir del grupo avisa");
+        assert_eq!(*rx.borrow_and_update(), before + 1);
+        assert!(g.others().is_empty());
+    }
+
+    /// Si no se puede escribir el fichero, el estado en memoria ya ha cambiado: la revisión sube
+    /// igual.
+    #[test]
+    fn the_revision_goes_up_even_if_the_disk_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // El padre de la ruta es un fichero: ni se crea la carpeta ni se escribe.
+        let file = dir.path().join("fichero");
+        std::fs::write(&file, b"no es una carpeta").unwrap();
+        let g = Group::load(file.join("group.json"), [1u8; 32]);
+        let mut rx = g.subscribe();
+        g.add_device(&[7u8; 32], "Firefox");
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), 1);
+        assert!(g.has_device(&[7u8; 32]), "en memoria sí está");
+        assert!(!file.join("group.json").exists());
+    }
+
+    /// Quien tiene leída la revisión (un `Ref` de `borrow`) mientras otro hilo cambia el grupo no
+    /// deja el estado bloqueado: la revisión sube después de soltarlo.
+    #[test]
+    fn holding_the_revision_does_not_lock_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = std::sync::Arc::new(Group::load(dir.path().join("group.json"), [1u8; 32]));
+        let rx = g.subscribe();
+        let held = rx.borrow();
+        let writer = {
+            let g = g.clone();
+            std::thread::spawn(move || g.add_device(&[7u8; 32], "Firefox"))
+        };
+        // Otro hilo lee el estado mientras el que escribe espera para subir la revisión.
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        {
+            let g = g.clone();
+            std::thread::spawn(move || {
+                while !g.has_device(&[7u8; 32]) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let _ = seen_tx.send(());
+            });
+        }
+        let r = seen.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert!(r.is_ok(), "el estado se quedó bloqueado");
+        writer.join().unwrap();
+        assert_eq!(*rx.borrow(), 1);
+    }
+
+    #[test]
+    fn every_change_bumps_the_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let mut rx = g.subscribe();
+        let start = *rx.borrow_and_update();
+        // Cada mutación avisa una vez, y la revisión sube.
+        let mut expect = start;
+        let mut bumped = |rx: &mut tokio::sync::watch::Receiver<u64>, what: &str| {
+            expect += 1;
+            assert!(rx.has_changed().unwrap(), "{what} avisa");
+            assert_eq!(*rx.borrow_and_update(), expect, "{what} sube la revisión");
+        };
+        g.set_self("yo", "wsl");
+        bumped(&mut rx, "set_self");
+        g.add_member("otro", "k-otro", "mac");
+        bumped(&mut rx, "add_member");
+        g.add_device(&[7u8; 32], "Firefox");
+        bumped(&mut rx, "add_device");
+        g.remove_device(&B64.encode([7u8; 32]));
+        bumped(&mut rx, "remove_device");
+        assert!(g.remove_member("otro"));
+        bumped(&mut rx, "remove_member");
+        let theirs = State {
+            members: vec![member("mac", now_ms() + 1, false)],
+            devices: vec![],
+        };
+        assert!(g.merge(&theirs));
+        bumped(&mut rx, "merge con cambios");
+        // Lo que no cambia nada no avisa.
+        assert!(!g.merge(&theirs));
+        assert!(!rx.has_changed().unwrap(), "merge sin cambios");
+        g.set_self("yo", "wsl");
+        assert!(!rx.has_changed().unwrap(), "set_self igual");
+        assert!(!g.remove_member("nadie"));
+        g.remove_device("nadie");
+        assert!(!rx.has_changed().unwrap(), "quitar lo que no está");
+    }
+
+    #[test]
+    fn revision_counts_without_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        // Sin nadie escuchando (como al arrancar) la revisión sigue subiendo, y quien se apunte
+        // después la ve.
+        g.add_device(&[7u8; 32], "Firefox");
+        g.set_self("yo", "wsl");
+        let rx = g.subscribe();
+        assert_eq!(*rx.borrow(), 2);
+        // Varios oyentes a la vez, cada uno con su aviso.
+        let mut a = g.subscribe();
+        let mut b = g.subscribe();
+        g.add_member("otro", "k-otro", "mac");
+        assert_eq!(*a.borrow_and_update(), 3);
+        assert_eq!(*b.borrow_and_update(), 3);
     }
 }

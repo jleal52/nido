@@ -287,6 +287,17 @@ const TABLE: &[(&str, &str)] = &[
         "solo un teléfono o una web emparejados pueden llamar",
         "only a paired phone or browser can make a call",
     ),
+    // La sesión del hub (`POST /api/v1/hub/session`)
+    (
+        "el hub no ofrece sesiones",
+        "the hub does not offer sessions",
+    ),
+    ("límite de sesiones", "session limit reached"),
+    ("el hub no dio el vale", "the hub did not give the grant"),
+    (
+        "solo un teléfono o una web emparejados pueden pedir una sesión del hub",
+        "only a paired phone or browser can ask for a hub session",
+    ),
     // La memoria de la voz (voice_memory.rs y `/api/v1/voice/memory`)
     (
         "solo un teléfono o una web emparejados pueden usar la memoria de la voz",

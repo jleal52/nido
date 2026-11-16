@@ -29,8 +29,9 @@ desde la app), sin abrir puertos ni tocar el router.
 Y es **privado**: el hub solo reenvía bytes cifrados entre tu equipo y tus dispositivos, que son
 los únicos que tienen las claves. No puede leer tus sesiones, lo que escribes ni lo que te
 contesta Claude. Lo que sí ve: qué equipos están conectados (por un identificador sacado de su
-clave, no por su nombre), cuántos dispositivos y cuánto tráfico, y el identificador para mandar
-avisos al teléfono (su contenido también va cifrado). La web la sirve el propio hub: guarda la
+clave, no por su nombre), cuántos dispositivos y cuánto tráfico, el identificador para mandar
+avisos al teléfono (su contenido también va cifrado) y lo poco que hace falta para tu cuenta (ver
+[La cuenta del hub](#la-cuenta-del-hub)). La web la sirve el propio hub: guarda la
 versión que usaste y te avisa si alguna vez recibes otra distinta.
 
 ```sh
@@ -122,7 +123,25 @@ nido group                       # los equipos del grupo; `nido group rm <id>` s
 Los equipos de un grupo comparten qué dispositivos están autorizados: un móvil o navegador
 emparejado con cualquiera sirve para todos, y quitarlo en uno lo quita en todos. Todos los equipos
 son iguales. Se sincronizan entre ellos por el hub, cifrado de extremo a extremo; el hub no ve la
-lista. El nombre de cada equipo es el del sistema, o el de `NIDO_NAME`.
+lista (solo los identificadores, ver [La cuenta del hub](#la-cuenta-del-hub)). El nombre de cada
+equipo es el del sistema, o el de `NIDO_NAME`.
+
+### La cuenta del hub
+
+Cada grupo de equipos tiene una cuenta en el hub, con un nombre (uno aleatorio, como
+`mirlo-sereno`, que se puede cambiar en «Mi cuenta» de la web) y un idioma, que siguen la web, la
+app y la voz. La cuenta se crea sola: la primera vez que la abre un dispositivo, el hub le pone el
+idioma de ese dispositivo y un nombre libre. El hub junta en una cuenta los equipos que se nombran
+el uno al otro: cada nido le dice los identificadores en el hub de los otros equipos de su grupo.
+
+De la cuenta, el hub sabe su nombre y su idioma, qué equipos están en ella (por sus
+identificadores en el hub) y los identificadores de los dispositivos emparejados (números al azar
+que pone cada equipo, no sacados de su nombre ni de su clave), para cerrar sus sesiones cuando se
+quitan. También ve cuándo usa cada dispositivo su sesión, desde qué IP y con qué idioma. No sabe
+cómo se llaman los equipos ni los dispositivos, ni nada de las sesiones. La web entra en la cuenta
+con un vale de un solo uso que pide a su nido por el canal cifrado (`POST /api/v1/hub/session`,
+más abajo), y el hub se lo cambia por una cookie. Cada nido recibe del hub el nombre y el idioma
+de su cuenta y se los pasa a sus dispositivos al conectar: así la app sabe el idioma sin cookie.
 
 ## Sesiones de Claude que trabajan juntas (el MCP de nido)
 
@@ -283,6 +302,20 @@ da el token. Solo un teléfono o un navegador emparejado puede pedirlo (`403` co
 mientras lo pide), `501` si el hub no ofrece voz (un hub anterior que no contesta cuenta como eso,
 a los 30 segundos), `429` si este equipo llegó al límite de voz del hub, `502` para cualquier otro
 error del hub. Un nido anterior, sin esta ruta, contesta `404`.
+
+`POST /api/v1/hub/session`: un vale de un solo uso para que la web entre en la cuenta de este
+equipo en el hub (ver [La cuenta del hub](#la-cuenta-del-hub)), que lo canjea allí por su cookie.
+nido se lo pide al hub a nombre del dispositivo que llama y devuelve lo que da el hub: `{"grant",
+"expires"}`. Solo un teléfono o un navegador emparejado puede pedirlo (`403` con el token de
+`~/.config/nido/token`). Errores: `503` si nido no está conectado a un hub, `501` si el hub no da
+sesiones (un hub anterior que no contesta cuenta como eso, a los 30 segundos), `429` si este
+equipo llegó al límite de sesiones del hub, `502` para cualquier otro error del hub. Un nido
+anterior, sin esta ruta, contesta `404`.
+
+La cuenta del hub, `{"name", "lang"}` (cualquiera de los dos puede ser `null` mientras no se haya
+abierto), va en `GET /api/v1/info` (`"account"`, o `null` si el hub aún no la ha dicho), en la
+información que recibe un dispositivo al emparejarse o conectar (`"account"`, o nada) y en cada
+lista de `/api/v1/events` (`"account"`, o `null`), que se vuelve a mandar cuando cambia.
 
 La memoria de la voz, para que una llamada siga donde se quedaron las anteriores: las notas que
 apunta el agente de voz cuando le pides que recuerde algo (hasta 50, de hasta 300 caracteres; una

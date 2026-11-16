@@ -44,6 +44,9 @@ pub const FRAME_DATA: u8 = 2;
 pub const FRAME_CLOSE: u8 = 3;
 /// El mensaje Noise más largo.
 pub const MAX_MSG: usize = 65535;
+/// Lo que añade Noise a la respuesta del emparejamiento o la conexión (la clave efímera y la
+/// etiqueta del cifrado), con holgura.
+const MSG2_OVERHEAD: usize = 128;
 /// Lo que cabe en un mensaje Noise menos la etiqueta (16) y la cabecera de la trama (5).
 pub const MAX_CHUNK: usize = MAX_MSG - 16 - 5;
 /// Lo que cabe en la respuesta de `MODE_PEER`: el segundo mensaje del IK lleva la clave efímera
@@ -603,12 +606,21 @@ pub trait Host: Send + Sync + 'static {
     fn hub_info(&self) -> Option<(String, String)> {
         None
     }
+    /// La cuenta de este nido en el hub (`{"name","lang"}`), si el hub la ha dicho: el
+    /// dispositivo saca de ella el idioma.
+    fn account(&self) -> Option<serde_json::Value> {
+        None
+    }
     /// El grupo de equipos, si lo hay.
     fn group(&self) -> Option<&crate::group::Group> {
         None
     }
     /// El grupo ha cambiado aquí: hay que contárselo a los demás equipos.
     fn group_changed(&self) {}
+    /// Ese dispositivo (su id aquí) ya no está emparejado con ese id: al volver a emparejarse
+    /// con la misma clave tiene otro. Lo que haya a nombre del viejo (sus sesiones del hub),
+    /// fuera.
+    fn device_replaced(&self, _old_id: &str) {}
     /// Lo mismo, pero esperando a que se lo hayan contado (al emparejar: el dispositivo recibe la
     /// lista de equipos y puede ir a cualquiera en el momento).
     fn sync_group_now(
@@ -712,11 +724,17 @@ async fn pair<H: Host>(host: &H, pattern: &'static str, msg1: &[u8], tx: &mpsc::
     let Some(key) = hs.get_remote_static().map(<[u8]>::to_vec) else {
         return;
     };
-    let phone = match host.phones().lock().expect("teléfonos").add(
-        &key,
-        &hello.name,
-        hello.push.filter(|h| valid_handle(h)),
-    ) {
+    let (added, old) = {
+        let mut phones = host.phones().lock().expect("teléfonos");
+        let old = phones.by_key(&key).map(|p| p.id.clone());
+        let added = phones.add(&key, &hello.name, hello.push.filter(|h| valid_handle(h)));
+        (added, old)
+    };
+    // El id viejo ha salido de la memoria aunque no se haya podido guardar el nuevo.
+    if let Some(old) = old.filter(|o| !matches!(&added, Ok(p) if p.id == *o)) {
+        host.device_replaced(&old);
+    }
+    let phone = match added {
         Ok(p) => p,
         Err(e) => {
             eprintln!("nido: no se pudo apuntar el teléfono: {e}");
@@ -741,11 +759,21 @@ async fn pair<H: Host>(host: &H, pattern: &'static str, msg1: &[u8], tx: &mpsc::
     }
 }
 
-/// El hub, el id de este nido y los equipos del grupo, para el dispositivo.
+/// El hub, el id de este nido, su cuenta y los equipos del grupo, para el dispositivo. Sin
+/// cuenta, no va la clave: el dispositivo se queda con su idioma.
 fn add_group_info<H: Host>(host: &H, reply: &mut serde_json::Value) {
     if let Some((hub, id)) = host.hub_info() {
         reply["hub"] = hub.into();
         reply["nido"] = id.into();
+    }
+    // Lo que pone el hub, solo si cabe: si no, no se podría emparejar ni conectar.
+    if let Some(account) = host.account() {
+        reply["account"] = account;
+        if reply.to_string().len() + MSG2_OVERHEAD > MAX_MSG
+            && let Some(r) = reply.as_object_mut()
+        {
+            r.remove("account");
+        }
     }
     if let Some(g) = host.group() {
         reply["group"] = serde_json::to_value(g.members()).unwrap_or_default();
@@ -1211,6 +1239,10 @@ mod tests {
         addr: Option<SocketAddr>,
         group: Option<crate::group::Group>,
         replays: PeerReplays,
+        /// Los ids de los dispositivos que se volvieron a emparejar (`device_replaced`).
+        replaced: Mutex<Vec<String>>,
+        /// La cuenta del hub que se da a los dispositivos.
+        account: Mutex<Option<serde_json::Value>>,
     }
 
     impl Host for TestHost {
@@ -1234,6 +1266,12 @@ mod tests {
         }
         fn peer_replays(&self) -> Option<&PeerReplays> {
             Some(&self.replays)
+        }
+        fn device_replaced(&self, old_id: &str) {
+            self.replaced.lock().unwrap().push(old_id.into());
+        }
+        fn account(&self) -> Option<serde_json::Value> {
+            self.account.lock().unwrap().clone()
         }
         /// Devuelve quién y qué pidió; `grande`, una respuesta que no cabe; `falla`, un error.
         fn peer_call<'a>(
@@ -1262,6 +1300,8 @@ mod tests {
             addr,
             group: None,
             replays: PeerReplays::default(),
+            replaced: Default::default(),
+            account: Default::default(),
         })
     }
 
@@ -1290,6 +1330,8 @@ mod tests {
             addr: None,
             group: Some(g),
             replays: PeerReplays::since(started),
+            replaced: Default::default(),
+            account: Default::default(),
         })
     }
 
@@ -1384,6 +1426,21 @@ mod tests {
             mpsc::Sender<Vec<u8>>,
             mpsc::Receiver<Vec<u8>>,
         )> {
+            let (noise, tx, rx, _) = self.connect_info(host, server_key).await?;
+            Some((noise, tx, rx))
+        }
+
+        /// Lo mismo, y la información de conexión que da nido.
+        async fn connect_info<H: Host>(
+            &self,
+            host: &Arc<H>,
+            server_key: &[u8],
+        ) -> Option<(
+            snow::TransportState,
+            mpsc::Sender<Vec<u8>>,
+            mpsc::Receiver<Vec<u8>>,
+            serde_json::Value,
+        )> {
             let (tx, mut rx) = Self::start(host);
             let mut hs = builder(CONNECT)
                 .local_private_key(&self.kp.private)
@@ -1402,8 +1459,10 @@ mod tests {
             let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .ok()??;
-            hs.read_message(&reply, &mut vec![0u8; 65535]).ok()?;
-            Some((hs.into_transport_mode().unwrap(), tx, rx))
+            let mut p = vec![0u8; 65535];
+            let n = hs.read_message(&reply, &mut p).ok()?;
+            let info = serde_json::from_slice(&p[..n]).ok()?;
+            Some((hs.into_transport_mode().unwrap(), tx, rx, info))
         }
     }
 
@@ -1440,6 +1499,8 @@ mod tests {
             addr: None,
             group: None,
             replays: PeerReplays::default(),
+            replaced: Default::default(),
+            account: Default::default(),
         });
         let server_key = host.id.public.to_vec();
         let offer = host
@@ -1471,6 +1532,95 @@ mod tests {
         assert!(!file.exists());
         assert!(Phone::new().pair(&host, &server_key, &psk).await.is_none());
         assert_eq!(host.phones.lock().unwrap().views().len(), 3);
+    }
+
+    /// El mismo dispositivo, emparejado otra vez: tiene otro id, y el viejo se da por quitado (lo
+    /// que haya a su nombre, como sus sesiones del hub, ya no se podría quitar).
+    #[tokio::test]
+    async fn pairing_again_replaces_the_old_id() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let host = test_host(dir.path(), None);
+        let server_key = host.id.public.to_vec();
+        let offer = host
+            .pairing
+            .offer_standing(&host.id, &[], None, 30)
+            .unwrap();
+        let psk = psk_of(&offer.uri);
+        let phone = Phone::new();
+        assert!(phone.pair(&host, &server_key, &psk).await.is_some());
+        let first = host.phones.lock().unwrap().list()[0].id.clone();
+        assert!(
+            host.replaced.lock().unwrap().is_empty(),
+            "el primero no sustituye a nadie"
+        );
+        // Otro dispositivo no toca al primero.
+        assert!(Phone::new().pair(&host, &server_key, &psk).await.is_some());
+        assert!(host.replaced.lock().unwrap().is_empty());
+        assert!(phone.pair(&host, &server_key, &psk).await.is_some());
+        assert_eq!(
+            host.replaced.lock().unwrap().as_slice(),
+            std::slice::from_ref(&first)
+        );
+        let ids: Vec<String> = host
+            .phones
+            .lock()
+            .unwrap()
+            .list()
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(!ids.contains(&first));
+    }
+
+    /// La cuenta del hub va en la información de conexión, al emparejar y al conectar; sin ella,
+    /// no va la clave (una app anterior a las cuentas no la espera, y sin ella usa el idioma del
+    /// teléfono).
+    #[tokio::test]
+    async fn the_connection_info_has_the_account() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let host = test_host(dir.path(), None);
+        let server_key = host.id.public;
+        // Cada emparejamiento, con un código nuevo (son de un solo uso).
+        let pair = async |phone: &Phone| {
+            let psk = psk_of(&host.pairing.offer(&host.id, &[], None).uri);
+            phone
+                .pair(&host, &server_key, &psk)
+                .await
+                .expect("empareja")
+        };
+        let phone = Phone::new();
+
+        // Sin cuenta: ni al emparejar ni al conectar.
+        let reply = pair(&phone).await;
+        assert!(reply.get("account").is_none(), "{reply}");
+        let (_, _, _, info) = phone.connect_info(&host, &server_key).await.unwrap();
+        assert!(info.get("account").is_none(), "{info}");
+
+        // Con cuenta: tal cual, también anónima.
+        let account = serde_json::json!({ "name": "mirlo-sereno", "lang": "en" });
+        *host.account.lock().unwrap() = Some(account.clone());
+        let (_, _, _, info) = phone.connect_info(&host, &server_key).await.unwrap();
+        assert_eq!(info["account"], account);
+        assert_eq!(info["name"], "equipo");
+        let other = Phone::new();
+        assert_eq!(pair(&other).await["account"], account);
+        let anonymous = serde_json::json!({ "name": null, "lang": null });
+        *host.account.lock().unwrap() = Some(anonymous.clone());
+        let (_, _, _, info) = other.connect_info(&host, &server_key).await.unwrap();
+        assert_eq!(info["account"], anonymous);
+
+        // Una cuenta que no cabría en la respuesta no va, y se empareja y se conecta igual.
+        let huge = serde_json::json!({ "name": "x".repeat(70_000), "lang": "es" });
+        *host.account.lock().unwrap() = Some(huge);
+        let third = Phone::new();
+        let reply = pair(&third).await;
+        assert!(reply.get("account").is_none());
+        assert!(reply["token"].is_string());
+        let (_, _, _, info) = third.connect_info(&host, &server_key).await.unwrap();
+        assert!(info.get("account").is_none());
     }
 
     #[tokio::test]

@@ -29,8 +29,9 @@ mobile app), without opening ports or touching your router.
 And it is **private**: the hub only relays encrypted bytes between your computer and your
 devices, which are the only ones holding the keys. It cannot read your sessions, what you type
 or what Claude answers. What it does see: which computers are connected (by an identifier derived
-from their key, not by name), how many devices and how much traffic, and the token used to send
-notifications to your phone (their content is encrypted too). The web app is served by the hub
+from their key, not by name), how many devices and how much traffic, the token used to send
+notifications to your phone (their content is encrypted too) and the little your account needs
+(see [The hub account](#the-hub-account)). The web app is served by the hub
 itself: your browser keeps the version you used and warns you if it ever gets a different one.
 
 ```sh
@@ -122,8 +123,28 @@ nido group                       # the computers in the group; `nido group rm <i
 
 The computers in a group share which devices are authorized: a phone or browser paired with any
 of them works with all of them, and removing it on one removes it on all. All computers are equal.
-They sync with each other through the hub, end-to-end encrypted; the hub does not see the list.
-Each computer's name is the system's, or `NIDO_NAME`.
+They sync with each other through the hub, end-to-end encrypted; the hub does not see the list
+(only the identifiers, see [The hub account](#the-hub-account)). Each computer's name is the
+system's, or `NIDO_NAME`.
+
+### The hub account
+
+Each group of computers has an account on the hub, with a name (a random one, like
+`mirlo-sereno`, which you can change in the web app's "My account") and a language, which the web
+app, the mobile app and the voice follow. The account creates itself: the first time a device
+opens it, the hub gives it that device's language and a free name. The hub puts in one account
+the computers that name each other: each nido tells it the hub identifiers of the other computers
+in its group.
+
+About the account, the hub knows its name and language, which computers are in it (by their hub
+identifiers) and the identifiers of the paired devices (random numbers each computer picks, not
+derived from their names or keys), to end their sessions when they are removed. It also sees when
+each device uses its session, from which IP and with which language. It does not know what the
+computers or the devices are called, nor anything about the sessions. The web app signs in to the
+account with a one-time grant it asks its nido for over the encrypted channel
+(`POST /api/v1/hub/session`, below), which the hub exchanges for a cookie. Each nido gets the
+name and language of its account from the hub and passes them on to its devices when they
+connect: that way the mobile app knows the language without a cookie.
 
 ## Claude sessions working together (the nido MCP)
 
@@ -297,6 +318,20 @@ only hands out the token. Only a paired phone or browser can ask for it (`403` w
 while asking), `501` if the hub does not offer voice (an older hub that doesn't answer counts as
 that, after 30 seconds), `429` if this computer reached the hub's voice limit, `502` for any
 other error from the hub. An older nido, without this endpoint, answers `404`.
+
+`POST /api/v1/hub/session`: a one-time grant for the web app to sign in to this computer's account
+on the hub (see [The hub account](#the-hub-account)), which it exchanges there for its cookie.
+nido asks the hub for it on behalf of the calling device and returns what the hub gives:
+`{"grant", "expires"}`. Only a paired phone or browser can ask for it (`403` with the token in
+`~/.config/nido/token`). Errors: `503` if nido is not connected to a hub, `501` if the hub does
+not offer sessions (an older hub that doesn't answer counts as that, after 30 seconds), `429` if
+this computer reached the hub's session limit, `502` for any other error from the hub. An older
+nido, without this endpoint, answers `404`.
+
+The hub account, `{"name", "lang"}` (either can be `null` until the account is first opened),
+comes in `GET /api/v1/info` (`"account"`, or `null` if the hub hasn't told it yet), in the
+information a device gets when it pairs or connects (`"account"`, or nothing) and in every list
+from `/api/v1/events` (`"account"`, or `null`), which is sent again when it changes.
 
 The voice memory, so that a call can pick up from earlier ones: the notes the voice agent takes when
 you ask it to remember something (up to 50, of up to 300 characters each; a longer note is cut), the

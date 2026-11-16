@@ -74,6 +74,9 @@ pub struct HubStatus {
     pub id: Option<String>,
     pub connected: bool,
     pub error: Option<String>,
+    /// La cuenta de este nido según el hub (`{"name","lang"}`), lo último que dijo: no se borra
+    /// al desconectar, solo si se cambia de hub.
+    pub account: Option<serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -128,7 +131,62 @@ const VOICE_WAIT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const VOICE_WAIT: Duration = Duration::from_secs(1);
 
-type VoicePending = Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>;
+/// Por qué no hay sesión del hub para un dispositivo.
+#[derive(Debug, PartialEq)]
+pub enum SessionError {
+    /// No hay conexión con el hub.
+    NoHub,
+    /// El hub no da sesiones (o no contesta, como uno antiguo, que no sabe qué es `session`).
+    NotOffered,
+    /// Este nido ya pidió todas las que le tocan por ahora (el freno del hub).
+    Limit,
+    /// Lo que dijo el hub.
+    Hub(String),
+}
+
+impl SessionError {
+    /// El mensaje para la API (en español; se traduce al responder).
+    pub fn message(&self) -> &str {
+        match self {
+            SessionError::NoHub => "sin conexión con el hub",
+            SessionError::NotOffered => SESSION_NOT_OFFERED,
+            SessionError::Limit => SESSION_LIMIT,
+            SessionError::Hub(e) => e,
+        }
+    }
+
+    /// El error según el texto que manda el hub.
+    fn from_hub(error: &str) -> Self {
+        match error {
+            SESSION_NOT_OFFERED => SessionError::NotOffered,
+            SESSION_LIMIT => SessionError::Limit,
+            e => SessionError::Hub(e.to_owned()),
+        }
+    }
+}
+
+/// Lo que dice el hub cuando no da sesiones y cuando se pasa del freno.
+const SESSION_NOT_OFFERED: &str = "el hub no ofrece sesiones";
+const SESSION_LIMIT: &str = "límite de sesiones";
+/// Un `ok` sin vale.
+const SESSION_NO_GRANT: &str = "el hub no dio el vale";
+
+/// Cuánto se espera el vale de sesión: un hub antiguo no contesta nunca.
+#[cfg(not(test))]
+const SESSION_WAIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SESSION_WAIT: Duration = Duration::from_secs(1);
+
+/// Los pedidos que esperan respuesta del hub, por su número.
+type Waiters = Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>;
+
+/// Por qué un pedido al hub se quedó sin respuesta.
+enum Unanswered {
+    /// No había conexión, o se cerró con el pedido en marcha.
+    NoHub,
+    /// Venció el plazo (un hub antiguo no contesta a lo que no conoce).
+    Silent,
+}
 
 /// El cliente: se reconecta solo y atiende los móviles que llegan por el hub.
 pub struct Hub {
@@ -137,9 +195,19 @@ pub struct Hub {
     config: watch::Sender<HubConfig>,
     /// Lo que va hacia el hub (mientras haya conexión).
     out: Mutex<Option<mpsc::Sender<Message>>>,
+    /// Los textos de control hacia el hub (el grupo, los dispositivos, las bajas, los pedidos
+    /// de voz y de sesión), mientras haya conexión: una cola aparte, sin límite (son pocos y
+    /// pequeños), para que no se pierdan con `out` lleno (los flujos de los móviles pueden
+    /// llenarlo) y salgan en el orden en que se mandaron.
+    control: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pending: Pending,
     /// Los pedidos de token de voz que esperan respuesta (lo que vino en `voiced`).
-    voice_pending: VoicePending,
+    voice_pending: Waiters,
+    /// Los pedidos de sesión de dispositivo que esperan respuesta (lo que vino en `sessioned`).
+    session_pending: Waiters,
+    /// Lo mandado en esta conexión (se vacía al conectar y al desconectar, así que al reconectar
+    /// se manda siempre). Va con `control`: se cogen en ese orden.
+    sent: Mutex<Sent>,
     next_req: AtomicU64,
 }
 
@@ -156,6 +224,9 @@ impl Hub {
             out: Default::default(),
             pending: Default::default(),
             voice_pending: Default::default(),
+            session_pending: Default::default(),
+            control: Default::default(),
+            sent: Default::default(),
             next_req: AtomicU64::new(1),
         })
     }
@@ -229,58 +300,187 @@ impl Hub {
         }
     }
 
-    /// Pide al hub un token de voz para que la web o la app hablen con el modelo directamente.
-    /// Devuelve lo que da el hub (`token`, `expires`, `project`, `location`, `host`, `model`).
-    pub async fn voice_token(&self) -> Result<serde_json::Value, VoiceError> {
-        let out = self
-            .out
+    /// Manda `{kind: {"req": N, …}}` (lo de `body`, con su número) y espera lo que conteste el
+    /// hub con ese número, que le entrega el despachador de los textos (`answered`).
+    async fn ask(
+        &self,
+        waiters: &Waiters,
+        kind: &str,
+        mut body: serde_json::Map<String, serde_json::Value>,
+        wait: Duration,
+    ) -> Result<serde_json::Value, Unanswered> {
+        let control = self
+            .control
             .lock()
             .expect("hub")
             .clone()
-            .ok_or(VoiceError::NoHub)?;
+            .ok_or(Unanswered::NoHub)?;
         let req = self.next_req.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.voice_pending.lock().expect("voz").insert(req, tx);
-        let msg = serde_json::json!({ "voice": { "req": req } });
-        if out
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            self.voice_pending.lock().expect("voz").remove(&req);
-            return Err(VoiceError::NoHub);
+        waiters.lock().expect("pedidos").insert(req, tx);
+        body.insert("req".into(), req.into());
+        let mut msg = serde_json::Map::new();
+        msg.insert(kind.into(), body.into());
+        let msg = serde_json::Value::Object(msg);
+        if control.send(Message::Text(msg.to_string().into())).is_err() {
+            waiters.lock().expect("pedidos").remove(&req);
+            return Err(Unanswered::NoHub);
         }
-        let mut v = match tokio::time::timeout(VOICE_WAIT, rx).await {
-            Ok(Ok(v)) => v,
+        match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(v)) => Ok(v),
             // Se cerró la conexión con el pedido en marcha (ver `disconnected`).
-            Ok(Err(_)) => return Err(VoiceError::NoHub),
+            Ok(Err(_)) => Err(Unanswered::NoHub),
             Err(_) => {
-                self.voice_pending.lock().expect("voz").remove(&req);
-                return Err(VoiceError::NotOffered);
+                waiters.lock().expect("pedidos").remove(&req);
+                Err(Unanswered::Silent)
             }
+        }
+    }
+
+    /// Pide al hub un token de voz para que la web o la app hablen con el modelo directamente.
+    /// Devuelve lo que da el hub (`token`, `expires`, `project`, `location`, `host`, `model`).
+    pub async fn voice_token(&self) -> Result<serde_json::Value, VoiceError> {
+        let mut v = match self
+            .ask(&self.voice_pending, "voice", Default::default(), VOICE_WAIT)
+            .await
+        {
+            Ok(v) => v,
+            Err(Unanswered::NoHub) => return Err(VoiceError::NoHub),
+            Err(Unanswered::Silent) => return Err(VoiceError::NotOffered),
         };
         if v["ok"] != true {
             return Err(VoiceError::from_hub(
                 v["error"].as_str().unwrap_or_default(),
             ));
         }
-        if let Some(o) = v.as_object_mut() {
-            o.remove("req");
-            o.remove("ok");
-        }
+        strip_reply(&mut v);
         Ok(v)
     }
 
-    /// Si es una respuesta `{"voiced":{"req":N,…}}`, se la entrega a quien la espera.
-    fn voiced(&self, t: &str) {
-        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(t) else {
+    /// Pide al hub un vale de sesión para un dispositivo (`device`, su id aquí; sin él, el hub da
+    /// una sesión que solo caduca): la web lo canjea en el hub por su cookie. Devuelve lo que da
+    /// el hub (`grant`, `expires`).
+    pub async fn hub_session(
+        &self,
+        device: Option<&str>,
+    ) -> Result<serde_json::Value, SessionError> {
+        let mut body = serde_json::Map::new();
+        if let Some(d) = device {
+            body.insert("device".into(), d.into());
+        }
+        let mut v = match self
+            .ask(&self.session_pending, "session", body, SESSION_WAIT)
+            .await
+        {
+            Ok(v) => v,
+            Err(Unanswered::NoHub) => return Err(SessionError::NoHub),
+            Err(Unanswered::Silent) => return Err(SessionError::NotOffered),
+        };
+        if v["ok"] != true {
+            return Err(SessionError::from_hub(
+                v["error"].as_str().unwrap_or_default(),
+            ));
+        }
+        if !v["grant"].is_string() {
+            return Err(SessionError::Hub(SESSION_NO_GRANT.into()));
+        }
+        strip_reply(&mut v);
+        Ok(v)
+    }
+
+    /// Manda al hub, si hay conexión, los ids de los otros equipos del grupo
+    /// (`{"group":{"ids":[…],"at":ms}}`), sin repetidos y ordenados; solo si no son los mismos
+    /// que se mandaron la última vez en esta conexión. Sin conexión no se manda nada: al
+    /// conectar se mandan.
+    pub fn send_group(&self, mut ids: Vec<String>) {
+        ids.sort();
+        ids.dedup();
+        // Con `control` cogido: lo apuntado como mandado va con la conexión por la que salió.
+        let control = self.control.lock().expect("hub");
+        let Some(control) = control.as_ref() else {
             return;
         };
-        if let Some(req) = v["voiced"]["req"].as_u64()
-            && let Some(waiter) = self.voice_pending.lock().expect("voz").remove(&req)
-        {
-            let _ = waiter.send(v["voiced"].take());
+        let mut sent = self.sent.lock().expect("hub");
+        if sent.group.as_ref() == Some(&ids) {
+            return;
         }
+        let msg = serde_json::json!({ "group": { "ids": ids, "at": crate::group::now_ms() } });
+        // Solo falla si la conexión ya se acabó: al reconectar se vuelve a mandar.
+        if control.send(Message::Text(msg.to_string().into())).is_ok() {
+            sent.group = Some(ids);
+        }
+    }
+
+    /// Manda al hub, una vez por conexión, los ids de los dispositivos emparejados aquí
+    /// (`{"devices":{"ids":[…]}}`, ordenados): el hub borra las sesiones de los que no estén. Así
+    /// se arregla una baja que no llegó (`unsession` sin conexión). Sin conexión, nada.
+    pub fn send_devices(&self, mut ids: Vec<String>) {
+        ids.sort();
+        ids.dedup();
+        let control = self.control.lock().expect("hub");
+        let Some(control) = control.as_ref() else {
+            return;
+        };
+        let mut sent = self.sent.lock().expect("hub");
+        if sent.devices {
+            return;
+        }
+        let msg = serde_json::json!({ "devices": { "ids": ids } });
+        if control.send(Message::Text(msg.to_string().into())).is_ok() {
+            sent.devices = true;
+        }
+    }
+
+    /// Avisa al hub de que este dispositivo (su id aquí) ya no está emparejado, para que borre
+    /// sus sesiones (`{"unsession":{"device":…}}`). Sin conexión no se manda: la lista de
+    /// dispositivos que va al conectar (`send_devices`) lo arregla.
+    pub fn unsession(&self, device: &str) {
+        let control = self.control.lock().expect("hub").clone();
+        let Some(control) = control else { return };
+        let msg = serde_json::json!({ "unsession": { "device": device } });
+        let _ = control.send(Message::Text(msg.to_string().into()));
+    }
+
+    /// Si es una respuesta `{"voiced":{"req":N,…}}`, se la entrega a quien la espera. Devuelve
+    /// si lo era. Con `get_mut` y no con `v["voiced"]`: el índice mutable de un `Value` mete la
+    /// clave que falta (y entra en pánico si no es un objeto), y por aquí pasan todos los textos.
+    fn voiced(&self, v: &mut serde_json::Value) -> bool {
+        v.get_mut("voiced")
+            .is_some_and(|r| answered(&self.voice_pending, r))
+    }
+
+    /// Lo mismo con `{"sessioned":{"req":N,…}}`.
+    fn sessioned(&self, v: &mut serde_json::Value) -> bool {
+        v.get_mut("sessioned")
+            .is_some_and(|r| answered(&self.session_pending, r))
+    }
+
+    /// Si es `{"account":{"name","lang"}}`, la cuenta de este nido: al estado (y, si cambió, avisa
+    /// a quien lo escuche). Devuelve si lo era. Un nombre o un idioma que no valen se quedan en
+    /// `null`: van a la información de los dispositivos, donde uno enorme no cabría y dejaría sin
+    /// emparejar ni conectar a nadie.
+    fn account(&self, v: &serde_json::Value) -> bool {
+        let Some(a) = v.get("account").and_then(|a| a.as_object()) else {
+            return false;
+        };
+        let text = |k: &str, valid: fn(&str) -> bool| {
+            a.get(k)
+                .and_then(|x| x.as_str())
+                .filter(|x| valid(x))
+                .map(str::to_owned)
+        };
+        let account = serde_json::json!({
+            "name": text("name", account_name),
+            "lang": text("lang", account_lang),
+        });
+        self.status.send_if_modified(|s| {
+            if s.account.as_ref() == Some(&account) {
+                return false;
+            }
+            s.account = Some(account);
+            true
+        });
+        true
     }
 
     /// Se acabó la conexión: ya no se manda nada y los que esperan respuesta dejan de esperar
@@ -288,12 +488,64 @@ impl Hub {
     /// un `out` de antes ya no llega a nadie: falla al mandarlo.
     fn disconnected(&self) {
         *self.out.lock().expect("hub") = None;
+        {
+            let mut control = self.control.lock().expect("hub");
+            *self.sent.lock().expect("hub") = Sent::default();
+            *control = None;
+        }
         self.pending.lock().expect("avisos").clear();
-        self.voice_pending.lock().expect("voz").clear();
+        self.voice_pending.lock().expect("pedidos").clear();
+        self.session_pending.lock().expect("pedidos").clear();
     }
 
     fn set_status(&self, f: impl FnOnce(&mut HubStatus)) {
         self.status.send_modify(f);
+    }
+}
+
+/// Si es un nombre de cuenta como los que da y acepta el hub: de 3 a 30 caracteres de
+/// `[a-z0-9-]`, sin guion al principio ni al final y sin dos seguidos.
+fn account_name(name: &str) -> bool {
+    (3..=30).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+/// Los idiomas de una cuenta.
+fn account_lang(lang: &str) -> bool {
+    matches!(lang, "es" | "en")
+}
+
+/// Lo mandado al hub en una conexión.
+#[derive(Default)]
+struct Sent {
+    /// Los ids del grupo de la última vez.
+    group: Option<Vec<String>>,
+    /// Si ya se mandó la lista de dispositivos.
+    devices: bool,
+}
+
+/// Le entrega `reply` (lo de dentro de `{"voiced":…}`, `{"sessioned":…}`) a quien espera su
+/// número. Devuelve si era una respuesta (con número), la esperase alguien o no.
+fn answered(waiters: &Waiters, reply: &mut serde_json::Value) -> bool {
+    let Some(req) = reply["req"].as_u64() else {
+        return false;
+    };
+    if let Some(waiter) = waiters.lock().expect("pedidos").remove(&req) {
+        let _ = waiter.send(reply.take());
+    }
+    true
+}
+
+/// Lo que da el hub, sin lo del pedido (`req`, `ok`).
+fn strip_reply(v: &mut serde_json::Value) {
+    if let Some(o) = v.as_object_mut() {
+        o.remove("req");
+        o.remove("ok");
     }
 }
 
@@ -322,8 +574,11 @@ pub fn spawn<H: e2e::Host>(hub: Arc<Hub>, host: Arc<H>) {
                 (c.url.clone(), c.address.clone())
             };
             hub.set_status(|s| {
+                // La cuenta es lo último que se supo de este hub: con otro, ya no vale.
+                let account = s.account.take().filter(|_| s.url == url);
                 *s = HubStatus {
                     url: url.clone(),
+                    account,
                     ..Default::default()
                 }
             });
@@ -494,7 +749,15 @@ async fn run<H: e2e::Host>(
     eprintln!("nido: conectado al hub {url} como {id}");
 
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
+    // `control_tx` vive aquí también: la cola no se cierra mientras dure la conexión.
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
     *hub.out.lock().expect("hub") = Some(out_tx.clone());
+    {
+        // Una conexión nueva: el grupo y los dispositivos se vuelven a mandar.
+        let mut control = hub.control.lock().expect("hub");
+        *hub.sent.lock().expect("hub") = Sent::default();
+        *control = Some(control_tx.clone());
+    }
     hub.set_status(|s| {
         s.id = Some(id.clone());
         s.connected = true;
@@ -511,6 +774,9 @@ async fn run<H: e2e::Host>(
             }
             m = out_rx.recv() => {
                 let Some(m) = m else { return Ok(()) };
+                tx.send(m).await.map_err(|e| e.to_string())?;
+            }
+            Some(m) = control_rx.recv() => {
                 tx.send(m).await.map_err(|e| e.to_string())?;
             }
             msg = rx.next() => match msg {
@@ -557,8 +823,9 @@ async fn run<H: e2e::Host>(
                             Err(PushError::Other(p.error.unwrap_or_default()))
                         };
                         let _ = waiter.send(r);
-                    } else {
-                        hub.voiced(&t);
+                    } else if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&t) {
+                        // Cada uno dice si era suyo; lo que no conoce nadie se ignora.
+                        let _ = hub.voiced(&mut v) || hub.sessioned(&mut v) || hub.account(&v);
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
@@ -732,6 +999,327 @@ mod tests {
         assert!(hub.pending.lock().unwrap().is_empty());
     }
 
+    // ---------- El grupo, la sesión de dispositivo y la cuenta ----------
+
+    /// Un nido conectado a un hub de mentira que graba lo que recibe.
+    async fn recorded(
+        dir: &Path,
+        answer: impl Fn(&serde_json::Value) -> Option<Reply> + Send + 'static,
+    ) -> (Arc<Hub>, fake::Recorder) {
+        let rec = fake::recording(answer).await;
+        let hub = connected(dir, rec.addr).await;
+        (hub, rec)
+    }
+
+    #[tokio::test]
+    async fn the_group_ids_go_once_per_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        let before = crate::group::now_ms();
+        hub.send_group(vec!["b".into(), "a".into(), "b".into()]);
+        let g = rec.next("group").await;
+        assert_eq!(
+            g["ids"],
+            serde_json::json!(["a", "b"]),
+            "ordenados y sin repetir"
+        );
+        assert!(g["at"].as_u64().unwrap() >= before, "{g}");
+        // La misma lista (en otro orden) no se repite; otra, sí.
+        hub.send_group(vec!["b".into(), "a".into()]);
+        hub.send_group(vec!["a".into(), "b".into(), "c".into()]);
+        assert_eq!(
+            rec.next("group").await["ids"],
+            serde_json::json!(["a", "b", "c"])
+        );
+        // Una lista vacía (este equipo solo) también es una lista.
+        hub.send_group(vec![]);
+        assert_eq!(rec.next("group").await["ids"], serde_json::json!([]));
+
+        // Al reconectar se manda aunque sea la misma.
+        hub.send_group(vec!["a".into()]);
+        assert_eq!(rec.next("group").await["ids"], serde_json::json!(["a"]));
+        rec.tell(fake::Tell::Hangup);
+        let mut status = hub.status.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        rec.next("pub").await;
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        hub.send_group(vec!["a".into()]);
+        assert_eq!(rec.next("group").await["ids"], serde_json::json!(["a"]));
+    }
+
+    #[tokio::test]
+    async fn the_account_from_the_hub_stays_in_the_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        assert_eq!(hub.status.borrow().account, None);
+        let mut status = hub.status.subscribe();
+        status.borrow_and_update();
+        // Lo que no se entiende se ignora, sin cortar la conexión.
+        for odd in [
+            serde_json::json!("hola"),
+            serde_json::json!([1, 2]),
+            serde_json::json!({ "voiced": 5 }),
+            serde_json::json!({ "sessioned": { "req": 99, "ok": true } }),
+            serde_json::json!({ "account": "mirlo" }),
+            serde_json::json!({ "nuevo": {} }),
+        ] {
+            rec.tell(fake::Tell::Send(odd));
+        }
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "account": { "name": "mirlo-sereno", "lang": "es", "otra": 1 }
+        })));
+        let want = serde_json::json!({ "name": "mirlo-sereno", "lang": "es" });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.account.as_ref() == Some(&want)),
+        )
+        .await
+        .expect("no llegó la cuenta")
+        .unwrap();
+        assert!(hub.status.borrow().connected);
+        // La misma otra vez no avisa; sin nombre ni idioma (recién creada), nulos.
+        status.borrow_and_update();
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "account": { "name": "mirlo-sereno", "lang": "es" }
+        })));
+        rec.tell(fake::Tell::Send(serde_json::json!({ "account": {} })));
+        let empty = serde_json::json!({ "name": null, "lang": null });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.account.as_ref() == Some(&empty)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "account": { "name": "mirlo-sereno", "lang": "en" }
+        })));
+        let en = serde_json::json!({ "name": "mirlo-sereno", "lang": "en" });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.account.as_ref() == Some(&en)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Al desconectar se queda (es lo último que se supo), también al reconectar.
+        rec.tell(fake::Tell::Hangup);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hub.status.borrow().account.as_ref(), Some(&en));
+        rec.next("pub").await;
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hub.status.borrow().account.as_ref(), Some(&en));
+        // Con otro hub, ya no.
+        hub.set_url(Some("ws://127.0.0.1:9".into()), None).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.account.is_none()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    /// El nombre y el idioma de la cuenta, como los valida el hub: lo demás no es un nombre ni un
+    /// idioma.
+    #[test]
+    fn account_names_and_langs() {
+        for ok in ["mirlo-sereno", "abc", "a1-b2", &"a".repeat(30)] {
+            assert!(account_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "ab",
+            "-abc",
+            "abc-",
+            "a--b",
+            "Mirlo",
+            "mirlo sereno",
+            "mirlo_s",
+            "ñandú",
+            &"a".repeat(31),
+        ] {
+            assert!(!account_name(bad), "{bad}");
+        }
+        assert!(account_lang("es") && account_lang("en"));
+        for bad in ["", "ES", "fr", "es-ES"] {
+            assert!(!account_lang(bad), "{bad}");
+        }
+    }
+
+    /// Un nombre o un idioma que no valen llegan como `null`: un hub no puede meter en la
+    /// información de los dispositivos lo que quiera (un nombre enorme no cabría al emparejar).
+    #[tokio::test]
+    async fn an_odd_account_from_the_hub_is_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, rec) = recorded(tmp.path(), |_| None).await;
+        let mut status = hub.status.subscribe();
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "account": { "name": "x".repeat(70_000), "lang": "fr" }
+        })));
+        let empty = serde_json::json!({ "name": null, "lang": null });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.account.as_ref() == Some(&empty)),
+        )
+        .await
+        .expect("no llegó la cuenta")
+        .unwrap();
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "account": { "name": "Mirlo--Sereno", "lang": "en" }
+        })));
+        let en = serde_json::json!({ "name": null, "lang": "en" });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.account.as_ref() == Some(&en)),
+        )
+        .await
+        .expect("no llegó la cuenta")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_session_grant_comes_from_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |v| {
+            v["session"]["req"].as_u64().map(|req| {
+                Reply::Send(serde_json::json!({ "sessioned": {
+                    "req": req, "ok": true, "grant": "vale-de-prueba", "expires": 60000,
+                }}))
+            })
+        })
+        .await;
+        // En nombre de un dispositivo: va su id.
+        let v = hub.hub_session(Some("a1b2c3")).await.unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "grant": "vale-de-prueba", "expires": 60000 })
+        );
+        let asked = rec.next("session").await;
+        assert_eq!(asked["device"], "a1b2c3");
+        assert!(asked["req"].as_u64().is_some(), "{asked}");
+        // Sin dispositivo, sin `device`.
+        assert!(hub.hub_session(None).await.is_ok());
+        let asked = rec.next("session").await;
+        assert!(asked.get("device").is_none(), "{asked}");
+        assert!(hub.session_pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_hub_errors_become_session_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Lo que contesta, según el dispositivo que pide (no según el número del pedido).
+        let (hub, _rec) = recorded(tmp.path(), |v| {
+            let req = v["session"]["req"].as_u64()?;
+            let reply = match v["session"]["device"].as_str() {
+                Some("freno") => serde_json::json!({ "ok": false, "error": "límite de sesiones" }),
+                Some("sin") => {
+                    serde_json::json!({ "ok": false, "error": "el hub no ofrece sesiones" })
+                }
+                Some("sin-vale") => serde_json::json!({ "ok": true, "expires": 60000 }),
+                Some("vale-raro") => serde_json::json!({ "ok": true, "grant": 7 }),
+                _ => serde_json::json!({ "ok": false, "error": "error del hub" }),
+            };
+            let mut reply = reply;
+            reply["req"] = req.into();
+            Some(Reply::Send(serde_json::json!({ "sessioned": reply })))
+        })
+        .await;
+        assert_eq!(
+            hub.hub_session(Some("freno")).await,
+            Err(SessionError::Limit)
+        );
+        assert_eq!(
+            hub.hub_session(Some("sin")).await,
+            Err(SessionError::NotOffered)
+        );
+        assert_eq!(
+            hub.hub_session(None).await,
+            Err(SessionError::Hub("error del hub".into()))
+        );
+        // Un `ok` sin vale (o con uno que no es texto) no es un vale.
+        let no_grant = Err(SessionError::Hub("el hub no dio el vale".into()));
+        assert_eq!(hub.hub_session(Some("sin-vale")).await, no_grant);
+        assert_eq!(hub.hub_session(Some("vale-raro")).await, no_grant);
+    }
+
+    /// La lista de dispositivos va una vez por conexión, y otra vez al reconectar.
+    #[tokio::test]
+    async fn the_devices_go_once_per_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        hub.send_devices(vec!["b2".into(), "a1".into()]);
+        assert_eq!(
+            rec.next("devices").await,
+            serde_json::json!({ "ids": ["a1", "b2"] })
+        );
+        hub.send_devices(vec!["a1".into()]);
+        rec.quiet("devices", Duration::from_millis(300)).await;
+        rec.tell(fake::Tell::Hangup);
+        let mut status = hub.status.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        rec.next("pub").await;
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        hub.send_devices(vec![]);
+        assert_eq!(rec.next("devices").await, serde_json::json!({ "ids": [] }));
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_does_not_answer_does_not_offer_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Un hub antiguo: no sabe qué es `session` y no contesta.
+        let (hub, _rec) = recorded(tmp.path(), |_| None).await;
+        assert_eq!(
+            hub.hub_session(Some("a1b2c3")).await,
+            Err(SessionError::NotOffered)
+        );
+        assert!(hub.session_pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_hangs_up_has_no_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, _rec) = recorded(tmp.path(), |v| v.get("session").map(|_| Reply::Close)).await;
+        let started = std::time::Instant::now();
+        assert_eq!(hub.hub_session(None).await, Err(SessionError::NoHub));
+        assert!(started.elapsed() < SESSION_WAIT, "{:?}", started.elapsed());
+        assert!(hub.session_pending.lock().unwrap().is_empty());
+        let none = Hub::new(tmp.path().join("otro.json"));
+        assert_eq!(none.hub_session(None).await, Err(SessionError::NoHub));
+    }
+
+    /// Un dispositivo dado de baja: se avisa al hub, si hay conexión (si no, nada).
+    #[tokio::test]
+    async fn unsession_tells_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        hub.unsession("a1b2c3");
+        assert_eq!(
+            rec.next("unsession").await,
+            serde_json::json!({ "device": "a1b2c3" })
+        );
+        let none = Hub::new(tmp.path().join("otro.json"));
+        none.unsession("a1b2c3");
+    }
+
     #[tokio::test]
     async fn without_a_hub_there_is_no_voice() {
         let tmp = tempfile::tempdir().unwrap();
@@ -801,6 +1389,117 @@ pub(crate) mod fake {
             }
         });
         addr
+    }
+
+    /// Lo que se le pide al hub de mentira que graba ([`recording`]).
+    pub enum Tell {
+        /// Que mande esto al nido.
+        Send(serde_json::Value),
+        /// Que cuelgue (y espere a la siguiente conexión).
+        Hangup,
+    }
+
+    /// Un hub de mentira que graba lo que le manda el nido.
+    pub struct Recorder {
+        pub addr: std::net::SocketAddr,
+        got: mpsc::UnboundedReceiver<serde_json::Value>,
+        tell: mpsc::UnboundedSender<Tell>,
+    }
+
+    impl Recorder {
+        /// Lo de dentro del siguiente texto del nido que sea `{kind: …}` (los demás se saltan).
+        /// La firma (`pub`) es lo primero de cada conexión.
+        pub async fn next(&mut self, kind: &str) -> serde_json::Value {
+            let wait = async {
+                loop {
+                    let mut v = self.got.recv().await.expect("el hub de mentira se cerró");
+                    if v.get(kind).is_some() {
+                        return v[kind].take();
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), wait)
+                .await
+                .unwrap_or_else(|_| panic!("no llegó «{kind}»"))
+        }
+
+        /// El siguiente texto del nido, sea el que sea.
+        pub async fn next_any(&mut self) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(10), self.got.recv())
+                .await
+                .expect("no llegó nada")
+                .expect("el hub de mentira se cerró")
+        }
+
+        /// Que no llegue ningún `{kind: …}` en `wait` (los demás se saltan).
+        pub async fn quiet(&mut self, kind: &str, wait: Duration) {
+            let deadline = tokio::time::Instant::now() + wait;
+            while let Ok(Some(v)) = tokio::time::timeout_at(deadline, self.got.recv()).await {
+                assert!(v.get(kind).is_none(), "no tenía que llegar: {v}");
+            }
+        }
+
+        pub fn tell(&self, t: Tell) {
+            self.tell.send(t).unwrap();
+        }
+    }
+
+    /// Un hub que acepta conexiones una tras otra, pide la firma (no la comprueba), da el id
+    /// `este`, graba todo lo que manda el nido (la firma también) y contesta según `answer`.
+    pub async fn recording(
+        answer: impl Fn(&serde_json::Value) -> Option<Reply> + Send + 'static,
+    ) -> Recorder {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (got_tx, got) = mpsc::unbounded_channel();
+        let (tell, mut tell_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                    continue;
+                };
+                let challenge = serde_json::json!({ "challenge": B64.encode([7u8; 32]) });
+                if ws
+                    .send(Message::Text(challenge.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                loop {
+                    tokio::select! {
+                        m = ws.next() => {
+                            let Some(Ok(m)) = m else { break };
+                            let Message::Text(t) = m else { continue };
+                            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                            let first = v.get("pub").is_some();
+                            let reply = answer(&v);
+                            let _ = got_tx.send(v);
+                            if first {
+                                let _ = ws.send(Message::Text(r#"{"id":"este"}"#.into())).await;
+                                continue;
+                            }
+                            match reply {
+                                Some(Reply::Send(r)) => {
+                                    let _ = ws.send(Message::Text(r.to_string().into())).await;
+                                }
+                                Some(Reply::Close) => break,
+                                Some(Reply::Silent) | None => {}
+                            }
+                        }
+                        t = tell_rx.recv() => match t {
+                            Some(Tell::Send(v)) => {
+                                let _ = ws.send(Message::Text(v.to_string().into())).await;
+                            }
+                            Some(Tell::Hangup) => break,
+                            None => return,
+                        },
+                    }
+                }
+                let _ = ws.close(None).await;
+            }
+        });
+        Recorder { addr, got, tell }
     }
 
     /// Conecta `hub` al hub de mentira de `addr` y espera a que esté conectado.
