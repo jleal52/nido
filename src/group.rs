@@ -48,12 +48,97 @@ pub struct Device {
     pub removed: bool,
 }
 
+/// Una clave del tablero de la cuenta (el llavero que comparten los equipos del grupo y que se
+/// da a sus dispositivos). Es secreta: no sale en `Debug`.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardKey {
+    /// `board_kid` de la clave: la identifica en cada objeto cifrado con ella.
+    pub kid: String,
+    /// Los 32 bytes de la clave, en base64 estándar.
+    pub key: String,
+    /// Último cambio (ms).
+    pub at: u64,
+    /// Desde cuándo está retirada (ms): ya no se cifra con ella, pero se sigue pudiendo leer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired: Option<u64>,
+    #[serde(default)]
+    pub removed: bool,
+}
+
+impl std::fmt::Debug for BoardKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoardKey")
+            .field("kid", &self.kid)
+            .field("key", &"<oculta>")
+            .field("at", &self.at)
+            .field("retired", &self.retired)
+            .field("removed", &self.removed)
+            .finish()
+    }
+}
+
+impl BoardKey {
+    /// Una clave nueva, al azar.
+    pub fn generate(at: u64) -> Self {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("aleatorio");
+        Self {
+            kid: board_kid(&key),
+            key: B64.encode(key),
+            at,
+            retired: None,
+            removed: false,
+        }
+    }
+}
+
+/// El id de una clave del tablero: `hex(SHA-256("nido-board-kid" || clave))[0..16]`, sobre los 32
+/// bytes en bruto. Es el mismo en nido, la web y la app.
+pub fn board_kid(key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"nido-board-kid");
+    h.update(key);
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Las claves del tablero que siguen en el llavero (las retiradas también; las borradas no),
+/// por `kid`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Keyring {
+    pub keys: Vec<BoardKey>,
+}
+
+impl Keyring {
+    pub fn of(st: &State) -> Self {
+        let mut keys: Vec<BoardKey> = st.keys.iter().filter(|k| !k.removed).cloned().collect();
+        keys.sort_by(|a, b| a.kid.cmp(&b.kid));
+        Self { keys }
+    }
+
+    /// Con la que se cifra: la no retirada más nueva por `at` y, a igualdad, la de `kid` menor.
+    /// Así todos los equipos eligen la misma sin ponerse de acuerdo.
+    pub fn current(&self) -> Option<&BoardKey> {
+        self.keys
+            .iter()
+            .filter(|k| !k.removed && k.retired.is_none())
+            .min_by(|a, b| b.at.cmp(&a.at).then_with(|| a.kid.cmp(&b.kid)))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub members: Vec<Member>,
     #[serde(default)]
     pub devices: Vec<Device>,
+    /// El llavero del tablero. Un nido de antes (0.9.1) no lo conoce: le llega vacío y, como
+    /// juntar es una unión, no borra las nuestras.
+    #[serde(default)]
+    pub keys: Vec<BoardKey>,
 }
 
 /// La entrada más reciente; a igual hora, la baja gana (no resucita lo quitado).
@@ -89,6 +174,18 @@ impl State {
             }
         }
         self.devices = devices.into_values().collect();
+        let mut keys: BTreeMap<String, BoardKey> =
+            self.keys.drain(..).map(|k| (k.kid.clone(), k)).collect();
+        for k in &other.keys {
+            match keys.get(&k.kid) {
+                Some(cur) if !newer(cur.at, cur.removed, k.at, k.removed) => {}
+                _ => {
+                    keys.insert(k.kid.clone(), k.clone());
+                    changed = true;
+                }
+            }
+        }
+        self.keys = keys.into_values().collect();
         changed
     }
 
@@ -182,7 +279,7 @@ impl Group {
     }
 
     /// Junta el estado de otro equipo; si cambió, lo guarda. Si a este equipo lo han sacado del
-    /// grupo, se queda solo (con sus dispositivos).
+    /// grupo, se queda solo (con sus dispositivos, pero sin el llavero del tablero).
     pub fn merge(&self, other: &State) -> bool {
         let mut st = self.state.lock().expect("grupo");
         let changed = st.merge(other);
@@ -198,6 +295,8 @@ impl Group {
                     me.removed = false;
                     me.at = now_ms();
                 }
+                // El tablero sigue a la casa: el equipo que sale no se lleva sus claves.
+                st.keys.clear();
             }
             self.save(&st);
         }
@@ -360,6 +459,61 @@ impl Group {
             .collect()
     }
 
+    // ---------- el llavero del tablero ----------
+
+    pub fn board_keys(&self) -> Keyring {
+        Keyring::of(&self.state.lock().expect("grupo"))
+    }
+
+    /// La clave actual; si no hay ninguna activa, la crea.
+    pub fn ensure_board_key(&self) -> BoardKey {
+        let mut current = None;
+        self.change(|st| {
+            if let Some(k) = Keyring::of(st).current() {
+                current = Some(k.clone());
+                return;
+            }
+            let k = BoardKey::generate(next_key_at(st));
+            st.keys.push(k.clone());
+            current = Some(k);
+        });
+        current.expect("clave actual")
+    }
+
+    /// Una clave nueva, que pasa a ser la actual; las demás quedan retiradas desde ahora (las que
+    /// ya lo estaban conservan su fecha). Devuelve la nueva.
+    pub fn rotate_board_key(&self) -> BoardKey {
+        let mut new = None;
+        self.change(|st| {
+            for k in st
+                .keys
+                .iter_mut()
+                .filter(|k| !k.removed && k.retired.is_none())
+            {
+                let t = now_ms().max(k.at + 1);
+                k.retired = Some(t);
+                k.at = t;
+            }
+            let k = BoardKey::generate(next_key_at(st));
+            st.keys.push(k.clone());
+            new = Some(k);
+        });
+        new.expect("clave nueva")
+    }
+
+    /// Quita una clave del llavero (en todo el grupo). Devuelve si estaba.
+    pub fn drop_board_key(&self, kid: &str) -> bool {
+        let mut found = false;
+        self.change(|st| {
+            for k in st.keys.iter_mut().filter(|k| k.kid == kid && !k.removed) {
+                k.removed = true;
+                k.at = now_ms().max(k.at + 1);
+                found = true;
+            }
+        });
+        found
+    }
+
     // ---------- invitar ----------
 
     /// Un código para que otro equipo se una (el anterior deja de valer). Hace falta estar
@@ -450,6 +604,13 @@ pub fn parse_invite(code: &str) -> Result<InviteCode, String> {
     })
 }
 
+/// La hora de una clave nueva: posterior a la de todas las que hay, para que gane al juntar
+/// aunque algún reloj vaya adelantado.
+fn next_key_at(st: &State) -> u64 {
+    let last = st.keys.iter().map(|k| k.at + 1).max().unwrap_or(0);
+    now_ms().max(last)
+}
+
 fn clean(n: &str) -> String {
     let n: String = n.chars().filter(|c| !c.is_control()).take(60).collect();
     let n = n.trim();
@@ -488,10 +649,12 @@ mod tests {
         let mut a = State {
             members: vec![member("wsl", 10, false)],
             devices: vec![device("iphone", 10, false), device("chrome", 20, false)],
+            keys: vec![],
         };
         let b = State {
             members: vec![member("mac", 15, false)],
             devices: vec![device("iphone", 30, true), device("chrome", 20, true)],
+            keys: vec![],
         };
         assert!(a.merge(&b));
         assert_eq!(a.live_members().count(), 2);
@@ -503,12 +666,14 @@ mod tests {
         c.merge(&State {
             members: vec![member("wsl", 10, false)],
             devices: vec![device("iphone", 10, false), device("chrome", 20, false)],
+            keys: vec![],
         });
         assert_eq!(c, a);
         // Un emparejamiento posterior lo vuelve a autorizar.
         assert!(a.merge(&State {
             members: vec![],
-            devices: vec![device("iphone", 40, false)]
+            devices: vec![device("iphone", 40, false)],
+            keys: vec![],
         }));
         assert!(a.device("iphone").is_some());
     }
@@ -655,6 +820,7 @@ mod tests {
         let theirs = State {
             members: vec![member("mac", now_ms() + 1, false)],
             devices: vec![],
+            keys: vec![],
         };
         assert!(g.merge(&theirs));
         bumped(&mut rx, "merge con cambios");
@@ -666,6 +832,18 @@ mod tests {
         assert!(!g.remove_member("nadie"));
         g.remove_device("nadie");
         assert!(!rx.has_changed().unwrap(), "quitar lo que no está");
+        // El llavero: crear la primera avisa; pedirla otra vez, no.
+        let first = g.ensure_board_key();
+        bumped(&mut rx, "ensure_board_key");
+        assert_eq!(g.ensure_board_key(), first);
+        assert!(!rx.has_changed().unwrap(), "ensure_board_key con clave");
+        g.rotate_board_key();
+        bumped(&mut rx, "rotate_board_key");
+        assert!(g.drop_board_key(&first.kid));
+        bumped(&mut rx, "drop_board_key");
+        assert!(!g.drop_board_key(&first.kid));
+        assert!(!g.drop_board_key("nadie"));
+        assert!(!rx.has_changed().unwrap(), "quitar una clave que no está");
     }
 
     #[test]
@@ -684,5 +862,269 @@ mod tests {
         g.add_member("otro", "k-otro", "mac");
         assert_eq!(*a.borrow_and_update(), 3);
         assert_eq!(*b.borrow_and_update(), 3);
+    }
+
+    // ---------- el llavero ----------
+
+    fn board_key(kid: &str, at: u64, retired: Option<u64>, removed: bool) -> BoardKey {
+        BoardKey {
+            kid: kid.into(),
+            key: B64.encode([kid.len() as u8; 32]),
+            at,
+            retired,
+            removed,
+        }
+    }
+
+    fn keys_state(keys: Vec<BoardKey>) -> State {
+        State {
+            keys,
+            ..State::default()
+        }
+    }
+
+    /// El `kid` sale de la clave en bruto (los 32 bytes, no su base64).
+    #[test]
+    fn the_kid_comes_from_the_raw_key() {
+        assert_eq!(board_kid(&[0u8; 32]), "cf1718d3fe1a8755");
+        let seq: Vec<u8> = (0u8..32).collect();
+        assert_eq!(board_kid(&seq), "1ffd9bb07aebb8f4");
+        let k = BoardKey::generate(5);
+        assert_eq!(k.kid, board_kid(&B64.decode(&k.key).unwrap()));
+        assert_eq!(B64.decode(&k.key).unwrap().len(), 32);
+        assert_eq!(k.at, 5);
+        assert_eq!((k.retired, k.removed), (None, false));
+        assert_ne!(BoardKey::generate(5).key, k.key, "cada una al azar");
+    }
+
+    /// Un nido 0.9.1 no conoce `keys`: lo que manda no las trae, y juntarlo no las borra.
+    #[test]
+    fn a_state_without_keys_keeps_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        g.set_self("yo", "wsl");
+        let ours = g.ensure_board_key();
+        let old: State = serde_json::from_str(&format!(
+            r#"{{"members":[{{"id":"mac","key":"k-mac","name":"mac","at":{},"removed":false}}],"devices":[]}}"#,
+            now_ms() + 1
+        ))
+        .unwrap();
+        assert!(old.keys.is_empty());
+        assert!(g.merge(&old));
+        assert_eq!(g.others().len(), 1, "lo suyo entra");
+        assert_eq!(g.board_keys().current(), Some(&ours), "lo nuestro sigue");
+        // Y al revés: lo que él guarde y nos devuelva sin `keys` tampoco las quita.
+        let back: serde_json::Value = serde_json::to_value(g.snapshot()).unwrap();
+        let mut back = back.as_object().unwrap().clone();
+        back.remove("keys");
+        let back: State = serde_json::from_value(back.into()).unwrap();
+        assert!(!g.merge(&back));
+        assert_eq!(g.board_keys().current(), Some(&ours));
+    }
+
+    /// Dos equipos crean su primera clave a la vez: al juntarse, los dos eligen la misma.
+    #[test]
+    fn keys_made_at_once_pick_the_same_current() {
+        // A igual `at`, la de `kid` menor; da igual el orden en que se junten.
+        let a = keys_state(vec![board_key("bbbbbbbbbbbbbbbb", 100, None, false)]);
+        let b = keys_state(vec![board_key("aaaaaaaaaaaaaaaa", 100, None, false)]);
+        let mut ab = a.clone();
+        assert!(ab.merge(&b));
+        let mut ba = b.clone();
+        assert!(ba.merge(&a));
+        assert_eq!(ab, ba);
+        assert_eq!(
+            Keyring::of(&ab).current().map(|k| k.kid.as_str()),
+            Some("aaaaaaaaaaaaaaaa")
+        );
+        // A distinto `at`, la más nueva.
+        let c = keys_state(vec![board_key("cccccccccccccccc", 101, None, false)]);
+        assert!(ab.merge(&c));
+        assert_eq!(
+            Keyring::of(&ab).current().map(|k| k.kid.as_str()),
+            Some("cccccccccccccccc")
+        );
+
+        // Y con dos grupos de verdad.
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let g1 = Group::load(d1.path().join("group.json"), [1u8; 32]);
+        let g2 = Group::load(d2.path().join("group.json"), [2u8; 32]);
+        let k1 = g1.ensure_board_key();
+        let k2 = g2.ensure_board_key();
+        assert_ne!(k1.kid, k2.kid);
+        assert!(g1.merge(&g2.snapshot()));
+        assert!(g2.merge(&g1.snapshot()));
+        let c1 = g1.board_keys().current().cloned().unwrap();
+        let c2 = g2.board_keys().current().cloned().unwrap();
+        assert_eq!(c1, c2);
+        assert_eq!(
+            g1.board_keys().keys.len(),
+            2,
+            "la otra sigue: hay objetos con ella"
+        );
+        // Pedir la clave ya no crea otra.
+        assert_eq!(g1.ensure_board_key(), c1);
+        assert_eq!(g2.ensure_board_key(), c1);
+    }
+
+    /// Rotar retira las demás, y la retirada llega a los otros equipos (aunque se rote en el
+    /// mismo milisegundo en que se creó).
+    #[test]
+    fn a_retired_key_merges() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let g1 = Group::load(d1.path().join("group.json"), [1u8; 32]);
+        let g2 = Group::load(d2.path().join("group.json"), [2u8; 32]);
+        let old = g1.ensure_board_key();
+        assert!(g2.merge(&g1.snapshot()));
+        assert_eq!(g2.board_keys().current(), Some(&old));
+        let new = g1.rotate_board_key();
+        assert_ne!(new.kid, old.kid);
+        assert_eq!(g1.board_keys().current(), Some(&new));
+        assert!(g2.merge(&g1.snapshot()));
+        let ring = g2.board_keys();
+        assert_eq!(ring.current(), Some(&new));
+        let retired = ring.keys.iter().find(|k| k.kid == old.kid).unwrap();
+        assert!(retired.retired.is_some(), "retirada también en el otro");
+        assert!(retired.at > old.at, "el cambio gana al juntar");
+        assert_eq!(g1.board_keys(), g2.board_keys());
+        // Rotar otra vez no vuelve a sellar la ya retirada (su plazo de 30 días sigue).
+        let since = retired.retired;
+        let newer_key = g1.rotate_board_key();
+        let ring = g1.board_keys();
+        assert_eq!(ring.current(), Some(&newer_key));
+        let first = ring.keys.iter().find(|k| k.kid == old.kid).unwrap();
+        assert_eq!(first.retired, since);
+        assert!(
+            ring.keys
+                .iter()
+                .find(|k| k.kid == new.kid)
+                .unwrap()
+                .retired
+                .is_some()
+        );
+        // Lo retirado no es la actual aunque sea lo más nuevo por `at`.
+        let st = keys_state(vec![
+            board_key("aaaaaaaaaaaaaaaa", 100, None, false),
+            board_key("bbbbbbbbbbbbbbbb", 200, Some(200), false),
+        ]);
+        assert_eq!(
+            Keyring::of(&st).current().map(|k| k.kid.as_str()),
+            Some("aaaaaaaaaaaaaaaa")
+        );
+    }
+
+    /// A igual `at`, el borrado gana (y no resucita), en los dos órdenes.
+    #[test]
+    fn a_removed_key_wins_ties() {
+        let live = keys_state(vec![board_key("aaaaaaaaaaaaaaaa", 100, None, false)]);
+        let gone = keys_state(vec![board_key("aaaaaaaaaaaaaaaa", 100, None, true)]);
+        let mut a = live.clone();
+        assert!(a.merge(&gone));
+        let mut b = gone.clone();
+        assert!(!b.merge(&live));
+        assert_eq!(a, b);
+        assert!(a.keys[0].removed);
+        assert!(Keyring::of(&a).current().is_none());
+        assert!(
+            Keyring::of(&a).keys.is_empty(),
+            "el llavero no da las borradas"
+        );
+        // Una más nueva sí gana al borrado.
+        let back = keys_state(vec![board_key("aaaaaaaaaaaaaaaa", 101, None, false)]);
+        assert!(a.merge(&back));
+        assert!(!a.keys[0].removed);
+
+        // Quitar la actual deja sin actual, y pedirla crea otra.
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let k = g.ensure_board_key();
+        assert!(g.drop_board_key(&k.kid));
+        assert!(g.board_keys().current().is_none());
+        let dropped = g
+            .snapshot()
+            .keys
+            .into_iter()
+            .find(|x| x.kid == k.kid)
+            .unwrap();
+        assert!(
+            dropped.removed && dropped.at > k.at,
+            "la baja gana al juntar"
+        );
+        let k2 = g.ensure_board_key();
+        assert_ne!(k2.kid, k.kid);
+    }
+
+    /// El equipo al que sacan del grupo se queda sin claves (decisión 8): el tablero sigue a la
+    /// casa. También en el disco.
+    #[test]
+    fn the_removed_machine_has_no_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        g.set_self("yo", "wsl");
+        g.add_member("otro", "k-otro", "mac");
+        g.ensure_board_key();
+        g.rotate_board_key();
+        let mut st = g.snapshot();
+        for m in st.members.iter_mut().filter(|m| m.id == "yo") {
+            m.removed = true;
+            m.at = now_ms() + 1;
+        }
+        assert!(g.merge(&st));
+        assert!(g.snapshot().keys.is_empty());
+        assert!(g.board_keys().current().is_none());
+        let again = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        assert!(again.snapshot().keys.is_empty(), "ni en el disco");
+        assert_eq!(again.self_id().as_deref(), Some("yo"));
+    }
+
+    /// El `State` entero va en un mensaje Noise de 65535 bytes: con 8 claves (con lápidas) y un
+    /// grupo grande, el JSON compacto que viaja queda muy por debajo.
+    #[test]
+    fn eight_keys_fit_in_one_message() {
+        let mut st = State::default();
+        for i in 0..12 {
+            st.members.push(Member {
+                id: format!("{i:026}"),
+                key: B64.encode([i as u8; 32]),
+                name: "un nombre de equipo bastante largo".into(),
+                at: now_ms(),
+                removed: i % 4 == 0,
+            });
+        }
+        for i in 0..60 {
+            st.devices.push(Device {
+                key: B64.encode([100 + i as u8; 32]),
+                name: "Firefox en el portátil de casa".into(),
+                at: now_ms(),
+                removed: i % 3 == 0,
+            });
+        }
+        for i in 0..8 {
+            let mut k = BoardKey::generate(now_ms());
+            if i < 6 {
+                k.retired = Some(now_ms());
+            }
+            k.removed = i == 0;
+            st.keys.push(k);
+        }
+        let one = serde_json::to_vec(&st.keys[1]).unwrap().len();
+        assert!(one <= 140, "una clave ocupa {one} bytes");
+        let wire = serde_json::to_vec(&st).unwrap().len();
+        assert!(wire < 16 * 1024, "el estado ocupa {wire} bytes");
+        assert!(wire < crate::e2e::MAX_MSG);
+    }
+
+    /// La clave es secreta: ni en `Debug` del llavero ni en el del estado.
+    #[test]
+    fn debug_hides_the_key() {
+        let k = BoardKey::generate(1);
+        let st = keys_state(vec![k.clone()]);
+        let ring = Keyring::of(&st);
+        for out in [format!("{k:?}"), format!("{st:?}"), format!("{ring:?}")] {
+            assert!(!out.contains(&k.key), "se ve la clave: {out}");
+            assert!(out.contains(&k.kid), "el kid sí: {out}");
+        }
     }
 }
