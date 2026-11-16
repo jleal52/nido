@@ -844,17 +844,20 @@ async fn group_sync<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) 
     let Some(key) = hs.get_remote_static().map(|k| B64.encode(k)) else {
         return;
     };
-    if g.state_for(&key).is_none() {
+    if g.peer_state(&key).is_none() {
         return;
     }
     let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload[..n]) else {
         return;
     };
     // De uno ya quitado no entra nada, y se le contesta sin el llavero (ver `merge_from` y
-    // `state_for`): solo se entera de que está fuera.
+    // `peer_state`): solo se entera de que está fuera.
     let changed = g.merge_from(&key, &theirs);
-    let ours = g.state_for(&key).unwrap_or_default();
-    let reply = serde_json::to_vec(&ours).unwrap_or_default();
+    // Si entre medias ha dejado de ser del grupo, ni se le contesta.
+    let Some(ours) = g.peer_state(&key) else {
+        return;
+    };
+    let reply = serde_json::to_vec(&ours.into_state()).unwrap_or_default();
     let mut msg2 = vec![0u8; MAX_MSG];
     if let Ok(n) = hs.write_message(&reply, &mut msg2) {
         msg2.truncate(n);
@@ -1013,10 +1016,7 @@ where
         let Ok(key) = <[u8; 32]>::try_from(key) else {
             continue;
         };
-        if !g.is_live(&m.key) {
-            continue;
-        }
-        let Some(ours) = g.state_for(&m.key) else {
+        let Some(crate::group::PeerState::Live(ours)) = g.peer_state(&m.key) else {
             continue;
         };
         let ours = serde_json::to_vec(&ours).unwrap_or_default();
@@ -2128,9 +2128,9 @@ mod tests {
         );
         let host = group_host(dir.path(), &mac, &viejo);
         let g = host.group.as_ref().unwrap();
-        let ours = g.ensure_board_key();
+        let ours = g.ensure_board_key().unwrap();
         let theirs = || crate::group::State {
-            keys: vec![crate::group::BoardKey::generate(now() + 60_000)],
+            keys: vec![crate::group::BoardKey::generate(now() + 60_000).unwrap()],
             ..Default::default()
         };
 
@@ -2177,7 +2177,7 @@ mod tests {
         );
         let host = group_host(dir.path(), &mac, &viejo);
         let g = host.group.as_ref().unwrap();
-        g.ensure_board_key();
+        g.ensure_board_key().unwrap();
         let before = g.snapshot();
         let later = now() + 60_000;
         let member = |id: &str, key: &[u8; 32]| crate::group::Member {
@@ -2199,7 +2199,7 @@ mod tests {
                 at: later,
                 removed: false,
             }],
-            keys: vec![crate::group::BoardKey::generate(later)],
+            keys: vec![crate::group::BoardKey::generate(later).unwrap()],
         };
         let reply = sync_with(&host, &viejo, &sent).await.expect("contesta");
         assert!(reply.keys.is_empty());
@@ -2234,7 +2234,7 @@ mod tests {
         );
         let host = group_host(dir.path(), &mac, &viejo);
         let g = host.group.as_ref().unwrap();
-        let ours = g.ensure_board_key();
+        let ours = g.ensure_board_key().unwrap();
         let empty = crate::group::State::default();
         assert!(
             sync_with(&host, &viejo, &empty)
@@ -2266,7 +2266,7 @@ mod tests {
 
         // Ya dentro, sincroniza normal: da y recibe claves.
         let mine = crate::group::State {
-            keys: vec![crate::group::BoardKey::generate(now())],
+            keys: vec![crate::group::BoardKey::generate(now()).unwrap()],
             ..Default::default()
         };
         let reply = sync_with(&host, &viejo, &mine).await.expect("contesta");
@@ -2317,7 +2317,7 @@ mod tests {
         g.set_self("yo-id", "Yo");
         g.add_member("a-mac", &ka, "A");
         g.add_member("b-viejo", &kb, "B");
-        let ours = g.ensure_board_key();
+        let ours = g.ensure_board_key().unwrap();
         // A ya sabe que B está fuera.
         let ga = crate::group::Group::load(da.join("group.json"), ida.public);
         ga.set_self("a-mac", "A");
@@ -2332,6 +2332,9 @@ mod tests {
         let a = host_with(&da, ida, ga);
         let b = host_with(&db, idb, gb);
 
+        // A va antes que B: así la respuesta de A llega antes de llamar a B.
+        let order: Vec<String> = g.others().into_iter().map(|m| m.id).collect();
+        assert_eq!(order, ["a-mac", "b-viejo"]);
         let to_b = std::sync::atomic::AtomicUsize::new(0);
         let learned = sync_members(&g, &yo, |id, first| {
             let (a, b, to_b) = (a.clone(), b.clone(), &to_b);
@@ -2353,7 +2356,10 @@ mod tests {
             0,
             "a B no se le llama"
         );
-        assert!(!g.is_live(&kb), "B sigue fuera");
+        assert!(
+            matches!(g.peer_state(&kb), Some(crate::group::PeerState::Removed(_))),
+            "B sigue fuera"
+        );
         let gb = b.group.as_ref().unwrap();
         assert!(
             gb.board_keys().keys.iter().all(|k| k.kid != ours.kid),

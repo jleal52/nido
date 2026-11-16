@@ -18,8 +18,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 const INVITE_LIFE: Duration = Duration::from_secs(600);
-/// Cada cuánto, como mucho, se avisa de claves del tablero que llegan mal.
-const BAD_KEY_QUIET: Duration = Duration::from_secs(3600);
+/// Cada cuánto, como mucho, se avisa de claves del tablero que llegan mal o de un llavero que
+/// pasa del tope.
+const KEY_WARN_QUIET: Duration = Duration::from_secs(3600);
+/// Lo más que se acepta por delante de nuestro reloj en una clave que llega: con un `at` del
+/// futuro lejano ganaría al juntar para siempre.
+const KEY_FUTURE_MS: u64 = 24 * 3600 * 1000;
+/// Cuántas entradas (lápidas incluidas) se esperan como mucho en el llavero: el `State` entero
+/// viaja en un mensaje Noise de 65535 bytes, y cada una ocupa unos 140. Aquí solo se avisa si se
+/// pasa; podar las borradas y las retiradas sin uso es de la Tarea 9.
+pub const MAX_BOARD_KEYS: usize = 16;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -52,6 +60,10 @@ pub struct Device {
 
 /// Una clave del tablero de la cuenta (el llavero que comparten los equipos del grupo y que se
 /// da a sus dispositivos). Es secreta: no sale en `Debug`.
+///
+/// No se usa `zeroize`: la clave va en base64 dentro de `State`, que se clona en cada instantánea,
+/// se serializa para sincronizar y se guarda en claro en group.json (0600). Borrar una de esas
+/// copias al soltarla no protegería nada; lo que la protege es el 0600 y no imprimirla nunca.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardKey {
     /// `board_kid` de la clave: la identifica en cada objeto cifrado con ella.
@@ -80,8 +92,17 @@ impl std::fmt::Debug for BoardKey {
 }
 
 impl BoardKey {
-    /// ¿Su `kid` es el de su clave? Una lápida sin clave, también vale.
+    /// ¿Está bien formada? Su `kid` son 16 hex y es el de su clave; una lápida sin clave vale
+    /// con el `kid` bien formado.
     pub fn fits(&self) -> bool {
+        let kid_ok = self.kid.len() == 16
+            && self
+                .kid
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !kid_ok {
+            return false;
+        }
         if self.key.is_empty() {
             return self.removed;
         }
@@ -89,18 +110,45 @@ impl BoardKey {
             .is_ok_and(|k| k.len() == 32 && board_kid(&k) == self.kid)
     }
 
-    /// Una clave nueva, al azar.
-    pub fn generate(at: u64) -> Self {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).expect("aleatorio");
+    /// La clave con estos 32 bytes.
+    pub fn from_raw(key: &[u8; 32], at: u64) -> Self {
         Self {
-            kid: board_kid(&key),
+            kid: board_kid(key),
             key: B64.encode(key),
             at,
             retired: None,
             removed: false,
         }
     }
+
+    /// Una clave nueva, al azar.
+    pub fn generate(at: u64) -> std::io::Result<Self> {
+        Ok(Self::from_raw(&random_key()?, at))
+    }
+
+    /// Activa < retirada < borrada: a igual `at`, gana la de rango mayor.
+    fn rank(&self) -> u8 {
+        if self.removed {
+            2
+        } else if self.retired.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// ¿`self` gana a `cur` al juntar? La de `at` mayor; a igual `at`, la de rango mayor (y,
+    /// entre dos retiradas, la retirada después), para que todos acaben con la misma.
+    fn beats(&self, cur: &BoardKey) -> bool {
+        (self.at, self.rank(), self.retired) > (cur.at, cur.rank(), cur.retired)
+    }
+}
+
+/// 32 bytes al azar para una clave del tablero.
+fn random_key() -> std::io::Result<[u8; 32]> {
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(std::io::Error::other)?;
+    Ok(key)
 }
 
 /// El id de una clave del tablero: `hex(SHA-256("nido-board-kid" || clave))[0..16]`, sobre los 32
@@ -189,7 +237,7 @@ impl State {
             self.keys.drain(..).map(|k| (k.kid.clone(), k)).collect();
         for k in &other.keys {
             match keys.get(&k.kid) {
-                Some(cur) if !newer(cur.at, cur.removed, k.at, k.removed) => {}
+                Some(cur) if !k.beats(cur) => {}
                 _ => {
                     let mut k = k.clone();
                     // Una lápida no guarda el secreto, aunque quien la manda no lo vaciara.
@@ -233,6 +281,34 @@ struct Invite {
     expires: Instant,
 }
 
+/// Lo que se le cuenta a otro equipo al sincronizar, según lo que es en el grupo.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PeerState {
+    /// Un miembro vivo: el estado entero, y lo suyo se junta.
+    Live(State),
+    /// Uno ya quitado: el estado sin el llavero, para que se entere de que está fuera (pero no
+    /// lea lo que se cifre después); de lo suyo no se junta nada (ver `merge_from`).
+    Removed(State),
+}
+
+impl PeerState {
+    pub fn into_state(self) -> State {
+        match self {
+            PeerState::Live(st) | PeerState::Removed(st) => st,
+        }
+    }
+}
+
+/// ¿Toca avisar? Como mucho una vez cada `quiet`.
+fn quietly(slot: &Mutex<Option<Instant>>, quiet: Duration) -> bool {
+    let mut said = slot.lock().expect("aviso");
+    if said.is_some_and(|t| t.elapsed() < quiet) {
+        return false;
+    }
+    *said = Some(Instant::now());
+    true
+}
+
 pub struct Group {
     path: PathBuf,
     /// La clave pública de este nido, base64.
@@ -244,14 +320,39 @@ pub struct Group {
     revision: watch::Sender<u64>,
     /// Cuándo se avisó por última vez de una clave que llegó mal (para no llenar el registro).
     bad_key_said: Mutex<Option<Instant>>,
+    /// Y de un llavero que pasa de `MAX_BOARD_KEYS`.
+    many_keys_said: Mutex<Option<Instant>>,
 }
 
 impl Group {
+    /// Lo guardado en `path`. Si no se entiende (roto, vacío o sin UTF-8), no se pisa en
+    /// silencio: se aparta como `group.json.bad-<ms>`, se avisa y se sigue con el grupo vacío.
     pub fn load(path: PathBuf, own_key: [u8; 32]) -> Self {
-        let state = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let broken = |why: String| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let aside = path.with_file_name(format!("{name}.bad-{}", now_ms()));
+            match std::fs::rename(&path, &aside) {
+                Ok(()) => eprintln!(
+                    "nido: el grupo guardado no se entiende ({why}); apartado en {}, se sigue \
+                     sin grupo",
+                    aside.display()
+                ),
+                Err(e) => eprintln!(
+                    "nido: el grupo guardado no se entiende ({why}) ni se pudo apartar ({e}); \
+                     se sigue sin grupo"
+                ),
+            }
+            State::default()
+        };
+        let state = match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| broken(e.to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => broken(e.to_string()),
+            Err(e) => {
+                eprintln!("nido: no se pudo leer el grupo: {e}; se sigue sin grupo");
+                State::default()
+            }
+        };
         Self {
             path,
             own_key: B64.encode(own_key),
@@ -259,6 +360,7 @@ impl Group {
             invite: Mutex::new(None),
             revision: watch::Sender::new(0),
             bad_key_said: Mutex::new(None),
+            many_keys_said: Mutex::new(None),
         }
     }
 
@@ -269,24 +371,57 @@ impl Group {
 
     /// Guarda el estado cambiado. Se llama con el estado bloqueado; la revisión la sube después
     /// quien llama (`bump`), ya sin él.
+    ///
     /// Solo para el usuario (0600): lleva el llavero del tablero. Un temporal que quedara de
-    /// antes se quita primero, porque los permisos solo se ponen al crear el fichero.
-    fn save(&self, st: &State) {
+    /// antes se quita primero, porque los permisos solo se ponen al crear el fichero. Se escribe
+    /// entero en el disco (`sync_all`) antes de renombrarlo, y luego la carpeta, para que una
+    /// clave que ya se ha dado no se pierda en un corte de luz.
+    fn save(&self, st: &State) -> std::io::Result<()> {
         use std::io::Write;
         let tmp = self.path.with_extension("json.tmp");
-        let write = || -> std::io::Result<()> {
-            if let Some(dir) = self.path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let body = serde_json::to_vec_pretty(st)?;
-            let _ = std::fs::remove_file(&tmp);
-            crate::sys::private(std::fs::OpenOptions::new().write(true).create_new(true))
-                .open(&tmp)?
-                .write_all(&body)?;
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let body = serde_json::to_vec_pretty(st)?;
+        let _ = std::fs::remove_file(&tmp);
+        let written = (|| {
+            let mut f =
+                crate::sys::private(std::fs::OpenOptions::new().write(true).create_new(true))
+                    .open(&tmp)?;
+            f.write_all(&body)?;
+            f.sync_all()?;
             std::fs::rename(&tmp, &self.path)
-        };
-        if let Err(e) = write() {
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written?;
+        // La carpeta, para que el renombrado también quede en el disco. Si el sistema no deja
+        // (Windows, algunos montajes), el fichero ya está escrito: no es un fallo.
+        #[cfg(unix)]
+        if let Some(dir) = self.path.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Guarda, y si no se puede lo apunta: el cambio ya está en memoria y se volverá a intentar
+    /// guardar en el siguiente.
+    fn save_or_say(&self, st: &State) {
+        if let Err(e) = self.save(st) {
             eprintln!("nido: no se pudo guardar el grupo: {e}");
+        }
+    }
+
+    /// Avisa (con freno) si el llavero pasa del tope.
+    fn check_key_count(&self, st: &State) {
+        if st.keys.len() > MAX_BOARD_KEYS && quietly(&self.many_keys_said, KEY_WARN_QUIET) {
+            eprintln!(
+                "nido: el llavero del tablero tiene {} entradas (se esperan como mucho {MAX_BOARD_KEYS})",
+                st.keys.len()
+            );
         }
     }
 
@@ -310,26 +445,19 @@ impl Group {
         self.merge_if(other, |_| true)
     }
 
-    /// ¿Es un miembro vivo del grupo (por su clave)?
-    pub fn is_live(&self, key_b64: &str) -> bool {
-        self.state
-            .lock()
-            .expect("grupo")
-            .member_by_key(key_b64)
-            .is_some()
-    }
-
-    /// Lo que se le cuenta a otro equipo al sincronizar: nada si no es del grupo; el estado sin
-    /// el llavero si ya está fuera (para que se entere, pero no lea lo que se cifre después).
-    pub fn state_for(&self, key_b64: &str) -> Option<State> {
+    /// Lo que se le cuenta a otro equipo (por su clave) al sincronizar: nada si no es del grupo;
+    /// si ya está fuera, el estado sin el llavero. Lo usan quien llama y quien contesta.
+    pub fn peer_state(&self, key_b64: &str) -> Option<PeerState> {
         let mut st = self.snapshot();
         if !st.members.iter().any(|m| m.key == key_b64) {
             return None;
         }
-        if st.member_by_key(key_b64).is_none() {
+        if st.member_by_key(key_b64).is_some() {
+            Some(PeerState::Live(st))
+        } else {
             st.keys.clear();
+            Some(PeerState::Removed(st))
         }
-        Some(st)
     }
 
     /// Junta lo que cuenta otro equipo, solo si es un miembro vivo (se mira con el mismo cerrojo
@@ -363,7 +491,8 @@ impl Group {
                 // El tablero sigue a la casa: el equipo que sale no se lleva sus claves.
                 st.keys.clear();
             }
-            self.save(&st);
+            self.check_key_count(&st);
+            self.save_or_say(&st);
         }
         drop(st);
         if changed {
@@ -372,17 +501,20 @@ impl Group {
         changed
     }
 
-    /// `other` sin las claves cuyo `kid` no es el de su clave (de un fallo o de alguien que se hace
-    /// pasar por otra). Se avisa con freno y sin el secreto.
+    /// `other` sin las claves mal formadas (`kid` que no es de 16 hex o no es el de su clave: un
+    /// fallo o alguien que se hace pasar por otra) ni las de más de un día por delante de nuestro
+    /// reloj. Se avisa con freno y sin el secreto.
     fn fitting_keys<'a>(&self, other: &'a State) -> std::borrow::Cow<'a, State> {
-        if other.keys.iter().all(BoardKey::fits) {
+        let horizon = now_ms().saturating_add(KEY_FUTURE_MS);
+        let ok = |k: &BoardKey| k.fits() && k.at <= horizon;
+        if other.keys.iter().all(ok) {
             return std::borrow::Cow::Borrowed(other);
         }
         let mut st = other.clone();
         let bad: Vec<String> = st
             .keys
             .iter()
-            .filter(|k| !k.fits())
+            .filter(|k| !ok(k))
             .map(|k| {
                 k.kid
                     .chars()
@@ -391,19 +523,18 @@ impl Group {
                     .collect()
             })
             .collect();
-        st.keys.retain(BoardKey::fits);
-        let mut said = self.bad_key_said.lock().expect("aviso");
-        if said.is_none_or(|t| t.elapsed() >= BAD_KEY_QUIET) {
-            *said = Some(Instant::now());
+        st.keys.retain(ok);
+        if quietly(&self.bad_key_said, KEY_WARN_QUIET) {
             eprintln!(
-                "nido: claves del tablero que no casan con su kid, descartadas: {}",
+                "nido: claves del tablero mal formadas o del futuro, descartadas: {}",
                 bad.join(", ")
             );
         }
         std::borrow::Cow::Owned(st)
     }
 
-    /// Cambia el estado y, si de verdad cambió, lo guarda.
+    /// Cambia el estado y, si de verdad cambió, lo guarda. Si no se puede guardar, lo apunta y
+    /// el cambio se queda en memoria.
     fn change(&self, f: impl FnOnce(&mut State)) {
         let changed = {
             let mut st = self.state.lock().expect("grupo");
@@ -411,13 +542,35 @@ impl Group {
             f(&mut st);
             let changed = *st != before;
             if changed {
-                self.save(&st);
+                self.check_key_count(&st);
+                self.save_or_say(&st);
             }
             changed
         };
         if changed {
             self.bump();
         }
+    }
+
+    /// Como `change`, pero el cambio solo llega a memoria si antes quedó en el disco: para lo que
+    /// se da fuera (una clave del tablero) y no puede perderse al reiniciar.
+    fn change_saved<T>(&self, f: impl FnOnce(&mut State) -> T) -> std::io::Result<T> {
+        let (out, changed) = {
+            let mut st = self.state.lock().expect("grupo");
+            let mut next = st.clone();
+            let out = f(&mut next);
+            let changed = next != *st;
+            if changed {
+                self.save(&next)?;
+                self.check_key_count(&next);
+                *st = next;
+            }
+            (out, changed)
+        };
+        if changed {
+            self.bump();
+        }
+        Ok(out)
     }
 
     /// Este equipo, con su id en el hub (se conoce al conectar con él) y su nombre.
@@ -561,26 +714,29 @@ impl Group {
         Keyring::of(&self.state.lock().expect("grupo"))
     }
 
-    /// La clave actual; si no hay ninguna activa, la crea.
-    pub fn ensure_board_key(&self) -> BoardKey {
-        let mut current = None;
-        self.change(|st| {
+    /// La clave actual; si no hay ninguna activa, la crea. Una nueva solo se da si ya quedó en
+    /// el disco: si no, se perdería al reiniciar y lo cifrado con ella quedaría ilegible.
+    pub fn ensure_board_key(&self) -> std::io::Result<BoardKey> {
+        if let Some(k) = self.board_keys().current() {
+            return Ok(k.clone());
+        }
+        let raw = random_key()?;
+        self.change_saved(|st| {
             if let Some(k) = Keyring::of(st).current() {
-                current = Some(k.clone());
-                return;
+                return k.clone();
             }
-            let k = BoardKey::generate(next_key_at(st));
+            let k = BoardKey::from_raw(&raw, next_key_at(st));
             st.keys.push(k.clone());
-            current = Some(k);
-        });
-        current.expect("clave actual")
+            k
+        })
     }
 
     /// Una clave nueva, que pasa a ser la actual; las demás quedan retiradas desde ahora (las que
-    /// ya lo estaban conservan su fecha). Devuelve la nueva.
-    pub fn rotate_board_key(&self) -> BoardKey {
-        let mut new = None;
-        self.change(|st| {
+    /// ya lo estaban conservan su fecha). Devuelve la nueva, solo si ya quedó en el disco; si no,
+    /// no cambia nada.
+    pub fn rotate_board_key(&self) -> std::io::Result<BoardKey> {
+        let raw = random_key()?;
+        self.change_saved(|st| {
             for k in st
                 .keys
                 .iter_mut()
@@ -590,11 +746,10 @@ impl Group {
                 k.retired = Some(t);
                 k.at = t;
             }
-            let k = BoardKey::generate(next_key_at(st));
+            let k = BoardKey::from_raw(&raw, next_key_at(st));
             st.keys.push(k.clone());
-            new = Some(k);
-        });
-        new.expect("clave nueva")
+            k
+        })
     }
 
     /// Quita una clave del llavero (en todo el grupo). La lápida se queda sin el secreto: para
@@ -936,11 +1091,11 @@ mod tests {
         g.remove_device("nadie");
         assert!(!rx.has_changed().unwrap(), "quitar lo que no está");
         // El llavero: crear la primera avisa; pedirla otra vez, no.
-        let first = g.ensure_board_key();
+        let first = g.ensure_board_key().unwrap();
         bumped(&mut rx, "ensure_board_key");
-        assert_eq!(g.ensure_board_key(), first);
+        assert_eq!(g.ensure_board_key().unwrap(), first);
         assert!(!rx.has_changed().unwrap(), "ensure_board_key con clave");
-        g.rotate_board_key();
+        g.rotate_board_key().unwrap();
         bumped(&mut rx, "rotate_board_key");
         assert!(g.drop_board_key(&first.kid));
         bumped(&mut rx, "drop_board_key");
@@ -997,12 +1152,16 @@ mod tests {
         assert_eq!(board_kid(&[0u8; 32]), "cf1718d3fe1a8755");
         let seq: Vec<u8> = (0u8..32).collect();
         assert_eq!(board_kid(&seq), "1ffd9bb07aebb8f4");
-        let k = BoardKey::generate(5);
+        let k = BoardKey::generate(5).unwrap();
         assert_eq!(k.kid, board_kid(&B64.decode(&k.key).unwrap()));
         assert_eq!(B64.decode(&k.key).unwrap().len(), 32);
         assert_eq!(k.at, 5);
         assert_eq!((k.retired, k.removed), (None, false));
-        assert_ne!(BoardKey::generate(5).key, k.key, "cada una al azar");
+        assert_ne!(
+            BoardKey::generate(5).unwrap().key,
+            k.key,
+            "cada una al azar"
+        );
     }
 
     /// Un nido 0.9.1 no conoce `keys`: lo que manda no las trae, y juntarlo no las borra.
@@ -1011,7 +1170,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
         g.set_self("yo", "wsl");
-        let ours = g.ensure_board_key();
+        let ours = g.ensure_board_key().unwrap();
         let old: State = serde_json::from_str(&format!(
             r#"{{"members":[{{"id":"mac","key":"k-mac","name":"mac","at":{},"removed":false}}],"devices":[]}}"#,
             now_ms() + 1
@@ -1058,8 +1217,8 @@ mod tests {
         let d2 = tempfile::tempdir().unwrap();
         let g1 = Group::load(d1.path().join("group.json"), [1u8; 32]);
         let g2 = Group::load(d2.path().join("group.json"), [2u8; 32]);
-        let k1 = g1.ensure_board_key();
-        let k2 = g2.ensure_board_key();
+        let k1 = g1.ensure_board_key().unwrap();
+        let k2 = g2.ensure_board_key().unwrap();
         assert_ne!(k1.kid, k2.kid);
         assert!(g1.merge(&g2.snapshot()));
         assert!(g2.merge(&g1.snapshot()));
@@ -1072,8 +1231,8 @@ mod tests {
             "la otra sigue: hay objetos con ella"
         );
         // Pedir la clave ya no crea otra.
-        assert_eq!(g1.ensure_board_key(), c1);
-        assert_eq!(g2.ensure_board_key(), c1);
+        assert_eq!(g1.ensure_board_key().unwrap(), c1);
+        assert_eq!(g2.ensure_board_key().unwrap(), c1);
     }
 
     /// Rotar retira las demás, y la retirada llega a los otros equipos (aunque se rote en el
@@ -1084,10 +1243,10 @@ mod tests {
         let d2 = tempfile::tempdir().unwrap();
         let g1 = Group::load(d1.path().join("group.json"), [1u8; 32]);
         let g2 = Group::load(d2.path().join("group.json"), [2u8; 32]);
-        let old = g1.ensure_board_key();
+        let old = g1.ensure_board_key().unwrap();
         assert!(g2.merge(&g1.snapshot()));
         assert_eq!(g2.board_keys().current(), Some(&old));
-        let new = g1.rotate_board_key();
+        let new = g1.rotate_board_key().unwrap();
         assert_ne!(new.kid, old.kid);
         assert_eq!(g1.board_keys().current(), Some(&new));
         assert!(g2.merge(&g1.snapshot()));
@@ -1099,7 +1258,7 @@ mod tests {
         assert_eq!(g1.board_keys(), g2.board_keys());
         // Rotar otra vez no vuelve a sellar la ya retirada (su plazo de 30 días sigue).
         let since = retired.retired;
-        let newer_key = g1.rotate_board_key();
+        let newer_key = g1.rotate_board_key().unwrap();
         let ring = g1.board_keys();
         assert_eq!(ring.current(), Some(&newer_key));
         let first = ring.keys.iter().find(|k| k.kid == old.kid).unwrap();
@@ -1147,7 +1306,7 @@ mod tests {
         // Quitar la actual deja sin actual, y pedirla crea otra.
         let dir = tempfile::tempdir().unwrap();
         let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
-        let k = g.ensure_board_key();
+        let k = g.ensure_board_key().unwrap();
         assert!(g.drop_board_key(&k.kid));
         assert!(g.board_keys().current().is_none());
         let dropped = g
@@ -1160,7 +1319,7 @@ mod tests {
             dropped.removed && dropped.at > k.at,
             "la baja gana al juntar"
         );
-        let k2 = g.ensure_board_key();
+        let k2 = g.ensure_board_key().unwrap();
         assert_ne!(k2.kid, k.kid);
     }
 
@@ -1172,8 +1331,8 @@ mod tests {
         let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
         g.set_self("yo", "wsl");
         g.add_member("otro", "k-otro", "mac");
-        g.ensure_board_key();
-        g.rotate_board_key();
+        g.ensure_board_key().unwrap();
+        g.rotate_board_key().unwrap();
         let mut st = g.snapshot();
         for m in st.members.iter_mut().filter(|m| m.id == "yo") {
             m.removed = true;
@@ -1210,7 +1369,7 @@ mod tests {
             });
         }
         for i in 0..8 {
-            let mut k = BoardKey::generate(now_ms());
+            let mut k = BoardKey::generate(now_ms()).unwrap();
             if i < 6 {
                 k.retired = Some(now_ms());
             }
@@ -1236,13 +1395,13 @@ mod tests {
         std::fs::write(&tmp, b"de antes").unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
         let g = Group::load(path.clone(), [1u8; 32]);
-        g.ensure_board_key();
+        g.ensure_board_key().unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(!tmp.exists());
         // Y un fichero de antes, con otros permisos, también queda solo para el usuario.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
-        g.rotate_board_key();
+        g.rotate_board_key().unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
@@ -1254,7 +1413,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("group.json");
         let g = Group::load(path.clone(), [1u8; 32]);
-        let k = g.ensure_board_key();
+        let k = g.ensure_board_key().unwrap();
         let before = g.snapshot();
         assert!(g.drop_board_key(&k.kid));
         let wire = serde_json::to_string(&g.snapshot()).unwrap();
@@ -1284,11 +1443,18 @@ mod tests {
     /// Un `at` al borde (de un reloj o un equipo raro) no desborda.
     #[test]
     fn a_huge_at_does_not_overflow() {
+        // Por la red no entra (viene del futuro); del disco, sí.
         let dir = tempfile::tempdir().unwrap();
-        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
-        let edge = BoardKey::generate(u64::MAX);
-        assert!(g.merge(&keys_state(vec![edge.clone()])));
-        let new = g.rotate_board_key();
+        let path = dir.path().join("group.json");
+        let edge = BoardKey::generate(u64::MAX).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&keys_state(vec![edge.clone()])).unwrap(),
+        )
+        .unwrap();
+        let g = Group::load(path, [1u8; 32]);
+        assert_eq!(g.board_keys().current(), Some(&edge));
+        let new = g.rotate_board_key().unwrap();
         assert_eq!(new.at, u64::MAX);
         assert!(g.drop_board_key(&edge.kid));
     }
@@ -1303,7 +1469,7 @@ mod tests {
         g.add_member("mac", "k-mac", "mac");
         g.add_member("viejo", "k-viejo", "viejo");
         assert!(g.remove_member("viejo"));
-        let ours = g.ensure_board_key();
+        let ours = g.ensure_board_key().unwrap();
         let before = g.snapshot();
         let later = now_ms() + 60_000;
         let theirs = State {
@@ -1318,24 +1484,31 @@ mod tests {
                 member("intruso", later, false),
             ],
             devices: vec![device("colado", later, false)],
-            keys: vec![BoardKey::generate(later)],
+            keys: vec![BoardKey::generate(later).unwrap()],
         };
-        assert!(g.is_live("k-mac"));
-        assert!(!g.is_live("k-viejo"));
-        assert!(!g.is_live("k-nadie"));
+        assert!(matches!(g.peer_state("k-mac"), Some(PeerState::Live(_))));
+        assert!(matches!(
+            g.peer_state("k-viejo"),
+            Some(PeerState::Removed(_))
+        ));
+        assert!(g.peer_state("k-nadie").is_none());
         // Del quitado no entra nada, ni dándose de alta a sí mismo.
         assert!(!g.merge_from("k-viejo", &theirs));
         assert_eq!(g.snapshot(), before);
         // Y se entera de que está fuera, sin claves.
-        let told = g.state_for("k-viejo").unwrap();
+        let Some(PeerState::Removed(told)) = g.peer_state("k-viejo") else {
+            panic!("quitado")
+        };
         assert!(told.keys.is_empty());
         assert!(told.members.iter().any(|m| m.id == "viejo" && m.removed));
         // A uno de fuera, nada; de él, tampoco.
-        assert!(g.state_for("k-nadie").is_none());
         assert!(!g.merge_from("k-nadie", &theirs));
         assert_eq!(g.snapshot(), before);
         // Un miembro vivo recibe las claves, y lo suyo entra.
-        assert!(g.state_for("k-mac").unwrap().keys.contains(&ours));
+        let Some(PeerState::Live(told)) = g.peer_state("k-mac") else {
+            panic!("vivo")
+        };
+        assert!(told.keys.contains(&ours));
         assert!(g.merge_from("k-mac", &theirs));
         assert!(
             g.board_keys()
@@ -1351,11 +1524,11 @@ mod tests {
     fn keys_must_match_their_kid() {
         let dir = tempfile::tempdir().unwrap();
         let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
-        let good = BoardKey::generate(10);
-        let mut forged = BoardKey::generate(10);
+        let good = BoardKey::generate(10).unwrap();
+        let mut forged = BoardKey::generate(10).unwrap();
         forged.kid = good.kid.clone();
         forged.at = 20;
-        let mut liar = BoardKey::generate(10);
+        let mut liar = BoardKey::generate(10).unwrap();
         liar.kid = "0123456789abcdef".into();
         let tomb = BoardKey {
             kid: "fedcba9876543210".into(),
@@ -1378,6 +1551,19 @@ mod tests {
             retired: None,
             removed: false,
         };
+        let bad_tomb = |kid: &str| BoardKey {
+            kid: kid.into(),
+            ..tomb.clone()
+        };
+        for kid in [
+            "",
+            "fedcba987654321",
+            "fedcba98765432100",
+            "FEDCBA9876543210",
+            "zzzzzzzzzzzzzzzz",
+        ] {
+            assert!(!bad_tomb(kid).fits(), "lápida con kid {kid:?}");
+        }
         assert!(good.fits() && tomb.fits());
         assert!(!forged.fits() && !liar.fits() && !empty.fits() && !junk.fits());
         assert!(g.merge(&keys_state(vec![
@@ -1396,10 +1582,123 @@ mod tests {
         assert_eq!(g.board_keys().current(), Some(&good));
     }
 
+    /// Una clave no se da si no ha quedado en el disco, y entonces tampoco se queda en memoria.
+    #[test]
+    fn a_key_is_not_handed_out_unless_saved() {
+        // Ni se puede crear la carpeta: el padre es un fichero.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fichero");
+        std::fs::write(&file, b"no es una carpeta").unwrap();
+        let g = Group::load(file.join("group.json"), [1u8; 32]);
+        let rx = g.subscribe();
+        assert!(g.ensure_board_key().is_err());
+        assert!(g.snapshot().keys.is_empty(), "en memoria tampoco");
+        assert!(!rx.has_changed().unwrap(), "no avisa");
+        assert!(g.rotate_board_key().is_err());
+        assert!(g.snapshot().keys.is_empty());
+
+        // Rotar con el disco roto (en el sitio del fichero hay una carpeta que no se pisa): la
+        // actual sigue siendo la de antes, sin retirar.
+        let path = dir.path().join("group.json");
+        let g = Group::load(path.clone(), [1u8; 32]);
+        let k = g.ensure_board_key().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("dentro"), b"x").unwrap();
+        let mut rx = g.subscribe();
+        rx.borrow_and_update();
+        assert!(g.rotate_board_key().is_err());
+        assert_eq!(g.snapshot().keys, vec![k.clone()]);
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(
+            g.ensure_board_key().unwrap(),
+            k,
+            "la que ya había no hace falta guardarla"
+        );
+    }
+
+    /// Un group.json que no se entiende (roto o vacío) no se pisa en silencio: se aparta como
+    /// `group.json.bad-<ms>` y se sigue con el grupo vacío.
+    #[test]
+    fn a_broken_group_file_is_set_aside() {
+        for (what, body) in [("roto", &b"{\"members\": ["[..]), ("vacío", &b""[..])] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("group.json");
+            std::fs::write(&path, body).unwrap();
+            let g = Group::load(path.clone(), [1u8; 32]);
+            assert_eq!(g.snapshot(), State::default(), "{what}");
+            assert!(!path.exists(), "{what}: no se queda donde estaba");
+            let aside: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.starts_with("group.json.bad-"))
+                .collect();
+            assert_eq!(aside.len(), 1, "{what}: {aside:?}");
+            assert_eq!(std::fs::read(dir.path().join(&aside[0])).unwrap(), body);
+        }
+        // Sin fichero, nada que apartar.
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        assert_eq!(g.snapshot(), State::default());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A igual `at`, gana por rango: activa < retirada < borrada; en los dos sentidos.
+    #[test]
+    fn key_ties_go_by_rank() {
+        let kid = "aaaaaaaaaaaaaaaa";
+        let active = keys_state(vec![board_key(kid, 100, None, false)]);
+        let retired = keys_state(vec![board_key(kid, 100, Some(100), false)]);
+        let removed = keys_state(vec![board_key(kid, 100, None, true)]);
+        for (low, high) in [
+            (&active, &retired),
+            (&retired, &removed),
+            (&active, &removed),
+        ] {
+            let mut a = low.clone();
+            assert!(a.merge(high));
+            let mut b = high.clone();
+            assert!(!b.merge(low));
+            assert_eq!(a, b);
+            assert_eq!(a, *high);
+        }
+        assert!(
+            Keyring::of(&{
+                let mut a = active.clone();
+                a.merge(&retired);
+                a
+            })
+            .current()
+            .is_none()
+        );
+    }
+
+    /// Una clave que llega con un `at` de más de un día por delante no entra: con él ganaría
+    /// para siempre.
+    #[test]
+    fn keys_from_the_future_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let day = 24 * 3600 * 1000;
+        let soon = BoardKey::generate(now_ms() + 3600 * 1000).unwrap();
+        let far = BoardKey::generate(now_ms() + day + 60_000).unwrap();
+        assert!(g.merge(&keys_state(vec![soon.clone(), far])));
+        assert_eq!(g.snapshot().keys, vec![soon]);
+    }
+
+    /// El freno de los avisos: el primero sale, los siguientes en un rato no.
+    #[test]
+    fn warnings_are_rate_limited() {
+        let slot = Mutex::new(None);
+        assert!(quietly(&slot, Duration::from_secs(3600)));
+        assert!(!quietly(&slot, Duration::from_secs(3600)));
+        assert!(quietly(&slot, Duration::ZERO));
+    }
+
     /// La clave es secreta: ni en `Debug` del llavero ni en el del estado.
     #[test]
     fn debug_hides_the_key() {
-        let k = BoardKey::generate(1);
+        let k = BoardKey::generate(1).unwrap();
         let st = keys_state(vec![k.clone()]);
         let ring = Keyring::of(&st);
         for out in [format!("{k:?}"), format!("{st:?}"), format!("{ring:?}")] {
