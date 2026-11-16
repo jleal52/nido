@@ -848,16 +848,16 @@ async fn group_sync<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) 
     if !ours.members.iter().any(|m| m.key == key) {
         return;
     }
-    // Al que ya está fuera, el llavero del tablero ni se le da ni se le coge: no leería lo que
-    // se cifre después ni podría colar una clave suya como la actual.
+    // A uno ya quitado (según lo que sabíamos antes de oírle) solo se le cuenta que está fuera:
+    // de lo suyo no se junta nada. Si no, se daría de alta él solo con su entrada más nueva y
+    // `removed: false`, colaría miembros, dispositivos o una clave suya como la actual, y en la
+    // siguiente se llevaría el llavero. Tampoco se le da el llavero: no leería lo que se cifre
+    // después. Volver es con una invitación nueva (`group_join`), que lo da de alta.
     let live = ours.member_by_key(&key).is_some();
-    let Ok(mut theirs) = serde_json::from_slice::<crate::group::State>(&payload[..n]) else {
+    let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload[..n]) else {
         return;
     };
-    if !live {
-        theirs.keys.clear();
-    }
-    let changed = g.merge(&theirs);
+    let changed = live && g.merge(&theirs);
     let mut ours = g.snapshot();
     if !live {
         ours.keys.clear();
@@ -2128,6 +2128,120 @@ mod tests {
         // Y uno de fuera ni recibe respuesta.
         let otro = new_identity(dir.path(), "otro");
         assert_eq!(sync_with(&host, &otro, &theirs()).await, None);
+    }
+
+    /// Lo que manda un quitado no entra: ni se da de alta a sí mismo con una hora más nueva, ni
+    /// cuela otros miembros, dispositivos o claves. Y sigue sin recibir el llavero.
+    #[tokio::test]
+    async fn a_removed_member_cannot_bring_itself_back() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let g = host.group.as_ref().unwrap();
+        g.ensure_board_key();
+        let before = g.snapshot();
+        let later = now() + 60_000;
+        let member = |id: &str, key: &[u8; 32]| crate::group::Member {
+            id: id.into(),
+            key: B64.encode(key),
+            name: id.into(),
+            at: later,
+            removed: false,
+        };
+        let intruso = new_identity(dir.path(), "intruso");
+        let sent = crate::group::State {
+            members: vec![
+                member("viejo-id", &viejo.public),
+                member("intruso-id", &intruso.public),
+            ],
+            devices: vec![crate::group::Device {
+                key: B64.encode([9u8; 32]),
+                name: "Colado".into(),
+                at: later,
+                removed: false,
+            }],
+            keys: vec![crate::group::BoardKey::generate(later)],
+        };
+        let reply = sync_with(&host, &viejo, &sent).await.expect("contesta");
+        assert!(reply.keys.is_empty());
+        assert_eq!(g.snapshot(), before, "no entra nada de lo suyo");
+        assert!(
+            g.snapshot()
+                .member_by_key(&B64.encode(viejo.public))
+                .is_none()
+        );
+        assert!(!g.has_device(&[9u8; 32]));
+        // En la siguiente, igual: sigue fuera y sin claves.
+        let reply = sync_with(&host, &viejo, &sent).await.expect("contesta");
+        assert!(reply.keys.is_empty(), "sigue sin claves");
+        assert!(
+            reply
+                .members
+                .iter()
+                .any(|m| m.id == "viejo-id" && m.removed)
+        );
+        assert_eq!(g.snapshot(), before);
+    }
+
+    /// Volver al grupo es con una invitación nueva: entonces sincroniza como uno más y recibe
+    /// el llavero.
+    #[tokio::test]
+    async fn a_removed_member_comes_back_with_an_invite() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let g = host.group.as_ref().unwrap();
+        let ours = g.ensure_board_key();
+        let empty = crate::group::State::default();
+        assert!(
+            sync_with(&host, &viejo, &empty)
+                .await
+                .unwrap()
+                .keys
+                .is_empty()
+        );
+
+        g.invite("https://hub.ejemplo", "yo-id");
+        let secret = g.current_invite().unwrap();
+        let hello = serde_json::json!({"id": "viejo-id", "name": "Viejo", "state": empty});
+        let (dial, first) = Dial::start(
+            &viejo,
+            &host.identity().public,
+            Some(&secret),
+            hello.to_string().as_bytes(),
+        )
+        .unwrap();
+        let reply = exchange_with(&host, first).await.expect("contesta");
+        let joined: crate::group::State =
+            serde_json::from_slice(&dial.finish(&reply).unwrap()).unwrap();
+        assert!(joined.keys.iter().any(|k| k.kid == ours.kid), "al unirse");
+        assert!(
+            g.snapshot()
+                .member_by_key(&B64.encode(viejo.public))
+                .is_some()
+        );
+
+        // Ya dentro, sincroniza normal: da y recibe claves.
+        let mine = crate::group::State {
+            keys: vec![crate::group::BoardKey::generate(now())],
+            ..Default::default()
+        };
+        let reply = sync_with(&host, &viejo, &mine).await.expect("contesta");
+        assert!(reply.keys.iter().any(|k| k.kid == ours.kid));
+        assert!(
+            g.board_keys()
+                .keys
+                .iter()
+                .any(|k| k.kid == mine.keys[0].kid)
+        );
     }
 
     #[tokio::test]
