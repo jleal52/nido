@@ -180,6 +180,65 @@ const SESSION_WAIT: Duration = Duration::from_secs(1);
 /// Los pedidos que esperan respuesta del hub, por su número.
 type Waiters = Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>;
 
+/// De qué es un pedido al hub que espera respuesta.
+#[derive(Clone, Copy)]
+enum Asking {
+    Voice,
+    Session,
+}
+
+impl Asking {
+    /// La clave del pedido (`{"voice":…}`, `{"session":…}`).
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Voice => "voice",
+            Self::Session => "session",
+        }
+    }
+}
+
+/// Un texto de control hacia el hub.
+struct Control {
+    text: String,
+    /// Si es un pedido que espera respuesta, con qué saber al sacarlo de la cola si todavía
+    /// hace falta: si su plazo venció o ya no lo espera nadie, no sale (lo que diera el hub no le
+    /// serviría a nadie y gastaría cupo de su freno).
+    ask: Option<Asked>,
+}
+
+impl Control {
+    /// Un texto que no espera respuesta: sale siempre.
+    fn text(msg: serde_json::Value) -> Self {
+        Self {
+            text: msg.to_string(),
+            ask: None,
+        }
+    }
+}
+
+/// Un pedido en la cola de control: de qué, su número y hasta cuándo se espera la respuesta.
+struct Asked {
+    of: Asking,
+    req: u64,
+    deadline: tokio::time::Instant,
+}
+
+/// Quita un pedido de los que esperan respuesta cuando `ask` acaba, sea como sea: con la
+/// respuesta, con el plazo vencido o porque quien lo pidió dejó de esperar.
+struct Forget<'a> {
+    waiters: &'a Waiters,
+    req: u64,
+}
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.req);
+    }
+}
+
 /// Por qué un pedido al hub se quedó sin respuesta.
 enum Unanswered {
     /// No había conexión, o se cerró con el pedido en marcha.
@@ -198,8 +257,9 @@ pub struct Hub {
     /// Los textos de control hacia el hub (el grupo, los dispositivos, las bajas, los pedidos
     /// de voz y de sesión), mientras haya conexión: una cola aparte, sin límite (son pocos y
     /// pequeños), para que no se pierdan con `out` lleno (los flujos de los móviles pueden
-    /// llenarlo) y salgan en el orden en que se mandaron.
-    control: Mutex<Option<mpsc::UnboundedSender<Message>>>,
+    /// llenarlo) y salgan en el orden en que se mandaron. Los pedidos que ya no hacen falta
+    /// (`Control::ask`) se descartan al sacarlos.
+    control: Mutex<Option<mpsc::UnboundedSender<Control>>>,
     pending: Pending,
     /// Los pedidos de token de voz que esperan respuesta (lo que vino en `voiced`).
     voice_pending: Waiters,
@@ -300,12 +360,20 @@ impl Hub {
         }
     }
 
-    /// Manda `{kind: {"req": N, …}}` (lo de `body`, con su número) y espera lo que conteste el
-    /// hub con ese número, que le entrega el despachador de los textos (`answered`).
+    /// Los que esperan respuesta a los pedidos de `of`.
+    fn waiters(&self, of: Asking) -> &Waiters {
+        match of {
+            Asking::Voice => &self.voice_pending,
+            Asking::Session => &self.session_pending,
+        }
+    }
+
+    /// Manda `{kind: {"req": N, …}}` (lo de `body`, con su número) y espera, como mucho `wait`,
+    /// lo que conteste el hub con ese número, que le entrega el despachador de los textos
+    /// (`answered`). Si el plazo vence antes de que el pedido salga, ya no sale.
     async fn ask(
         &self,
-        waiters: &Waiters,
-        kind: &str,
+        of: Asking,
         mut body: serde_json::Map<String, serde_json::Value>,
         wait: Duration,
     ) -> Result<serde_json::Value, Unanswered> {
@@ -315,33 +383,49 @@ impl Hub {
             .expect("hub")
             .clone()
             .ok_or(Unanswered::NoHub)?;
+        let deadline = tokio::time::Instant::now() + wait;
+        let waiters = self.waiters(of);
         let req = self.next_req.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         waiters.lock().expect("pedidos").insert(req, tx);
+        let _forget = Forget { waiters, req };
         body.insert("req".into(), req.into());
         let mut msg = serde_json::Map::new();
-        msg.insert(kind.into(), body.into());
-        let msg = serde_json::Value::Object(msg);
-        if control.send(Message::Text(msg.to_string().into())).is_err() {
-            waiters.lock().expect("pedidos").remove(&req);
+        msg.insert(of.kind().into(), body.into());
+        let msg = Control {
+            text: serde_json::Value::Object(msg).to_string(),
+            ask: Some(Asked { of, req, deadline }),
+        };
+        if control.send(msg).is_err() {
             return Err(Unanswered::NoHub);
         }
-        match tokio::time::timeout(wait, rx).await {
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(v)) => Ok(v),
             // Se cerró la conexión con el pedido en marcha (ver `disconnected`).
             Ok(Err(_)) => Err(Unanswered::NoHub),
-            Err(_) => {
-                waiters.lock().expect("pedidos").remove(&req);
-                Err(Unanswered::Silent)
-            }
+            Err(_) => Err(Unanswered::Silent),
         }
+    }
+
+    /// Si lo que sale de la cola de control todavía hace falta: un pedido, si no ha vencido su
+    /// plazo y alguien espera aún la respuesta; lo demás, siempre. Solo se mira al sacarlo de la
+    /// cola: si luego se queda atascado al mandarlo (`tx.send(…).await`), puede salir vencido.
+    fn wanted(&self, c: &Control) -> bool {
+        let Some(a) = &c.ask else { return true };
+        tokio::time::Instant::now() < a.deadline
+            && self
+                .waiters(a.of)
+                .lock()
+                .expect("pedidos")
+                .get(&a.req)
+                .is_some_and(|w| !w.is_closed())
     }
 
     /// Pide al hub un token de voz para que la web o la app hablen con el modelo directamente.
     /// Devuelve lo que da el hub (`token`, `expires`, `project`, `location`, `host`, `model`).
     pub async fn voice_token(&self) -> Result<serde_json::Value, VoiceError> {
         let mut v = match self
-            .ask(&self.voice_pending, "voice", Default::default(), VOICE_WAIT)
+            .ask(Asking::Voice, Default::default(), VOICE_WAIT)
             .await
         {
             Ok(v) => v,
@@ -368,10 +452,7 @@ impl Hub {
         if let Some(d) = device {
             body.insert("device".into(), d.into());
         }
-        let mut v = match self
-            .ask(&self.session_pending, "session", body, SESSION_WAIT)
-            .await
-        {
+        let mut v = match self.ask(Asking::Session, body, SESSION_WAIT).await {
             Ok(v) => v,
             Err(Unanswered::NoHub) => return Err(SessionError::NoHub),
             Err(Unanswered::Silent) => return Err(SessionError::NotOffered),
@@ -406,7 +487,7 @@ impl Hub {
         }
         let msg = serde_json::json!({ "group": { "ids": ids, "at": crate::group::now_ms() } });
         // Solo falla si la conexión ya se acabó: al reconectar se vuelve a mandar.
-        if control.send(Message::Text(msg.to_string().into())).is_ok() {
+        if control.send(Control::text(msg)).is_ok() {
             sent.group = Some(ids);
         }
     }
@@ -426,7 +507,7 @@ impl Hub {
             return;
         }
         let msg = serde_json::json!({ "devices": { "ids": ids } });
-        if control.send(Message::Text(msg.to_string().into())).is_ok() {
+        if control.send(Control::text(msg)).is_ok() {
             sent.devices = true;
         }
     }
@@ -438,7 +519,7 @@ impl Hub {
         let control = self.control.lock().expect("hub").clone();
         let Some(control) = control else { return };
         let msg = serde_json::json!({ "unsession": { "device": device } });
-        let _ = control.send(Message::Text(msg.to_string().into()));
+        let _ = control.send(Control::text(msg));
     }
 
     /// Si es una respuesta `{"voiced":{"req":N,…}}`, se la entrega a quien la espera. Devuelve
@@ -750,7 +831,7 @@ async fn run<H: e2e::Host>(
 
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
     // `control_tx` vive aquí también: la cola no se cierra mientras dure la conexión.
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Control>();
     *hub.out.lock().expect("hub") = Some(out_tx.clone());
     {
         // Una conexión nueva: el grupo y los dispositivos se vuelven a mandar.
@@ -776,8 +857,11 @@ async fn run<H: e2e::Host>(
                 let Some(m) = m else { return Ok(()) };
                 tx.send(m).await.map_err(|e| e.to_string())?;
             }
-            Some(m) = control_rx.recv() => {
-                tx.send(m).await.map_err(|e| e.to_string())?;
+            Some(c) = control_rx.recv() => {
+                // Un pedido que ya no hace falta (venció o nadie lo espera) no sale.
+                if hub.wanted(&c) {
+                    tx.send(Message::Text(c.text.into())).await.map_err(|e| e.to_string())?;
+                }
             }
             msg = rx.next() => match msg {
                 Some(Ok(Message::Binary(b))) if b.len() >= 5 => {
@@ -1318,6 +1402,80 @@ mod tests {
         );
         let none = Hub::new(tmp.path().join("otro.json"));
         none.unsession("a1b2c3");
+    }
+
+    /// Lo que le llega al hub de mentira antes de la marca: un `unsession` de `marca`, que sale
+    /// detrás por la misma cola (en orden).
+    async fn sent_before_the_mark(hub: &Hub, rec: &mut fake::Recorder) -> Vec<serde_json::Value> {
+        hub.unsession("marca");
+        let mut sent = vec![];
+        loop {
+            let v = rec.next_any().await;
+            if v["unsession"]["device"] == "marca" {
+                return sent;
+            }
+            sent.push(v);
+        }
+    }
+
+    /// Un pedido cuyo plazo vence antes de salir por la conexión (un hub lento, una reconexión)
+    /// ya no sale: lo que diera el hub no le serviría a nadie y gastaría cupo de su freno.
+    #[tokio::test]
+    async fn an_expired_ask_is_not_sent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        let r = hub
+            .ask(Asking::Session, Default::default(), Duration::ZERO)
+            .await;
+        assert!(matches!(r, Err(Unanswered::Silent)));
+        let sent = sent_before_the_mark(&hub, &mut rec).await;
+        assert!(sent.iter().all(|v| v.get("session").is_none()), "{sent:?}");
+    }
+
+    /// Basta con el plazo: aunque quien lo pidió siga esperando, si venció, no sale.
+    #[tokio::test]
+    async fn an_expired_ask_is_not_sent_even_if_awaited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        let (tx, _rx) = oneshot::channel();
+        hub.session_pending.lock().unwrap().insert(77, tx);
+        let control = hub.control.lock().unwrap().clone().unwrap();
+        let ask = Asked {
+            of: Asking::Session,
+            req: 77,
+            deadline: tokio::time::Instant::now(),
+        };
+        let text = serde_json::json!({ "session": { "req": 77 } }).to_string();
+        assert!(
+            control
+                .send(Control {
+                    text,
+                    ask: Some(ask)
+                })
+                .is_ok()
+        );
+        let sent = sent_before_the_mark(&hub, &mut rec).await;
+        assert!(sent.iter().all(|v| v.get("session").is_none()), "{sent:?}");
+    }
+
+    /// Ni uno que ya no espera nadie (quien lo pidió se fue antes de que saliera): tampoco se
+    /// queda entre los que esperan respuesta.
+    #[tokio::test]
+    async fn an_ask_nobody_waits_for_is_not_sent() {
+        use futures_util::FutureExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        // Se pide y se deja de esperar enseguida, antes de que el pedido salga.
+        assert!(hub.hub_session(Some("a1b2c3")).now_or_never().is_none());
+        assert!(hub.voice_token().now_or_never().is_none());
+        let sent = sent_before_the_mark(&hub, &mut rec).await;
+        assert!(
+            sent.iter()
+                .all(|v| v.get("session").is_none() && v.get("voice").is_none()),
+            "{sent:?}"
+        );
+        assert!(hub.session_pending.lock().unwrap().is_empty());
+        assert!(hub.voice_pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -766,7 +766,11 @@ fn add_group_info<H: Host>(host: &H, reply: &mut serde_json::Value) {
         reply["hub"] = hub.into();
         reply["nido"] = id.into();
     }
-    // Lo que pone el hub, solo si cabe: si no, no se podría emparejar ni conectar.
+    if let Some(g) = host.group() {
+        reply["group"] = serde_json::to_value(g.members()).unwrap_or_default();
+    }
+    // Lo que pone el hub, solo si cabe: si no, no se podría emparejar ni conectar. Va lo
+    // último, para medir con todo lo demás ya puesto.
     if let Some(account) = host.account() {
         reply["account"] = account;
         if reply.to_string().len() + MSG2_OVERHEAD > MAX_MSG
@@ -774,9 +778,6 @@ fn add_group_info<H: Host>(host: &H, reply: &mut serde_json::Value) {
         {
             r.remove("account");
         }
-    }
-    if let Some(g) = host.group() {
-        reply["group"] = serde_json::to_value(g.members()).unwrap_or_default();
     }
 }
 
@@ -1621,6 +1622,46 @@ mod tests {
         assert!(reply["token"].is_string());
         let (_, _, _, info) = third.connect_info(&host, &server_key).await.unwrap();
         assert!(info.get("account").is_none());
+    }
+
+    /// Lo que cabe se mide con todo lo que va a ir, el grupo también: una cuenta que solo
+    /// cabría sin el grupo no va, y una que cabe con él, sí.
+    #[test]
+    fn the_account_fits_with_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let base = serde_json::json!({ "token": "t", "push_key": "k", "name": "equipo" });
+        let info = |account: serde_json::Value| {
+            *host.account.lock().unwrap() = Some(account);
+            let mut reply = base.clone();
+            add_group_info(&*host, &mut reply);
+            reply
+        };
+        let account = |name: String| serde_json::json!({ "name": name, "lang": "es" });
+
+        // Con una cuenta normal, va todo.
+        let reply = info(account("mirlo-sereno".into()));
+        assert_eq!(reply["account"]["name"], "mirlo-sereno");
+        assert!(reply["group"].as_array().is_some_and(|g| !g.is_empty()));
+
+        // Un nombre que deja la respuesta entera un byte por encima del tope.
+        let tight = reply.to_string().len() - "mirlo-sereno".len();
+        let huge = "x".repeat(MAX_MSG - MSG2_OVERHEAD + 1 - tight);
+        let mut without_group = base.clone();
+        without_group["account"] = account(huge.clone());
+        assert!(without_group.to_string().len() + MSG2_OVERHEAD <= MAX_MSG);
+        // Un byte menos, justo en el tope: va.
+        let reply = info(account(huge[1..].to_owned()));
+        assert!(reply["account"].is_object(), "no va la cuenta");
+        assert_eq!(reply.to_string().len() + MSG2_OVERHEAD, MAX_MSG);
+        let reply = info(account(huge));
+        assert!(reply.get("account").is_none(), "va la cuenta");
+        assert!(reply["group"].as_array().is_some_and(|g| !g.is_empty()));
+        assert!(reply.to_string().len() + MSG2_OVERHEAD <= MAX_MSG);
     }
 
     #[tokio::test]
