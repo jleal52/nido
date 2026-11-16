@@ -844,24 +844,16 @@ async fn group_sync<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) 
     let Some(key) = hs.get_remote_static().map(|k| B64.encode(k)) else {
         return;
     };
-    let ours = g.snapshot();
-    if !ours.members.iter().any(|m| m.key == key) {
+    if g.state_for(&key).is_none() {
         return;
     }
-    // A uno ya quitado (según lo que sabíamos antes de oírle) solo se le cuenta que está fuera:
-    // de lo suyo no se junta nada. Si no, se daría de alta él solo con su entrada más nueva y
-    // `removed: false`, colaría miembros, dispositivos o una clave suya como la actual, y en la
-    // siguiente se llevaría el llavero. Tampoco se le da el llavero: no leería lo que se cifre
-    // después. Volver es con una invitación nueva (`group_join`), que lo da de alta.
-    let live = ours.member_by_key(&key).is_some();
     let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload[..n]) else {
         return;
     };
-    let changed = live && g.merge(&theirs);
-    let mut ours = g.snapshot();
-    if !live {
-        ours.keys.clear();
-    }
+    // De uno ya quitado no entra nada, y se le contesta sin el llavero (ver `merge_from` y
+    // `state_for`): solo se entera de que está fuera.
+    let changed = g.merge_from(&key, &theirs);
+    let ours = g.state_for(&key).unwrap_or_default();
     let reply = serde_json::to_vec(&ours).unwrap_or_default();
     let mut msg2 = vec![0u8; MAX_MSG];
     if let Ok(n) = hs.write_message(&reply, &mut msg2) {
@@ -999,6 +991,49 @@ where
 /// transporte lo pone quien llama (el hub).
 pub struct Dial {
     hs: snow::HandshakeState,
+}
+
+/// Una vuelta de sincronización del grupo: cuenta el estado a cada equipo vivo (por `exchange`,
+/// con su id en el hub) y junta lo que conteste. Devuelve si alguno sabía algo nuevo.
+///
+/// La lista se saca al empezar, pero lo que conteste uno puede sacar del grupo a otro que viene
+/// detrás: antes de llamarle y antes de juntar lo suyo se mira otra vez que siga vivo. Si no, se
+/// le mandaría el llavero y, al enterarse de la baja por ese mensaje, contestaría dándose de alta
+/// de nuevo, por encima de nuestra baja.
+pub async fn sync_members<F, Fut>(g: &crate::group::Group, identity: &Identity, exchange: F) -> bool
+where
+    F: Fn(String, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    let mut learned = false;
+    for m in g.others() {
+        let Ok(key) = B64.decode(&m.key) else {
+            continue;
+        };
+        let Ok(key) = <[u8; 32]>::try_from(key) else {
+            continue;
+        };
+        if !g.is_live(&m.key) {
+            continue;
+        }
+        let Some(ours) = g.state_for(&m.key) else {
+            continue;
+        };
+        let ours = serde_json::to_vec(&ours).unwrap_or_default();
+        let Ok((dial, first)) = Dial::start(identity, &key, None, &ours) else {
+            continue;
+        };
+        let Ok(reply) = exchange(m.id.clone(), first).await else {
+            continue; // apagado o sin conexión: ya se pondrá al día
+        };
+        if let Ok(payload) = dial.finish(&reply)
+            && let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload)
+            && g.merge_from(&m.key, &theirs)
+        {
+            learned = true;
+        }
+    }
+    learned
 }
 
 impl Dial {
@@ -2242,6 +2277,91 @@ mod tests {
                 .iter()
                 .any(|k| k.kid == mine.keys[0].kid)
         );
+    }
+
+    /// Un nido de pruebas con este grupo.
+    fn host_with(dir: &Path, id: Identity, g: crate::group::Group) -> Arc<TestHost> {
+        Arc::new(TestHost {
+            id,
+            pairing: Pairing::default(),
+            phones: Mutex::new(Phones::load(dir.join("phones.json"))),
+            addr: None,
+            group: Some(g),
+            replays: PeerReplays::default(),
+            replaced: Default::default(),
+            account: Default::default(),
+        })
+    }
+
+    /// En una misma vuelta de `sync_members`, la respuesta de A dice que B ya está fuera: a B no
+    /// se le manda nada (ni el llavero), y no se le deja resucitar con su respuesta.
+    #[tokio::test]
+    async fn a_member_removed_mid_round_is_skipped() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (da, db, dy) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("yo"),
+        );
+        let ida = Identity::load_or_create(&da.join("hub.key")).unwrap();
+        let idb = Identity::load_or_create(&db.join("hub.key")).unwrap();
+        let yo = Identity::load_or_create(&dy.join("hub.key")).unwrap();
+        let (ka, kb, ky) = (
+            B64.encode(ida.public),
+            B64.encode(idb.public),
+            B64.encode(yo.public),
+        );
+        // Nosotros: A y B vivos, y el llavero.
+        let g = crate::group::Group::load(dy.join("group.json"), yo.public);
+        g.set_self("yo-id", "Yo");
+        g.add_member("a-mac", &ka, "A");
+        g.add_member("b-viejo", &kb, "B");
+        let ours = g.ensure_board_key();
+        // A ya sabe que B está fuera.
+        let ga = crate::group::Group::load(da.join("group.json"), ida.public);
+        ga.set_self("a-mac", "A");
+        ga.add_member("yo-id", &ky, "Yo");
+        ga.add_member("b-viejo", &kb, "B");
+        assert!(ga.remove_member("b-viejo"));
+        // B aún no: cree que sigue dentro.
+        let gb = crate::group::Group::load(db.join("group.json"), idb.public);
+        gb.set_self("b-viejo", "B");
+        gb.add_member("yo-id", &ky, "Yo");
+        gb.add_member("a-mac", &ka, "A");
+        let a = host_with(&da, ida, ga);
+        let b = host_with(&db, idb, gb);
+
+        let to_b = std::sync::atomic::AtomicUsize::new(0);
+        let learned = sync_members(&g, &yo, |id, first| {
+            let (a, b, to_b) = (a.clone(), b.clone(), &to_b);
+            async move {
+                match id.as_str() {
+                    "a-mac" => exchange_with(&a, first).await,
+                    "b-viejo" => {
+                        to_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        exchange_with(&b, first).await
+                    }
+                    _ => Err("no está".into()),
+                }
+            }
+        })
+        .await;
+        assert!(learned, "de A se aprende la baja");
+        assert_eq!(
+            to_b.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a B no se le llama"
+        );
+        assert!(!g.is_live(&kb), "B sigue fuera");
+        let gb = b.group.as_ref().unwrap();
+        assert!(
+            gb.board_keys().keys.iter().all(|k| k.kid != ours.kid),
+            "B no tiene nuestras claves"
+        );
+        // A, que sigue dentro, sí las tiene.
+        let ga = a.group.as_ref().unwrap();
+        assert!(ga.board_keys().keys.iter().any(|k| k.kid == ours.kid));
     }
 
     #[tokio::test]

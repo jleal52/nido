@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 const INVITE_LIFE: Duration = Duration::from_secs(600);
+/// Cada cuánto, como mucho, se avisa de claves del tablero que llegan mal.
+const BAD_KEY_QUIET: Duration = Duration::from_secs(3600);
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -78,6 +80,15 @@ impl std::fmt::Debug for BoardKey {
 }
 
 impl BoardKey {
+    /// ¿Su `kid` es el de su clave? Una lápida sin clave, también vale.
+    pub fn fits(&self) -> bool {
+        if self.key.is_empty() {
+            return self.removed;
+        }
+        B64.decode(&self.key)
+            .is_ok_and(|k| k.len() == 32 && board_kid(&k) == self.kid)
+    }
+
     /// Una clave nueva, al azar.
     pub fn generate(at: u64) -> Self {
         let mut key = [0u8; 32];
@@ -231,6 +242,8 @@ pub struct Group {
     /// La revisión: sube cada vez que cambia el estado. La escucha quien quiera enterarse de
     /// cualquier cambio (venga de este equipo o de otro), aparte de la sincronización.
     revision: watch::Sender<u64>,
+    /// Cuándo se avisó por última vez de una clave que llegó mal (para no llenar el registro).
+    bad_key_said: Mutex<Option<Instant>>,
 }
 
 impl Group {
@@ -245,6 +258,7 @@ impl Group {
             state: Mutex::new(state),
             invite: Mutex::new(None),
             revision: watch::Sender::new(0),
+            bad_key_said: Mutex::new(None),
         }
     }
 
@@ -293,8 +307,47 @@ impl Group {
     /// Junta el estado de otro equipo; si cambió, lo guarda. Si a este equipo lo han sacado del
     /// grupo, se queda solo (con sus dispositivos, pero sin el llavero del tablero).
     pub fn merge(&self, other: &State) -> bool {
+        self.merge_if(other, |_| true)
+    }
+
+    /// ¿Es un miembro vivo del grupo (por su clave)?
+    pub fn is_live(&self, key_b64: &str) -> bool {
+        self.state
+            .lock()
+            .expect("grupo")
+            .member_by_key(key_b64)
+            .is_some()
+    }
+
+    /// Lo que se le cuenta a otro equipo al sincronizar: nada si no es del grupo; el estado sin
+    /// el llavero si ya está fuera (para que se entere, pero no lea lo que se cifre después).
+    pub fn state_for(&self, key_b64: &str) -> Option<State> {
+        let mut st = self.snapshot();
+        if !st.members.iter().any(|m| m.key == key_b64) {
+            return None;
+        }
+        if st.member_by_key(key_b64).is_none() {
+            st.keys.clear();
+        }
+        Some(st)
+    }
+
+    /// Junta lo que cuenta otro equipo, solo si es un miembro vivo (se mira con el mismo cerrojo
+    /// con el que se junta). De uno quitado no entra nada: si no, se daría de alta él solo con
+    /// su entrada más nueva y `removed: false`, colaría miembros, dispositivos o una clave suya
+    /// como la actual, y en la siguiente se llevaría el llavero. Volver es con una invitación
+    /// nueva (`merge` desde `group_join`). Vale igual para quien llama y para quien contesta.
+    pub fn merge_from(&self, key_b64: &str, other: &State) -> bool {
+        self.merge_if(other, |st| st.member_by_key(key_b64).is_some())
+    }
+
+    fn merge_if(&self, other: &State, heard: impl FnOnce(&State) -> bool) -> bool {
+        let other = self.fitting_keys(other);
         let mut st = self.state.lock().expect("grupo");
-        let changed = st.merge(other);
+        if !heard(&st) {
+            return false;
+        }
+        let changed = st.merge(&other);
         if changed {
             if st
                 .members
@@ -317,6 +370,37 @@ impl Group {
             self.bump();
         }
         changed
+    }
+
+    /// `other` sin las claves cuyo `kid` no es el de su clave (de un fallo o de alguien que se hace
+    /// pasar por otra). Se avisa con freno y sin el secreto.
+    fn fitting_keys<'a>(&self, other: &'a State) -> std::borrow::Cow<'a, State> {
+        if other.keys.iter().all(BoardKey::fits) {
+            return std::borrow::Cow::Borrowed(other);
+        }
+        let mut st = other.clone();
+        let bad: Vec<String> = st
+            .keys
+            .iter()
+            .filter(|k| !k.fits())
+            .map(|k| {
+                k.kid
+                    .chars()
+                    .filter(char::is_ascii_hexdigit)
+                    .take(16)
+                    .collect()
+            })
+            .collect();
+        st.keys.retain(BoardKey::fits);
+        let mut said = self.bad_key_said.lock().expect("aviso");
+        if said.is_none_or(|t| t.elapsed() >= BAD_KEY_QUIET) {
+            *said = Some(Instant::now());
+            eprintln!(
+                "nido: claves del tablero que no casan con su kid, descartadas: {}",
+                bad.join(", ")
+            );
+        }
+        std::borrow::Cow::Owned(st)
     }
 
     /// Cambia el estado y, si de verdad cambió, lo guarda.
@@ -1202,15 +1286,114 @@ mod tests {
     fn a_huge_at_does_not_overflow() {
         let dir = tempfile::tempdir().unwrap();
         let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
-        assert!(g.merge(&keys_state(vec![board_key(
-            "aaaaaaaaaaaaaaaa",
-            u64::MAX,
-            None,
-            false
-        )])));
+        let edge = BoardKey::generate(u64::MAX);
+        assert!(g.merge(&keys_state(vec![edge.clone()])));
         let new = g.rotate_board_key();
         assert_eq!(new.at, u64::MAX);
-        assert!(g.drop_board_key("aaaaaaaaaaaaaaaa"));
+        assert!(g.drop_board_key(&edge.kid));
+    }
+
+    /// Lo que cuenta otro equipo solo entra si es un miembro vivo, y a uno ya quitado se le da el
+    /// estado sin el llavero (la misma regla para quien llama y para quien contesta).
+    #[test]
+    fn only_live_members_are_heard() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        g.set_self("yo", "wsl");
+        g.add_member("mac", "k-mac", "mac");
+        g.add_member("viejo", "k-viejo", "viejo");
+        assert!(g.remove_member("viejo"));
+        let ours = g.ensure_board_key();
+        let before = g.snapshot();
+        let later = now_ms() + 60_000;
+        let theirs = State {
+            members: vec![
+                Member {
+                    id: "viejo".into(),
+                    key: "k-viejo".into(),
+                    name: "viejo".into(),
+                    at: later,
+                    removed: false,
+                },
+                member("intruso", later, false),
+            ],
+            devices: vec![device("colado", later, false)],
+            keys: vec![BoardKey::generate(later)],
+        };
+        assert!(g.is_live("k-mac"));
+        assert!(!g.is_live("k-viejo"));
+        assert!(!g.is_live("k-nadie"));
+        // Del quitado no entra nada, ni dándose de alta a sí mismo.
+        assert!(!g.merge_from("k-viejo", &theirs));
+        assert_eq!(g.snapshot(), before);
+        // Y se entera de que está fuera, sin claves.
+        let told = g.state_for("k-viejo").unwrap();
+        assert!(told.keys.is_empty());
+        assert!(told.members.iter().any(|m| m.id == "viejo" && m.removed));
+        // A uno de fuera, nada; de él, tampoco.
+        assert!(g.state_for("k-nadie").is_none());
+        assert!(!g.merge_from("k-nadie", &theirs));
+        assert_eq!(g.snapshot(), before);
+        // Un miembro vivo recibe las claves, y lo suyo entra.
+        assert!(g.state_for("k-mac").unwrap().keys.contains(&ours));
+        assert!(g.merge_from("k-mac", &theirs));
+        assert!(
+            g.board_keys()
+                .keys
+                .iter()
+                .any(|k| k.kid == theirs.keys[0].kid)
+        );
+    }
+
+    /// Una clave que llega con un `kid` que no es el suyo no entra (lo demás, sí). Las lápidas
+    /// sin clave pasan.
+    #[test]
+    fn keys_must_match_their_kid() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let good = BoardKey::generate(10);
+        let mut forged = BoardKey::generate(10);
+        forged.kid = good.kid.clone();
+        forged.at = 20;
+        let mut liar = BoardKey::generate(10);
+        liar.kid = "0123456789abcdef".into();
+        let tomb = BoardKey {
+            kid: "fedcba9876543210".into(),
+            key: String::new(),
+            at: 10,
+            retired: None,
+            removed: true,
+        };
+        let empty = BoardKey {
+            kid: "1111111111111111".into(),
+            key: String::new(),
+            at: 10,
+            retired: None,
+            removed: false,
+        };
+        let junk = BoardKey {
+            kid: "2222222222222222".into(),
+            key: "no es base64".into(),
+            at: 10,
+            retired: None,
+            removed: false,
+        };
+        assert!(good.fits() && tomb.fits());
+        assert!(!forged.fits() && !liar.fits() && !empty.fits() && !junk.fits());
+        assert!(g.merge(&keys_state(vec![
+            good.clone(),
+            liar,
+            tomb.clone(),
+            empty,
+            junk
+        ])));
+        let kids: Vec<String> = g.snapshot().keys.into_iter().map(|k| k.kid).collect();
+        let mut expect = vec![good.kid.clone(), tomb.kid.clone()];
+        expect.sort();
+        assert_eq!(kids, expect);
+        // Una que se hace pasar por la nuestra (mismo `kid`, otra clave, más nueva) tampoco.
+        assert!(!g.merge(&keys_state(vec![forged])));
+        assert_eq!(g.board_keys().current(), Some(&good));
     }
 
     /// La clave es secreta: ni en `Debug` del llavero ni en el del estado.

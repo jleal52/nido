@@ -2019,31 +2019,10 @@ impl AppState {
     /// nuevo, se repite una vez para que lo sepan todos.
     async fn sync_group(&self) {
         for _ in 0..2 {
-            let mut learned = false;
-            for m in self.group.others() {
-                let Ok(key) =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &m.key)
-                else {
-                    continue;
-                };
-                let Ok(key) = <[u8; 32]>::try_from(key) else {
-                    continue;
-                };
-                let ours = serde_json::to_vec(&self.group.snapshot()).unwrap_or_default();
-                let Ok((dial, first)) = e2e::Dial::start(&self.identity, &key, None, &ours) else {
-                    continue;
-                };
-                let reply = match self.hub.exchange(&m.id, first).await {
-                    Ok(r) => r,
-                    Err(_) => continue, // apagado o sin conexión: ya se pondrá al día
-                };
-                if let Ok(payload) = dial.finish(&reply)
-                    && let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload)
-                    && self.group.merge(&theirs)
-                {
-                    learned = true;
-                }
-            }
+            let learned = e2e::sync_members(&self.group, &self.identity, |id, first| async move {
+                self.hub.exchange(&id, first).await
+            })
+            .await;
             self.apply_group();
             if !learned {
                 break;
