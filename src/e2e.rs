@@ -44,6 +44,9 @@ pub const FRAME_DATA: u8 = 2;
 pub const FRAME_CLOSE: u8 = 3;
 /// El mensaje Noise más largo.
 pub const MAX_MSG: usize = 65535;
+/// Lo que añade Noise a la respuesta del emparejamiento o la conexión (la clave efímera y la
+/// etiqueta del cifrado), con holgura.
+const MSG2_OVERHEAD: usize = 128;
 /// Lo que cabe en un mensaje Noise menos la etiqueta (16) y la cabecera de la trama (5).
 pub const MAX_CHUNK: usize = MAX_MSG - 16 - 5;
 /// Lo que cabe en la respuesta de `MODE_PEER`: el segundo mensaje del IK lleva la clave efímera
@@ -763,8 +766,14 @@ fn add_group_info<H: Host>(host: &H, reply: &mut serde_json::Value) {
         reply["hub"] = hub.into();
         reply["nido"] = id.into();
     }
+    // Lo que pone el hub, solo si cabe: si no, no se podría emparejar ni conectar.
     if let Some(account) = host.account() {
         reply["account"] = account;
+        if reply.to_string().len() + MSG2_OVERHEAD > MAX_MSG
+            && let Some(r) = reply.as_object_mut()
+        {
+            r.remove("account");
+        }
     }
     if let Some(g) = host.group() {
         reply["group"] = serde_json::to_value(g.members()).unwrap_or_default();
@@ -1602,6 +1611,16 @@ mod tests {
         *host.account.lock().unwrap() = Some(anonymous.clone());
         let (_, _, _, info) = other.connect_info(&host, &server_key).await.unwrap();
         assert_eq!(info["account"], anonymous);
+
+        // Una cuenta que no cabría en la respuesta no va, y se empareja y se conecta igual.
+        let huge = serde_json::json!({ "name": "x".repeat(70_000), "lang": "es" });
+        *host.account.lock().unwrap() = Some(huge);
+        let third = Phone::new();
+        let reply = pair(&third).await;
+        assert!(reply.get("account").is_none());
+        assert!(reply["token"].is_string());
+        let (_, _, _, info) = third.connect_info(&host, &server_key).await.unwrap();
+        assert!(info.get("account").is_none());
     }
 
     #[tokio::test]

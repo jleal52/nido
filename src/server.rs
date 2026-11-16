@@ -4206,8 +4206,10 @@ async fn events(mut socket: WebSocket, st: Arc<AppState>) {
     st.scan().await;
     // La cuenta que lleva la última lista mandada: el estado del hub avisa también de otras
     // cosas (conectado o no, el error), y por eso no se manda otra lista.
-    let mut account = hub.borrow_and_update().account.clone();
+    let mut account;
     loop {
+        // La de ahora, aunque se mande por la lista: si cambiaron las dos a la vez, una sola.
+        account = hub.borrow_and_update().account.clone();
         let json = {
             let listing = rx.borrow_and_update();
             let event = Event {
@@ -4226,9 +4228,8 @@ async fn events(mut socket: WebSocket, st: Arc<AppState>) {
                     if r.is_err() {
                         return;
                     }
-                    let now = hub.borrow_and_update().account.clone();
-                    if now != account {
-                        account = now;
+                    // Vista (si no, `changed` volvería enseguida); la copia de arriba la relee.
+                    if hub.borrow_and_update().account != account {
                         break;
                     }
                 }
@@ -4991,6 +4992,58 @@ mod tests {
             .status
             .send_modify(|s| s.account = Some(anonymous.clone()));
         assert_eq!(info().await["account"], anonymous);
+    }
+
+    /// Por el router: sin token o con uno que no es de nadie, ni llega (401); con el de este
+    /// equipo, 403; y cada dispositivo pide la sesión con su id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hub_session_route_goes_by_each_device() {
+        use hub::fake::Reply;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, first) = memory_server(tmp.path()).await;
+        let second = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[2u8; 32], "otro", None)
+            .unwrap();
+        // El vale lleva el id del dispositivo: así se ve que cada uno va con el suyo.
+        let rec = hub::fake::recording(|v| {
+            let s = v.get("session")?;
+            Some(Reply::Send(json!({ "sessioned": {
+                "req": s["req"], "ok": true,
+                "grant": format!("vale-{}", s["device"].as_str().unwrap_or("nadie")),
+                "expires": 60000,
+            }})))
+        })
+        .await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        const PATH: &str = "/api/v1/hub/session";
+
+        for bearer in ["", "no-es-de-nadie"] {
+            let (code, _) = memory_call(addr, bearer, "POST", PATH, None).await;
+            assert_eq!(code, 401, "«{bearer}»");
+        }
+        let (code, r) = memory_call(addr, "local", "POST", PATH, None).await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (
+                403,
+                Some("only a paired phone or browser can ask for a hub session")
+            )
+        );
+        let first_id = st.phones.lock().unwrap().id_by_token(&first).unwrap();
+        for (token, id) in [(&first, &first_id), (&second.token, &second.id)] {
+            let (code, r) = memory_call(addr, token, "POST", PATH, None).await;
+            assert_eq!(
+                (code, r),
+                (
+                    200,
+                    json!({ "grant": format!("vale-{id}"), "expires": 60000 })
+                )
+            );
+        }
+        assert_ne!(first_id, second.id);
     }
 
     /// El siguiente texto de `/api/v1/events`, o `None` si no llega ninguno en `wait`.

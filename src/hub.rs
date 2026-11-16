@@ -456,13 +456,23 @@ impl Hub {
     }
 
     /// Si es `{"account":{"name","lang"}}`, la cuenta de este nido: al estado (y, si cambió, avisa
-    /// a quien lo escuche). Devuelve si lo era.
+    /// a quien lo escuche). Devuelve si lo era. Un nombre o un idioma que no valen se quedan en
+    /// `null`: van a la información de los dispositivos, donde uno enorme no cabría y dejaría sin
+    /// emparejar ni conectar a nadie.
     fn account(&self, v: &serde_json::Value) -> bool {
         let Some(a) = v.get("account").and_then(|a| a.as_object()) else {
             return false;
         };
-        let text = |k: &str| a.get(k).and_then(|x| x.as_str()).map(str::to_owned);
-        let account = serde_json::json!({ "name": text("name"), "lang": text("lang") });
+        let text = |k: &str, valid: fn(&str) -> bool| {
+            a.get(k)
+                .and_then(|x| x.as_str())
+                .filter(|x| valid(x))
+                .map(str::to_owned)
+        };
+        let account = serde_json::json!({
+            "name": text("name", account_name),
+            "lang": text("lang", account_lang),
+        });
         self.status.send_if_modified(|s| {
             if s.account.as_ref() == Some(&account) {
                 return false;
@@ -491,6 +501,23 @@ impl Hub {
     fn set_status(&self, f: impl FnOnce(&mut HubStatus)) {
         self.status.send_modify(f);
     }
+}
+
+/// Si es un nombre de cuenta como los que da y acepta el hub: de 3 a 30 caracteres de
+/// `[a-z0-9-]`, sin guion al principio ni al final y sin dos seguidos.
+fn account_name(name: &str) -> bool {
+    (3..=30).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+/// Los idiomas de una cuenta.
+fn account_lang(lang: &str) -> bool {
+    matches!(lang, "es" | "en")
 }
 
 /// Lo mandado al hub en una conexión.
@@ -1102,6 +1129,64 @@ mod tests {
         )
         .await
         .unwrap()
+        .unwrap();
+    }
+
+    /// El nombre y el idioma de la cuenta, como los valida el hub: lo demás no es un nombre ni un
+    /// idioma.
+    #[test]
+    fn account_names_and_langs() {
+        for ok in ["mirlo-sereno", "abc", "a1-b2", &"a".repeat(30)] {
+            assert!(account_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "ab",
+            "-abc",
+            "abc-",
+            "a--b",
+            "Mirlo",
+            "mirlo sereno",
+            "mirlo_s",
+            "ñandú",
+            &"a".repeat(31),
+        ] {
+            assert!(!account_name(bad), "{bad}");
+        }
+        assert!(account_lang("es") && account_lang("en"));
+        for bad in ["", "ES", "fr", "es-ES"] {
+            assert!(!account_lang(bad), "{bad}");
+        }
+    }
+
+    /// Un nombre o un idioma que no valen llegan como `null`: un hub no puede meter en la
+    /// información de los dispositivos lo que quiera (un nombre enorme no cabría al emparejar).
+    #[tokio::test]
+    async fn an_odd_account_from_the_hub_is_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, rec) = recorded(tmp.path(), |_| None).await;
+        let mut status = hub.status.subscribe();
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "account": { "name": "x".repeat(70_000), "lang": "fr" }
+        })));
+        let empty = serde_json::json!({ "name": null, "lang": null });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.account.as_ref() == Some(&empty)),
+        )
+        .await
+        .expect("no llegó la cuenta")
+        .unwrap();
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "account": { "name": "Mirlo--Sereno", "lang": "en" }
+        })));
+        let en = serde_json::json!({ "name": null, "lang": "en" });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.account.as_ref() == Some(&en)),
+        )
+        .await
+        .expect("no llegó la cuenta")
         .unwrap();
     }
 
