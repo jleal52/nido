@@ -188,13 +188,16 @@ Lo que nido cambia en tu configuración de Claude:
   (los channels están en vista previa, y el de nido es un channel de desarrollo) y
   `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert
   mcp__nido__secret mcp__nido__clipboard mcp__nido__send_file mcp__nido__plan_set
-  mcp__nido__plan_task mcp__nido__plan_get mcp__nido__plan_clear`. Al cargar un channel de
-  desarrollo, Claude enseña un aviso al arrancar: nido lo acepta por ti, pero solo si la lista es
-  exactamente `server:nido`.
-- Solo esas once herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo a ti
-  (`secret` lo controla su propio diálogo), o llevan el plan de la propia sesión. `open`, `answer`, `close`, `start` y `stop` actúan
-  sobre otras sesiones, así que pasan por el permiso de siempre de Claude (en modo auto, decide su
-  clasificador).
+  mcp__nido__plan_task mcp__nido__plan_get mcp__nido__plan_clear mcp__nido__board
+  mcp__nido__project mcp__nido__objective mcp__nido__join mcp__nido__leave`. Al cargar un channel
+  de desarrollo, Claude enseña un aviso al arrancar: nido lo acepta por ti, pero solo si la lista
+  es exactamente `server:nido`.
+- Solo esas dieciséis herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo
+  a ti (`secret` lo controla su propio diálogo), llevan el plan de la propia sesión o trabajan en
+  el tablero de proyectos de la cuenta. Las del tablero cambian y borran (en cascada) lo que ven
+  tus otros equipos, la web y la app, sin preguntar; no tocan ninguna sesión. `open`, `answer`,
+  `close`, `start` y `stop` actúan sobre otras sesiones, así que pasan por el permiso de siempre
+  de Claude (en modo auto, decide su clasificador).
 - También llevan `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
   con la ruta absoluta de la carpeta de secretos de nido (y también la de verdad, si hay un enlace
   por medio). Claude aplica la regla de `Read` a su herramienta Read y a `cat`, `head`, `<`… en
