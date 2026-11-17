@@ -237,8 +237,9 @@ impl Progress {
                 .any(|s| i.linked.contains(s) && due(i.last.get(s), now))
     }
 
-    /// Fuera los cierres pendientes de hace `KEEP_CLOSED` o más: sus enlaces, si quedan, ya se
-    /// cierran por no estar la sesión en el registro (y se borran enseguida).
+    /// Fuera los cierres pendientes de hace `KEEP_CLOSED` o más. Sus enlaces, si quedan abiertos,
+    /// se cierran igual por no estar la sesión en el registro, pero con la hora de ahora y sin el
+    /// último resumen, y se borran `KEEP_CLOSED` después de ese cierre.
     fn expire(&self, now: u64) {
         self.lock()
             .closing
@@ -322,6 +323,12 @@ impl Progress {
         let ids: HashSet<&str> = mine.iter().map(|m| m.id.as_str()).collect();
         i.stuck.retain(|l, _| ids.contains(l.as_str()));
         tasks
+    }
+
+    /// Que no se escriba hasta `t` (ms), sin acortar una espera más larga que ya hubiera.
+    fn wait_until(&self, t: u64) {
+        let mut i = self.lock();
+        i.busy_until = i.busy_until.max(t);
     }
 
     fn say(&self, what: String) {
@@ -511,7 +518,7 @@ async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>
     let start = st.hub.board_writes();
     for t in tasks {
         if st.hub.board_writes().saturating_sub(start) >= MAX_WRITES as u64 {
-            p.lock().busy_until = now + BUSY_WAIT;
+            p.wait_until(now + BUSY_WAIT);
             again = true;
             break;
         }
@@ -568,12 +575,12 @@ async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>
                 (false, false)
             }
             Err(EditError::Board(BoardError::Busy)) => {
-                p.lock().busy_until = now + BUSY_WAIT;
+                p.wait_until(now + BUSY_WAIT);
                 (true, true)
             }
             Err(e @ (EditError::Board(BoardError::Hub(_)) | EditError::NoKey)) => {
                 p.say(format!("no se pudieron poner al día los enlaces ({e})"));
-                p.lock().busy_until = now + HUB_WAIT;
+                p.wait_until(now + HUB_WAIT);
                 (true, true)
             }
             // Choca una y otra vez: en la próxima.
@@ -1416,5 +1423,41 @@ mod tests {
         assert_eq!(st.progress.closing_len(), 1);
         pass(&st, T0 + KEEP_CLOSED).await;
         assert_eq!(st.progress.closing_len(), 0);
+    }
+
+    /// Si la copia cambia antes de su turno (otro lo escribió, un `join` de aquí lo reabrió),
+    /// el borrado no se hace, aunque el enlace siga cerrado hace 30 días: se vuelve a mirar.
+    #[tokio::test]
+    async fn a_link_changed_before_its_turn_is_not_removed() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let l = "1".repeat(32);
+        put_link(&w, &l, &o, "este", "dead0000", json!({"closed": T0}));
+        w.st.board.sync().await.unwrap();
+        let v = w.st.board.item(&l).unwrap().v;
+        put_link(
+            &w,
+            &l,
+            &o,
+            "este",
+            "dead0000",
+            json!({"closed": T0, "changed": 7}),
+        );
+        w.st.board.sync().await.unwrap();
+        assert!(w.st.board.item(&l).unwrap().v > v);
+        pass(&w.st, T0).await;
+        assert!(w.st.progress.has_read());
+        let n = w.writes();
+        let task = Task {
+            link: l.clone(),
+            v,
+            job: Job::Remove,
+        };
+        let keys = w.st.group.board_keys();
+        run(&w.st, &keys, "este", vec![task], T0 + KEEP_CLOSED).await;
+        assert_eq!(w.writes(), n);
+        assert_eq!(w.stored(&l).unwrap()["changed"], 7);
+        assert!(!w.st.progress.has_read(), "se vuelve a mirar");
     }
 }

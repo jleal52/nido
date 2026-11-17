@@ -1626,7 +1626,9 @@ impl BoardCache {
 
     /// Como `remove`, pero solo si `when` vale para el objeto como está: el de la copia y, tras
     /// cada choque (409), el de ahora. Uno que no se puede leer no se borra. Devuelve si se borró
-    /// (o ya lo estaba): `false` si `when` no vale.
+    /// (o ya lo estaba): `false` si `when` no vale, o si la copia cambió mientras se miraba (que
+    /// se vuelva a intentar luego). `when` se evalúa sin el cerrojo de la copia, pero no debe
+    /// usarla: recibe el objeto, y es lo único que tiene que mirar.
     pub async fn remove_when(
         self: &Arc<Self>,
         keys: &Keyring,
@@ -1647,6 +1649,16 @@ impl BoardCache {
                 .is_none_or(|f| read(keys, id, s).is_ok_and(|o| f(&o)))
         };
         let epoch = self.epoch();
+        // Se descifra y se mira fuera del cerrojo, sobre una copia; si entretanto cambia, no se
+        // borra.
+        let seen = match self.lock().items.get(id) {
+            None => return Err(EditError::Missing),
+            Some(s) if s.gone => return Ok(true),
+            Some(s) => s.clone(),
+        };
+        if !holds(&seen) {
+            return Ok(false);
+        }
         let (mut v, pending) = {
             let mut c = self.lock();
             let Some(s) = c.items.get(id) else {
@@ -1655,7 +1667,7 @@ impl BoardCache {
             if s.gone {
                 return Ok(true);
             }
-            if !holds(s) {
+            if when.is_some() && *s != seen {
                 return Ok(false);
             }
             let v = s.v;
@@ -3315,6 +3327,71 @@ mod tests {
         r.cache.remove(&keyring(), &other).await.unwrap();
         assert!(r.board.lock().unwrap().items[&other].gone);
         assert!(r.cache.item(&other).unwrap().gone);
+    }
+
+    fn named(name: &'static str) -> impl Fn(&Object) -> bool + Sync {
+        move |o| matches!(o, Object::Project(p) if p.name == name)
+    }
+
+    /// `remove_when`: con `when` falso desde el principio, nada; con un 409 que lo vuelve falso,
+    /// tampoco (y la copia queda con lo de ahora); con él cierto, se borra.
+    #[tokio::test]
+    async fn remove_when_looks_at_the_object_as_it_is() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(1);
+        r.write(&K_CUR, &id, &project("x"));
+        r.cache.sync().await.unwrap();
+        assert!(
+            !r.cache
+                .remove_when(&keyring(), &id, named("z"))
+                .await
+                .unwrap()
+        );
+        assert!(r.writes().is_empty());
+
+        let (k, b) = sealed(&K_CUR, &id, &project("y"));
+        r.board.lock().unwrap().clash(&id, Some((k, b)));
+        assert!(
+            !r.cache
+                .remove_when(&keyring(), &id, named("x"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(r.writes(), vec![("del".into(), id.clone(), 1)]);
+        assert!(!r.board.lock().unwrap().items[&id].gone);
+        assert_eq!(r.cache.item(&id).unwrap().v, 2, "con lo de ahora");
+
+        assert!(
+            r.cache
+                .remove_when(&keyring(), &id, named("y"))
+                .await
+                .unwrap()
+        );
+        assert!(r.board.lock().unwrap().items[&id].gone);
+        assert!(r.cache.item(&id).unwrap().gone);
+    }
+
+    /// Uno que falta por resubir y que el hub sí tiene, más nuevo (409 sin lápida): la copia se
+    /// queda con lo de ahora, ya no falta por resubir, y `when` se mira sobre eso.
+    #[tokio::test]
+    async fn remove_when_a_pending_reupload_clashes() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(1);
+        r.write(&K_CUR, &id, &project("x"));
+        r.cache.sync().await.unwrap();
+        r.write(&K_CUR, &id, &project("y"));
+        r.cache.lock().reupload.insert(id.clone());
+        assert!(
+            !r.cache
+                .remove_when(&keyring(), &id, named("x"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(r.writes(), vec![("put".into(), id.clone(), 0)]);
+        let s = r.cache.item(&id).unwrap();
+        assert_eq!(s.v, 2);
+        assert_eq!(r.cache.pending_reupload(), 0);
+        assert!(!r.board.lock().unwrap().items[&id].gone);
     }
 
     /// Cada objeto se descifra con la clave de su `kid` (nunca probando las demás). Lo que no se
