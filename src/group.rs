@@ -1878,7 +1878,7 @@ mod tests {
         }
     }
 
-    // ---------- el llavero se ordena (Tarea 9) ----------
+    // ---------- el llavero se ordena ----------
 
     const DAY: u64 = 24 * 3600 * 1000;
 

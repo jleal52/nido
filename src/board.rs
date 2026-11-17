@@ -773,11 +773,11 @@ fn retired(keys: &Keyring, kid: &str) -> bool {
 enum Recrypted {
     /// Escrito con la clave actual.
     Wrote,
-    /// Nada que hacer ya: lo de ahora va con una clave que no está retirada, otro lo borró, el
-    /// hub no lo tiene, o no tiene su clave.
+    /// Nada que hacer ya: lo de ahora va con una clave que no está retirada, otro lo borró o el
+    /// hub no lo tiene.
     Done,
-    /// No se puede (no se descifra, el hub no lo quiere, choca una y otra vez): en esta pasada,
-    /// no se vuelve a intentar.
+    /// No se puede (su clave no vale, no se descifra, el hub no lo quiere, choca una y otra
+    /// vez): en esta pasada, no se vuelve a intentar.
     Skip,
     /// Cambió la clave actual: se empieza otra vez con la nueva.
     Again,
@@ -1783,9 +1783,10 @@ impl BoardCache {
                     _ => return Recrypted::Done,
                 }
             };
-            // Con la clave de su `kid`, nunca otra.
+            // Con la clave de su `kid`, nunca otra. Si está en el llavero pero no son 32 bytes
+            // (un disco roto), se salta: si no, se elegiría una y otra vez.
             let Some(old) = key_of(&ring, &s.kid) else {
-                return Recrypted::Done;
+                return Recrypted::Skip;
             };
             let sealed = open(&old, id, s.blob.as_deref().unwrap_or_default())
                 .and_then(|b| seal(key, id, &b));
@@ -4200,7 +4201,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
-    // ---------- El recifrado y la poda del llavero (Tarea 9) ----------
+    // ---------- El recifrado y la poda del llavero ----------
 
     const K_NEW: [u8; 32] = [0x33; 32];
     const DAY_MS: u64 = 24 * 3600 * 1000;
@@ -4395,6 +4396,31 @@ mod tests {
             assert_eq!(on_hub(&r.board, &K_NEW, &bid(n)), project(&format!("p{n}")));
             assert_eq!(r.cache.item(&bid(n)).unwrap().kid, kid(&K_NEW));
         }
+    }
+
+    /// Una retirada que está en el llavero pero no es una clave (un disco roto): lo suyo se
+    /// salta, y la pasada acaba.
+    #[tokio::test]
+    async fn a_broken_retired_key_is_skipped() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_OLD, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        let broken = BoardKey {
+            kid: kid(&K_OLD),
+            key: "no es una clave".into(),
+            at: 2,
+            retired: Some(2),
+            removed: false,
+        };
+        let ring = Keyring {
+            keys: vec![broken, BoardKey::from_raw(&K_CUR, 3)],
+        };
+        let keys: Keys = Arc::new(move || ring.clone());
+        let done = tokio::time::timeout(Duration::from_secs(5), r.cache.recrypt(&keys))
+            .await
+            .expect("la pasada acaba");
+        assert!(done);
+        assert!(r.writes().is_empty());
     }
 
     /// Mientras falte algo por resubir, no se recifra (la resubida ya cifra con la actual, y
