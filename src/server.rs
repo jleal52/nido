@@ -4136,6 +4136,7 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
         );
     }
     if st.group.remove_member(&id) {
+        rotate_board_key(&st);
         st.group_dirty.notify_one();
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -4143,7 +4144,24 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
     }
 }
 
-/// Quita un dispositivo de este equipo y de todo el grupo (por su clave).
+/// Tras quitar un equipo o un dispositivo del grupo, la clave del tablero cambia: lo que se
+/// cifre desde ahora no lo lee quien se fue, y la tarea del llavero (`board::spawn_upkeep`)
+/// recifra lo de antes. Solo donde se quita: al enterarse de que lo quitó otro equipo
+/// (`apply_group`) no, que ese ya rotó. Con el llavero vacío no hay nada que cambiar: quien se
+/// fue no tenía ninguna clave.
+fn rotate_board_key(st: &AppState) {
+    if st.group.board_keys().keys.is_empty() {
+        return;
+    }
+    match st.group.rotate_board_key() {
+        Ok(k) => eprintln!("nido: la clave del tablero ha cambiado ({})", k.kid),
+        Err(e) => eprintln!("nido: no se pudo cambiar la clave del tablero: {e}"),
+    }
+}
+
+/// Quita un dispositivo de este equipo y de todo el grupo (por su clave). Si estaba en el grupo,
+/// cambia la clave del tablero (`rotate_board_key`); por aquí pasa también el que se sale solo
+/// (`api_remove_me`).
 fn remove_phone(st: &AppState, id: &str) -> Response {
     let key = st
         .phones
@@ -4154,7 +4172,9 @@ fn remove_phone(st: &AppState, id: &str) -> Response {
         .find(|p| p.id == id)
         .map(|p| p.key.clone());
     if let Some(k) = &key {
-        st.group.remove_device(k);
+        if st.group.remove_device(k) {
+            rotate_board_key(st);
+        }
         st.group_dirty.notify_one();
     }
     let removed = st.phones.lock().expect("teléfonos").remove(id);
@@ -5317,6 +5337,113 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert_eq!(rec.next("unsession").await, json!({ "device": third.id }));
+    }
+
+    // ---------- La clave del tablero al quitar ----------
+
+    /// El llavero: la actual y cuántas retiradas.
+    fn ring_of(st: &AppState) -> (String, usize) {
+        let ring = st.group.board_keys();
+        let current = ring.current().unwrap().kid.clone();
+        let retired = ring.keys.iter().filter(|k| k.retired.is_some()).count();
+        (current, retired)
+    }
+
+    /// Quitar un dispositivo (aquí, o él mismo con «Cerrar sesión») o un equipo cambia la clave
+    /// del tablero: la nueva es la actual y la de antes queda retirada. Una vez por baja.
+    #[tokio::test]
+    async fn removing_a_device_or_a_machine_rotates_the_board_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let first = st.group.ensure_board_key().unwrap();
+        let add = |n: u8| {
+            st.group.add_device(&[n; 32], "tel");
+            st.phones
+                .lock()
+                .unwrap()
+                .add(&[n; 32], "tel", None)
+                .unwrap()
+        };
+        let (phone, web) = (add(1), add(2));
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        let (cur, retired) = ring_of(&st);
+        assert_ne!(cur, first.kid);
+        assert_eq!(retired, 1);
+        // Otra vez el mismo: ya no está, no rota.
+        assert_eq!(remove_phone(&st, &phone.id).status(), StatusCode::NOT_FOUND);
+        assert_eq!(ring_of(&st), (cur.clone(), 1));
+        // El que se sale solo (`DELETE /api/v1/phones/me`).
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", web.token).parse().unwrap(),
+        );
+        let r = api_remove_me(State(st.clone()), headers).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        let (cur2, retired) = ring_of(&st);
+        assert_ne!(cur2, cur);
+        assert_eq!(retired, 2);
+        // Un equipo del grupo.
+        st.group.add_member("otro", "k-otro", "mac");
+        let r = api_group_remove(State(st.clone()), Path("otro".into())).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        let (cur3, retired) = ring_of(&st);
+        assert_ne!(cur3, cur2);
+        assert_eq!(retired, 3);
+        let r = api_group_remove(State(st.clone()), Path("otro".into())).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(ring_of(&st), (cur3, 3));
+    }
+
+    /// Sin llavero (el tablero no se ha usado), quitar no crea ninguna clave: quien se va no
+    /// tenía ninguna.
+    #[tokio::test]
+    async fn removing_without_board_keys_makes_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        st.group.add_device(&[1u8; 32], "tel");
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(st.group.snapshot().keys.is_empty());
+    }
+
+    /// Lo que quitó otro equipo, al llegar por el grupo (`apply_group`), no vuelve a rotar: ese
+    /// ya rotó. Los dos acaban con el mismo llavero, con una sola clave nueva.
+    #[tokio::test]
+    async fn a_removal_from_another_machine_does_not_rotate_twice() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        a.group.ensure_board_key().unwrap();
+        a.group.add_device(&[1u8; 32], "tel");
+        b.group.merge(&a.group.snapshot());
+        let phone = a
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        b.phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        assert_eq!(remove_phone(&a, &phone.id).status(), StatusCode::NO_CONTENT);
+        assert!(b.group.merge(&a.group.snapshot()));
+        b.apply_group();
+        assert!(b.phones.lock().unwrap().list().is_empty(), "quitado aquí");
+        assert_eq!(b.group.board_keys(), a.group.board_keys());
+        assert_eq!(b.group.board_keys().keys.len(), 2);
     }
 
     // ---------- La memoria de la voz ----------
