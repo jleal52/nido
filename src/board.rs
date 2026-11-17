@@ -470,6 +470,13 @@ const MAX_READ: usize = 60;
 pub const MAX_COPY: usize = 5000;
 /// Lo que se dice de una paginación del hub que no tiene sentido.
 const BAD_PAGING: &str = "paginación no válida";
+/// Cuántas veces puede cambiar la `ref` de las páginas en una lectura. Irse a otra cuenta es un
+/// cambio (dos, si se vuelve a mover mientras se relee); más es un hub que contesta de cuentas
+/// distintas sin parar (servidores que no se ponen de acuerdo). Entonces se deja esa
+/// sincronización sin tocar la copia, y la próxima (aviso, tic o conexión) lo vuelve a intentar.
+const MAX_REF_CHANGES: usize = 3;
+/// Lo que se dice entonces.
+const REF_FLAPPING: &str = "la cuenta del tablero cambia sin parar";
 
 /// El llavero del grupo, que se pide cada vez que hace falta (cambia con las rotaciones).
 pub type Keys = Arc<dyn Fn() -> Keyring + Send + Sync>;
@@ -518,6 +525,9 @@ struct Copy {
     /// El hub del que es la copia (su URL): con otro, se vuelve a leer desde 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hub: Option<String>,
+    /// La cuenta de la que es `next` (su `ref`, como la dan las páginas): con otra, también.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    account_ref: Option<String>,
 }
 
 impl Copy {
@@ -761,6 +771,8 @@ struct Read {
     items: Vec<BoardItem>,
     next: i64,
     reset: bool,
+    /// La cuenta de lo leído: la `ref` esperada al acabar.
+    account_ref: Option<String>,
 }
 
 /// La lápida que deja un borrado propio.
@@ -953,13 +965,40 @@ impl BoardCache {
     /// `since` y el `after` de la anterior. Comprueba que el hub pagina como dice: el cursor
     /// avanza, lo de cada página va detrás del cursor pedido, `reset` solo en la primera y con
     /// `since > 0`, y como mucho `MAX_READ` objetos y páginas. Los ids que no son ids se saltan.
-    async fn read_all(&self, since: i64) -> Result<Read, BoardError> {
+    ///
+    /// `account_ref` es la cuenta que se espera (la guardada con `since`). Una página con otra
+    /// `ref` es otra cuenta: su `since` no vale, y la nueva pasa a ser la esperada y se lee otra
+    /// vez desde 0, sin tocar la copia (no hace falta si era la primera página desde 0). Una
+    /// página sin `ref` (un hub de antes) no cuenta como cambio. Si cambia más de
+    /// `MAX_REF_CHANGES` veces, se deja.
+    async fn read_all(&self, since: i64, account_ref: Option<String>) -> Result<Read, BoardError> {
         let bad = || BoardError::Hub(BAD_PAGING.into());
+        let (mut since, mut expected, mut changes) = (since, account_ref, 0);
         let mut items = Vec::new();
         let mut cursor: Option<(i64, String)> = None;
-        for _ in 0..MAX_READ {
+        let mut pages = 0;
+        while pages < MAX_READ {
+            pages += 1;
             let after = cursor.as_ref().map(|(at, id)| format!("{at}:{id}"));
             let page = self.hub.board_get(since, after.as_deref()).await?;
+            if let Some(r) = &page.account_ref
+                && expected.as_ref() != Some(r)
+            {
+                // La primera página de toda la lectura no cuenta: es la primera `ref` que se ve.
+                if pages > 1 || expected.is_some() {
+                    changes += 1;
+                    if changes > MAX_REF_CHANGES {
+                        return Err(BoardError::Hub(REF_FLAPPING.into()));
+                    }
+                }
+                expected = Some(r.clone());
+                if since > 0 || cursor.is_some() {
+                    since = 0;
+                    cursor = None;
+                    items.clear();
+                    continue;
+                }
+            }
             if page.reset {
                 if cursor.is_some() || since == 0 || !page.items.is_empty() {
                     return Err(bad());
@@ -968,6 +1007,7 @@ impl BoardCache {
                     items: vec![],
                     next: 0,
                     reset: true,
+                    account_ref: expected,
                 });
             }
             if let Some((at, id)) = &cursor
@@ -984,6 +1024,7 @@ impl BoardCache {
                     items,
                     next: page.next,
                     reset: false,
+                    account_ref: expected,
                 });
             }
             let next = page
@@ -999,25 +1040,28 @@ impl BoardCache {
         Err(bad())
     }
 
-    /// Se pone al día con el hub desde el `since` guardado (desde 0 si la copia es de otro hub,
-    /// sin tirar lo que tiene). Todo se lee antes de tocar la copia: si se corta a medias, la
-    /// próxima empieza otra vez desde el guardado. `next` nunca baja. Con `reset`, la copia se
-    /// rehace aparte desde 0 y se cambia solo al acabar. Devuelve si cambió algún objeto.
+    /// Se pone al día con el hub desde el `since` guardado (desde 0 si la copia es de otro hub o
+    /// de otra cuenta, sin tirar lo que tiene; ver `read_all`). Todo se lee antes de tocar la
+    /// copia: si se corta a medias, la próxima empieza otra vez desde el guardado. Con la misma
+    /// cuenta, `next` nunca baja; con otra, es el de esa cuenta, y se guarda con su `ref`. Con
+    /// `reset`, la copia se rehace aparte desde 0 y se cambia solo al acabar. Devuelve si cambió
+    /// algún objeto.
     pub async fn sync(self: &Arc<Self>) -> Result<bool, BoardError> {
         let _one = self.syncing.lock().await;
         let epoch = self.epoch();
         let url = self.hub.url();
-        let (since, same_hub) = {
+        let (since, same_hub, saved_ref) = {
             let c = self.lock();
             let same = c.hub == url;
-            (if same { c.next } else { 0 }, same)
+            (if same { c.next } else { 0 }, same, c.account_ref.clone())
         };
-        let read = self.read_all(since).await?;
+        let read = self.read_all(since, saved_ref.clone()).await?;
         if read.reset {
-            let fresh = self.read_all(0).await?;
+            let fresh = self.read_all(0, read.account_ref).await?;
             let mut copy = Copy {
                 hub: url,
                 next: fresh.next,
+                account_ref: fresh.account_ref,
                 ..Default::default()
             };
             for item in fresh.items {
@@ -1033,9 +1077,11 @@ impl BoardCache {
             if self.epoch() != epoch {
                 return Ok(false);
             }
-            // Con otro hub, la lectura es completa: lo vivo que no trae no está en ese hub. Se
-            // marca, y el sondeo decide si se resube (hub vacío) o sale de la copia.
-            let lost: Vec<String> = if same_hub {
+            // Con otro hub o con otra cuenta (otra `ref`), la lectura es completa (desde 0): lo
+            // vivo que no trae no está en esa cuenta. Se marca, y el sondeo decide si se resube
+            // (hub vacío) o sale de la copia. `next` es entonces el de esa cuenta, aunque baje.
+            let other = !same_hub || read.account_ref != saved_ref;
+            let lost: Vec<String> = if !other {
                 vec![]
             } else {
                 let read_ids: BTreeSet<&str> = read.items.iter().map(|i| i.id.as_str()).collect();
@@ -1054,9 +1100,10 @@ impl BoardCache {
             for item in read.items {
                 changed |= c.apply(item);
             }
-            let moved = if !same_hub {
+            let moved = if other {
                 c.hub = url;
                 c.next = read.next;
+                c.account_ref = read.account_ref;
                 true
             } else if read.next > c.next {
                 c.next = read.next;
@@ -1081,7 +1128,7 @@ impl BoardCache {
     /// (puede llegar en una rotación) se queda, marcado como que no está en el hub.
     async fn prune(self: &Arc<Self>, epoch: u64, keys: &Keyring) -> Result<(), BoardError> {
         let _one = self.syncing.lock().await;
-        let read = self.read_all(0).await?;
+        let read = self.read_all(0, None).await?;
         let on_hub: BTreeSet<String> = read.items.iter().map(|i| i.id.clone()).collect();
         let mut gone = 0;
         self.change(epoch, |c| {
@@ -1578,7 +1625,8 @@ impl BoardCache {
 /// Mantiene la copia al día mientras haya conexión con el hub: con cada conexión nueva (lo
 /// primero, un `get`, que es lo que hace que el hub avise en esa conexión), con cada aviso del
 /// hub y cada `SYNC_EVERY`. Mira además si el hub se quedó sin tablero (`probe`), de lo que el
-/// hub no avisa: al conectar, si cambia la cuenta (nombre, idioma o `ref`), cada `SYNC_EVERY` y
+/// hub no avisa: al conectar, si cambia la cuenta (nombre, idioma o `ref`, también frente a la
+/// `ref` de la copia), cada `SYNC_EVERY` y
 /// cuando una escritura ve que el hub no tiene un objeto de la copia. `keys` da el llavero del
 /// grupo cada vez.
 ///
@@ -1624,9 +1672,13 @@ pub fn spawn_with(
                     if now {
                         seen = connections;
                     }
-                    // Otra cuenta (no la primera que se sabe): puede venir con el tablero vacío.
+                    // Otra cuenta (no la primera que se sabe, o una `ref` que no es la de la
+                    // copia): puede venir con el tablero vacío.
                     let known = acct.0.is_some() || acct.1.is_some();
-                    let moved = known && account.as_ref().is_some_and(|a| *a != acct);
+                    let saved = cache.lock().account_ref.clone();
+                    let other_ref = acct.1.is_some() && saved.is_some() && acct.1 != saved;
+                    let moved = known
+                        && (other_ref || account.as_ref().is_some_and(|a| *a != acct));
                     if known {
                         account = Some(acct);
                     }
@@ -3492,6 +3544,230 @@ mod tests {
             unreadable(&r.cache),
             vec![(alien.clone(), Unreadable::NotInHub)]
         );
+    }
+
+    const REF_A: &str = "0123456789abcdef";
+    const REF_B: &str = "fedcba9876543210";
+
+    fn with_ref(r: &str) -> fake::Board {
+        fake::Board {
+            account_ref: Some(r.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Otra `ref` en las páginas (el nido se fue solo a otra cuenta, o se partió el grupo): el
+    /// `since` guardado no vale en esa cuenta y se vuelve a leer desde 0, sin vaciar la copia, y
+    /// `next` pasa a ser el de esa cuenta. Lo que no vino queda marcado como que no está en el
+    /// hub, y el sondeo lo saca (salvo lo que no tiene su clave).
+    #[tokio::test]
+    async fn another_account_ref_reads_from_zero() {
+        let r = rig(with_ref(REF_A)).await;
+        let (cur, alien, theirs) = (bid(1), bid(2), bid(3));
+        r.write(&K_CUR, &cur, &project("uno"));
+        r.write(&[0x33; 32], &alien, &project("ajena"));
+        r.cache.sync().await.unwrap();
+        assert_eq!(r.cache.lock().account_ref.as_deref(), Some(REF_A));
+        let since = r.cache.next();
+        // La otra cuenta tiene su tablero, con marcas que no tienen que ver (aquí, más viejas).
+        {
+            let mut b = r.board.lock().unwrap();
+            b.account_ref = Some(REF_B.into());
+            b.items.clear();
+            b.clock = fake::BOARD_T0 - 10_000_000;
+        }
+        let t = r.write(&K_CUR, &theirs, &project("suyo"));
+        r.cache.sync().await.unwrap();
+        let gets = r.board.lock().unwrap().gets.clone();
+        assert_eq!(&gets[gets.len() - 2..], &[(since, None), (0, None)]);
+        assert_eq!(r.cache.next(), t.at);
+        assert_eq!(r.cache.lock().account_ref.as_deref(), Some(REF_B));
+        tokio::time::timeout(Duration::from_secs(1), r.cache.probe_wanted.notified())
+            .await
+            .expect("no se pidió el sondeo");
+        assert_eq!(
+            r.cache.ids(),
+            vec![cur.clone(), alien.clone(), theirs.clone()]
+        );
+        assert_eq!(
+            unreadable(&r.cache),
+            vec![
+                (cur.clone(), Unreadable::NotInHub),
+                (alien.clone(), Unreadable::NotInHub)
+            ]
+        );
+        r.cache.probe(&keys()).await.unwrap();
+        assert_eq!(r.cache.ids(), vec![alien.clone(), theirs.clone()]);
+        assert_eq!(
+            unreadable(&r.cache),
+            vec![(alien.clone(), Unreadable::NotInHub)]
+        );
+        assert!(r.writes().is_empty());
+        assert_eq!(r.on_disk().await.lock().account_ref.as_deref(), Some(REF_B));
+        // La siguiente, desde su `next`.
+        let next = r.cache.next();
+        r.cache.sync().await.unwrap();
+        let last = r.board.lock().unwrap().gets.last().cloned().unwrap();
+        assert_eq!(last, (next, None));
+    }
+
+    /// La primera `ref`, con la copia vacía: una lectura, sin marcar nada ni pedir sondeo.
+    #[tokio::test]
+    async fn the_first_ref_with_an_empty_copy() {
+        let r = rig(with_ref(REF_A)).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        assert_eq!(r.board.lock().unwrap().gets, vec![(0, None)]);
+        assert_eq!(r.cache.ids(), vec![bid(1)]);
+        assert!(unreadable(&r.cache).is_empty());
+        assert_eq!(r.cache.lock().account_ref.as_deref(), Some(REF_A));
+        let probe =
+            tokio::time::timeout(Duration::from_millis(200), r.cache.probe_wanted.notified());
+        assert!(probe.await.is_err(), "un sondeo de más");
+    }
+
+    /// Un hub que no manda `ref` sigue como siempre: desde el `next` guardado, sin marcar nada.
+    /// Y la `ref` que tuviera la copia se queda: que no venga no es otra cuenta.
+    #[tokio::test]
+    async fn a_hub_without_ref_works_as_before() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        assert_eq!(r.cache.lock().account_ref, None);
+        for n in [2, 3] {
+            let next = r.cache.next();
+            r.write(&K_CUR, &bid(n), &project("otro"));
+            r.cache.sync().await.unwrap();
+            let last = r.board.lock().unwrap().gets.last().cloned().unwrap();
+            assert_eq!(last, (next, None));
+            r.cache.lock().account_ref = Some(REF_A.into());
+        }
+        assert_eq!(r.cache.ids(), vec![bid(1), bid(2), bid(3)]);
+        assert!(unreadable(&r.cache).is_empty());
+        assert_eq!(r.cache.lock().account_ref.as_deref(), Some(REF_A));
+        let probe =
+            tokio::time::timeout(Duration::from_millis(200), r.cache.probe_wanted.notified());
+        assert!(probe.await.is_err(), "un sondeo de más");
+    }
+
+    /// Un hub de guion: la llamada `n` (desde 0) a `get` da `page(n)`.
+    async fn scripted(
+        dir: &Path,
+        page: impl Fn(usize) -> serde_json::Value + Send + 'static,
+    ) -> (
+        fake::Recorder,
+        Arc<BoardCache>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = calls.clone();
+        let rec = fake::recording(move |v| {
+            let b = v.get("board")?;
+            let mut p = page(n.fetch_add(1, Ordering::SeqCst));
+            p["req"] = b["req"].clone();
+            p["status"] = 200.into();
+            Some(fake::Reply::Send(serde_json::json!({ "boarded": p })))
+        })
+        .await;
+        let hub = fake::nido(dir, rec.addr).await;
+        let cache = BoardCache::load_with(dir.join("board.json"), hub, GAP);
+        (rec, cache, calls)
+    }
+
+    /// Una página del guion: el objeto `n` con marca `at`, la `ref` (si hay) y si sigue.
+    fn scripted_page(n: u8, at: i64, r: Option<&str>, more: bool) -> serde_json::Value {
+        let mut p = serde_json::json!({
+            "items": [{ "id": bid(n), "v": 1, "kid": "", "blob": null, "gone": true, "at": at }],
+            "next": at, "more": more, "reset": false,
+            "after": if more { serde_json::json!(format!("{at}:{}", bid(n))) } else { serde_json::Value::Null },
+        });
+        if let Some(r) = r {
+            p["ref"] = r.into();
+        }
+        p
+    }
+
+    /// La `ref` cambia a mitad de una lectura: la nueva pasa a ser la esperada y se empieza
+    /// otra vez desde 0; con ella se guarda `next`, y solo queda lo de esa lectura.
+    #[tokio::test]
+    async fn a_ref_change_while_reading_starts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rec, cache, calls) = scripted(dir.path(), |n| match n {
+            0 => scripted_page(1, 10, Some(REF_A), true),
+            1 => scripted_page(2, 20, Some(REF_B), true),
+            2 => scripted_page(3, 5, Some(REF_B), true),
+            _ => scripted_page(4, 7, Some(REF_B), false),
+        })
+        .await;
+        cache.sync().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(cache.ids(), vec![bid(3), bid(4)]);
+        assert_eq!(cache.next(), 7);
+        assert_eq!(cache.lock().account_ref.as_deref(), Some(REF_B));
+    }
+
+    /// Una página sin `ref` (un hub de antes, mientras se despliega el nuevo) no es otra cuenta:
+    /// la esperada se queda como estaba, y la lectura sigue.
+    #[tokio::test]
+    async fn pages_without_ref_do_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rec, cache, calls) = scripted(dir.path(), |n| match n {
+            0 => scripted_page(1, 10, Some(REF_A), true),
+            1 => scripted_page(2, 20, None, true),
+            2 => scripted_page(3, 30, Some(REF_A), true),
+            _ => scripted_page(4, 40, None, false),
+        })
+        .await;
+        cache.sync().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(cache.ids(), vec![bid(1), bid(2), bid(3), bid(4)]);
+        assert_eq!(cache.lock().account_ref.as_deref(), Some(REF_A));
+    }
+
+    /// Una `ref` que cambia una y otra vez: como mucho `MAX_REF_CHANGES` cambios, y luego un
+    /// error, sin tocar la copia.
+    #[tokio::test]
+    async fn a_ref_that_keeps_changing_gives_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rec, cache, calls) = scripted(dir.path(), |n| {
+            let r = if n % 2 == 0 { REF_A } else { REF_B };
+            scripted_page(1, 10, Some(r), true)
+        })
+        .await;
+        let e = tokio::time::timeout(Duration::from_secs(10), cache.sync())
+            .await
+            .expect("no acabó")
+            .unwrap_err();
+        assert_eq!(e, BoardError::Hub(REF_FLAPPING.into()));
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_REF_CHANGES + 2);
+        assert!(cache.ids().is_empty());
+        assert_eq!(cache.next(), 0);
+        assert_eq!(cache.lock().account_ref, None);
+    }
+
+    /// Una `ref` por `{"account"}` que no es la guardada trae una sincronización con sondeo,
+    /// aunque sea la primera que se sabe en esta conexión.
+    #[tokio::test]
+    async fn an_account_ref_other_than_the_saved_one_brings_a_probe() {
+        let r = rig(with_ref(REF_A)).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        spawn_with(r.cache.clone(), keyring, LONG);
+        until("la primera", || r.cache.item(&bid(1)).is_some()).await;
+        until("el sondeo al conectar", || {
+            r.board.lock().unwrap().gets.len() == 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let mut b = r.board.lock().unwrap();
+            b.account_ref = Some(REF_B.into());
+            b.items.clear();
+        }
+        r.rec.tell(fake::Tell::Send(serde_json::json!({
+            "account": { "name": "mirlo-sereno", "lang": "es", "ref": REF_B }
+        })));
+        until("la resubida", || r.writes().len() == 1).await;
+        assert_eq!(on_hub(&r.board, &K_CUR, &bid(1)), project("uno"));
     }
 
     /// Un equipo que sale del grupo vacía su copia, en memoria y en el disco.

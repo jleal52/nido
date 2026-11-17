@@ -237,6 +237,9 @@ pub struct BoardPage {
     pub after: Option<String>,
     /// La marca era más vieja que las lápidas: hay que vaciar la copia y empezar desde 0.
     pub reset: bool,
+    /// La `ref` de la cuenta que se ha leído (la de `{"account"}`): un `since` solo vale en la
+    /// cuenta de la que vino. Un hub de antes no la manda.
+    pub account_ref: Option<String>,
 }
 
 /// Lo que da una escritura que sale bien: la versión nueva y su marca.
@@ -735,12 +738,22 @@ impl Hub {
         if more && after.is_none() {
             return Err(odd());
         }
+        let account_ref = match &v["ref"] {
+            serde_json::Value::Null => None,
+            r => Some(
+                r.as_str()
+                    .filter(|r| account_ref(r))
+                    .ok_or_else(odd)?
+                    .to_owned(),
+            ),
+        };
         Ok(BoardPage {
             items,
             next: v["next"].as_i64().ok_or_else(odd)?,
             more,
             after,
             reset: v["reset"].as_bool().unwrap_or(false),
+            account_ref,
         })
     }
 
@@ -1792,7 +1805,8 @@ mod tests {
                 next: 0,
                 more: false,
                 after: None,
-                reset: false
+                reset: false,
+                account_ref: None,
             }
         );
         let asked = rec.next("board").await;
@@ -1851,6 +1865,27 @@ mod tests {
         );
         assert_eq!(cur.v, 2);
         assert!(hub.board_pending.lock().unwrap().is_empty());
+    }
+
+    /// Cada página trae la `ref` de la cuenta leída; un hub de antes no la manda, y una que no
+    /// es una `ref` es una respuesta rara.
+    #[tokio::test]
+    async fn the_board_page_carries_the_account_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = shared(fake::Board::default());
+        let rec = fake::board(board.clone()).await;
+        let hub = connected(tmp.path(), rec.addr).await;
+        assert_eq!(hub.board_get(0, None).await.unwrap().account_ref, None);
+        board.lock().unwrap().account_ref = Some("0123456789abcdef".into());
+        assert_eq!(
+            hub.board_get(0, None).await.unwrap().account_ref.as_deref(),
+            Some("0123456789abcdef")
+        );
+        board.lock().unwrap().account_ref = Some("otra".into());
+        assert_eq!(
+            hub.board_get(0, None).await.unwrap_err(),
+            BoardError::Hub(BOARD_ODD.into())
+        );
     }
 
     /// Las páginas siguen el cursor del hub, tal cual.
@@ -2321,6 +2356,8 @@ pub(crate) mod fake {
         pub bad: std::collections::BTreeSet<String>,
         /// Lo menos que da como `next`: un hub cuyo reloj avanzó sin nada nuevo que enseñar.
         pub floor: i64,
+        /// La `ref` de la cuenta que lleva cada página; sin ella, como un hub de antes.
+        pub account_ref: Option<String>,
         /// Lo que se hace al recibir cada lectura (con cuántas van, contándola) y cada escritura
         /// (con cuántas van): para cortar algo a medias en las pruebas.
         pub on_get: Option<Box<dyn FnMut(usize) + Send>>,
@@ -2342,6 +2379,7 @@ pub(crate) mod fake {
                 too_big: Default::default(),
                 bad: Default::default(),
                 floor: 0,
+                account_ref: None,
                 on_get: None,
                 on_write: None,
             }
@@ -2381,7 +2419,13 @@ pub(crate) mod fake {
             let b = msg.get("board")?;
             let req = b["req"].as_u64()?;
             let mut reply = match b["op"].as_str() {
-                Some("get") => self.get(b["since"].as_i64().unwrap_or(0), b["after"].as_str()),
+                Some("get") => {
+                    let mut page = self.get(b["since"].as_i64().unwrap_or(0), b["after"].as_str());
+                    if let Some(r) = &self.account_ref {
+                        page["ref"] = r.clone().into();
+                    }
+                    page
+                }
                 Some(op @ ("put" | "del")) => self.change(op, b),
                 _ => serde_json::json!({
                     "status": 400, "error": "petición del tablero no válida",
