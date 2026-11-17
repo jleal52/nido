@@ -1,0 +1,1059 @@
+//! El resumen del plan de las sesiones de este equipo en sus enlaces del tablero, y el cierre y
+//! la limpieza de los enlaces de las sesiones que ya no están.
+//!
+//! Una tarea (`spawn`) hace una pasada (`pass`) cada `TICK` y cuando la llaman (`plan_changed`,
+//! `session_deleted`). Una pasada solo lee el tablero si hay algo que mirar: un plan cambiado de
+//! una sesión a la que ya le toca, un cierre pendiente, una copia o un registro que no son los
+//! de la última vez, o la limpieza de cada `CLEAN_EVERY`. Entonces descifra la copia una vez
+//! (fuera del hilo de tokio) y mira solo los enlaces de este equipo (`session.machine` es su id
+//! en el hub ahora; los de un id viejo, de otro hub o de otra cuenta, ya no son suyos):
+//!
+//! - De una sesión que está en el registro (aunque esté parada), abierto: si su resumen
+//!   (`title`, `done`, `total`, `active`, `blocked`, `failed`) o su nombre no son los del
+//!   enlace, se escriben; como mucho una vez cada `GAP` por sesión, y todos sus enlaces a la vez.
+//!   Lo que cambie mientras tanto se junta: se sube lo que haya al tocarle, nunca una cola.
+//! - De una sesión que no está en el registro, abierto: se cierra (`closed`), con la hora en que
+//!   se borró si fue aquí (`session_deleted`, con el último resumen de su plan) o la de ahora.
+//! - Cerrado hace `KEEP_CLOSED` o más: se borra.
+//!
+//! Lo que no se toca nunca: los enlaces de otros equipos, los que no se pueden leer y los
+//! huérfanos (su objetivo no está o no se puede leer). Un objetivo que falta puede volver (un
+//! hub que se quedó sin tablero y se está resubiendo, una copia de otra cuenta, una clave que
+//! llega con el grupo): borrar o cerrar sus enlaces entonces los perdería para siempre. Los
+//! borra quien borra el objetivo (`objective`, `project`).
+//!
+//! Sin conexión no se hace nada y no se pierde nada: lo pendiente es «lo que hay ahora frente a
+//! lo que tiene el enlace», que se mira al volver. Con un 429 se espera `BUSY_WAIT`.
+
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::Map;
+
+use crate::board::{EditError, Object, PlanSummary};
+use crate::group::Keyring;
+use crate::hub::BoardError;
+use crate::registry::now_ms;
+use crate::server::AppState;
+
+/// Lo menos que pasa entre dos subidas del resumen de una sesión (ms). El freno del hub es de
+/// 3000 escrituras por hora y cuenta (decisión 6): una sesión en dos objetivos, como mucho 240.
+pub const GAP: u64 = 30_000;
+/// Cada cuánto se mira, como poco. Menos que `GAP`, para que la siguiente subida no espere
+/// otra vuelta entera por unos milisegundos de diferencia entre los relojes.
+const TICK: Duration = Duration::from_secs(10);
+/// Cuánto se guarda un enlace cerrado antes de borrarlo (ms).
+pub const KEEP_CLOSED: u64 = 30 * 24 * 3600 * 1000;
+/// Cada cuánto se repasa el tablero aunque no haya cambiado nada, para los cerrados que
+/// cumplen sus 30 días (ms).
+const CLEAN_EVERY: u64 = 3600 * 1000;
+/// Lo que se espera tras un 429 (ms).
+const BUSY_WAIT: u64 = 60_000;
+/// Lo más que se escribe en una pasada; lo demás, en la siguiente.
+const MAX_WRITES: usize = 50;
+
+/// El estado de la tarea: está en `AppState`, pero la tarea la lanza `spawn_scanner`.
+#[derive(Default)]
+pub struct Progress {
+    inner: std::sync::Mutex<Inner>,
+    /// Que la tarea haga una pasada ya.
+    wake: tokio::sync::Notify,
+    /// Una pasada a la vez.
+    one: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct Inner {
+    /// Las sesiones cuyo plan cambió y que quizá falta subir.
+    dirty: HashSet<String>,
+    /// Cuándo se subió por última vez lo de cada sesión (ms).
+    last: HashMap<String, u64>,
+    /// Las sesiones borradas aquí cuyos enlaces aún no se han cerrado.
+    closing: HashMap<String, Closing>,
+    /// Lo que vio el último repaso: la revisión de la copia y la huella del registro. `None`:
+    /// hay que volver a repasar.
+    seen: Option<(u64, u64)>,
+    /// Cuándo toca el próximo repaso aunque no cambie nada (ms).
+    next_clean: u64,
+    /// Hasta cuándo no se escribe, tras un 429 (ms).
+    busy_until: u64,
+    /// Los enlaces que no se pudieron escribir por algo que no se arregla reintentando: su `v` y
+    /// lo que se quería. Mientras no cambien, no se vuelve a probar (gastaría el freno del hub).
+    stuck: HashMap<String, (i64, Job)>,
+    /// El último error que se apuntó, para no repetirlo.
+    said: Option<String>,
+}
+
+/// Una sesión borrada: cuándo y el último resumen de su plan (`None` si no se pudo leer: el
+/// resumen del enlace se deja como está).
+#[derive(Debug, Clone, PartialEq)]
+struct Closing {
+    at: u64,
+    plan: Option<Option<PlanSummary>>,
+}
+
+/// Lo que hay que hacer con un enlace.
+#[derive(Debug, Clone, PartialEq)]
+enum Job {
+    /// Poner el resumen del plan y el nombre de su sesión.
+    Copy {
+        session: String,
+        plan: Option<PlanSummary>,
+        name: String,
+    },
+    /// Cerrarlo.
+    Close { session: String, closing: Closing },
+    /// Borrarlo.
+    Remove,
+}
+
+impl Job {
+    /// Si es lo mismo que `o`, sin mirar la hora de un cierre (la de ahora, en cada pasada).
+    fn same(&self, o: &Job) -> bool {
+        match (self, o) {
+            (Job::Close { session: a, .. }, Job::Close { session: b, .. }) => a == b,
+            _ => self == o,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Task {
+    link: String,
+    v: i64,
+    job: Job,
+}
+
+/// Un enlace de este equipo, legible y con su objetivo.
+#[derive(Debug)]
+struct Mine {
+    id: String,
+    v: i64,
+    session: String,
+    name: String,
+    plan: Option<PlanSummary>,
+    closed: Option<u64>,
+}
+
+/// El resumen de un plan como va en el enlace.
+pub fn link_plan(s: &crate::plan::Summary) -> PlanSummary {
+    PlanSummary {
+        title: s.title.clone(),
+        done: s.done,
+        total: s.total,
+        active: s.active,
+        blocked: s.blocked,
+        failed: s.failed,
+        extra: Map::new(),
+    }
+}
+
+/// Si dos resúmenes dicen lo mismo (lo que no conocemos, `extra`, no cuenta).
+fn same_plan(a: Option<&PlanSummary>, b: Option<&PlanSummary>) -> bool {
+    let key = |p: &PlanSummary| {
+        (
+            p.title.clone(),
+            p.done,
+            p.total,
+            p.active,
+            p.blocked,
+            p.failed,
+        )
+    };
+    a.map(key) == b.map(key)
+}
+
+/// Pone `want` en `slot`, en el sitio: lo que no conocemos del resumen que había se queda.
+fn put_plan(slot: &mut Option<PlanSummary>, want: Option<&PlanSummary>) {
+    match (slot.as_mut(), want) {
+        (_, None) => *slot = None,
+        (Some(p), Some(w)) => {
+            p.title = w.title.clone();
+            p.done = w.done;
+            p.total = w.total;
+            p.active = w.active;
+            p.blocked = w.blocked;
+            p.failed = w.failed;
+        }
+        (None, Some(w)) => *slot = Some(w.clone()),
+    }
+}
+
+/// Si a la sesión ya le toca subir (`last`: la última vez).
+fn due(last: Option<&u64>, now: u64) -> bool {
+    last.is_none_or(|&t| now < t || now - t >= GAP)
+}
+
+impl Progress {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().expect("resumen del tablero")
+    }
+
+    /// Ha cambiado el plan de la sesión `id`.
+    pub fn plan_changed(&self, id: &str) {
+        self.lock().dirty.insert(id.to_owned());
+        self.wake.notify_one();
+    }
+
+    /// Se ha borrado la sesión `id` a las `at` (ms): sus enlaces se cierran, con `plan` (el
+    /// último resumen de su plan; `None` si no se pudo leer) si cambió.
+    pub fn session_deleted(&self, id: &str, at: u64, plan: Option<Option<PlanSummary>>) {
+        let mut i = self.lock();
+        i.dirty.remove(id);
+        i.last.remove(id);
+        i.closing.insert(id.to_owned(), Closing { at, plan });
+        drop(i);
+        self.wake.notify_one();
+    }
+
+    /// Si hay que repasar el tablero.
+    fn wanted(&self, now: u64, seen: (u64, u64)) -> bool {
+        let i = self.lock();
+        if now < i.busy_until {
+            return false;
+        }
+        !i.closing.is_empty()
+            || i.seen != Some(seen)
+            || now >= i.next_clean
+            || i.dirty.iter().any(|s| due(i.last.get(s), now))
+    }
+
+    /// Qué hacer con cada enlace de este equipo (`mine`), con los resúmenes de ahora (`plans`:
+    /// `Err` si el plan no se pudo leer; una sesión que falta es que no se miró, porque llegó al
+    /// registro mientras se leía) y las sesiones del registro (`names`, por id, con su nombre en
+    /// el tablero). Las sesiones a las que aún no les toca, o cuyo plan no se pudo leer o mirar,
+    /// se quedan pendientes.
+    fn decide(
+        &self,
+        mine: &[Mine],
+        plans: &HashMap<String, Plan>,
+        names: &HashMap<String, String>,
+        now: u64,
+    ) -> Vec<Task> {
+        let mut i = self.lock();
+        let mut tasks = vec![];
+        let (mut later, mut unread) = (HashSet::new(), HashSet::new());
+        for m in mine {
+            let job = if let Some(t) = m.closed {
+                if now.saturating_sub(t) < KEEP_CLOSED {
+                    continue;
+                }
+                Job::Remove
+            } else if let Some(name) = names.get(&m.session) {
+                let plan = match plans.get(&m.session) {
+                    Some(Ok(p)) => p,
+                    Some(Err(())) => {
+                        unread.insert(m.session.clone());
+                        continue;
+                    }
+                    None => {
+                        later.insert(m.session.clone());
+                        continue;
+                    }
+                };
+                if same_plan(m.plan.as_ref(), plan.as_ref()) && m.name == *name {
+                    continue;
+                }
+                if !due(i.last.get(&m.session), now) {
+                    later.insert(m.session.clone());
+                    continue;
+                }
+                Job::Copy {
+                    session: m.session.clone(),
+                    plan: plan.clone(),
+                    name: name.clone(),
+                }
+            } else {
+                let closing = i.closing.get(&m.session).cloned().unwrap_or(Closing {
+                    at: now,
+                    plan: None,
+                });
+                Job::Close {
+                    session: m.session.clone(),
+                    closing,
+                }
+            };
+            if i.stuck
+                .get(&m.id)
+                .is_some_and(|(v, j)| *v == m.v && j.same(&job))
+            {
+                continue;
+            }
+            tasks.push(Task {
+                link: m.id.clone(),
+                v: m.v,
+                job,
+            });
+        }
+        // Un plan que no se pudo leer se vuelve a probar a su ritmo, no en cada vuelta.
+        for s in &unread {
+            i.last.insert(s.clone(), now);
+        }
+        i.dirty.extend(later.into_iter().chain(unread));
+        // Lo de las sesiones que ya no están, fuera.
+        i.last.retain(|s, _| names.contains_key(s));
+        let ids: HashSet<&str> = mine.iter().map(|m| m.id.as_str()).collect();
+        i.stuck.retain(|l, _| ids.contains(l.as_str()));
+        tasks
+    }
+
+    fn say(&self, what: String) {
+        let mut i = self.lock();
+        if i.said.as_deref() != Some(what.as_str()) {
+            eprintln!("nido: tablero: {what}");
+            i.said = Some(what);
+        }
+    }
+}
+
+/// El resumen de ahora del plan de una sesión (`None`: no tiene), o `Err` si no se pudo leer.
+type Plan = Result<Option<PlanSummary>, ()>;
+
+/// Los enlaces de este equipo (`machine`) que se pueden leer y tienen su objetivo, y los
+/// resúmenes de ahora de las sesiones de `sessions` que tienen alguno abierto. Descifra la copia
+/// entera y puede leer planes del disco: fuera del hilo de tokio.
+fn read_mine(
+    st: &AppState,
+    keys: &Keyring,
+    machine: &str,
+    sessions: &HashSet<String>,
+) -> (Vec<Mine>, HashMap<String, Plan>) {
+    let d = st.board.decrypted(keys);
+    let objectives: HashSet<&str> = d
+        .objects
+        .iter()
+        .filter(|e| matches!(e.object, Object::Objective(_)))
+        .map(|e| e.id.as_str())
+        .collect();
+    let mine: Vec<Mine> = d
+        .objects
+        .iter()
+        .filter_map(|e| match &e.object {
+            Object::Link(l)
+                if l.session.machine == machine && objectives.contains(l.objective.as_str()) =>
+            {
+                Some(Mine {
+                    id: e.id.clone(),
+                    v: e.v,
+                    session: l.session.id.clone(),
+                    name: l.session.name.clone(),
+                    plan: l.plan.clone(),
+                    closed: l.closed,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    let mut plans = HashMap::new();
+    for m in mine.iter().filter(|m| m.closed.is_none()) {
+        if plans.contains_key(&m.session) || !sessions.contains(&m.session) {
+            continue;
+        }
+        let plan = st.plans.try_summary(&m.session).map_err(drop);
+        plans.insert(m.session.clone(), plan.map(|s| s.as_ref().map(link_plan)));
+    }
+    (mine, plans)
+}
+
+/// Las sesiones del registro, por id, con su nombre en el tablero, y su huella.
+async fn registry(st: &AppState, host: &str) -> (HashMap<String, String>, u64) {
+    let mut list: Vec<(String, String)> = st
+        .registry
+        .lock()
+        .await
+        .sessions()
+        .iter()
+        .map(|s| (s.id.clone(), crate::board_tools::label(host, &s.name)))
+        .collect();
+    list.sort();
+    let mut h = DefaultHasher::new();
+    list.hash(&mut h);
+    (list.into_iter().collect(), h.finish())
+}
+
+/// Lo que se escribe en el enlace: solo si sigue siendo de la sesión (tras un 409 se vuelve a
+/// aplicar sobre el de ahora). El resumen y el nombre, en uno abierto; `copied` solo si cambia
+/// el resumen. `changed` y `by` no: no es un cambio de nadie, es una copia (`copied` dice
+/// cuándo).
+fn copy(
+    o: &mut Object,
+    machine: &str,
+    session: &str,
+    plan: Option<&PlanSummary>,
+    name: &str,
+    now: u64,
+) {
+    if let Object::Link(l) = o
+        && l.session.machine == machine
+        && l.session.id == session
+        && l.closed.is_none()
+    {
+        if !same_plan(l.plan.as_ref(), plan) {
+            put_plan(&mut l.plan, plan);
+            l.copied = now;
+        }
+        name.clone_into(&mut l.session.name);
+    }
+}
+
+/// Cierra el enlace (si sigue abierto y es de la sesión), con el último resumen si se sabe. Esto
+/// sí es un cambio: `changed` es ahora y `by`, la sesión que se cerró.
+fn close(o: &mut Object, machine: &str, session: &str, c: &Closing, now: u64) {
+    if let Object::Link(l) = o
+        && l.session.machine == machine
+        && l.session.id == session
+        && l.closed.is_none()
+    {
+        l.closed = Some(c.at);
+        if let Some(plan) = &c.plan
+            && !same_plan(l.plan.as_ref(), plan.as_ref())
+        {
+            put_plan(&mut l.plan, plan.as_ref());
+            l.copied = c.at;
+        }
+        l.changed = now;
+        l.by = l.session.name.clone();
+    }
+}
+
+/// Una pasada a la hora `now` (ms). Ver el principio del módulo.
+pub async fn pass(st: &Arc<AppState>, now: u64) {
+    let p = &st.progress;
+    let _one = p.one.lock().await;
+    let machine = {
+        let s = st.hub.status.borrow();
+        if !s.connected {
+            return;
+        }
+        s.id.clone()
+    };
+    let Some(machine) = machine else { return };
+    let host = crate::e2e::Host::host_name(st.as_ref());
+    let rev = *st.board.subscribe().borrow();
+    let (before, fp) = registry(st, &host).await;
+    if !p.wanted(now, (rev, fp)) {
+        return;
+    }
+    let keys = st.group.board_keys();
+    if keys.current().is_none() {
+        // Sin clave no hay tablero que leer ni escribir (la crea quien escribe el primero).
+        return;
+    }
+    // Lo que cambie desde aquí se queda para la próxima.
+    let taken = std::mem::take(&mut p.lock().dirty);
+    let read = {
+        let (st, keys, machine) = (st.clone(), keys.clone(), machine.clone());
+        let sessions: HashSet<String> = before.into_keys().collect();
+        tokio::task::spawn_blocking(move || read_mine(&st, &keys, &machine, &sessions)).await
+    };
+    let Ok((mine, plans)) = read else {
+        p.lock().dirty.extend(taken);
+        return;
+    };
+    // El registro, después de leer: una sesión que se borra entretanto ya no está (y no se le
+    // sube un plan vacío), y una que se crea y se une entretanto ya está (y no se cierra).
+    let (names, _) = registry(st, &host).await;
+    let tasks = p.decide(&mine, &plans, &names, now);
+    {
+        let mut i = p.lock();
+        i.seen = Some((rev, fp));
+        i.next_clean = now + CLEAN_EVERY;
+        // Las borradas que ya no tienen enlaces abiertos, hechas (o no tenían ninguno). Una que
+        // se borra mientras tanto aún los tiene: se queda.
+        let open: HashSet<&str> = mine
+            .iter()
+            .filter(|m| m.closed.is_none())
+            .map(|m| m.session.as_str())
+            .collect();
+        i.closing.retain(|s, _| open.contains(s.as_str()));
+    }
+    run(st, &keys, &machine, tasks, now).await;
+}
+
+/// Hace lo decidido, en orden. Un error que se puede arreglar esperando deja lo que falte para
+/// la próxima pasada; con el hub caído o un 429, se para.
+async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>, now: u64) {
+    let p = &st.progress;
+    let (mut again, mut closed, mut removed) = (false, 0, 0);
+    for (n, t) in tasks.into_iter().enumerate() {
+        if n >= MAX_WRITES {
+            again = true;
+            break;
+        }
+        let r = match &t.job {
+            Job::Copy {
+                session,
+                plan,
+                name,
+            } => st
+                .board
+                .update(keys, &t.link, |o| {
+                    copy(o, machine, session, plan.as_ref(), name, now)
+                })
+                .await
+                .map(drop),
+            Job::Close { session, closing } => st
+                .board
+                .update(keys, &t.link, |o| close(o, machine, session, closing, now))
+                .await
+                .map(drop),
+            Job::Remove => st.board.remove(keys, &t.link).await,
+        };
+        // Si hay que parar y si falta algo (que la próxima pasada vuelva a mirar).
+        let (stop, pending) = match r {
+            Ok(()) | Err(EditError::Missing) => {
+                match &t.job {
+                    Job::Copy { session, .. } => {
+                        p.lock().last.insert(session.clone(), now);
+                    }
+                    Job::Close { .. } => closed += 1,
+                    Job::Remove => removed += 1,
+                }
+                (false, false)
+            }
+            Err(EditError::Board(BoardError::Busy)) => {
+                p.lock().busy_until = now + BUSY_WAIT;
+                (true, true)
+            }
+            Err(e @ (EditError::Board(BoardError::Hub(_)) | EditError::NoKey)) => {
+                p.say(format!("no se pudieron poner al día los enlaces ({e})"));
+                (true, true)
+            }
+            // Choca una y otra vez: en la próxima.
+            Err(EditError::Board(BoardError::Conflict(_))) => (false, true),
+            Err(e) => {
+                p.say(format!(
+                    "el enlace {} no se pudo poner al día ({e})",
+                    t.link
+                ));
+                let mut i = p.lock();
+                i.stuck.insert(t.link.clone(), (t.v, t.job.clone()));
+                // No se va a cerrar: que no se repase en cada vuelta por él.
+                if let Job::Close { session, .. } = &t.job {
+                    i.closing.remove(session);
+                }
+                (false, false)
+            }
+        };
+        again |= pending;
+        if stop {
+            break;
+        }
+    }
+    {
+        let mut i = p.lock();
+        if again {
+            i.seen = None;
+        } else {
+            i.said = None;
+        }
+    }
+    if closed > 0 {
+        eprintln!("nido: tablero: {closed} enlaces de sesiones que ya no están, cerrados");
+    }
+    if removed > 0 {
+        eprintln!("nido: tablero: {removed} enlaces de sesiones cerradas hace 30 días, fuera");
+    }
+}
+
+/// La tarea: una pasada cada `TICK` y cada vez que la llaman.
+pub fn spawn(st: Arc<AppState>) {
+    spawn_with(st, TICK);
+}
+
+/// `spawn`, cada `every` (para las pruebas).
+pub fn spawn_with(st: Arc<AppState>, every: Duration) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = st.progress.wake.notified() => {}
+            }
+            pass(&st, now_ms()).await;
+        }
+    });
+}
+
+#[cfg(test)]
+impl Progress {
+    /// Como tras reiniciar nido: sin nada apuntado.
+    fn forget_all(&self) {
+        *self.lock() = Inner::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board;
+    use crate::board_tools::tests::{World, session, world};
+    use crate::registry::Session;
+    use serde_json::{Value, json};
+
+    /// Una hora cualquiera (ms).
+    const T0: u64 = 1_800_000_000_000;
+    const DAY: u64 = 24 * 3600 * 1000;
+
+    fn limit() -> crate::watchdog::Limit {
+        crate::watchdog::limit(Duration::from_secs(60))
+    }
+
+    /// Pone a la sesión `id` un plan de una fase con tareas en estos estados.
+    fn set_plan(w: &World, id: &str, title: &str, states: &[&str]) {
+        let tasks: Vec<Value> = states
+            .iter()
+            .enumerate()
+            .map(|(n, s)| json!({"id": format!("t{n}"), "name": format!("tarea {n}"), "status": s}))
+            .collect();
+        let a = serde_json::from_value(
+            json!({"title": title, "phases": [{"id": "f1", "name": "Uno", "tasks": tasks}]}),
+        )
+        .unwrap();
+        w.st.plans.set(id, a, 1).unwrap();
+        crate::server::plan_changed(&w.st, id);
+    }
+
+    /// Un proyecto «P» con un objetivo «O»: el id del objetivo.
+    async fn goal(w: &World) -> String {
+        w.call("project", json!({"name": "P"})).await.unwrap();
+        let r = w
+            .call("objective", json!({"project": "P", "name": "O"}))
+            .await
+            .unwrap();
+        r["id"].as_str().unwrap().to_owned()
+    }
+
+    /// `s` se une a «O»: el id del enlace.
+    async fn join(w: &World, s: &Session) -> String {
+        let r = w
+            .call_as(s, "join", json!({"objective": "O"}))
+            .await
+            .unwrap();
+        r["link"].as_str().unwrap().to_owned()
+    }
+
+    /// Otro cliente escribe un enlace al objetivo `o` de la sesión `session` del equipo
+    /// `machine`, con lo de `more` encima.
+    fn put_link(w: &World, id: &str, o: &str, machine: &str, session: &str, more: Value) {
+        let mut v = json!({"t": "link", "objective": o,
+            "session": {"machine": machine, "id": session, "name": "Otro/vieja"},
+            "plan": null, "copied": 0, "closed": null, "created": 1, "changed": 1, "by": "web"});
+        for (k, x) in more.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        w.put(id, v);
+    }
+
+    fn summary(title: &str, done: u64, total: u64, active: u64) -> Value {
+        json!({"title": title, "done": done, "total": total, "active": active, "blocked": 0,
+            "failed": 0})
+    }
+
+    fn items(w: &World) -> std::collections::BTreeMap<String, crate::hub::BoardItem> {
+        w.board.lock().unwrap().items.clone()
+    }
+
+    /// El primer cambio sube enseguida; los que llegan en los 30 s siguientes se juntan y sube
+    /// solo el último, al cumplirse. Sin cambios, nada.
+    #[tokio::test]
+    async fn two_changes_in_30_s_upload_one() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        let l = join(&w, &w.s).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done", "in_progress", "pending"]);
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n + 1);
+        let v = w.stored(&l).unwrap();
+        assert_eq!(v["plan"], summary("Migrar", 1, 3, 1));
+        assert_eq!(v["copied"], T0);
+        assert_eq!(
+            (&v["changed"], &v["by"]),
+            (&w.stored(&l).unwrap()["created"], &json!(w.by(&w.s)))
+        );
+
+        set_plan(&w, &w.s.id, "Migrar", &["done", "done", "pending"]);
+        pass(&w.st, T0 + 10_000).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done", "done", "in_progress"]);
+        pass(&w.st, T0 + 29_999).await;
+        assert_eq!(w.writes(), n + 1, "aún no le toca");
+        pass(&w.st, T0 + GAP).await;
+        assert_eq!(w.writes(), n + 2);
+        let v = w.stored(&l).unwrap();
+        assert_eq!(v["plan"], summary("Migrar", 2, 3, 1));
+        assert_eq!(v["copied"], T0 + GAP);
+
+        // Sin cambios, ni con la copia nueva ni pasado el tiempo.
+        pass(&w.st, T0 + 2 * GAP).await;
+        pass(&w.st, T0 + DAY).await;
+        assert_eq!(w.writes(), n + 2);
+    }
+
+    /// Un cambio del plan que no toca el resumen (una nota) no sube.
+    #[tokio::test]
+    async fn a_change_outside_the_summary_does_not_upload() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        join(&w, &w.s).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done", "in_progress"]);
+        pass(&w.st, T0).await;
+        let n = w.writes();
+        let t =
+            serde_json::from_value(json!({"id": "t1", "status": "in_progress", "note": "va bien"}))
+                .unwrap();
+        w.st.plans.update_task(&w.s.id, t, 2).unwrap();
+        crate::server::plan_changed(&w.st, &w.s.id);
+        pass(&w.st, T0 + 2 * GAP).await;
+        assert_eq!(w.writes(), n);
+    }
+
+    /// Una sesión sin enlaces no sube nada, aunque cambie su plan.
+    #[tokio::test]
+    async fn a_session_without_links_uploads_nothing() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        // El enlace de otra sesión de aquí no es suyo.
+        let other =
+            w.st.registry
+                .lock()
+                .await
+                .add(session(w.tmp.path(), "otra"))
+                .unwrap();
+        let l = join(&w, &other).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        pass(&w.st, T0 + GAP).await;
+        assert_eq!(w.writes(), n);
+        assert_eq!(w.stored(&l).unwrap()["objective"], o.as_str());
+        assert_eq!(w.stored(&l).unwrap()["plan"], Value::Null);
+    }
+
+    /// Tras reiniciar (sin nada apuntado), lo que ya está en el enlace no se vuelve a subir.
+    #[tokio::test]
+    async fn what_the_link_already_has_is_not_uploaded_again() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        join(&w, &w.s).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done", "pending"]);
+        pass(&w.st, T0).await;
+        let n = w.writes();
+        w.st.progress.forget_all();
+        crate::server::plan_changed(&w.st, &w.s.id);
+        pass(&w.st, T0 + 1).await;
+        assert_eq!(w.writes(), n);
+    }
+
+    /// Al borrar la sesión, sus enlaces se cierran con la hora del borrado y el último resumen
+    /// de su plan (aunque aún no tocara subirlo).
+    #[tokio::test]
+    async fn deleting_the_session_closes_its_links() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        w.call("objective", json!({"project": "P", "name": "O2"}))
+            .await
+            .unwrap();
+        let l1 = join(&w, &w.s).await;
+        let l2 = w.call("join", json!({"objective": "O2"})).await.unwrap()["link"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        set_plan(&w, &w.s.id, "Migrar", &["done", "pending"]);
+        // Con el reloj de verdad: el cierre lleva la hora del borrado.
+        let t0 = now_ms();
+        pass(&w.st, t0).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done", "done"]);
+        let before = now_ms();
+        crate::server::delete_session(&w.st, &w.s.id).await.unwrap();
+        let after = now_ms();
+        pass(&w.st, t0 + 1000).await;
+        for l in [&l1, &l2] {
+            let v = w.stored(l).unwrap();
+            let closed = v["closed"].as_u64().expect("cerrado");
+            assert!((before..=after).contains(&closed), "{v}");
+            assert_eq!(v["plan"], summary("Migrar", 2, 2, 0));
+            assert_eq!(v["copied"], closed);
+            assert_eq!(v["changed"], t0 + 1000);
+            assert_eq!(v["session"]["name"], w.by(&w.s));
+            assert_eq!(v["by"], w.by(&w.s));
+        }
+        assert_eq!(w.stored(&l1).unwrap()["objective"], o.as_str());
+        // Hecho: nada más (hasta los 30 días).
+        let n = w.writes();
+        pass(&w.st, t0 + 2000).await;
+        pass(&w.st, t0 + DAY).await;
+        assert_eq!(w.writes(), n);
+    }
+
+    /// Un enlace cerrado de este equipo se borra a los 30 días; antes no.
+    #[tokio::test]
+    async fn after_30_days_a_closed_link_goes() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let l = "1".repeat(32);
+        put_link(&w, &l, &o, "este", "dead0000", json!({"closed": T0}));
+        // Uno de una sesión que sigue (`join` lo vuelve a abrir): también.
+        let mine = "2".repeat(32);
+        put_link(&w, &mine, &o, "este", &w.s.id, json!({"closed": T0}));
+        w.st.board.sync().await.unwrap();
+        let n = w.writes();
+        pass(&w.st, T0 + KEEP_CLOSED - CLEAN_EVERY).await;
+        assert_eq!(w.writes(), n);
+        assert!(w.stored(&l).is_some());
+        pass(&w.st, T0 + KEEP_CLOSED).await;
+        assert!(w.stored(&l).is_none(), "borrado");
+        assert!(w.stored(&mine).is_none(), "borrado");
+        assert!(items(&w)[&l].gone);
+    }
+
+    /// Una sesión que ya no está en el registro: primero se cierra (ahora) y se borra a los 30
+    /// días. Una parada sigue en el registro: no se toca.
+    #[tokio::test]
+    async fn links_of_sessions_that_are_gone_are_closed_then_removed() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let mut stopped = session(w.tmp.path(), "parada");
+        stopped.stopped = 5;
+        let stopped = w.st.registry.lock().await.add(stopped).unwrap();
+        let ls = join(&w, &stopped).await;
+        let gone = "1".repeat(32);
+        put_link(&w, &gone, &o, "este", "dead0000", json!({}));
+        w.st.board.sync().await.unwrap();
+        pass(&w.st, T0).await;
+        let v = w.stored(&gone).unwrap();
+        assert_eq!(v["closed"], T0);
+        assert_eq!(v["plan"], Value::Null, "sin plan que copiar");
+        assert_eq!(v["by"], "Otro/vieja");
+        assert_eq!(w.stored(&ls).unwrap()["closed"], Value::Null);
+
+        pass(&w.st, T0 + KEEP_CLOSED - CLEAN_EVERY).await;
+        assert!(w.stored(&gone).is_some());
+        pass(&w.st, T0 + KEEP_CLOSED).await;
+        assert!(w.stored(&gone).is_none());
+        assert_eq!(w.stored(&ls).unwrap()["closed"], Value::Null);
+    }
+
+    /// Los enlaces de otros equipos, o de este con otro id en el hub (otro hub, otra cuenta), no
+    /// se tocan: ni el resumen, ni el cierre, ni el borrado.
+    #[tokio::test]
+    async fn links_of_other_machines_are_not_touched() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        put_link(&w, &"1".repeat(32), &o, "mac", &w.s.id, json!({}));
+        put_link(&w, &"2".repeat(32), &o, "viejo", "dead0000", json!({}));
+        put_link(
+            &w,
+            &"3".repeat(32),
+            &o,
+            "mac",
+            "dead0000",
+            json!({"closed": 1}),
+        );
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        w.st.board.sync().await.unwrap();
+        let (before, n) = (items(&w), w.writes());
+        pass(&w.st, T0).await;
+        pass(&w.st, T0 + KEEP_CLOSED).await;
+        assert_eq!(w.writes(), n);
+        assert_eq!(items(&w), before);
+    }
+
+    /// Los huérfanos (su objetivo no está o no se puede leer) y los que no se pueden leer no se
+    /// tocan.
+    #[tokio::test]
+    async fn orphans_and_unreadable_links_are_not_touched() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let nowhere = "9".repeat(32);
+        put_link(&w, &"1".repeat(32), &nowhere, "este", &w.s.id, json!({}));
+        put_link(&w, &"2".repeat(32), &nowhere, "este", "dead0000", json!({}));
+        put_link(
+            &w,
+            &"3".repeat(32),
+            &nowhere,
+            "este",
+            "dead0000",
+            json!({"closed": 1}),
+        );
+        // Un objetivo con una clave que no está en el llavero, y su enlace.
+        let other = [9u8; 32];
+        let hidden = "8".repeat(32);
+        let blob = board::seal(
+            &other,
+            &hidden,
+            br#"{"t":"objective","project":"x","name":"O3","state":"doing","created":1,"changed":1}"#,
+        )
+        .unwrap();
+        w.board
+            .lock()
+            .unwrap()
+            .write(&hidden, Some((&board::kid(&other), &blob)));
+        put_link(&w, &"4".repeat(32), &hidden, "este", &w.s.id, json!({}));
+        // Un enlace con esa clave, y uno que no es un enlace (sin `session`).
+        let text = json!({"t": "link", "objective": o,
+            "session": {"machine": "este", "id": w.s.id, "name": "x"}, "created": 1,
+            "changed": 1});
+        let id = "5".repeat(32);
+        let blob = board::seal(&other, &id, text.to_string().as_bytes()).unwrap();
+        w.board
+            .lock()
+            .unwrap()
+            .write(&id, Some((&board::kid(&other), &blob)));
+        w.put(
+            &"6".repeat(32),
+            json!({"t": "link", "objective": o, "created": 1, "changed": 1}),
+        );
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        w.st.board.sync().await.unwrap();
+        let (before, n) = (items(&w), w.writes());
+        pass(&w.st, T0).await;
+        pass(&w.st, T0 + KEEP_CLOSED).await;
+        assert_eq!(w.writes(), n);
+        assert_eq!(items(&w), before);
+    }
+
+    /// Se escribe en el enlace leído: lo que no conocemos (del enlace, de su sesión y de su
+    /// resumen) se queda, y `changed` y `by` no cambian.
+    #[tokio::test]
+    async fn what_we_do_not_know_is_kept() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let l = "1".repeat(32);
+        put_link(
+            &w,
+            &l,
+            &o,
+            "este",
+            &w.s.id,
+            json!({"futuro": {"a": 1},
+                "session": {"machine": "este", "id": w.s.id, "name": "viejo", "apodo": "x"},
+                "plan": {"title": "a", "done": 0, "total": 1, "active": 0, "blocked": 0,
+                    "failed": 0, "color": "rojo"},
+                "copied": 5, "changed": 2}),
+        );
+        w.st.board.sync().await.unwrap();
+        set_plan(&w, &w.s.id, "Migrar", &["done", "in_progress"]);
+        pass(&w.st, T0).await;
+        let v = w.stored(&l).unwrap();
+        assert_eq!(v["futuro"], json!({"a": 1}));
+        assert_eq!(
+            v["session"],
+            json!({"machine": "este", "id": w.s.id, "name": w.by(&w.s), "apodo": "x"})
+        );
+        let mut want = summary("Migrar", 1, 2, 1);
+        want["color"] = "rojo".into();
+        assert_eq!(v["plan"], want);
+        assert_eq!(
+            (&v["copied"], &v["changed"], &v["by"]),
+            (&json!(T0), &json!(2), &json!("web"))
+        );
+    }
+
+    /// Si la sesión cambia de nombre, sus enlaces también (sin tocar `copied`: el resumen es el
+    /// mismo).
+    #[tokio::test]
+    async fn a_renamed_session_renames_its_links() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        let l = join(&w, &w.s).await;
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n, "sin plan y con su nombre: nada");
+        let renamed =
+            w.st.registry
+                .lock()
+                .await
+                .update(&w.s.id, |s| s.name = "nueva".into())
+                .unwrap();
+        pass(&w.st, T0 + 1000).await;
+        let v = w.stored(&l).unwrap();
+        assert_eq!(v["session"]["name"], w.by(&renamed));
+        assert_eq!((&v["plan"], &v["copied"]), (&Value::Null, &json!(0)));
+        assert_eq!(w.writes(), n + 1);
+    }
+
+    /// Sin conexión no se sube nada; al volver, solo lo último.
+    #[tokio::test]
+    async fn offline_only_the_last_one_goes_up_on_return() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        let l = join(&w, &w.s).await;
+        set_plan(&w, &w.s.id, "Migrar", &["pending", "pending"]);
+        pass(&w.st, T0).await;
+        let mut status = w.st.hub.status.subscribe();
+        w.rec.tell(crate::hub::fake::Tell::Hangup);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        set_plan(&w, &w.s.id, "Migrar", &["done", "pending"]);
+        pass(&w.st, T0 + GAP).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done", "done"]);
+        pass(&w.st, T0 + 2 * GAP).await;
+        let n = w.writes();
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        pass(&w.st, T0 + 3 * GAP).await;
+        assert_eq!(w.writes(), n + 1);
+        assert_eq!(w.stored(&l).unwrap()["plan"], summary("Migrar", 2, 2, 0));
+    }
+
+    /// Con un 429 se espera antes de volver a escribir.
+    #[tokio::test]
+    async fn on_429_it_waits() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        let l = join(&w, &w.s).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        w.board.lock().unwrap().busy = 1;
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n + 1);
+        assert_eq!(w.stored(&l).unwrap()["plan"], Value::Null);
+        pass(&w.st, T0 + GAP).await;
+        assert_eq!(w.writes(), n + 1, "esperando");
+        pass(&w.st, T0 + BUSY_WAIT).await;
+        assert_eq!(w.writes(), n + 2);
+        assert_eq!(w.stored(&l).unwrap()["plan"], summary("Migrar", 1, 1, 0));
+    }
+
+    /// La tarea: un cambio del plan la despierta.
+    #[tokio::test]
+    async fn the_task_wakes_up_with_a_change() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        let l = join(&w, &w.s).await;
+        spawn_with(w.st.clone(), Duration::from_secs(3600));
+        // El primer tic, ya: que pase antes del cambio.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        let wait = async {
+            while w.stored(&l).unwrap()["plan"].is_null() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("no subió el resumen");
+    }
+}

@@ -107,6 +107,9 @@ pub struct AppState {
     pub outbox: Arc<crate::outbox::Outbox>,
     /// El plan de fases y tareas de cada sesión (`plan_*` del MCP).
     pub plans: Arc<crate::plan::Plans>,
+    /// El resumen del plan de las sesiones en sus enlaces del tablero, y el cierre de los de las
+    /// que se borran (la tarea, `board_progress::spawn`, la lanza `spawn_scanner`).
+    pub progress: crate::board_progress::Progress,
     /// La memoria de la voz (`/api/v1/voice/memory`), en `<state>/voice-memory.json`.
     pub voice_memory: Arc<crate::voice_memory::VoiceMemory>,
     /// Los modelos que se pueden elegir, como los enseñó el menú de `/model` la última vez que
@@ -682,6 +685,7 @@ impl AppState {
             asks: Default::default(),
             outbox,
             plans,
+            progress: Default::default(),
             voice_memory,
             models: std::sync::Mutex::new(models),
             model_seen: Default::default(),
@@ -2470,6 +2474,9 @@ pub fn spawn_scanner(state: Arc<AppState>) {
     }
     // El llavero: recifrar lo cifrado con claves retiradas y quitar las que no usa nadie.
     crate::board::spawn_upkeep(state.board.clone(), state.clone());
+    // El resumen del plan de las sesiones en sus enlaces del tablero, y el cierre y la limpieza
+    // de los de las sesiones que ya no están.
+    crate::board_progress::spawn(state.clone());
     // Las cuentas de Claude: lo que gasta cada una, mirado de vez en cuando.
     state.accounts.spawn(state.paths.home.clone());
     // Tras un cambio automático de cuenta, las sesiones paradas por el límite siguen con la nueva.
@@ -3930,7 +3937,20 @@ async fn api_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> 
 /// La para, la quita del registro y borra su estado (historial, registro del guardián).
 pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), RegistryError> {
     stop_and_wait(st, id).await;
+    // El último resumen de su plan, para sus enlaces del tablero, que se cierran (parada, ya no
+    // cambia). Puede leer del disco: fuera del hilo.
+    let last = {
+        let (plans, id) = (st.plans.clone(), id.to_owned());
+        tokio::task::spawn_blocking(move || plans.try_summary(&id))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
     let res = st.registry.lock().await.remove(id);
+    if res.is_ok() {
+        let last = last.map(|s| s.as_ref().map(crate::board_progress::link_plan));
+        st.progress.session_deleted(id, now_ms(), last);
+    }
     st.mcp_cursors.forget(id);
     st.inbox.forget(id);
     st.asks.cancel_session(id);
@@ -3971,9 +3991,11 @@ async fn api_plan(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Re
     }
 }
 
-/// Ha cambiado el plan de una sesión: la lista, otra vez (con el `rev` nuevo de su resumen).
-pub fn plan_changed(st: &AppState) {
+/// Ha cambiado el plan de la sesión `id`: la lista, otra vez (con el `rev` nuevo de su
+/// resumen), y su resumen a sus enlaces del tablero (`board_progress`, a su ritmo).
+pub fn plan_changed(st: &AppState, id: &str) {
     st.refresh.notify_one();
+    st.progress.plan_changed(id);
 }
 
 #[derive(Deserialize)]
@@ -8338,7 +8360,7 @@ mod tests {
         }))
         .unwrap();
         st.plans.set(&id, args, 1000).unwrap();
-        plan_changed(&st);
+        plan_changed(&st, &id);
         let (_, list) = get_json(addr, "/api/v1/sessions").await;
         let plan = &list[0]["plan"];
         assert_eq!(plan["title"], "Migrar", "{list}");
@@ -8355,7 +8377,7 @@ mod tests {
         let t: crate::plan::TaskArgs =
             serde_json::from_value(json!({"id": "t2", "status": "done"})).unwrap();
         st.plans.update_task(&id, t, 2000).unwrap();
-        plan_changed(&st);
+        plan_changed(&st, &id);
         let (_, list) = get_json(addr, "/api/v1/sessions").await;
         let plan = &list[0]["plan"];
         assert!(plan["rev"].as_u64().unwrap() > rev, "{list}");

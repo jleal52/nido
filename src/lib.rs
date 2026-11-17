@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod attach;
 pub mod auth;
 pub mod board;
+pub mod board_progress;
 pub mod board_tools;
 pub mod browse;
 pub mod claude;

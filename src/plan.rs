@@ -546,9 +546,15 @@ impl Plans {
     }
 
     pub fn summary(&self, id: &str) -> Option<Summary> {
+        self.try_summary(id).ok().flatten()
+    }
+
+    /// Como `summary`, pero un plan que no se pudo leer del disco es un error, no «sin plan»:
+    /// el tablero no borra el resumen de un enlace por un fallo del disco.
+    pub fn try_summary(&self, id: &str) -> Result<Option<Summary>, String> {
         let mut inner = self.lock();
-        let _ = self.load(&mut inner, id);
-        inner.plans.get(id).map(|(p, rev)| Summary::of(p, *rev))
+        self.load(&mut inner, id)?;
+        Ok(inner.plans.get(id).map(|(p, rev)| Summary::of(p, *rev)))
     }
 
     /// `plan_set`: sustituye el plan entero (con las horas de las tareas que ya estaban).

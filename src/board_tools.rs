@@ -65,18 +65,23 @@ pub struct Who {
     pub id: String,
 }
 
+/// Cómo se ve una sesión de este equipo (`host`) en el tablero: `"<equipo>/<sesión>"`. Es lo
+/// que va en `by` y en el nombre de sus enlaces (`board_progress` lo pone al día si cambia).
+pub fn label(host: &str, session: &str) -> String {
+    format!("{host}/{session}")
+}
+
 impl Who {
     pub fn of(st: &AppState, s: &Session) -> Self {
         Self {
-            by: format!("{}/{}", Machine::of(st).name, s.name),
+            by: label(&Machine::of(st).name, &s.name),
             machine: st.hub.status.borrow().id.clone(),
             id: s.id.clone(),
         }
     }
 }
 
-/// Los enlaces de la sesión `id` del equipo `machine` (abiertos y cerrados). La Tarea 12 sube
-/// con ellos el resumen del plan de la sesión.
+/// Los enlaces de la sesión `id` del equipo `machine` (abiertos y cerrados).
 pub fn session_links<'a>(
     d: &'a Decrypted,
     machine: &'a str,
@@ -1296,7 +1301,7 @@ pub async fn tool_leave(st: &Arc<AppState>, s: &Session, args: Value) -> Reply {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Mutex;
@@ -1318,15 +1323,15 @@ mod tests {
     type FakeBoard = Arc<Mutex<hub::fake::Board>>;
 
     /// Un nido conectado al hub de mentira, con una sesión «api».
-    struct World {
-        st: Arc<AppState>,
-        s: Session,
-        board: FakeBoard,
-        _rec: hub::fake::Recorder,
-        _tmp: tempfile::TempDir,
+    pub(crate) struct World {
+        pub(crate) st: Arc<AppState>,
+        pub(crate) s: Session,
+        pub(crate) board: FakeBoard,
+        pub(crate) rec: hub::fake::Recorder,
+        pub(crate) tmp: tempfile::TempDir,
     }
 
-    fn session(dir: &Path, name: &str) -> Session {
+    pub(crate) fn session(dir: &Path, name: &str) -> Session {
         Session {
             id: new_id(),
             name: name.into(),
@@ -1362,7 +1367,7 @@ mod tests {
         AppState::new(paths, crate::launch::Launcher::Detached, None, true).unwrap()
     }
 
-    async fn world() -> World {
+    pub(crate) async fn world() -> World {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
         let s = st
@@ -1378,17 +1383,17 @@ mod tests {
             st,
             s,
             board,
-            _rec: rec,
-            _tmp: tmp,
+            rec,
+            tmp,
         }
     }
 
     impl World {
-        async fn call(&self, tool: &str, args: Value) -> Reply {
+        pub(crate) async fn call(&self, tool: &str, args: Value) -> Reply {
             self.call_as(&self.s, tool, args).await
         }
 
-        async fn call_as(&self, s: &Session, tool: &str, args: Value) -> Reply {
+        pub(crate) async fn call_as(&self, s: &Session, tool: &str, args: Value) -> Reply {
             match tool {
                 "board" => tool_board(&self.st, s, args).await,
                 "project" => tool_project(&self.st, s, args).await,
@@ -1406,11 +1411,11 @@ mod tests {
         }
 
         /// Cómo se llama una sesión de aquí en `by` y en los enlaces.
-        fn by(&self, s: &Session) -> String {
+        pub(crate) fn by(&self, s: &Session) -> String {
             format!("{}/{}", Machine::of(&self.st).name, s.name)
         }
 
-        fn key(&self) -> (String, [u8; 32]) {
+        pub(crate) fn key(&self) -> (String, [u8; 32]) {
             let k = self.st.group.ensure_board_key().unwrap();
             (
                 k.kid.clone(),
@@ -1419,14 +1424,14 @@ mod tests {
         }
 
         /// Otro cliente escribe `id` en el hub, con la clave actual.
-        fn put(&self, id: &str, v: Value) {
+        pub(crate) fn put(&self, id: &str, v: Value) {
             let (kid, raw) = self.key();
             let blob = board::seal(&raw, id, v.to_string().as_bytes()).unwrap();
             self.board.lock().unwrap().write(id, Some((&kid, &blob)));
         }
 
         /// `id` tal como está en el hub, descifrado; `None` si es una lápida o no está.
-        fn stored(&self, id: &str) -> Option<Value> {
+        pub(crate) fn stored(&self, id: &str) -> Option<Value> {
             let item = self.board.lock().unwrap().items.get(id).cloned()?;
             if item.gone {
                 return None;
@@ -1439,7 +1444,7 @@ mod tests {
         }
 
         /// Los objetos vivos del hub de este tipo: id y texto.
-        fn live(&self, t: &str) -> Vec<(String, Value)> {
+        pub(crate) fn live(&self, t: &str) -> Vec<(String, Value)> {
             let ids: Vec<String> = self.board.lock().unwrap().items.keys().cloned().collect();
             ids.into_iter()
                 .filter_map(|id| self.stored(&id).map(|v| (id, v)))
@@ -1447,7 +1452,7 @@ mod tests {
                 .collect()
         }
 
-        fn writes(&self) -> usize {
+        pub(crate) fn writes(&self) -> usize {
             self.board.lock().unwrap().writes.len()
         }
     }
@@ -1655,7 +1660,7 @@ mod tests {
             w.st.registry
                 .lock()
                 .await
-                .add(session(w._tmp.path(), "otra"))
+                .add(session(w.tmp.path(), "otra"))
                 .unwrap();
         let o = id_of(
             &w.call("objective", json!({"project": "Q", "name": "O2"}))
@@ -1735,7 +1740,7 @@ mod tests {
             w.st.registry
                 .lock()
                 .await
-                .add(session(w._tmp.path(), "otra"))
+                .add(session(w.tmp.path(), "otra"))
                 .unwrap();
         let p = id_of(&w.call("project", json!({"name": "P"})).await.unwrap());
         let first = w.stored(&p).unwrap();

@@ -2639,7 +2639,7 @@ async fn tool_plan_set(st: &Arc<AppState>, caller: &Session, args: Value) -> Rep
     let a: plan::SetArgs = args_of(args)?;
     let id = caller.id.clone();
     let p = with_plans(st, move |plans| plans.set(&id, a, now_ms())).await?;
-    server::plan_changed(st);
+    server::plan_changed(st, &caller.id);
     progress_reply(p)
 }
 
@@ -2648,7 +2648,7 @@ async fn tool_plan_task(st: &Arc<AppState>, caller: &Session, args: Value) -> Re
     let a: plan::TaskArgs = args_of(args)?;
     let id = caller.id.clone();
     let p = with_plans(st, move |plans| plans.update_task(&id, a, now_ms())).await?;
-    server::plan_changed(st);
+    server::plan_changed(st, &caller.id);
     progress_reply(p)
 }
 
@@ -2657,7 +2657,7 @@ async fn tool_plan_clear(st: &Arc<AppState>, caller: &Session, args: Value) -> R
     let NoArgs {} = args_of(args)?;
     let id = caller.id.clone();
     with_plans(st, move |plans| plans.clear(&id)).await?;
-    server::plan_changed(st);
+    server::plan_changed(st, &caller.id);
     Ok(json!({ "ok": true }))
 }
 
