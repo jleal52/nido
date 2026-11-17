@@ -32,14 +32,25 @@ pub const KEY_RETIRED_LIFE_MS: u64 = 30 * DAY_MS;
 /// Lo que dura la lápida de una clave quitada: lo que tarda en llegar a todos los equipos, y
 /// mientras tanto no deja que vuelva la clave viva de uno que aún no se ha enterado.
 pub const KEY_TOMB_LIFE_MS: u64 = 30 * DAY_MS;
-/// Cuántas claves con secreto (la actual y las retiradas) se guardan como mucho (decisión 10):
-/// el `State` entero viaja en un mensaje Noise de 65535 bytes, y cada una ocupa unos 140. Si hay
-/// más, las retiradas sin objetos se quitan antes de sus 30 días (la retirada antes primero);
-/// una con objetos no se quita nunca, y entonces solo se avisa.
-pub const MAX_BOARD_KEYS: usize = 8;
-/// Cuántas entradas del llavero, lápidas incluidas, se guardan como mucho: si hay más, se podan
-/// las lápidas más viejas antes de sus 30 días. Si aun así hay más (claves con objetos), se avisa.
-pub const MAX_KEY_ENTRIES: usize = 2 * MAX_BOARD_KEYS;
+/// Cuántas claves con secreto (la actual y las retiradas) se esperan como mucho: por encima,
+/// solo se avisa. No se quita ninguna antes de sus 30 días por pasar de aquí (decisión 9).
+///
+/// La decisión 10 pedía 8 claves como mucho, por el tamaño: el `State` entero viaja en un
+/// mensaje Noise de 65535 bytes, y cada clave ocupa unos 140. Pero cada baja rota (también cada
+/// «Cerrar sesión» de la web), y 8 rotaciones en 30 días se juntan fácil; quitar entonces una
+/// retirada antes de tiempo deja ilegible lo que escriba con ella un dispositivo con el llavero
+/// viejo. Y el tamaño no obliga: 16 claves son unos 2 KB. Así que el tope de 8 pasa a ser un
+/// aviso a 16, y el tope de verdad, por el tamaño, es `MAX_BOARD_KEYS_HARD`.
+pub const MAX_BOARD_KEYS: usize = 16;
+/// El tope duro de claves con secreto, solo por seguridad (unos 9 KB): por encima se quitan las
+/// retiradas sin objetos más antiguas, aunque no lleven 30 días, con un aviso en el registro.
+/// Una con objetos no se quita nunca.
+pub const MAX_BOARD_KEYS_HARD: usize = 64;
+/// Cuántas entradas del llavero, lápidas incluidas, se guardan como mucho: el tope duro de claves
+/// y 32 lápidas más (unas 70 bytes cada una: en total, unos 11 KB). Si hay más, se podan las
+/// lápidas más viejas antes de sus 30 días; perder una solo deja que vuelva, retirada, una clave
+/// que ya no usa nadie, y se vuelve a quitar. Si aun así hay más (claves con objetos), se avisa.
+pub const MAX_KEY_ENTRIES: usize = MAX_BOARD_KEYS_HARD + 32;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -332,10 +343,13 @@ pub struct Group {
     revision: watch::Sender<u64>,
     /// Cuándo se avisó por última vez de una clave que llegó mal (para no llenar el registro).
     bad_key_said: Mutex<Option<Instant>>,
-    /// Y de un llavero que pasa de `MAX_KEY_ENTRIES` o de `MAX_BOARD_KEYS`.
+    /// Y de un llavero que pasa de `MAX_KEY_ENTRIES` o de `MAX_BOARD_KEYS` (solo aviso).
     many_keys_said: Mutex<Option<Instant>>,
     /// Y de claves propias de más de un día por delante (un reloj adelantado).
     future_key_said: Mutex<Option<Instant>>,
+    /// Una baja cuya rotación no se pudo guardar: se reintenta (`retry_pending_rotation`) hasta
+    /// que salga. Solo en memoria: si no se pudo guardar, la baja tampoco está en el disco.
+    rotation_pending: std::sync::atomic::AtomicBool,
     /// Lo que se hace cuando este equipo sale del grupo (vaciar la copia del tablero).
     on_leave: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
@@ -378,6 +392,7 @@ impl Group {
             bad_key_said: Mutex::new(None),
             many_keys_said: Mutex::new(None),
             future_key_said: Mutex::new(None),
+            rotation_pending: Default::default(),
             on_leave: std::sync::OnceLock::new(),
         }
     }
@@ -761,6 +776,35 @@ impl Group {
         })
     }
 
+    /// La rotación tras quitar un equipo o un dispositivo: lo que se cifre desde ahora no lo lee
+    /// quien se fue. Con el llavero vacío no hay nada que cambiar (quien se fue no tenía ninguna
+    /// clave): `None`. Si no se puede guardar, queda pendiente y se reintenta
+    /// (`retry_pending_rotation`).
+    pub fn rotate_after_removal(&self) -> std::io::Result<Option<BoardKey>> {
+        use std::sync::atomic::Ordering;
+        if self.board_keys().keys.is_empty() {
+            self.rotation_pending.store(false, Ordering::SeqCst);
+            return Ok(None);
+        }
+        match self.rotate_board_key() {
+            Ok(k) => {
+                self.rotation_pending.store(false, Ordering::SeqCst);
+                Ok(Some(k))
+            }
+            Err(e) => {
+                self.rotation_pending.store(true, Ordering::SeqCst);
+                Err(e)
+            }
+        }
+    }
+
+    /// Reintenta la rotación de una baja que no se pudo guardar, si hay una pendiente.
+    pub fn retry_pending_rotation(&self) -> Option<std::io::Result<Option<BoardKey>>> {
+        self.rotation_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| self.rotate_after_removal())
+    }
+
     /// Quita una clave del llavero (en todo el grupo). La lápida se queda sin el secreto: para
     /// ganar al juntar le bastan `kid`, `at` y `removed`. Devuelve si estaba.
     pub fn drop_board_key(&self, kid: &str) -> bool {
@@ -809,33 +853,53 @@ impl Group {
     /// Las retiradas que ya se pueden quitar si ningún objeto usa su `kid` (`in_use`): ver
     /// `drop_unused_board_keys`. Para saber si hace falta mirar el tablero antes.
     pub fn droppable_board_keys(&self, in_use: &BTreeSet<String>) -> Vec<String> {
-        droppable(&self.state.lock().expect("grupo"), in_use, now_ms())
+        let st = self.state.lock().expect("grupo");
+        let mut out = droppable(&st, in_use, now_ms());
+        let early = over_hard_cap(&st, in_use, &out);
+        out.extend(early);
+        out
     }
 
     /// Quita del llavero (en todo el grupo) las claves retiradas que no usa ningún objeto
     /// (`in_use`: los `kid` de la copia del tablero recién puesta al día) y llevan más de
-    /// `KEY_RETIRED_LIFE_MS` retiradas (decisión 9); y, si hay más de `MAX_BOARD_KEYS` claves,
-    /// también las más viejas de las retiradas sin objetos, aunque no lleven 30 días (decisión
-    /// 10). Ni la actual ni una con objetos. Se decide y se quita con el mismo cerrojo. Devuelve
-    /// las quitadas.
+    /// `KEY_RETIRED_LIFE_MS` retiradas (decisión 9). Solo por encima de `MAX_BOARD_KEYS_HARD`
+    /// se quitan también, con un aviso, las retiradas sin objetos más antiguas que sobren,
+    /// aunque no lleven 30 días. Ni la actual ni una con objetos. Se decide y se quita con el
+    /// mismo cerrojo. Devuelve las quitadas.
     pub fn drop_unused_board_keys(&self, in_use: &BTreeSet<String>) -> Vec<String> {
         let now = now_ms();
         let mut dropped = vec![];
+        let mut early = vec![];
         self.change(|st| {
             dropped = droppable(st, in_use, now);
-            for k in st.keys.iter_mut().filter(|k| dropped.contains(&k.kid)) {
+            early = over_hard_cap(st, in_use, &dropped);
+            for k in st
+                .keys
+                .iter_mut()
+                .filter(|k| dropped.contains(&k.kid) || early.contains(&k.kid))
+            {
                 k.removed = true;
                 k.key.clear();
                 k.at = now.max(k.at.saturating_add(1));
             }
         });
+        if !early.is_empty() {
+            eprintln!(
+                "nido: AVISO: el llavero del tablero pasaba de {MAX_BOARD_KEYS_HARD} claves; se \
+                 quitan antes de sus 30 días {} retiradas sin objetos: {} (lo que escriba con \
+                 ellas un dispositivo con el llavero viejo no se podrá leer)",
+                early.len(),
+                early.join(", ")
+            );
+        }
         let live = self.board_keys().keys.len();
         if live > MAX_BOARD_KEYS && quietly(&self.many_keys_said, KEY_WARN_QUIET) {
             eprintln!(
                 "nido: el llavero del tablero tiene {live} claves (se esperan como mucho \
-                 {MAX_BOARD_KEYS}); las que sobran aún tienen objetos"
+                 {MAX_BOARD_KEYS}); las retiradas se quitan a los 30 días, si no tienen objetos"
             );
         }
+        dropped.extend(early);
         dropped
     }
 
@@ -989,10 +1053,8 @@ fn without_old_tombs<'a>(
     std::borrow::Cow::Owned(other)
 }
 
-/// Las retiradas que se pueden quitar ya (ver `Group::drop_unused_board_keys`): sin objetos y
-/// con más de 30 días retiradas, y las que sobren del tope, la retirada antes primero.
-fn droppable(st: &State, in_use: &BTreeSet<String>, now: u64) -> Vec<String> {
-    let ring = Keyring::of(st);
+/// Las retiradas sin objetos (ni la actual), la retirada antes primero.
+fn unused_retired<'a>(ring: &'a Keyring, in_use: &BTreeSet<String>) -> Vec<&'a BoardKey> {
     let current = ring.current().map(|k| k.kid.clone());
     let mut free: Vec<&BoardKey> = ring
         .keys
@@ -1002,18 +1064,35 @@ fn droppable(st: &State, in_use: &BTreeSet<String>, now: u64) -> Vec<String> {
         })
         .collect();
     free.sort_by(|a, b| (a.retired, &a.kid).cmp(&(b.retired, &b.kid)));
-    let mut excess = ring.keys.len().saturating_sub(MAX_BOARD_KEYS);
-    let mut out = vec![];
-    for k in free {
-        let old = k
-            .retired
-            .is_some_and(|r| r.saturating_add(KEY_RETIRED_LIFE_MS) < now);
-        if old || excess > 0 {
-            out.push(k.kid.clone());
-            excess = excess.saturating_sub(1);
-        }
-    }
-    out
+    free
+}
+
+/// Las retiradas que se pueden quitar ya (decisión 9; ver `Group::drop_unused_board_keys`): sin
+/// objetos y con más de 30 días retiradas. Pasar de `MAX_BOARD_KEYS` no adelanta nada.
+fn droppable(st: &State, in_use: &BTreeSet<String>, now: u64) -> Vec<String> {
+    let ring = Keyring::of(st);
+    unused_retired(&ring, in_use)
+        .into_iter()
+        .filter(|k| {
+            k.retired
+                .is_some_and(|r| r.saturating_add(KEY_RETIRED_LIFE_MS) < now)
+        })
+        .map(|k| k.kid.clone())
+        .collect()
+}
+
+/// Las que sobran del tope duro (`MAX_BOARD_KEYS_HARD`) aparte de las ya quitadas (`dropped`):
+/// las retiradas sin objetos más antiguas, aunque no lleven 30 días.
+fn over_hard_cap(st: &State, in_use: &BTreeSet<String>, dropped: &[String]) -> Vec<String> {
+    let ring = Keyring::of(st);
+    let live = ring.keys.len() - dropped.len();
+    let excess = live.saturating_sub(MAX_BOARD_KEYS_HARD);
+    unused_retired(&ring, in_use)
+        .into_iter()
+        .filter(|k| !dropped.contains(&k.kid))
+        .take(excess)
+        .map(|k| k.kid.clone())
+        .collect()
 }
 
 /// Las claves del llavero de más de un día por delante de `now`: los demás equipos las
@@ -1553,6 +1632,41 @@ mod tests {
         assert!(wire < crate::e2e::MAX_MSG);
     }
 
+    /// Con el llavero lleno hasta los topes (`MAX_BOARD_KEYS_HARD` claves y lápidas hasta
+    /// `MAX_KEY_ENTRIES`) y un grupo grande, el estado sigue cabiendo de sobra en un mensaje.
+    #[test]
+    fn the_hard_cap_fits_in_one_message() {
+        let mut st = State::default();
+        for i in 0..12 {
+            st.members
+                .push(member(&format!("{i:026}"), now_ms(), false));
+        }
+        for i in 0..60u8 {
+            st.devices.push(Device {
+                key: B64.encode([100 + i; 32]),
+                name: "Firefox en el portátil de casa".into(),
+                at: now_ms(),
+                removed: false,
+            });
+        }
+        for i in 0..MAX_KEY_ENTRIES {
+            let mut k = BoardKey::generate(now_ms()).unwrap();
+            k.retired = Some(now_ms());
+            if i >= MAX_BOARD_KEYS_HARD {
+                k.removed = true;
+                k.key.clear();
+            }
+            st.keys.push(k);
+        }
+        let keys = serde_json::to_vec(&st.keys).unwrap().len();
+        assert!(keys < 12 * 1024, "el llavero ocupa {keys} bytes");
+        let wire = serde_json::to_vec(&st).unwrap().len();
+        assert!(
+            wire < crate::e2e::MAX_MSG / 2,
+            "el estado ocupa {wire} bytes"
+        );
+    }
+
     /// `group.json` lleva el llavero: solo para el usuario, también si quedó un temporal de antes
     /// con otros permisos.
     #[cfg(unix)]
@@ -2021,7 +2135,8 @@ mod tests {
         let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
         let cur = real_key(now - DAY, None);
         let mut keys = vec![cur.clone()];
-        for i in 0..20u64 {
+        let n = MAX_KEY_ENTRIES as u64 + 4;
+        for i in 0..n {
             keys.push(board_key(&format!("{i:016x}"), now - DAY + i, None, true));
         }
         assert!(g.merge(&keys_state(keys)));
@@ -2084,37 +2199,90 @@ mod tests {
         );
     }
 
-    /// Decisión 10: como mucho `MAX_BOARD_KEYS` claves con secreto. Si hay más, se van antes de
-    /// tiempo las retiradas sin objetos, la retirada antes primero; una con objetos, nunca.
+    /// La actual y `n` retiradas hace 1, 2… minutos (sin objetos): la de índice mayor, la retirada
+    /// antes.
+    fn many_retired(now: u64, n: u64) -> Vec<BoardKey> {
+        let mut keys = vec![real_key(now - 1000, None)];
+        for m in 1..=n {
+            keys.push(real_key(now - 10 * DAY, Some(now - m * 60_000)));
+        }
+        keys
+    }
+
+    /// Decisión 9 sobre la 10: con más de `MAX_BOARD_KEYS` claves retiradas hace horas y sin
+    /// objetos, no se quita ninguna antes de sus 30 días; solo se avisa.
     #[test]
-    fn the_keyring_is_capped_but_never_drops_used_keys() {
+    fn many_young_retired_keys_only_warn() {
         let now = now_ms();
         let dir = tempfile::tempdir().unwrap();
         let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
-        let cur = real_key(now - 1000, None);
-        let mut keys = vec![cur.clone()];
-        // Nueve retiradas de hace 1 a 9 horas: diez en total.
-        for h in 1..=9u64 {
-            keys.push(real_key(now - 10 * DAY, Some(now - h * 3600 * 1000)));
-        }
+        g.merge(&keys_state(many_retired(now, 20)));
+        assert!(g.droppable_board_keys(&BTreeSet::new()).is_empty());
+        assert!(g.drop_unused_board_keys(&BTreeSet::new()).is_empty());
+        assert_eq!(g.board_keys().keys.len(), 21);
+        assert!(g.many_keys_said.lock().unwrap().is_some(), "se avisa");
+    }
+
+    /// Por encima del tope duro (`MAX_BOARD_KEYS_HARD`) sí se quitan las retiradas sin objetos
+    /// más antiguas, aunque no tengan 30 días; una con objetos, nunca; la actual, tampoco.
+    #[test]
+    fn above_the_hard_cap_the_oldest_unused_go() {
+        let now = now_ms();
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let extra = 7u64;
+        // La actual y `n` retiradas: `extra` claves de más.
+        let n = MAX_BOARD_KEYS_HARD as u64 + extra - 1;
+        let keys = many_retired(now, n);
         g.merge(&keys_state(keys.clone()));
-        // Las dos más viejas (9 h y 8 h) se usan: se va la de 7 h y la de 6 h.
-        let in_use: BTreeSet<String> = [keys[9].kid.clone(), keys[8].kid.clone()].into();
-        let dropped = g.drop_unused_board_keys(&in_use);
-        let mut want = vec![keys[7].kid.clone(), keys[6].kid.clone()];
-        want.sort();
-        let mut got = dropped.clone();
+        // La más antigua tiene objetos: se queda.
+        let in_use: BTreeSet<String> = [keys[n as usize].kid.clone()].into();
+        let mut got = g.drop_unused_board_keys(&in_use);
         got.sort();
+        let want = kids(&keys[(n - extra) as usize..n as usize], |_| true);
         assert_eq!(got, want);
-        assert_eq!(g.board_keys().keys.len(), MAX_BOARD_KEYS);
-        assert_eq!(g.board_keys().current(), Some(&cur));
-        // Todas usadas: se pasa del tope, pero no se quita ninguna.
+        assert_eq!(g.board_keys().keys.len(), MAX_BOARD_KEYS_HARD);
+        assert_eq!(g.board_keys().current(), Some(&keys[0]));
+        assert!(
+            g.board_keys()
+                .keys
+                .iter()
+                .any(|k| k.kid == keys[n as usize].kid)
+        );
+        // Todas con objetos: se pasa del tope duro, pero no se quita ninguna.
         let all: BTreeSet<String> = keys.iter().map(|k| k.kid.clone()).collect();
         let d2 = tempfile::tempdir().unwrap();
         let g2 = Group::load(d2.path().join("group.json"), [2u8; 32]);
         g2.merge(&keys_state(keys));
         assert!(g2.drop_unused_board_keys(&all).is_empty());
-        assert_eq!(g2.board_keys().keys.len(), 10);
+        assert_eq!(g2.board_keys().keys.len(), n as usize + 1);
+    }
+
+    /// Una rotación tras una baja que no se puede guardar queda pendiente, y se reintenta hasta
+    /// que sale. Sin llavero no hay nada que rotar.
+    #[test]
+    fn a_failed_rotation_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.json");
+        let g = Group::load(path.clone(), [1u8; 32]);
+        assert!(g.rotate_after_removal().unwrap().is_none(), "sin llavero");
+        assert!(g.retry_pending_rotation().is_none());
+        let old = g.ensure_board_key().unwrap();
+        // En el sitio del fichero, una carpeta que no se pisa: no se puede guardar.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("dentro"), b"x").unwrap();
+        assert!(g.rotate_after_removal().is_err());
+        assert_eq!(g.board_keys().current(), Some(&old));
+        assert!(matches!(g.retry_pending_rotation(), Some(Err(_))));
+        // Arreglado el disco, el reintento sale, y ya no queda nada pendiente.
+        std::fs::remove_dir_all(&path).unwrap();
+        let Some(Ok(Some(new))) = g.retry_pending_rotation() else {
+            panic!("se reintenta")
+        };
+        assert_ne!(new.kid, old.kid);
+        assert_eq!(g.board_keys().current(), Some(&new));
+        assert!(g.retry_pending_rotation().is_none());
     }
 
     /// Una clave propia con `at` de más de un día por delante (un reloj adelantado) se ve: los

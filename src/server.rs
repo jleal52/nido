@@ -4148,14 +4148,13 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
 /// cifre desde ahora no lo lee quien se fue, y la tarea del llavero (`board::spawn_upkeep`)
 /// recifra lo de antes. Solo donde se quita: al enterarse de que lo quitó otro equipo
 /// (`apply_group`) no, que ese ya rotó. Con el llavero vacío no hay nada que cambiar: quien se
-/// fue no tenía ninguna clave.
+/// fue no tenía ninguna clave. Si no se puede guardar, queda pendiente y la reintenta la tarea
+/// del llavero (`BoardCache::upkeep`) hasta que sale.
 fn rotate_board_key(st: &AppState) {
-    if st.group.board_keys().keys.is_empty() {
-        return;
-    }
-    match st.group.rotate_board_key() {
-        Ok(k) => eprintln!("nido: la clave del tablero ha cambiado ({})", k.kid),
-        Err(e) => eprintln!("nido: no se pudo cambiar la clave del tablero: {e}"),
+    match st.group.rotate_after_removal() {
+        Ok(Some(k)) => eprintln!("nido: la clave del tablero ha cambiado ({})", k.kid),
+        Ok(None) => {}
+        Err(e) => eprintln!("nido: no se pudo cambiar la clave del tablero ({e}); se reintentará"),
     }
 }
 
@@ -5396,6 +5395,75 @@ mod tests {
         let r = api_group_remove(State(st.clone()), Path("otro".into())).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         assert_eq!(ring_of(&st), (cur3, 3));
+    }
+
+    /// De punta a punta: quitar un dispositivo rota la clave, la tarea del llavero lo recifra
+    /// todo en el hub con la nueva (los bytes tal cual), y la vieja queda retirada (se quitará a
+    /// los 30 días, sin objetos).
+    #[tokio::test]
+    async fn removing_a_device_ends_with_everything_recrypted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let board = Arc::new(std::sync::Mutex::new(hub::fake::Board::default()));
+        let rec = hub::fake::board(board.clone()).await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        let old = st.group.ensure_board_key().unwrap();
+        let raw = |k: &crate::group::BoardKey| -> [u8; 32] {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &k.key)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let texts: Vec<(String, Vec<u8>)> = (1..=2u8)
+            .map(|n| {
+                let id = format!("{n:032x}");
+                let text = format!(r#"{{"t":"project","name":"p{n}","futuro":true}}"#);
+                (id, text.into_bytes())
+            })
+            .collect();
+        for (id, text) in &texts {
+            let blob = crate::board::seal(&raw(&old), id, text).unwrap();
+            board.lock().unwrap().write(id, Some((&old.kid, &blob)));
+        }
+        st.board.sync().await.unwrap();
+        st.group.add_device(&[1u8; 32], "tel");
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        let new = st.group.board_keys().current().cloned().unwrap();
+        assert_ne!(new.kid, old.kid);
+        crate::board::spawn_upkeep_with(st.board.clone(), st.clone(), Duration::from_secs(3600));
+        // Dos escrituras, a 6 s una de otra.
+        let wait = async {
+            while !board
+                .lock()
+                .unwrap()
+                .items
+                .values()
+                .all(|i| i.kid == new.kid)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("todo recifrado");
+        for (id, text) in &texts {
+            let b = board.lock().unwrap();
+            let blob = b.items[id].blob.clone().unwrap();
+            assert_eq!(&crate::board::open(&raw(&new), id, &blob).unwrap(), text);
+        }
+        let ring = st.group.board_keys();
+        let was = ring.keys.iter().find(|k| k.kid == old.kid).unwrap();
+        assert!(was.retired.is_some(), "la vieja, retirada");
+        assert_eq!(ring.current(), Some(&new));
     }
 
     /// Sin llavero (el tablero no se ha usado), quitar no crea ninguna clave: quien se va no

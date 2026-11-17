@@ -450,6 +450,10 @@ pub const SYNC_EVERY: Duration = Duration::from_secs(1);
 /// minuto y conexión y a 3000 por hora y cuenta, y la resubida tiene que dejar sitio a lo que se
 /// edita a mano (1200 por hora).
 pub const REUPLOAD_GAP: Duration = Duration::from_secs(3);
+/// El recifrado espera el doble que la resubida entre dos escrituras: 6 s, unas 10 por minuto.
+/// Lo hacen todos los nidos del grupo a la vez (la resubida, casi nunca): con tres, 1800 por
+/// hora, por debajo de las 3000 del freno de la cuenta, y con sitio para lo que se edita a mano.
+const RECRYPT_SLOWER: u32 = 2;
 /// Con el freno del hub (429), la resubida espera esto en huecos de `REUPLOAD_GAP` (un minuto).
 const BUSY_GAPS: u32 = 20;
 /// Cuántas veces se intenta una escritura que choca (409) antes de dejarlo.
@@ -711,9 +715,12 @@ pub struct BoardCache {
     /// Que `spawn` mire cuanto antes si el hub se ha quedado sin tablero (una escritura vio que
     /// el hub no tiene un objeto de la copia).
     probe_wanted: tokio::sync::Notify,
-    /// Cuándo acabó la última escritura del recifrado: hasta la siguiente, `gap` (como la
-    /// resubida).
+    /// Cuándo acabó la última escritura del recifrado: hasta la siguiente, `gap` por
+    /// `RECRYPT_SLOWER`.
     recrypt_last: Mutex<Option<tokio::time::Instant>>,
+    /// Lo que ya se apuntó de lo que no se recifra (id y motivo): una vez cada uno, no en cada
+    /// pasada.
+    recrypt_said: Mutex<BTreeSet<(String, String)>>,
     /// Sube con cada cambio de la copia.
     revision: watch::Sender<u64>,
     /// El último error al sincronizar que se apuntó, para no repetirlo cada vez.
@@ -777,8 +784,13 @@ enum Recrypted {
     /// Nada que hacer ya: lo de ahora va con una clave que no está retirada, otro lo borró o el
     /// hub no lo tiene.
     Done,
-    /// No se puede (su clave no vale, no se descifra, el hub no lo quiere, choca una y otra
-    /// vez): en esta pasada, no se vuelve a intentar.
+    /// No se puede, en esta pasada y con esta clave actual (si cambia, se vuelve a intentar):
+    /// - su clave retirada está en el llavero pero no son 32 bytes (un disco roto);
+    /// - no se descifra con ella (`Broken`), o no se puede volver a cifrar;
+    /// - el hub no lo quiere (413 demasiado grande o cuenta llena, 400);
+    /// - choca (409) `MAX_TRIES` veces seguidas con escrituras que siguen con claves retiradas.
+    ///
+    /// Un 429 no salta nada: se espera y se sigue con el mismo.
     Skip,
     /// Cambió la clave actual: se empieza otra vez con la nueva.
     Again,
@@ -867,6 +879,7 @@ impl BoardCache {
             gap,
             probe_wanted: Default::default(),
             recrypt_last: Mutex::new(None),
+            recrypt_said: Mutex::new(BTreeSet::new()),
             revision: watch::Sender::new(0),
             said: Mutex::new(None),
             #[cfg(test)]
@@ -1688,22 +1701,39 @@ impl BoardCache {
     async fn recrypt_pace(&self) {
         let last = *self.recrypt_last.lock().expect("tablero");
         if let Some(t) = last {
-            tokio::time::sleep_until(t + self.gap).await;
+            tokio::time::sleep_until(t + self.gap * RECRYPT_SLOWER).await;
+        }
+    }
+
+    /// Apunta que `id` no se recifra, y por qué (nunca nada de lo descifrado): una vez por id y
+    /// motivo.
+    fn say_skip(&self, id: &str, why: &str) {
+        let new = self
+            .recrypt_said
+            .lock()
+            .expect("tablero")
+            .insert((id.to_owned(), why.to_owned()));
+        if new {
+            eprintln!("nido: tablero: {id} no se recifra ({why})");
         }
     }
 
     /// Recifra con la clave actual lo que la copia tiene cifrado con claves retiradas (decisión
-    /// 9: cualquier nido que lo vea). Uno a uno, a ritmo (`gap`, como la resubida) y en orden al
-    /// azar: todos los nidos del grupo lo hacen a la vez y así chocan menos. Se recifran los
+    /// 9: cualquier nido que lo vea). Uno a uno, a ritmo (`RECRYPT_SLOWER`) y en orden al azar:
+    /// todos los nidos del grupo lo hacen a la vez y así chocan menos. Se recifran los
     /// bytes que da `open`, tal cual (`recrypt_one`). No toca lo que no está en el hub ni lo que
     /// no tiene su clave en el llavero, y no empieza ni sigue mientras falte algo por resubir
     /// (la resubida ya cifra con la actual). Se para si se vacía la copia (`epoch`), y si cambia
     /// la clave actual sigue con la nueva.
     ///
+    /// Lo que no se puede recifrar (ver `Recrypted::Skip`) se salta en la pasada mientras no
+    /// cambie la clave actual; con una nueva, se vuelve a intentar.
+    ///
     /// Devuelve si acabó: no queda nada con una clave retirada que se pueda recifrar.
     pub async fn recrypt(self: &Arc<Self>, keys: &Keys) -> bool {
         let epoch = self.epoch();
         let mut skipped = BTreeSet::new();
+        let mut skipped_with = String::new();
         let mut done = 0usize;
         let finished = loop {
             let ring = keys();
@@ -1711,6 +1741,10 @@ impl BoardCache {
                 // Sin clave con que cifrar, no hay nada que hacer.
                 break true;
             };
+            if kid != skipped_with {
+                skipped.clear();
+                skipped_with = kid.clone();
+            }
             let pick = {
                 let c = self.lock();
                 if self.epoch() != epoch || !c.reupload.is_empty() {
@@ -1753,7 +1787,7 @@ impl BoardCache {
     /// cual, sin pasar por `Object`. Antes de cada escritura espera su turno (`recrypt_pace`) y
     /// vuelve a mirar el objeto en la copia: el aviso de otro nido que se adelantó ya lo habrá
     /// traído recifrado. Si choca (409), sigue sobre lo de ahora mientras su clave siga retirada,
-    /// hasta `MAX_TRIES` escrituras.
+    /// hasta `MAX_TRIES` choques; con el freno (429), espera y sigue, sin contarlo.
     async fn recrypt_one(
         self: &Arc<Self>,
         epoch: u64,
@@ -1787,6 +1821,7 @@ impl BoardCache {
             // Con la clave de su `kid`, nunca otra. Si está en el llavero pero no son 32 bytes
             // (un disco roto), se salta: si no, se elegiría una y otra vez.
             let Some(old) = key_of(&ring, &s.kid) else {
+                self.say_skip(id, "su clave no vale");
                 return Recrypted::Skip;
             };
             let sealed = open(&old, id, s.blob.as_deref().unwrap_or_default())
@@ -1794,14 +1829,10 @@ impl BoardCache {
             let blob = match sealed {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!(
-                        "nido: tablero: {id} no se recifra ({})",
-                        blob_error_kind(&e)
-                    );
+                    self.say_skip(id, blob_error_kind(&e));
                     return Recrypted::Skip;
                 }
             };
-            tries += 1;
             let r = self.hub.board_put(id, s.v, kid, &blob).await;
             *self.recrypt_last.lock().expect("tablero") = Some(tokio::time::Instant::now());
             match r {
@@ -1828,13 +1859,16 @@ impl BoardCache {
                 Err(BoardError::Conflict(current)) => {
                     // Lo de ahora, a la copia: la vuelta siguiente lo mira.
                     self.change(epoch, |c| c.apply(current));
+                    tries += 1;
                     if tries >= MAX_TRIES {
+                        self.say_skip(id, "choca una y otra vez");
                         return Recrypted::Skip;
                     }
                 }
+                // El freno no es culpa del objeto: no cuenta como intento.
                 Err(BoardError::Busy) => tokio::time::sleep(self.gap * BUSY_GAPS).await,
                 Err(e @ (BoardError::TooBig | BoardError::Bad(_) | BoardError::Full)) => {
-                    eprintln!("nido: tablero: {id} no se recifra ({e})");
+                    self.say_skip(id, &e.to_string());
                     return Recrypted::Skip;
                 }
                 Err(BoardError::Hub(e)) => {
@@ -1845,10 +1879,19 @@ impl BoardCache {
         }
     }
 
-    /// Lo que hace la tarea del llavero cada vez (`spawn_upkeep`): ordena el llavero (retira
-    /// las activas que no son la actual, poda lápidas), y con hub recifra lo cifrado con claves
-    /// retiradas; si acaba, quita las retiradas que ya no usa nadie (`drop_unused_keys`).
+    /// Lo que hace la tarea del llavero cada vez (`spawn_upkeep`): reintenta la rotación de una
+    /// baja que no se pudo guardar, ordena el llavero (retira las activas que no son la actual,
+    /// poda lápidas), y con hub recifra lo cifrado con claves retiradas; si acaba, quita las
+    /// retiradas que ya no usa nadie (`drop_unused_keys`).
     pub async fn upkeep<H: KeyHolder>(self: &Arc<Self>, holder: &Arc<H>) {
+        // Si sigue sin poder guardarse, se vuelve a intentar la próxima vez (el tic, como poco).
+        if let Some(Ok(Some(k))) = holder.keychain().retry_pending_rotation() {
+            eprintln!(
+                "nido: la clave del tablero ha cambiado ({}), tras no poder guardarla",
+                k.kid
+            );
+            holder.keys_changed();
+        }
         if holder.keychain().tidy_board_keys() {
             holder.keys_changed();
         }
@@ -4273,7 +4316,7 @@ mod tests {
             "una vez cada uno"
         );
         for pair in w[before..].windows(2) {
-            assert!(pair[1].0 - pair[0].0 >= GAP - Duration::from_millis(5));
+            assert!(pair[1].0 - pair[0].0 >= GAP * RECRYPT_SLOWER);
         }
         let cur = kid(&K_CUR);
         assert_eq!(on_hub(&r.board, &K_CUR, &p), project("uno"));
@@ -4290,9 +4333,60 @@ mod tests {
         assert_eq!(r.cache.item(&nokey).unwrap().v, 1);
         assert_eq!(r.cache.item(&broken).unwrap().kid, kid(&K_OLD));
         assert_eq!(r.cache.item(&fine).unwrap().v, 1);
-        // Otra vez: nada que hacer.
+        // Otra vez: nada que hacer. Y lo que no se recifra se apuntó una sola vez.
         assert!(r.cache.recrypt(&keys()).await);
         assert_eq!(r.writes().len(), before + 3);
+        let said = r.cache.recrypt_said.lock().unwrap().clone();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said.iter().next().unwrap().0, broken);
+    }
+
+    /// Un 429 no cuenta como intento: tras el freno y dos choques con claves retiradas, sale.
+    #[tokio::test]
+    async fn the_brake_does_not_count_as_a_try() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(1);
+        r.write(&K_OLD, &id, &goal(""));
+        r.cache.sync().await.unwrap();
+        {
+            let mut b = r.board.lock().unwrap();
+            b.busy = 1;
+            for n in 0..MAX_TRIES - 1 {
+                b.clash(&id, Some(sealed(&K_OLD, &id, &goal(&format!("otro {n}")))));
+            }
+        }
+        assert!(r.cache.recrypt(&keys()).await);
+        assert_eq!(r.writes().len(), MAX_TRIES + 1);
+        assert_eq!(on_hub(&r.board, &K_CUR, &id), goal("otro 1"));
+    }
+
+    /// Lo saltado con una clave actual se vuelve a intentar con la siguiente.
+    #[tokio::test]
+    async fn what_was_skipped_is_tried_again_with_a_new_key() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(1);
+        r.write(&K_OLD, &id, &goal(""));
+        r.cache.sync().await.unwrap();
+        let (ring, keys) = shared(keyring());
+        {
+            let mut b = r.board.lock().unwrap();
+            for n in 0..MAX_TRIES {
+                b.clash(&id, Some(sealed(&K_OLD, &id, &goal(&format!("otro {n}")))));
+            }
+            // Con el último choque, otra clave actual.
+            b.on_write = Some(Box::new(move |n| {
+                if n == MAX_TRIES {
+                    let mut r = ring.lock().unwrap();
+                    for k in r.keys.iter_mut() {
+                        k.retired.get_or_insert(4);
+                    }
+                    r.keys.push(BoardKey::from_raw(&K_NEW, 5));
+                }
+            }));
+        }
+        assert!(r.cache.recrypt(&keys).await);
+        assert_eq!(r.writes().len(), MAX_TRIES + 1);
+        assert_eq!(on_hub(&r.board, &K_NEW, &id), goal("otro 2"));
     }
 
     /// Un 409 a mitad: si lo de ahora sigue con una clave retirada, se recifra eso (lo del
@@ -4606,6 +4700,27 @@ mod tests {
         for k in [&K_CUR, &k29, &kbroken, &kmissing] {
             assert!(have.contains(&kid(k)), "{} se queda", kid(k));
         }
+    }
+
+    /// Una rotación tras una baja que no se pudo guardar la reintenta la tarea del llavero hasta
+    /// que sale.
+    #[tokio::test]
+    async fn the_upkeep_retries_a_failed_rotation() {
+        let r = rig(fake::Board::default()).await;
+        let path = r.dir.path().join("data/group.json");
+        let group = group_with(r.dir.path(), vec![]);
+        let old = group.ensure_board_key().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("dentro"), b"x").unwrap();
+        assert!(group.rotate_after_removal().is_err());
+        r.cache.upkeep(&group).await;
+        assert_eq!(group.board_keys().current(), Some(&old), "sigue sin disco");
+        std::fs::remove_dir_all(&path).unwrap();
+        r.cache.upkeep(&group).await;
+        let now = group.board_keys().current().cloned().unwrap();
+        assert_ne!(now.kid, old.kid);
+        assert!(group.retry_pending_rotation().is_none());
     }
 
     /// Sin poder ponerse al día con el hub, no se quita nada.
