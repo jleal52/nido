@@ -355,7 +355,10 @@ fn board_fail(e: BoardError) -> Fail {
             "demasiadas escrituras en el tablero: prueba en un rato",
         ),
         e @ BoardError::Bad(_) => fail(StatusCode::BAD_GATEWAY, e.to_string()),
-        BoardError::Hub(e) => fail(StatusCode::SERVICE_UNAVAILABLE, e),
+        BoardError::Hub(e) => fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("el tablero no está disponible: {e}"),
+        ),
     }
 }
 
@@ -534,9 +537,13 @@ pub async fn tool_board(st: &Arc<AppState>, _s: &Session, args: Value) -> Reply 
     };
     let lang = i18n::lang();
     let stale = stale.map(|e| {
-        i18n::in_lang(
+        say(
             lang,
-            &format!("sin poder hablar con el hub: {e}; es la copia de este equipo"),
+            format!("sin poder hablar con el hub: {e}; es la copia de este equipo"),
+            format!(
+                "could not talk to the hub: {}; this is this machine's copy",
+                i18n::in_lang(lang, &e)
+            ),
         )
     });
     let view = View {
@@ -593,25 +600,49 @@ impl Done {
     }
 }
 
+/// Una etiqueta de `board` en su idioma. Van aquí y no en la tabla de `i18n`: `english` traduce
+/// también lo que cae en los huecos de otros mensajes, y un patrón como «{} fallidas» cambiaría
+/// el nombre de un objetivo («Pruebas fallidas») en un error.
+fn say(lang: Lang, es: String, en: String) -> String {
+    match lang {
+        Lang::Es => es,
+        Lang::En => en,
+    }
+}
+
+/// Por qué no se puede leer, para `board`.
+fn why_text(lang: Lang, why: Unreadable) -> String {
+    let en = match why {
+        Unreadable::NoKey => "without its key",
+        Unreadable::Broken => "does not decrypt",
+        Unreadable::NotAnObject => "not an object",
+        Unreadable::Unknown => "of an unknown type",
+        Unreadable::NotInHub => "not in the hub",
+    };
+    say(lang, why.to_string(), en.into())
+}
+
 /// `12/20, 1 bloqueada` (sin plan, «sin plan»).
-fn plan_text(p: Option<&PlanSummary>, t: &dyn Fn(&str) -> String) -> String {
+fn plan_text(p: Option<&PlanSummary>, lang: Lang) -> String {
     let Some(p) = p else {
-        return t("sin plan");
+        return say(lang, "sin plan".into(), "no plan".into());
     };
     let mut s = format!("{}/{}", p.done, p.total);
+    let count = |n: usize, one: &str, many: &str, en: &str| {
+        let es = if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        };
+        say(lang, es, format!("{n} {en}"))
+    };
     if p.blocked > 0 {
         s.push_str(", ");
-        s.push_str(&match p.blocked {
-            1 => t("1 bloqueada"),
-            n => t(&format!("{n} bloqueadas")),
-        });
+        s.push_str(&count(p.blocked, "bloqueada", "bloqueadas", "blocked"));
     }
     if p.failed > 0 {
         s.push_str(", ");
-        s.push_str(&match p.failed {
-            1 => t("1 fallida"),
-            n => t(&format!("{n} fallidas")),
-        });
+        s.push_str(&count(p.failed, "fallida", "fallidas", "failed"));
     }
     s
 }
@@ -622,7 +653,7 @@ fn plan_text(p: Option<&PlanSummary>, t: &dyn Fn(&str) -> String) -> String {
 /// los huérfanos, no. Al final, cuántos archivados no salen y lo que no se puede leer (id y por
 /// qué). Como mucho `max` bytes, por líneas enteras: lo que no cabe se cuenta.
 pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
-    let t = |s: &str| i18n::in_lang(lang, s);
+    let t = |es: &str, en: &str| say(lang, es.into(), en.into());
     let archived = |p: &Project| p.state == ProjectState::Archived;
     let mut shown: Vec<(&Entry, &Project)> = projects(d)
         .filter(|(e, p)| match v.only {
@@ -697,7 +728,7 @@ pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
         if v.only.is_some() && !p.desc.trim().is_empty() {
             s.push_str(&format!(
                 "    {}{}\n",
-                t("descripción: "),
+                t("descripción: ", "description: "),
                 oneline(&p.desc, SHOWN_DESC)
             ));
         }
@@ -713,14 +744,14 @@ pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
             if v.only.is_some() && !o.desc.trim().is_empty() {
                 s.push_str(&format!(
                     "      {}{}\n",
-                    t("descripción: "),
+                    t("descripción: ", "description: "),
                     oneline(&o.desc, SHOWN_DESC)
                 ));
             }
             if !o.note.trim().is_empty() {
                 s.push_str(&format!(
                     "      {}{}\n",
-                    t("nota: "),
+                    t("nota: ", "note: "),
                     oneline(&o.note, SHOWN_NOTE)
                 ));
             }
@@ -730,13 +761,13 @@ pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
                     n => n,
                 };
                 let closed = if l.closed.is_some() {
-                    format!(" · {}", t("cerrada"))
+                    format!(" · {}", t("cerrada", "closed"))
                 } else {
                     String::new()
                 };
                 s.push_str(&format!(
                     "      {who} · {}{closed}\n",
-                    plan_text(l.plan.as_ref(), &t)
+                    plan_text(l.plan.as_ref(), lang)
                 ));
             }
             chunks.push((Kind::Objective, s));
@@ -749,10 +780,13 @@ pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
         0 => {}
         1 => tail.push_str(&t(
             "1 proyecto archivado sin enseñar (archived: true para verlo)",
+            "1 archived project not shown (archived: true to see it)",
         )),
-        n => tail.push_str(&t(&format!(
-            "{n} proyectos archivados sin enseñar (archived: true para verlos)"
-        ))),
+        n => tail.push_str(&say(
+            lang,
+            format!("{n} proyectos archivados sin enseñar (archived: true para verlos)"),
+            format!("{n} archived projects not shown (archived: true to see them)"),
+        )),
     }
     if hidden > 0 {
         tail.push('\n');
@@ -761,20 +795,29 @@ pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
         let mut lost: Vec<&(String, Unreadable)> = d.unreadable.iter().collect();
         lost.sort();
         tail.push_str(&match lost.len() {
-            1 => t("No se puede leer 1 objeto:"),
-            n => t(&format!("No se pueden leer {n} objetos:")),
+            1 => t("No se puede leer 1 objeto:", "1 object can't be read:"),
+            n => say(
+                lang,
+                format!("No se pueden leer {n} objetos:"),
+                format!("{n} objects can't be read:"),
+            ),
         });
         tail.push('\n');
         for (id, why) in lost.iter().take(SHOWN_UNREADABLE) {
             tail.push_str(&format!(
                 "  {} {} · {}\n",
                 short(id),
-                t("(no se puede leer)"),
-                t(&why.to_string())
+                t("(no se puede leer)", "(unreadable)"),
+                why_text(lang, *why)
             ));
         }
         if lost.len() > SHOWN_UNREADABLE {
-            tail.push_str(&t(&format!("  … y {} más", lost.len() - SHOWN_UNREADABLE)));
+            let n = lost.len() - SHOWN_UNREADABLE;
+            tail.push_str(&say(
+                lang,
+                format!("  … y {n} más"),
+                format!("  … and {n} more"),
+            ));
             tail.push('\n');
         }
     }
@@ -784,7 +827,10 @@ pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
         out.push_str(&format!("({s})\n"));
     }
     if chunks.is_empty() && v.only.is_none() && hidden == 0 && d.unreadable.is_empty() {
-        out.push_str(&t("El tablero está vacío: crea un proyecto con `project`."));
+        out.push_str(&t(
+            "El tablero está vacío: crea un proyecto con `project`.",
+            "The board is empty: create a project with `project`.",
+        ));
         out.push('\n');
         return out;
     }
@@ -803,9 +849,11 @@ pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
         let rest = &chunks[i..];
         let p = rest.iter().filter(|(k, _)| *k == Kind::Project).count();
         let o = rest.len() - p;
-        out.push_str(&t(&format!(
-            "… se omiten {o} objetivos y {p} proyectos: pide uno con `project`"
-        )));
+        out.push_str(&say(
+            lang,
+            format!("… se omiten {o} objetivos y {p} proyectos: pide uno con `project`"),
+            format!("… {o} objectives and {p} projects left out: ask for one with `project`"),
+        ));
         out.push('\n');
     }
     out.push_str(&tail);
@@ -1931,6 +1979,45 @@ mod tests {
             assert!(has(&e, "ningún hub"), "{tool}: {}", e.1);
         }
         assert!(st.group.board_keys().keys.is_empty(), "no crea clave");
+    }
+
+    /// Un hub sin cuenta para este nido contesta 503: se dice, con lo que dijo el hub.
+    #[tokio::test]
+    async fn without_an_account_it_says_so() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let s = st
+            .registry
+            .lock()
+            .await
+            .add(session(tmp.path(), "api"))
+            .unwrap();
+        let rec = hub::fake::recording(|v| {
+            let req = v.get("board")?.get("req")?.as_u64()?;
+            Some(hub::fake::Reply::Send(
+                json!({"boarded": {"req": req, "status": 503,
+                "error": "el nido no tiene cuenta"}}),
+            ))
+        })
+        .await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        for (tool, args) in [("board", json!({})), ("project", json!({"name": "P"}))] {
+            let e = match tool {
+                "board" => tool_board(&st, &s, args).await,
+                _ => tool_project(&st, &s, args).await,
+            }
+            .unwrap_err();
+            assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{tool}");
+            assert_eq!(
+                e.1, "el tablero no está disponible: el nido no tiene cuenta",
+                "{tool}"
+            );
+            assert_eq!(
+                i18n::english(&e.1),
+                "the board is not available: this nido has no account"
+            );
+        }
     }
 
     // ---------- `render`, sin hub ----------

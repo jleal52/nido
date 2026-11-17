@@ -1289,47 +1289,17 @@ const TABLE: &[(&str, &str)] = &[
         "nothing to change: give name, desc, state, note, order or delete",
     ),
     ("order tiene que ser un número", "order must be a number"),
-    // El texto de `board` (solo las etiquetas: lo que escribió el usuario va tal cual)
+    // Por qué no se puede leer un objeto (`Unreadable`), en los errores
     ("sin su clave", "without its key"),
     ("no se descifra", "does not decrypt"),
     ("no es un objeto", "not an object"),
     ("de un tipo que no se conoce", "of an unknown type"),
     ("no está en el hub", "not in the hub"),
-    ("sin plan", "no plan"),
-    ("1 bloqueada", "1 blocked"),
-    ("{} bloqueadas", "{0} blocked"),
-    ("1 fallida", "1 failed"),
-    ("{} fallidas", "{0} failed"),
-    ("descripción: ", "description: "),
-    ("nota: ", "note: "),
-    ("cerrada", "closed"),
     (
-        "1 proyecto archivado sin enseñar (archived: true para verlo)",
-        "1 archived project not shown (archived: true to see it)",
+        "el tablero no está disponible: {}",
+        "the board is not available: {0}",
     ),
-    (
-        "{} proyectos archivados sin enseñar (archived: true para verlos)",
-        "{0} archived projects not shown (archived: true to see them)",
-    ),
-    ("No se puede leer 1 objeto:", "1 object can't be read:"),
-    (
-        "No se pueden leer {} objetos:",
-        "{0} objects can't be read:",
-    ),
-    ("(no se puede leer)", "(unreadable)"),
-    ("  … y {} más", "  … and {0} more"),
-    (
-        "El tablero está vacío: crea un proyecto con `project`.",
-        "The board is empty: create a project with `project`.",
-    ),
-    (
-        "… se omiten {} objetivos y {} proyectos: pide uno con `project`",
-        "… {0} objectives and {1} projects left out: ask for one with `project`",
-    ),
-    (
-        "sin poder hablar con el hub: {}; es la copia de este equipo",
-        "could not talk to the hub: {0}; this is this machine's copy",
-    ),
+    ("el nido no tiene cuenta", "this nido has no account"),
 ];
 
 #[cfg(test)]
@@ -1515,14 +1485,14 @@ mod tests {
             "too many writes to the board: try again in a while (the deletion was left halfway: \
              ask again to finish it)"
         );
-        assert_eq!(english("3 bloqueadas"), "3 blocked");
         assert_eq!(
-            english("… se omiten 12 objetivos y 3 proyectos: pide uno con `project`"),
-            "… 12 objectives and 3 projects left out: ask for one with `project`"
+            english("el tablero no está disponible: el nido no tiene cuenta"),
+            "the board is not available: this nido has no account"
         );
+        // Las etiquetas de `board` no están aquí: un nombre que acabe como una no cambia.
         assert_eq!(
-            english("sin poder hablar con el hub: el hub no contestó; es la copia de este equipo"),
-            "could not talk to the hub: the hub did not answer; this is this machine's copy"
+            english("no hay ningún objetivo «Pruebas fallidas»"),
+            "there is no objective “Pruebas fallidas”"
         );
     }
 
