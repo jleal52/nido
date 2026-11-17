@@ -371,7 +371,8 @@ impl Group {
     /// grupo cogido y antes de guardarlo, así que no puede usar el grupo. Si se corta antes de
     /// guardarlo, al volver a enterarse se llama otra vez. Solo vale el primero que se ponga.
     pub fn on_leave(&self, f: impl Fn() + Send + Sync + 'static) {
-        let _ = self.on_leave.set(Box::new(f));
+        let first = self.on_leave.set(Box::new(f)).is_ok();
+        debug_assert!(first, "on_leave se pone una sola vez");
     }
 
     /// Avisa de cada cambio del grupo: el valor es la revisión, que solo sube.

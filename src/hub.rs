@@ -77,6 +77,15 @@ pub struct HubStatus {
     /// La cuenta de este nido según el hub (`{"name","lang"}`), lo último que dijo: no se borra
     /// al desconectar, solo si se cambia de hub.
     pub account: Option<serde_json::Value>,
+    /// El `ref` de la cuenta (16 hex que no dicen nada, el mismo mientras sea la misma cuenta),
+    /// si el hub lo da (uno antiguo, no). Como `account`, pero no sale de aquí: solo sirve para
+    /// saber que la cuenta cambió.
+    #[serde(skip)]
+    pub account_ref: Option<String>,
+    /// Cuántas veces se ha conectado: sube con cada conexión, así quien mira el estado no se
+    /// pierde una reconexión aunque `connected` ya estuviera a `true` la última vez que miró.
+    #[serde(skip)]
+    pub connections: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -185,9 +194,9 @@ const BOARD_WAIT: Duration = Duration::from_secs(30);
 const BOARD_WAIT: Duration = Duration::from_secs(2);
 /// Peticiones del tablero sin contestar a la vez: el hub contesta 429 a la quinta.
 pub const BOARD_IN_FLIGHT: usize = 4;
-/// El 413 del hub cuando la cuenta ya tiene todos los objetos que caben (el otro 413 es el de un
-/// blob demasiado largo).
-const BOARD_FULL: &str = "la cuenta ya tiene 2000 objetos";
+/// Cómo empieza el 413 del hub cuando la cuenta ya tiene todos los objetos que caben («la cuenta
+/// ya tiene 2000 objetos»; el otro 413 es el de un blob demasiado largo).
+const BOARD_FULL: &str = "la cuenta ya tiene";
 const BOARD_NO_HUB: &str = "sin conexión con el hub";
 const BOARD_SILENT: &str = "el hub no contestó";
 /// Una respuesta del tablero que no es como dice el protocolo.
@@ -248,6 +257,8 @@ pub enum BoardError {
     TooBig,
     /// El freno de escrituras, o demasiadas peticiones a la vez (429).
     Busy,
+    /// El hub no acepta la petición (400): un id, un `kid` o un blob que no valen.
+    Bad(String),
     /// Sin conexión, sin respuesta, un 503 (sin cuenta, MongoDB) o algo que no se esperaba.
     Hub(String),
 }
@@ -259,6 +270,7 @@ impl std::fmt::Display for BoardError {
             BoardError::Full => write!(f, "el tablero de la cuenta está lleno"),
             BoardError::TooBig => write!(f, "el objeto es demasiado grande para el hub"),
             BoardError::Busy => write!(f, "demasiadas escrituras en el tablero: prueba en un rato"),
+            BoardError::Bad(e) => write!(f, "el hub no acepta la petición del tablero ({e})"),
             BoardError::Hub(e) => write!(f, "{e}"),
         }
     }
@@ -687,9 +699,16 @@ impl Hub {
                 Ok(current) => Err(BoardError::Conflict(current)),
                 Err(_) => Err(BoardError::Hub(BOARD_ODD.into())),
             },
-            Some(413) if v["error"] == BOARD_FULL => Err(BoardError::Full),
+            Some(413)
+                if v["error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with(BOARD_FULL)) =>
+            {
+                Err(BoardError::Full)
+            }
             Some(413) => Err(BoardError::TooBig),
             Some(429) => Err(BoardError::Busy),
+            Some(400) => Err(BoardError::Bad(error())),
             Some(_) if !error().is_empty() => Err(BoardError::Hub(error())),
             _ => Err(BoardError::Hub(BOARD_ODD.into())),
         }
@@ -769,11 +788,13 @@ impl Hub {
             "name": text("name", account_name),
             "lang": text("lang", account_lang),
         });
+        let account_ref = text("ref", account_ref);
         self.status.send_if_modified(|s| {
-            if s.account.as_ref() == Some(&account) {
+            if s.account.as_ref() == Some(&account) && s.account_ref == account_ref {
                 return false;
             }
             s.account = Some(account);
+            s.account_ref = account_ref;
             true
         });
         true
@@ -810,6 +831,11 @@ fn account_name(name: &str) -> bool {
         && !name.starts_with('-')
         && !name.ends_with('-')
         && !name.contains("--")
+}
+
+/// El `ref` de una cuenta: 16 hex en minúsculas.
+fn account_ref(r: &str) -> bool {
+    r.len() == 16 && r.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Los idiomas de una cuenta.
@@ -880,10 +906,14 @@ pub fn spawn<H: e2e::Host>(hub: Arc<Hub>, host: Arc<H>) {
             };
             hub.set_status(|s| {
                 // La cuenta es lo último que se supo de este hub: con otro, ya no vale.
-                let account = s.account.take().filter(|_| s.url == url);
+                let same = s.url == url;
+                let account = s.account.take().filter(|_| same);
+                let account_ref = s.account_ref.take().filter(|_| same);
                 *s = HubStatus {
                     url: url.clone(),
                     account,
+                    account_ref,
+                    connections: s.connections,
                     ..Default::default()
                 }
             });
@@ -1066,6 +1096,7 @@ async fn run<H: e2e::Host>(
     hub.set_status(|s| {
         s.id = Some(id.clone());
         s.connected = true;
+        s.connections += 1;
         s.error = None;
     });
 
@@ -1411,6 +1442,60 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    /// El `ref` de la cuenta: 16 hex o nada, y cambiar solo el `ref` también avisa; no va en la
+    /// cuenta que sale hacia fuera. Y cada conexión suma una a `connections`; la cuenta y su
+    /// `ref` se quedan al reconectar.
+    #[tokio::test]
+    async fn the_account_ref_and_the_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        assert_eq!(hub.status.borrow().connections, 1);
+        let mut status = hub.status.subscribe();
+        let send_ref = |r: &str| {
+            rec.tell(fake::Tell::Send(serde_json::json!({
+                "account": { "name": "mirlo-sereno", "lang": "es", "ref": r }
+            })));
+        };
+        let wait_ref = |status: &mut watch::Receiver<HubStatus>, want: Option<&'static str>| {
+            let mut status = status.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    status.wait_for(|s| s.account_ref.as_deref() == want),
+                )
+                .await
+                .expect("no llegó el ref")
+                .unwrap();
+            }
+        };
+        send_ref("0123456789abcdef");
+        wait_ref(&mut status, Some("0123456789abcdef")).await;
+        send_ref("fedcba9876543210");
+        wait_ref(&mut status, Some("fedcba9876543210")).await;
+        send_ref("NO-ES-HEX-NO-ES-");
+        wait_ref(&mut status, None).await;
+        assert_eq!(
+            hub.status.borrow().account,
+            Some(serde_json::json!({ "name": "mirlo-sereno", "lang": "es" }))
+        );
+        send_ref("0123456789abcdef");
+        wait_ref(&mut status, Some("0123456789abcdef")).await;
+        rec.tell(fake::Tell::Hangup);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        rec.next("pub").await;
+        rec.next("pub").await;
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        let s = hub.status.borrow().clone();
+        assert_eq!(s.connections, 2);
+        assert_eq!(s.account_ref.as_deref(), Some("0123456789abcdef"));
     }
 
     /// El nombre y el idioma de la cuenta, como los valida el hub: lo demás no es un nombre ni un
@@ -1811,6 +1896,7 @@ mod tests {
             let req = b["req"].as_u64()?;
             let (status, error) = match b["kid"].as_str().unwrap_or_default() {
                 "full" => (413, "la cuenta ya tiene 2000 objetos"),
+                "full5000" => (413, "la cuenta ya tiene 5000 objetos"),
                 "big" => (413, "el blob pasa de 11000 bytes"),
                 "rate" => (
                     429,
@@ -1844,7 +1930,12 @@ mod tests {
             put("mongo").await,
             Err(BoardError::Hub("error del hub".into()))
         );
-        assert!(matches!(put("bad").await, Err(BoardError::Hub(_))));
+        assert_eq!(
+            put("bad").await,
+            Err(BoardError::Bad("petición del tablero no válida".into()))
+        );
+        // El de la cuenta llena, con otro número de objetos, también.
+        assert_eq!(put("full5000").await, Err(BoardError::Full));
         // Un 409 sin el objeto como está no es un conflicto que se pueda resolver.
         assert!(matches!(put("odd").await, Err(BoardError::Hub(_))));
         // Uno que no contesta (un hub antiguo): al vencer el plazo, `Hub`.
@@ -1980,6 +2071,8 @@ pub(crate) mod fake {
     pub enum Reply {
         /// Contesta esto.
         Send(serde_json::Value),
+        /// Contesta todo esto, en orden (solo el hub que graba).
+        SendAll(Vec<serde_json::Value>),
         /// Nada (como un hub antiguo).
         Silent,
         /// Cuelga.
@@ -2027,7 +2120,7 @@ pub(crate) mod fake {
                         .await
                         .unwrap(),
                     Some(Reply::Close) => return,
-                    Some(Reply::Silent) | None => {}
+                    Some(Reply::Silent | Reply::SendAll(_)) | None => {}
                 }
             }
         });
@@ -2126,6 +2219,11 @@ pub(crate) mod fake {
                                 Some(Reply::Send(r)) => {
                                     let _ = ws.send(Message::Text(r.to_string().into())).await;
                                 }
+                                Some(Reply::SendAll(all)) => {
+                                    for r in all {
+                                        let _ = ws.send(Message::Text(r.to_string().into())).await;
+                                    }
+                                }
                                 Some(Reply::Close) => break,
                                 Some(Reply::Silent) | None => {}
                             }
@@ -2192,8 +2290,9 @@ pub(crate) mod fake {
     const BOARD_OVERLAP: i64 = 2_000_000;
 
     /// Un tablero en memoria que contesta como el del hub (versiones, lápidas, el solape de 2 s,
-    /// páginas por número de objetos y el cursor `after`), con lo que hace falta para las pruebas:
-    /// un `reset`, escrituras de otro que se adelantan y el freno.
+    /// páginas por número de objetos, el cursor `after`, los avisos y los 413), con lo que hace
+    /// falta para las pruebas: un `reset`, escrituras de otro que se adelantan, el freno, un 400
+    /// y ganchos para cortar algo a medias.
     pub struct Board {
         pub items: std::collections::BTreeMap<String, BoardItem>,
         /// La marca de la última escritura.
@@ -2214,6 +2313,16 @@ pub(crate) mod fake {
         pub gets: Vec<(i64, Option<String>)>,
         /// Las escrituras que han llegado: cuándo, `op`, id y `v`.
         pub writes: Vec<(std::time::Instant, String, String, i64)>,
+        /// Cuántos objetos caben (lápidas incluidas): crear uno más da 413 «cuenta llena».
+        pub limit: usize,
+        /// Los ids cuyo blob es «demasiado largo» (413).
+        pub too_big: std::collections::BTreeSet<String>,
+        /// Los ids que el hub no acepta (400).
+        pub bad: std::collections::BTreeSet<String>,
+        /// Lo que se hace al recibir cada lectura (con cuántas van, contándola) y cada escritura
+        /// (con cuántas van): para cortar algo a medias en las pruebas.
+        pub on_get: Option<Box<dyn FnMut(usize) + Send>>,
+        pub on_write: Option<Box<dyn FnMut(usize) + Send>>,
     }
 
     impl Default for Board {
@@ -2227,6 +2336,11 @@ pub(crate) mod fake {
                 busy: 0,
                 gets: vec![],
                 writes: vec![],
+                limit: 2000,
+                too_big: Default::default(),
+                bad: Default::default(),
+                on_get: None,
+                on_write: None,
             }
         }
     }
@@ -2258,23 +2372,34 @@ pub(crate) mod fake {
             item
         }
 
-        /// Contesta un `{"board": …}` del nido como el hub; lo demás, nada.
+        /// Contesta un `{"board": …}` del nido como el hub; lo demás, nada. Tras una escritura
+        /// que sale bien avisa del cambio, también a quien escribe (como el hub).
         pub fn answer(&mut self, msg: &serde_json::Value) -> Option<Reply> {
             let b = msg.get("board")?;
             let req = b["req"].as_u64()?;
             let mut reply = match b["op"].as_str() {
                 Some("get") => self.get(b["since"].as_i64().unwrap_or(0), b["after"].as_str()),
                 Some(op @ ("put" | "del")) => self.change(op, b),
-                _ => {
-                    serde_json::json!({ "status": 400, "error": "petición del tablero no válida" })
-                }
+                _ => serde_json::json!({
+                    "status": 400, "error": "petición del tablero no válida",
+                }),
             };
             reply["req"] = req.into();
-            Some(Reply::Send(serde_json::json!({ "boarded": reply })))
+            let at = (reply["status"] == 200 && b["op"] != "get")
+                .then(|| reply["at"].as_i64())
+                .flatten();
+            let mut all = vec![serde_json::json!({ "boarded": reply })];
+            if let Some(at) = at {
+                all.push(serde_json::json!({ "board": { "at": at } }));
+            }
+            Some(Reply::SendAll(all))
         }
 
         fn get(&mut self, since: i64, after: Option<&str>) -> serde_json::Value {
             self.gets.push((since, after.map(str::to_owned)));
+            if let Some(f) = self.on_get.as_mut() {
+                f(self.gets.len());
+            }
             if after.is_none() && since > 0 && std::mem::take(&mut self.reset) {
                 return serde_json::json!({ "status": 200, "items": [], "next": 0,
                     "more": false, "after": null, "reset": true });
@@ -2313,6 +2438,15 @@ pub(crate) mod fake {
             let v = b["v"].as_i64().unwrap_or(-1);
             self.writes
                 .push((std::time::Instant::now(), op.into(), id.clone(), v));
+            if let Some(f) = self.on_write.as_mut() {
+                f(self.writes.len());
+            }
+            if self.bad.contains(&id) {
+                return serde_json::json!({ "status": 400, "error": "el blob no es base64" });
+            }
+            if op == "put" && self.too_big.contains(&id) {
+                return serde_json::json!({ "status": 413, "error": "el blob pasa de 11000 bytes" });
+            }
             if self.busy > 0 {
                 self.busy -= 1;
                 return serde_json::json!({ "status": 429,
@@ -2332,6 +2466,10 @@ pub(crate) mod fake {
             if current.v != v {
                 return serde_json::json!({ "status": 409,
                     "error": "la versión no es la que hay", "current": current });
+            }
+            if op == "put" && v == 0 && self.items.len() >= self.limit {
+                return serde_json::json!({ "status": 413,
+                    "error": format!("la cuenta ya tiene {} objetos", self.limit) });
             }
             let item = if op == "put" {
                 let (kid, blob) = (b["kid"].as_str().unwrap(), b["blob"].as_str().unwrap());
