@@ -337,7 +337,7 @@ them as `#1a2b3c4d`; the `#` is optional) or by its exact name, ignoring case. A
 name is looked for in `project` if given, otherwise in every project. A name or a prefix that
 matches several gives an error with the candidates. Every change records who made it as
 `<computer>/<session>`. Like the rest of the tools, they answer in English (Claude reads them);
-the names you wrote go as you wrote them. What can't be read (without its key, or of a type this
+in `board`'s text, the names you wrote go as you wrote them. What can't be read (without its key, or of a type this
 nido doesn't know) is listed by its id, and is never changed or deleted.
 
 Each computer copies the plan summary of its sessions (title, and how many tasks are done, in
@@ -349,10 +349,12 @@ nor those it can't read, nor those whose objective is missing (it may come back,
 while the board is being uploaded again); those go when their objective is deleted.
 
 **Careful with the session registry**: nido closes the links of every session of this computer
-that isn't in its registry (`sessions.json` in the data folder, below). If that file is lost, or
-nido starts with another data folder (for instance after changing `XDG_DATA_HOME` or `NIDO_HOME`
-in a service), it closes every link of this computer. Nothing opens them again by itself: the
-sessions have to `join` again, and the closed links are deleted after 30 days.
+that isn't in its registry (`sessions.json` in the data folder, below). If that file is lost, it
+closes every link of this computer. Nothing opens them again by itself: the sessions have to
+`join` again, and the closed links are deleted after 30 days. Don't start nido with another data
+folder either (for instance by changing `XDG_DATA_HOME` in a service): besides the registry, it
+holds the group (`group.json`, with the board's keyring) and the copy of the board, and nido would
+start without them.
 
 Each nido keeps a copy of the board in `board.json`, in its data folder (`~/.local/share/nido`,
 `$XDG_DATA_HOME/nido` or `$NIDO_HOME/data`; on Windows, `%USERPROFILE%\.local\share\nido`),

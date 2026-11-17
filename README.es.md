@@ -321,7 +321,7 @@ enseña como `#1a2b3c4d`; el `#` es opcional) o por su nombre exacto, sin mirar 
 objetivo por nombre se busca en `project` si se da, y si no en todos los proyectos. Un nombre o un
 principio de id que valen para varios dan error con los candidatos. Cada cambio apunta quién lo
 hizo como `<equipo>/<sesión>`. Como el resto de las herramientas, contestan en inglés (las lee
-Claude); los nombres que escribiste van tal cual. Lo que no se puede leer (sin su clave, o de un
+Claude); en el texto de `board`, los nombres que escribiste van tal cual. Lo que no se puede leer (sin su clave, o de un
 tipo que este nido no conoce) sale por su id, y nunca se cambia ni se borra.
 
 Cada equipo copia el resumen del plan de sus sesiones (el título, y cuántas tareas hay hechas, en
@@ -334,10 +334,11 @@ vuelve a subir el tablero); esos se van al borrar su objetivo.
 
 **Cuidado con el registro de sesiones**: nido cierra los enlaces de toda sesión de este equipo que
 no esté en su registro (`sessions.json` en la carpeta de datos, más abajo). Si se pierde ese
-fichero, o nido arranca con otra carpeta de datos (por ejemplo al cambiar `XDG_DATA_HOME` o
-`NIDO_HOME` en un servicio), cierra todos los enlaces de este equipo. Nada los vuelve a abrir
-solo: las sesiones tienen que volver a hacer `join`, y los enlaces cerrados se borran a los 30
-días.
+fichero, cierra todos los enlaces de este equipo. Nada los vuelve a abrir solo: las sesiones
+tienen que volver a hacer `join`, y los enlaces cerrados se borran a los 30 días. Tampoco hay que
+arrancar nido con otra carpeta de datos (por ejemplo al cambiar `XDG_DATA_HOME` en un servicio):
+además del registro, guarda el grupo (`group.json`, con el llavero del tablero) y la copia del
+tablero, y nido arrancaría sin ellos.
 
 Cada nido guarda una copia del tablero en `board.json`, en su carpeta de datos
 (`~/.local/share/nido`, `$XDG_DATA_HOME/nido` o `$NIDO_HOME/data`; en Windows,
