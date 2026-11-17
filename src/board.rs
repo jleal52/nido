@@ -17,17 +17,21 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
-/// El id de una clave del tablero (`hex(SHA-256("nido-board-kid" || clave))[0..16]`).
-pub use crate::group::board_kid as kid;
+/// El id de una clave del tablero: `hex(SHA-256("nido-board-kid" || clave))[0..16]`.
+pub fn kid(key: &[u8; 32]) -> String {
+    crate::group::board_kid(key)
+}
 
 /// La versión del formato del blob: su primer byte.
 pub const VERSION: u8 = 1;
 /// Lo más que puede ocupar el texto de un objeto (su JSON en UTF-8). Cifrado y en base64 son
 /// 10 964 caracteres, por debajo de los 11 000 que acepta el hub.
 pub const MAX_PLAIN: usize = 8192;
+/// Lo más largo que acepta el hub en un blob (caracteres): uno más largo ni se decodifica.
+pub const MAX_BLOB: usize = 11_000;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const AAD_PREFIX: &[u8] = b"nido-board/1/";
@@ -46,6 +50,9 @@ pub enum BlobError {
     Version(u8),
     /// No se descifra: otra clave, otro id o un blob tocado.
     Open,
+    /// El objeto no se puede escribir (un `Unknown`, un `order` no finito) o lo descifrado no es
+    /// un objeto.
+    BadObject(String),
 }
 
 impl std::fmt::Display for BlobError {
@@ -62,6 +69,7 @@ impl std::fmt::Display for BlobError {
             BlobError::BadBlob => write!(f, "blob mal formado"),
             BlobError::Version(v) => write!(f, "blob de una versión que no se conoce ({v})"),
             BlobError::Open => write!(f, "el blob no se descifra con esta clave y este id"),
+            BlobError::BadObject(e) => write!(f, "objeto del tablero no válido: {e}"),
         }
     }
 }
@@ -111,7 +119,7 @@ fn seal_with_nonce(
                 aad: &aad(id),
             },
         )
-        .map_err(|_| BlobError::Open)?;
+        .expect("AES-GCM cifra cualquier texto de hasta MAX_PLAIN bytes");
     let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
     out.push(VERSION);
     out.extend_from_slice(nonce);
@@ -123,6 +131,9 @@ fn seal_with_nonce(
 pub fn open(key: &[u8; 32], id: &str, blob: &str) -> Result<Vec<u8>, BlobError> {
     if !is_id(id) {
         return Err(BlobError::BadId);
+    }
+    if blob.len() > MAX_BLOB {
+        return Err(BlobError::BadBlob);
     }
     let raw = B64.decode(blob).map_err(|_| BlobError::BadBlob)?;
     if raw.len() < 1 + NONCE_LEN + TAG_LEN {
@@ -143,6 +154,20 @@ pub fn open(key: &[u8; 32], id: &str, blob: &str) -> Result<Vec<u8>, BlobError> 
         .map_err(|_| BlobError::Open)
 }
 
+/// Cifra un objeto: su JSON, sin lo de `extra` que choca con lo conocido (`clean_extra`). Es la
+/// forma de escribir un objeto; `seal` cifra bytes y no sabe de objetos.
+pub fn seal_object(key: &[u8; 32], id: &str, obj: &Object) -> Result<String, BlobError> {
+    let mut obj = obj.clone();
+    obj.clean_extra();
+    let text = serde_json::to_vec(&obj).map_err(|e| BlobError::BadObject(e.to_string()))?;
+    seal(key, id, &text)
+}
+
+/// Descifra y lee el objeto `id`.
+pub fn open_object(key: &[u8; 32], id: &str, blob: &str) -> Result<Object, BlobError> {
+    serde_json::from_slice(&open(key, id, blob)?).map_err(|e| BlobError::BadObject(e.to_string()))
+}
+
 fn aad(id: &str) -> Vec<u8> {
     [AAD_PREFIX, id.as_bytes()].concat()
 }
@@ -156,8 +181,37 @@ fn hex(b: &[u8]) -> String {
 // Los campos desconocidos (de versiones futuras) no rompen la lectura y se conservan: van a
 // `extra` y se vuelven a escribir tal cual, así que un nido viejo que cambia el estado de un
 // objetivo no borra lo que añadió una versión nueva. `t` no llega a `extra`: lo consume el
-// `tag` de `Object` antes de leer la variante, y al escribir lo pone él delante (quien rellene
-// `extra` a mano no debe meter `t` ni un campo conocido: saldría dos veces).
+// `tag` de `Object` antes de leer la variante, y al escribir lo pone él delante. Si alguien
+// mete en `extra` `t` o un campo conocido, saldría dos veces: `seal_object` los quita antes con
+// `clean_extra`.
+//
+// Un `null` en un campo con valor por omisión se lee como si faltara (`null_default`): otro
+// cliente puede escribir `"desc": null` y no por eso el objeto entero tiene que ser ilegible.
+
+/// Un campo que falta o que viene a `null`: su valor por omisión.
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// `order` solo se escribe si es finito: JSON no tiene `NaN` ni infinitos, y `serde_json` los
+/// escribiría como `null`, que al leer sería un 0. Así no llega a cifrarse.
+fn finite<S: Serializer>(x: &f64, s: S) -> Result<S::Ok, S::Error> {
+    if !x.is_finite() {
+        return Err(serde::ser::Error::custom(format!(
+            "order no es finito: {x}"
+        )));
+    }
+    s.serialize_f64(*x)
+}
+
+/// Quita de `extra` las claves que chocan con los campos conocidos (y `t`, si `tag`).
+fn clean(extra: &mut Map<String, Value>, known: &[&str], tag: bool) {
+    extra.retain(|k, _| !((tag && k == "t") || known.contains(&k.as_str())));
+}
 
 /// Un objeto del tablero, por su `t`. Un `t` que no se conoce (de una versión futura) se lee
 /// como `Unknown` en vez de fallar, y quien sincroniza se lo salta: así un tipo nuevo no rompe
@@ -172,18 +226,69 @@ pub enum Object {
     Unknown,
 }
 
+impl Object {
+    /// Quita de `extra` (también de `session` y `plan`) lo que repetiría un campo conocido o
+    /// `t`. Lo leído de un JSON ya viene así; esto es para lo que se rellena a mano.
+    pub fn clean_extra(&mut self) {
+        match self {
+            Object::Project(p) => clean(&mut p.extra, Project::FIELDS, true),
+            Object::Objective(o) => clean(&mut o.extra, Objective::FIELDS, true),
+            Object::Link(l) => {
+                clean(&mut l.extra, Link::FIELDS, true);
+                clean(&mut l.session.extra, LinkSession::FIELDS, false);
+                if let Some(p) = &mut l.plan {
+                    clean(&mut p.extra, PlanSummary::FIELDS, false);
+                }
+            }
+            Object::Unknown => {}
+        }
+    }
+}
+
+impl Project {
+    /// Los campos que se conocen, como salen en el JSON.
+    pub const FIELDS: &[&str] = &["name", "desc", "state", "created", "changed", "by"];
+}
+
+impl Objective {
+    pub const FIELDS: &[&str] = &[
+        "project", "name", "desc", "state", "note", "order", "created", "changed", "by",
+    ];
+}
+
+impl Link {
+    pub const FIELDS: &[&str] = &[
+        "objective",
+        "session",
+        "plan",
+        "copied",
+        "closed",
+        "created",
+        "changed",
+        "by",
+    ];
+}
+
+impl LinkSession {
+    pub const FIELDS: &[&str] = &["machine", "id", "name"];
+}
+
+impl PlanSummary {
+    pub const FIELDS: &[&str] = &["title", "done", "total", "active", "blocked", "failed"];
+}
+
 /// Un proyecto: agrupa objetivos.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub desc: String,
     pub state: ProjectState,
     /// Cuándo se creó y cuándo cambió por última vez (ms Unix).
     pub created: u64,
     pub changed: u64,
     /// Quién lo cambió: `"<equipo>/<sesión>"`, `"web"`, `"app"` o `"Cuco"`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub by: String,
     /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
     #[serde(flatten)]
@@ -196,17 +301,17 @@ pub struct Objective {
     /// El id del proyecto.
     pub project: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub desc: String,
     pub state: ObjectiveState,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub note: String,
     /// Dónde va en su proyecto. Es real: para meter uno entre dos se usa la media, sin renumerar.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default", serialize_with = "finite")]
     pub order: f64,
     pub created: u64,
     pub changed: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub by: String,
     /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
     #[serde(flatten)]
@@ -224,14 +329,14 @@ pub struct Link {
     #[serde(default)]
     pub plan: Option<PlanSummary>,
     /// Cuándo se copió el resumen (ms).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub copied: u64,
     /// Cuándo se cerró la sesión (ms), o `null` si sigue.
     #[serde(default)]
     pub closed: Option<u64>,
     pub created: u64,
     pub changed: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub by: String,
     /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
     #[serde(flatten)]
@@ -246,7 +351,7 @@ pub struct LinkSession {
     /// El id de la sesión en su nido (8 hex).
     pub id: String,
     /// Cómo se ve: `"<equipo>/<sesión>"`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
     /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
     #[serde(flatten)]
@@ -259,15 +364,15 @@ pub struct LinkSession {
 pub struct PlanSummary {
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub done: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub total: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub active: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub blocked: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub failed: usize,
     /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
     #[serde(flatten)]
@@ -307,6 +412,13 @@ mod tests {
 
     fn seq_key() -> [u8; 32] {
         std::array::from_fn(|i| i as u8)
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
@@ -373,11 +485,28 @@ mod tests {
             open(&key, ID, "no es base64!"),
             Err(BlobError::BadBlob)
         ));
-        // Base64 URL o sin relleno no es el estándar.
-        let url = blob.replace('+', "-").replace('/', "_");
-        if url != blob {
-            assert!(matches!(open(&key, ID, &url), Err(BlobError::BadBlob)));
-        }
+        // Base64 URL o sin relleno no es el estándar. Con bytes fijos: `0xfb` da `+` y `/` en
+        // estándar (`-` y `_` en URL), y 34 bytes llevan `==` de relleno. Si se aceptaran, el
+        // error sería otro (versión 0xfb), no `BadBlob`.
+        use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE};
+        let url = URL_SAFE.encode([0xfb; 33]);
+        assert!(url.contains('-') && url.contains('_'), "{url}");
+        assert!(matches!(open(&key, ID, &url), Err(BlobError::BadBlob)));
+        assert!(matches!(
+            open(&key, ID, &B64.encode([0xfb; 33])),
+            Err(BlobError::Version(0xfb))
+        ));
+        let no_pad = STANDARD_NO_PAD.encode([0xfb; 34]);
+        assert!(B64.encode([0xfb; 34]).ends_with("=="));
+        assert!(matches!(open(&key, ID, &no_pad), Err(BlobError::BadBlob)));
+        // Más largo de lo que acepta el hub, aunque sea base64 bueno: ni se decodifica.
+        let long = B64.encode(vec![1u8; 8253]);
+        assert_eq!(long.len(), 11004);
+        assert!(matches!(open(&key, ID, &long), Err(BlobError::BadBlob)));
+        assert!(matches!(
+            open(&key, ID, &B64.encode(vec![1u8; 8250])),
+            Err(BlobError::Open)
+        ));
         // El id va tal cual en `aad`: en mayúsculas o con otro largo no vale.
         let upper = ID.to_uppercase();
         assert!(matches!(seal(&key, &upper, b"x"), Err(BlobError::BadId)));
@@ -468,7 +597,8 @@ mod tests {
             serde_json::json!({"os": "linux"})
         );
         assert_eq!(link.plan.as_ref().unwrap().extra["skipped"], 3);
-        // Sin cambios, vuelve el mismo texto (los desconocidos van al final, por orden).
+        // Sin cambios, vuelve el mismo texto (los desconocidos van al final, por orden
+        // alfabético).
         assert_eq!(serde_json::to_string(&o).unwrap(), text);
         // Con un cambio, cambia solo eso.
         let Object::Link(link) = &mut o else {
@@ -525,6 +655,201 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Un `null` explícito en un campo con valor por omisión no hace ilegible el objeto: se lee
+    /// como si faltara.
+    #[test]
+    fn nulls_read_as_missing() {
+        let o: Object = serde_json::from_str(
+            r#"{"t":"objective","project":"p","name":"n","desc":null,"state":"pending",
+                "note":null,"order":null,"created":1,"changed":1,"by":null}"#,
+        )
+        .unwrap();
+        let Object::Objective(ob) = o else {
+            panic!("{o:?}")
+        };
+        assert_eq!(
+            (ob.desc.as_str(), ob.note.as_str(), ob.by.as_str()),
+            ("", "", "")
+        );
+        assert_eq!(ob.order, 0.0);
+        let o: Object = serde_json::from_str(
+            r#"{"t":"link","objective":"o","session":{"machine":"m","id":"ab12cd34","name":null},
+                "plan":{"title":null,"done":null,"total":null,"active":null,"blocked":null,"failed":null},
+                "copied":null,"closed":null,"created":1,"changed":1,"by":"web"}"#,
+        )
+        .unwrap();
+        let Object::Link(link) = o else {
+            panic!("{o:?}")
+        };
+        assert_eq!(link.session.name, "");
+        assert_eq!(link.copied, 0);
+        let plan = link.plan.unwrap();
+        assert_eq!(
+            (
+                plan.done,
+                plan.total,
+                plan.active,
+                plan.blocked,
+                plan.failed
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        let o: Object = serde_json::from_str(
+            r#"{"t":"project","name":"x","desc":null,"state":"active","created":1,"changed":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(o, Object::Project(p) if p.desc.is_empty()));
+        // Los que no tienen valor por omisión siguen siendo obligatorios.
+        assert!(
+            serde_json::from_str::<Object>(
+                r#"{"t":"project","name":null,"state":"active","created":1,"changed":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    fn objective(order: f64) -> Object {
+        Object::Objective(Objective {
+            project: "p".into(),
+            name: "n".into(),
+            desc: String::new(),
+            state: ObjectiveState::Pending,
+            note: String::new(),
+            order,
+            created: 1,
+            changed: 1,
+            by: "web".into(),
+            extra: Map::new(),
+        })
+    }
+
+    /// Un `order` que no es un número finito no se escribe: JSON no tiene `NaN` ni infinitos y
+    /// `serde_json` los escribiría como `null`.
+    #[test]
+    fn order_must_be_finite() {
+        let key = seq_key();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(serde_json::to_string(&objective(bad)).is_err(), "{bad}");
+            assert!(
+                matches!(
+                    seal_object(&key, ID, &objective(bad)),
+                    Err(BlobError::BadObject(_))
+                ),
+                "{bad}"
+            );
+        }
+        let blob = seal_object(&key, ID, &objective(-2.5)).unwrap();
+        assert_eq!(open_object(&key, ID, &blob).unwrap(), objective(-2.5));
+    }
+
+    /// Los campos conocidos de cada tipo, tal y como salen al escribirlo: `clean_extra` los
+    /// necesita al día.
+    #[test]
+    fn known_fields_are_up_to_date() {
+        fn keys(v: &Value) -> Vec<String> {
+            let mut k: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        }
+        fn want(fields: &[&str], tagged: bool) -> Vec<String> {
+            let mut k: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+            if tagged {
+                k.push("t".into());
+            }
+            k.sort();
+            k
+        }
+        let project = Object::Project(Project {
+            name: "x".into(),
+            desc: String::new(),
+            state: ProjectState::Active,
+            created: 1,
+            changed: 1,
+            by: String::new(),
+            extra: Map::new(),
+        });
+        let v = serde_json::to_value(&project).unwrap();
+        assert_eq!(keys(&v), want(Project::FIELDS, true));
+        let v = serde_json::to_value(objective(1.0)).unwrap();
+        assert_eq!(keys(&v), want(Objective::FIELDS, true));
+        let link: Object = serde_json::from_str(
+            r#"{"t":"link","objective":"o","session":{"machine":"m","id":"i","name":"n"},
+                "plan":{"title":"x","done":1,"total":1,"active":0,"blocked":0,"failed":0},
+                "copied":1,"closed":null,"created":1,"changed":1,"by":"web"}"#,
+        )
+        .unwrap();
+        let v = serde_json::to_value(&link).unwrap();
+        assert_eq!(keys(&v), want(Link::FIELDS, true));
+        assert_eq!(keys(&v["session"]), want(LinkSession::FIELDS, false));
+        assert_eq!(keys(&v["plan"]), want(PlanSummary::FIELDS, false));
+    }
+
+    /// Aunque alguien meta en `extra` lo que mande un cliente, al cifrar no sale un JSON con
+    /// claves repetidas: `seal_object` quita de `extra` `t` y los campos conocidos.
+    #[test]
+    fn sealing_cleans_extra() {
+        let key = seq_key();
+        let mut extra = Map::new();
+        extra.insert("t".into(), "link".into());
+        extra.insert("name".into(), "otro".into());
+        extra.insert("color".into(), "verde".into());
+        let p = Object::Project(Project {
+            name: "Casa".into(),
+            desc: String::new(),
+            state: ProjectState::Active,
+            created: 1,
+            changed: 1,
+            by: "app".into(),
+            extra,
+        });
+        let text = open(&key, ID, &seal_object(&key, ID, &p).unwrap()).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert_eq!(text.matches(r#""t":"#).count(), 1, "{text}");
+        assert_eq!(text.matches(r#""name":"#).count(), 1, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            (&v["t"], &v["name"], &v["color"]),
+            (&"project".into(), &"Casa".into(), &"verde".into())
+        );
+
+        // También dentro de `session` y `plan` (ahí `t` no es de nadie y se queda).
+        let mut link: Object = serde_json::from_str(
+            r#"{"t":"link","objective":"o","session":{"machine":"m","id":"i","name":"n"},
+                "plan":{"title":"x","done":1,"total":1,"active":0,"blocked":0,"failed":0},
+                "copied":1,"closed":null,"created":1,"changed":1,"by":"web"}"#,
+        )
+        .unwrap();
+        let Object::Link(l) = &mut link else {
+            unreachable!()
+        };
+        l.extra.insert("objective".into(), "otro".into());
+        l.session.extra.insert("machine".into(), "otra".into());
+        l.session.extra.insert("t".into(), "x".into());
+        l.plan
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert("done".into(), 9.into());
+        let mut clean = link.clone();
+        clean.clean_extra();
+        let Object::Link(c) = &clean else {
+            unreachable!()
+        };
+        assert!(c.extra.is_empty());
+        assert_eq!(
+            Value::Object(c.session.extra.clone()),
+            serde_json::json!({"t": "x"})
+        );
+        assert!(c.plan.as_ref().unwrap().extra.is_empty());
+        let back = open_object(&key, ID, &seal_object(&key, ID, &link).unwrap()).unwrap();
+        assert_eq!(back, clean);
+        // `Unknown` no se cifra.
+        assert!(matches!(
+            seal_object(&key, ID, &Object::Unknown),
+            Err(BlobError::BadObject(_))
+        ));
     }
 
     /// Un tipo que no se conoce se lee como `Unknown` (y no se puede volver a escribir).
@@ -614,8 +939,8 @@ mod tests {
 
     /// Vectores para la web y la app: blobs con clave, nonce, id y texto fijos, y blobs que no se
     /// deben descifrar. Se guardan en `tests/data/board_vectors.json` (la web y la app llevan una
-    /// copia); si falta o con `NIDO_WRITE_VECTORS=1` se regenera, y si no, se comprueba que el
-    /// código sigue dando lo mismo.
+    /// copia). Con `NIDO_WRITE_VECTORS=1` se regenera; si no, tiene que estar, el código tiene
+    /// que seguir dando lo mismo y cada caso del archivo se comprueba como lo harán ellas.
     #[test]
     fn vectors() {
         let project = r#"{"t":"project","name":"Reforma del baño","desc":"Azulejos, ducha y la luz del espejo","state":"active","created":1763300000000,"changed":1763300000000,"by":"app"}"#;
@@ -650,10 +975,6 @@ mod tests {
                 "blob": blob,
             }));
         }
-        assert!(matches!(
-            serde_json::from_str::<Object>(objective).unwrap(),
-            Object::Objective(_)
-        ));
         // Los que no se deben descifrar, todos a partir del primero.
         let (key, id) = (seq_key(), ID);
         let blob = ok[0]["blob"].as_str().unwrap().to_string();
@@ -664,6 +985,15 @@ mod tests {
         *tag.last_mut().unwrap() ^= 0x01;
         let mut body = raw.clone();
         body[13] ^= 0x80;
+        // El mismo blob en base64 URL (tiene `+` y `/`), y uno de 40 bytes (con `==`) sin relleno.
+        use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE};
+        let url = URL_SAFE.encode(&raw);
+        assert!(blob.contains('+') && blob.contains('/') && url != blob);
+        let nonce3: [u8; 12] = std::array::from_fn(|i| 0x30 + i as u8);
+        let padded = seal_with_nonce(&key, id, &nonce3, b"sin relleno").unwrap();
+        assert!(padded.ends_with("=="), "{padded}");
+        assert_eq!(open(&key, id, &padded).unwrap(), b"sin relleno");
+        let no_pad = STANDARD_NO_PAD.encode(B64.decode(&padded).unwrap());
         let bad = [
             (
                 "otro id",
@@ -676,6 +1006,8 @@ mod tests {
             ("etiqueta tocada", key, id, B64.encode(&tag)),
             ("cifrado tocado", key, id, B64.encode(&body)),
             ("corto", key, id, B64.encode(&raw[..28])),
+            ("base64url", key, id, url),
+            ("sin relleno", key, id, no_pad),
         ];
         let bad: Vec<_> = bad
             .iter()
@@ -685,21 +1017,51 @@ mod tests {
             })
             .collect();
         let v = serde_json::json!({
-            "about": "nido: blobs del tablero. blob = base64(0x01 || nonce(12) || AES-256-GCM(key, nonce, plaintext, aad)), con la etiqueta de 16 bytes al final; aad = \"nido-board/1/\" || id en ASCII; kid = hex(SHA-256(\"nido-board-kid\" || key))[0..16]. key y blob en base64 estándar con relleno; nonce en hex; plaintext en UTF-8. Los de ok se descifran a su plaintext; los de bad no se deben descifrar.",
+            "about": "nido: blobs del tablero. blob = base64(0x01 || nonce(12) || AES-256-GCM(key, nonce, plaintext, aad)), con la etiqueta de 16 bytes al final; aad = \"nido-board/1/\" || id en ASCII; kid = hex(SHA-256(\"nido-board-kid\" || key))[0..16]. key y blob en base64 estándar con relleno (ni base64url ni sin relleno: se rechazan); nonce en hex; plaintext en UTF-8. Antes de descifrar se rechaza un blob de más de 11000 caracteres, de menos de 29 bytes o cuyo primer byte no sea 0x01 (la etiqueta no lo cubre). Los de ok se descifran a su plaintext; los de bad no se deben descifrar.",
             "ok": ok,
             "bad": bad,
         });
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/board_vectors.json");
-        let text = serde_json::to_string_pretty(&v).unwrap() + "\n";
-        if !path.exists() || std::env::var_os("NIDO_WRITE_VECTORS").is_some() {
+        if std::env::var_os("NIDO_WRITE_VECTORS").is_some() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, &text).unwrap();
+            std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap() + "\n").unwrap();
+            return;
         }
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            text,
-            "vectores de {}",
-            path.display()
-        );
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "falta {}: genéralo con NIDO_WRITE_VECTORS=1 ({e})",
+                path.display()
+            )
+        });
+        let file: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(file, v, "vectores de {}", path.display());
+        // Y lo que hay en el archivo, leído como lo leerán la web y la app.
+        let key_of = |c: &Value| -> [u8; 32] {
+            B64.decode(c["key"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let s = |c: &Value, k: &str| c[k].as_str().unwrap().to_string();
+        for c in file["ok"].as_array().unwrap() {
+            let key = key_of(c);
+            let nonce: [u8; 12] = unhex(&s(c, "nonce")).try_into().unwrap();
+            let (id, plain) = (s(c, "id"), s(c, "plaintext"));
+            assert_eq!(
+                seal_with_nonce(&key, &id, &nonce, plain.as_bytes()).unwrap(),
+                s(c, "blob"),
+                "{}",
+                c["name"]
+            );
+            assert_eq!(open(&key, &id, &s(c, "blob")).unwrap(), plain.as_bytes());
+            assert_eq!(kid(&key), s(c, "kid"));
+        }
+        for c in file["bad"].as_array().unwrap() {
+            assert!(
+                open(&key_of(c), &s(c, "id"), &s(c, "blob")).is_err(),
+                "{}",
+                c["name"]
+            );
+        }
     }
 }

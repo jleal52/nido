@@ -1,5 +1,5 @@
 {
-  "about": "nido: blobs del tablero. blob = base64(0x01 || nonce(12) || AES-256-GCM(key, nonce, plaintext, aad)), con la etiqueta de 16 bytes al final; aad = \"nido-board/1/\" || id en ASCII; kid = hex(SHA-256(\"nido-board-kid\" || key))[0..16]. key y blob en base64 estándar con relleno; nonce en hex; plaintext en UTF-8. Los de ok se descifran a su plaintext; los de bad no se deben descifrar.",
+  "about": "nido: blobs del tablero. blob = base64(0x01 || nonce(12) || AES-256-GCM(key, nonce, plaintext, aad)), con la etiqueta de 16 bytes al final; aad = \"nido-board/1/\" || id en ASCII; kid = hex(SHA-256(\"nido-board-kid\" || key))[0..16]. key y blob en base64 estándar con relleno (ni base64url ni sin relleno: se rechazan); nonce en hex; plaintext en UTF-8. Antes de descifrar se rechaza un blob de más de 11000 caracteres, de menos de 29 bytes o cuyo primer byte no sea 0x01 (la etiqueta no lo cubre). Los de ok se descifran a su plaintext; los de bad no se deben descifrar.",
   "bad": [
     {
       "blob": "AQABAgMEBQYHCAkKCzwgojn/x7Jp4ivy6MXLVE/tt+pR0kF9Ll0BivdwCCDWZHyOns4Co/dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS/qsCBlBf0qOif+4HdKDr6qbLY/SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ/2y1l4imTFop9qwrjcq23mWC+l/8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nk",
@@ -36,6 +36,18 @@
       "id": "0123456789abcdef0123456789abcdef",
       "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "name": "corto"
+    },
+    {
+      "blob": "AQABAgMEBQYHCAkKCzwgojn_x7Jp4ivy6MXLVE_tt-pR0kF9Ll0BivdwCCDWZHyOns4Co_dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS_qsCBlBf0qOif-4HdKDr6qbLY_SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ_2y1l4imTFop9qwrjcq23mWC-l_8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nk",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "base64url"
+    },
+    {
+      "blob": "ATAxMjM0NTY3ODk6O8BcX+CbCiZvT13h9h4zm3Llt1sPPTyuC15Ixw",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "sin relleno"
     }
   ],
   "ok": [
