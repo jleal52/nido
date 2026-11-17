@@ -796,9 +796,10 @@ enum Recrypted {
     /// - el hub no lo quiere (413 demasiado grande o cuenta llena, 400);
     /// - choca (409) `MAX_TRIES` veces seguidas con escrituras que siguen con claves retiradas.
     ///
-    /// Un 429 no salta nada: se espera y se sigue con el mismo.
+    /// Un 429 no salta nada: se espera y se vuelve a elegir (`Again`).
     Skip,
-    /// Cambió la clave actual: se empieza otra vez con la nueva.
+    /// Cambió la clave actual (se empieza otra vez con la nueva), o se esperó al freno (429): a
+    /// la vuelta de fuera, sin contar como intento.
     Again,
     /// Se para la pasada: se vació la copia, falta algo por resubir o no hay hub.
     Stop,
@@ -1809,7 +1810,7 @@ impl BoardCache {
     /// cual, sin pasar por `Object`. Antes de cada escritura espera su turno (`recrypt_pace`) y
     /// vuelve a mirar el objeto en la copia: el aviso de otro nido que se adelantó ya lo habrá
     /// traído recifrado. Si choca (409), sigue sobre lo de ahora mientras su clave siga retirada,
-    /// hasta `MAX_TRIES` choques; con el freno (429), espera y sigue, sin contarlo.
+    /// hasta `MAX_TRIES` choques; con el freno (429), espera y vuelve (`Again`), sin contarlo.
     async fn recrypt_one(
         self: &Arc<Self>,
         epoch: u64,
@@ -1887,8 +1888,12 @@ impl BoardCache {
                         return Recrypted::Skip;
                     }
                 }
-                // El freno no es culpa del objeto: no cuenta como intento.
-                Err(BoardError::Busy) => tokio::time::sleep(self.gap * BUSY_GAPS).await,
+                // El freno no es culpa del objeto: no cuenta como intento. Tras la espera, a la
+                // vuelta de fuera: que corran antes las tareas del llavero (`chores`).
+                Err(BoardError::Busy) => {
+                    tokio::time::sleep(self.gap * BUSY_GAPS).await;
+                    return Recrypted::Again;
+                }
                 Err(e @ (BoardError::TooBig | BoardError::Bad(_) | BoardError::Full)) => {
                     self.say_skip(kid, id, &e.to_string());
                     return Recrypted::Skip;
@@ -4396,6 +4401,30 @@ mod tests {
         assert_eq!(on_hub(&r.board, &K_CUR, &id), goal("otro 1"));
     }
 
+    /// Tras esperar al freno (429), las tareas del llavero corren antes de volver a escribir.
+    #[tokio::test]
+    async fn the_brake_lets_the_chores_run() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_OLD, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        r.board.lock().unwrap().busy = 1;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chores = {
+            let (board, seen) = (r.board.clone(), seen.clone());
+            move || {
+                let n = board.lock().unwrap().writes.len();
+                seen.lock().unwrap().push(n);
+            }
+        };
+        assert!(r.cache.recrypt_with(&keys(), &chores).await);
+        assert_eq!(r.writes().len(), 2);
+        assert!(
+            seen.lock().unwrap().contains(&1),
+            "entre el 429 y la escritura siguiente: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
     /// Lo saltado con una clave actual se vuelve a intentar con la siguiente.
     #[tokio::test]
     async fn what_was_skipped_is_tried_again_with_a_new_key() {
@@ -4843,6 +4872,10 @@ mod tests {
         r.write(&K_OLD, &id, &goal("nota"));
         r.cache.sync().await.unwrap();
         let (ring, ks) = (keyring(), keys());
+        // `join!` va en esta misma tarea (el runtime de las pruebas es de un hilo): cada una
+        // corre hasta su primer `await`, y las dos leen la v1 de la copia antes de que ninguna
+        // escriba (el turno del recifrado no espera: aún no ha escrito nada). Así una de las dos
+        // choca seguro; cuál, depende de qué escritura atienda antes el hub, y vale cualquiera.
         let (done, edited) = tokio::join!(
             r.cache.recrypt(&ks),
             r.cache.update(&ring, &id, |o| {

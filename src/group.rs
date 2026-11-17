@@ -610,7 +610,10 @@ impl Group {
             return;
         }
         self.change(|st| {
-            // Si cambió de id (otro hub), la entrada vieja se da de baja.
+            // Si cambió de id (otro hub), la entrada vieja se da de baja. Es una baja como otra
+            // (`rotation_due`): la tarea del llavero cambia la clave del tablero. Sobra, pero es
+            // inofensivo (y si otro equipo se entera antes de la baja que de la clave y rota
+            // también, `retire_stale` deja una).
             for m in st.members.iter_mut().filter(|m| m.key == own && m.id != id) {
                 m.removed = true;
                 m.at = now_ms();
@@ -669,16 +672,58 @@ impl Group {
         });
     }
 
+    /// Da de baja un equipo en el grupo, sin rotar (eso es `remove_member_rotating`). Devuelve
+    /// si estaba.
     pub fn remove_member(&self, id: &str) -> bool {
         let mut found = false;
-        self.change(|st| {
-            for m in st.members.iter_mut().filter(|m| m.id == id && !m.removed) {
-                m.removed = true;
-                m.at = now_ms();
-                found = true;
+        self.change(|st| found = mark_member_removed(st, id, now_ms()));
+        found
+    }
+
+    /// Da de baja un equipo y cambia la clave del tablero en el mismo cambio (ver
+    /// `remove_rotating`). Devuelve si estaba y la clave nueva, si se rotó.
+    pub fn remove_member_rotating(&self, id: &str) -> (bool, Option<BoardKey>) {
+        self.remove_rotating(|st, now| mark_member_removed(st, id, now))
+    }
+
+    /// Da de baja un dispositivo y cambia la clave del tablero en el mismo cambio (ver
+    /// `remove_rotating`). Devuelve si estaba y la clave nueva, si se rotó.
+    pub fn remove_device_rotating(&self, key_b64: &str) -> (bool, Option<BoardKey>) {
+        self.remove_rotating(|st, now| mark_device_removed(st, key_b64, now))
+    }
+
+    /// Una baja (`mark`) y la rotación de la clave del tablero, juntas en un solo cambio que se
+    /// guarda entero antes de darse: ningún otro equipo ve la baja sin la clave nueva (y la
+    /// rotaría él también: inofensivo, `retire_stale` deja una, pero sobra una clave). Con el
+    /// llavero vacío no se rota (quien se va no tenía ninguna clave). Si no se puede guardar, la
+    /// baja va igual a memoria (que no siga autorizado) y la rotación queda pendiente en el
+    /// estado: la hace `rotate_if_due`, aquí o en otro equipo.
+    fn remove_rotating(&self, mark: impl Fn(&mut State, u64) -> bool) -> (bool, Option<BoardKey>) {
+        let now = now_ms();
+        let raw = random_key();
+        let r = self.change_saved(|st| {
+            if !mark(st, now) {
+                return (false, None);
+            }
+            match &raw {
+                Ok(raw) if !Keyring::of(st).keys.is_empty() => {
+                    (true, Some(rotate_in(st, raw, now)))
+                }
+                _ => (true, None),
             }
         });
-        found
+        match r {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!(
+                    "nido: no se pudo guardar la baja ni cambiar la clave del tablero ({e}); la \
+                     clave se cambiará en cuanto se pueda"
+                );
+                let mut found = false;
+                self.change(|st| found = mark(st, now_ms()));
+                (found, None)
+            }
+        }
     }
 
     /// Un dispositivo emparejado aquí: autorizado en todo el grupo.
@@ -695,20 +740,11 @@ impl Group {
         });
     }
 
-    /// Da de baja un dispositivo en el grupo. Devuelve si estaba (y no dado ya de baja).
+    /// Da de baja un dispositivo en el grupo, sin rotar (eso es `remove_device_rotating`).
+    /// Devuelve si estaba (y no dado ya de baja).
     pub fn remove_device(&self, key_b64: &str) -> bool {
         let mut found = false;
-        self.change(|st| {
-            for d in st
-                .devices
-                .iter_mut()
-                .filter(|d| d.key == key_b64 && !d.removed)
-            {
-                d.removed = true;
-                d.at = now_ms();
-                found = true;
-            }
-        });
+        self.change(|st| found = mark_device_removed(st, key_b64, now_ms()));
         found
     }
 
@@ -1062,11 +1098,59 @@ fn rotate_in(st: &mut State, raw: &[u8; 32], now: u64) -> BoardKey {
     k
 }
 
-/// Las bajas (de equipos y de dispositivos) que cuentan para rotar: las de hasta un día por
-/// delante de `now`. Una más lejana (un reloj muy adelantado) no se mira hasta que entre: si no,
+/// Lo más por delante de `now` que se toma como hora (`clock`) y que cuenta como baja
+/// (`removals`): medio día, la mitad de lo que aceptan los demás equipos en una clave
+/// (`KEY_FUTURE_MS`), para que lo sellado con ella les llegue con margen aunque su reloj vaya
+/// algo atrasado.
+const CLOCK_AHEAD_MS: u64 = KEY_FUTURE_MS / 2;
+
+/// La hora de una baja: `clock`, y siempre posterior a la clave actual (si la hay). Así una baja
+/// nunca queda por detrás de la clave actual (la de un reloj adelantado), y si no se llega a
+/// rotar, `rotation_due` llega a ser cierta (si la actual va más de `CLOCK_AHEAD_MS` por
+/// delante, cuando entre en ese margen).
+fn removal_at(st: &State, now: u64) -> u64 {
+    let t = clock(st, now);
+    match Keyring::of(st).current() {
+        Some(k) => t.max(k.at.saturating_add(1)),
+        None => t,
+    }
+}
+
+/// Da de baja el equipo `id` (`removal_at`). Devuelve si estaba.
+fn mark_member_removed(st: &mut State, id: &str, now: u64) -> bool {
+    let at = removal_at(st, now);
+    let mut found = false;
+    for m in st.members.iter_mut().filter(|m| m.id == id && !m.removed) {
+        m.removed = true;
+        m.at = at;
+        found = true;
+    }
+    found
+}
+
+/// Da de baja el dispositivo de clave `key_b64` (`removal_at`). Devuelve si estaba.
+fn mark_device_removed(st: &mut State, key_b64: &str, now: u64) -> bool {
+    let at = removal_at(st, now);
+    let mut found = false;
+    for d in st
+        .devices
+        .iter_mut()
+        .filter(|d| d.key == key_b64 && !d.removed)
+    {
+        d.removed = true;
+        d.at = at;
+        found = true;
+    }
+    found
+}
+
+/// Las bajas (de equipos y de dispositivos) que cuentan para rotar: las de hasta
+/// `CLOCK_AHEAD_MS` por delante de `now`, el mismo margen que `clock`. Así la clave nueva
+/// (`next_key_at`, que no baja de `clock`) siempre es posterior a toda baja que cuenta, y tras
+/// rotar ya no toca. Una más lejana (un reloj muy adelantado) no se mira hasta que entre: si no,
 /// la clave nueva tendría que ser de ese futuro, y los demás equipos la descartarían.
 fn removals(st: &State, now: u64) -> impl Iterator<Item = u64> + '_ {
-    let horizon = now.saturating_add(KEY_FUTURE_MS);
+    let horizon = now.saturating_add(CLOCK_AHEAD_MS);
     let members = st.members.iter().filter(|m| m.removed).map(|m| m.at);
     let devices = st.devices.iter().filter(|d| d.removed).map(|d| d.at);
     members.chain(devices).filter(move |at| *at <= horizon)
@@ -1082,12 +1166,12 @@ fn rotation_due(st: &State, now: u64) -> bool {
     removals(st, now).any(|at| at > current)
 }
 
-/// La hora con que se sella una retirada o una clave nueva: `now`, o lo más nuevo que se ha
-/// visto en el estado si es posterior (hasta un día por delante). Así un reloj atrasado no sella
-/// una retirada antes de tiempo (la poda se adelantaría lo que vaya atrasado) ni crea una clave
-/// anterior a una baja (`rotation_due` volvería a tocar sin fin).
+/// La hora con que se sella una baja, una retirada o una clave nueva: `now`, o lo más nuevo que
+/// se ha visto en el estado si es posterior (hasta `CLOCK_AHEAD_MS` por delante). Así un reloj
+/// atrasado no sella una retirada antes de tiempo (la poda se adelantaría lo que vaya atrasado)
+/// ni crea una clave anterior a una baja (`rotation_due` volvería a tocar sin fin).
 fn clock(st: &State, now: u64) -> u64 {
-    let horizon = now.saturating_add(KEY_FUTURE_MS);
+    let horizon = now.saturating_add(CLOCK_AHEAD_MS);
     let seen = st
         .keys
         .iter()
@@ -2494,6 +2578,59 @@ mod tests {
             .count();
         assert_eq!(actives, 1);
         assert!(a.rotate_if_due().is_none() && b.rotate_if_due().is_none());
+    }
+
+    /// La clave actual es de un equipo con el reloj adelantado unos minutos: la baja se sella
+    /// después de ella, así que si la rotación falla, después toca y se rota.
+    #[test]
+    fn a_removal_is_never_behind_the_current_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.json");
+        let g = Group::load(path.clone(), [1u8; 32]);
+        let ahead = real_key(now_ms() + 5 * 60_000, None);
+        g.merge(&keys_state(vec![ahead.clone()]));
+        g.add_member("otro", "k-otro", "mac");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("dentro"), b"x").unwrap();
+        assert_eq!(
+            g.remove_member_rotating("otro"),
+            (true, None),
+            "no se guarda"
+        );
+        let gone = g.snapshot().members.into_iter().find(|m| m.id == "otro");
+        assert!(gone.is_some_and(|m| m.removed && m.at > ahead.at));
+        assert_eq!(g.board_keys().current(), Some(&ahead));
+        std::fs::remove_dir_all(&path).unwrap();
+        let new = g.rotate_if_due().expect("toca rotar");
+        assert!(new.at > ahead.at);
+        assert!(g.rotate_if_due().is_none());
+    }
+
+    /// Baja y rotación juntas, en un solo cambio: lo que ve otro equipo ya lleva la clave nueva,
+    /// y no rota. Sin llavero, solo la baja.
+    #[test]
+    fn removal_and_rotation_go_together() {
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, old) = keyed(&d1.path().join("group.json"), 1);
+        let mut rx = a.subscribe();
+        let before = *rx.borrow_and_update();
+        let (found, new) = a.remove_device_rotating(&B64.encode([7u8; 32]));
+        assert!(found);
+        let new = new.unwrap();
+        assert_ne!(new.kid, old.kid);
+        assert_eq!(*rx.borrow_and_update(), before + 1, "un solo cambio");
+        let b = Group::load(d2.path().join("group.json"), [2u8; 32]);
+        b.merge(&a.snapshot());
+        assert!(b.rotate_if_due().is_none());
+        assert_eq!(
+            a.remove_device_rotating(&B64.encode([7u8; 32])),
+            (false, None)
+        );
+        let empty = Group::load(d1.path().join("vacío.json"), [1u8; 32]);
+        empty.add_member("otro", "k-otro", "mac");
+        assert_eq!(empty.remove_member_rotating("otro"), (true, None));
+        assert!(empty.snapshot().keys.is_empty());
     }
 
     /// Con el llavero vacío no se rota; cuando llega una clave anterior a la baja, sí.

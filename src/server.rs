@@ -4135,8 +4135,9 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
             "para sacar este equipo, hazlo desde otro del grupo",
         );
     }
-    if st.group.remove_member(&id) {
-        rotate_board_key(&st);
+    let (found, rotated) = st.group.remove_member_rotating(&id);
+    if found {
+        said_rotated(rotated);
         st.group_dirty.notify_one();
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -4144,23 +4145,21 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
     }
 }
 
-/// Tras quitar un equipo o un dispositivo del grupo, la clave del tablero cambia: lo que se
+/// Tras quitar un equipo o un dispositivo del grupo, la clave del tablero cambia, en el mismo
+/// cambio que la baja (`Group::remove_member_rotating`, `remove_device_rotating`): lo que se
 /// cifre desde ahora no lo lee quien se fue, y la tarea del llavero (`board::spawn_upkeep`)
 /// recifra lo de antes. Solo donde se quita: al enterarse de que lo quitó otro equipo
 /// (`apply_group`) no, que ese ya rotó. Con el llavero vacío no hay nada que cambiar: quien se
 /// fue no tenía ninguna clave. Si no se puede guardar, la baja queda en el estado y la tarea del
-/// llavero (`BoardCache::upkeep`, aquí o en otro equipo) rota en cuanto pueda
-/// (`Group::rotate_if_due`).
-fn rotate_board_key(st: &AppState) {
-    match st.group.rotate_after_removal() {
-        Ok(Some(k)) => eprintln!("nido: la clave del tablero ha cambiado ({})", k.kid),
-        Ok(None) => {}
-        Err(e) => eprintln!("nido: no se pudo cambiar la clave del tablero ({e}); se reintentará"),
+/// llavero (aquí o en otro equipo) rota en cuanto pueda (`Group::rotate_if_due`).
+fn said_rotated(rotated: Option<crate::group::BoardKey>) {
+    if let Some(k) = rotated {
+        eprintln!("nido: la clave del tablero ha cambiado ({})", k.kid);
     }
 }
 
 /// Quita un dispositivo de este equipo y de todo el grupo (por su clave). Si estaba en el grupo,
-/// cambia la clave del tablero (`rotate_board_key`); por aquí pasa también el que se sale solo
+/// cambia la clave del tablero (`said_rotated`); por aquí pasa también el que se sale solo
 /// (`api_remove_me`).
 fn remove_phone(st: &AppState, id: &str) -> Response {
     let key = st
@@ -4171,13 +4170,11 @@ fn remove_phone(st: &AppState, id: &str) -> Response {
         .iter()
         .find(|p| p.id == id)
         .map(|p| p.key.clone());
-    let in_group = key.as_ref().is_some_and(|k| st.group.remove_device(k));
     // Fuera de aquí antes de rotar: que no pueda pedir la clave nueva entre medias.
     let removed = st.phones.lock().expect("teléfonos").remove(id);
-    if in_group {
-        rotate_board_key(st);
-    }
-    if key.is_some() {
+    if let Some(k) = &key {
+        let (_, rotated) = st.group.remove_device_rotating(k);
+        said_rotated(rotated);
         st.group_dirty.notify_one();
     }
     // Sus sesiones del hub, fuera también; aunque no se haya podido guardar la baja, de la
