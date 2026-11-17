@@ -14,7 +14,9 @@
 //! `tests/data/board_vectors.json` fija todo esto para la web y la app.
 //!
 //! Abajo, `BoardCache`: la copia de este nido del tablero del hub (`data/board.json`), que se
-//! sincroniza por la conexión con el hub (`hub::Hub::board_get`…).
+//! sincroniza por la conexión con el hub (`hub::Hub::board_get`…). Y la tarea del llavero
+//! (`spawn_upkeep`): recifra con la clave actual lo cifrado con claves retiradas y quita del
+//! llavero las que ya no usa nadie.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -29,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::group::Keyring;
+use crate::group::{Group, Keyring};
 use crate::hub::{BoardError, BoardItem, Hub};
 
 /// El id de una clave del tablero: `hex(SHA-256("nido-board-kid" || clave))[0..16]`.
@@ -184,6 +186,10 @@ pub fn open(key: &[u8; 32], id: &str, blob: &str) -> Result<Vec<u8>, BlobError> 
 
 /// Cifra un objeto: su JSON, sin lo de `extra` que choca con lo conocido (`clean_extra`). Es la
 /// forma de escribir un objeto; `seal` cifra bytes y no sabe de objetos.
+///
+/// Para recifrar con otra clave no se usa: se recifran los bytes que da `open`, tal cual, con
+/// `seal` (`BoardCache::recrypt`). Pasar por `Object` perdería un tipo que no conocemos
+/// (`Unknown` no se escribe) y reescribiría distinto los que sí.
 pub fn seal_object(key: &[u8; 32], id: &str, obj: &Object) -> Result<String, BlobError> {
     let mut obj = obj.clone();
     obj.clean_extra();
@@ -191,7 +197,8 @@ pub fn seal_object(key: &[u8; 32], id: &str, obj: &Object) -> Result<String, Blo
     seal(key, id, &text)
 }
 
-/// Descifra y lee el objeto `id`.
+/// Descifra y lee el objeto `id`. Para recifrar, `open` y `seal` con los bytes tal cual (ver
+/// `seal_object`).
 pub fn open_object(key: &[u8; 32], id: &str, blob: &str) -> Result<Object, BlobError> {
     serde_json::from_slice(&open(key, id, blob)?).map_err(|e| BlobError::BadObject(e.to_string()))
 }
@@ -704,6 +711,8 @@ pub struct BoardCache {
     /// Que `spawn` mire cuanto antes si el hub se ha quedado sin tablero (una escritura vio que
     /// el hub no tiene un objeto de la copia).
     probe_wanted: tokio::sync::Notify,
+    /// Cuándo fue la última escritura del recifrado: entre dos, `gap` (como la resubida).
+    recrypt_last: Mutex<Option<tokio::time::Instant>>,
     /// Sube con cada cambio de la copia.
     revision: watch::Sender<u64>,
     /// El último error al sincronizar que se apuntó, para no repetirlo cada vez.
@@ -749,6 +758,43 @@ fn reupload_blob(keys: &Keyring, id: &str, s: &Stored) -> Option<(String, String
     match current_key(keys) {
         Some((kid, key)) if kid != s.kid => Some((kid, seal(&key, id, &bytes).ok()?)),
         _ => Some((s.kid.clone(), blob.to_owned())),
+    }
+}
+
+/// ¿Está retirada en el llavero la clave de este `kid` (y la tenemos)? Lo cifrado con ella se
+/// recifra con la actual.
+fn retired(keys: &Keyring, kid: &str) -> bool {
+    keys.keys
+        .iter()
+        .any(|k| k.kid == kid && !k.removed && k.retired.is_some())
+}
+
+/// Lo que dio recifrar un objeto.
+enum Recrypted {
+    /// Escrito con la clave actual.
+    Wrote,
+    /// Nada que hacer ya: lo de ahora va con una clave que no está retirada, otro lo borró, el
+    /// hub no lo tiene, o no tiene su clave.
+    Done,
+    /// No se puede (no se descifra, el hub no lo quiere, choca una y otra vez): en esta pasada,
+    /// no se vuelve a intentar.
+    Skip,
+    /// Cambió la clave actual: se empieza otra vez con la nueva.
+    Again,
+    /// Se para la pasada: se vació la copia, falta algo por resubir o no hay hub.
+    Stop,
+}
+
+/// Lo que el recifrado y la poda del llavero necesitan del grupo (`spawn_upkeep`).
+pub trait KeyHolder: Send + Sync + 'static {
+    fn keychain(&self) -> &Group;
+    /// Se retiró o se quitó una clave aquí: que se entere el resto del grupo.
+    fn keys_changed(&self) {}
+}
+
+impl KeyHolder for Group {
+    fn keychain(&self) -> &Group {
+        self
     }
 }
 
@@ -819,6 +865,7 @@ impl BoardCache {
             reuploading: AtomicBool::new(false),
             gap,
             probe_wanted: Default::default(),
+            recrypt_last: Mutex::new(None),
             revision: watch::Sender::new(0),
             said: Mutex::new(None),
             #[cfg(test)]
@@ -1624,6 +1671,227 @@ impl BoardCache {
         }
     }
 
+    /// Los `kid` que usa algún objeto de la copia: todo lo que no es lápida, también lo que no
+    /// está en el hub, lo que falta por resubir y lo que no se puede leer.
+    pub fn kids_in_use(&self) -> BTreeSet<String> {
+        self.lock()
+            .items
+            .values()
+            .filter(|s| !s.gone)
+            .map(|s| s.kid.clone())
+            .collect()
+    }
+
+    /// Espera lo que falte para que pase `gap` desde la última escritura del recifrado.
+    async fn recrypt_pace(&self) {
+        let last = *self.recrypt_last.lock().expect("tablero");
+        if let Some(t) = last {
+            tokio::time::sleep_until(t + self.gap).await;
+        }
+        *self.recrypt_last.lock().expect("tablero") = Some(tokio::time::Instant::now());
+    }
+
+    /// Recifra con la clave actual lo que la copia tiene cifrado con claves retiradas (decisión
+    /// 9: cualquier nido que lo vea). Uno a uno, a ritmo (`gap`, como la resubida) y en orden al
+    /// azar: todos los nidos del grupo lo hacen a la vez y así chocan menos. Se recifran los
+    /// bytes que da `open`, tal cual (`recrypt_one`). No toca lo que no está en el hub ni lo que
+    /// no tiene su clave en el llavero, y no empieza ni sigue mientras falte algo por resubir
+    /// (la resubida ya cifra con la actual). Se para si se vacía la copia (`epoch`), y si cambia
+    /// la clave actual sigue con la nueva.
+    ///
+    /// Devuelve si acabó: no queda nada con una clave retirada que se pueda recifrar.
+    pub async fn recrypt(self: &Arc<Self>, keys: &Keys) -> bool {
+        let epoch = self.epoch();
+        let mut skipped = BTreeSet::new();
+        let mut done = 0usize;
+        let finished = loop {
+            let ring = keys();
+            let Some((kid, key)) = current_key(&ring) else {
+                // Sin clave con que cifrar, no hay nada que hacer.
+                break true;
+            };
+            let pick = {
+                let c = self.lock();
+                if self.epoch() != epoch || !c.reupload.is_empty() {
+                    break false;
+                }
+                let ids: Vec<&String> = c
+                    .items
+                    .iter()
+                    .filter(|(id, s)| {
+                        !s.gone
+                            && s.blob.is_some()
+                            && !c.missing.contains(*id)
+                            && !skipped.contains(*id)
+                            && retired(&ring, &s.kid)
+                    })
+                    .map(|(id, _)| id)
+                    .collect();
+                if ids.is_empty() {
+                    break true;
+                }
+                ids[random_below(ids.len())].clone()
+            };
+            match self.recrypt_one(epoch, keys, &pick, &kid, &key).await {
+                Recrypted::Wrote => done += 1,
+                Recrypted::Done | Recrypted::Again => {}
+                Recrypted::Skip => {
+                    skipped.insert(pick);
+                }
+                Recrypted::Stop => break false,
+            }
+        };
+        if done > 0 {
+            self.flush().await;
+            eprintln!("nido: tablero: {done} objetos recifrados con la clave actual");
+        }
+        finished
+    }
+
+    /// Recifra el objeto `id` con la clave actual (`kid`, `key`): es `update` con los bytes tal
+    /// cual, sin pasar por `Object`. Antes de cada escritura espera su turno (`recrypt_pace`) y
+    /// vuelve a mirar el objeto en la copia: el aviso de otro nido que se adelantó ya lo habrá
+    /// traído recifrado. Si choca (409), sigue sobre lo de ahora mientras su clave siga retirada,
+    /// hasta `MAX_TRIES` escrituras.
+    async fn recrypt_one(
+        self: &Arc<Self>,
+        epoch: u64,
+        keys: &Keys,
+        id: &str,
+        kid: &str,
+        key: &[u8; 32],
+    ) -> Recrypted {
+        let mut tries = 0;
+        loop {
+            self.recrypt_pace().await;
+            if self.epoch() != epoch {
+                return Recrypted::Stop;
+            }
+            let ring = keys();
+            if current_key(&ring).is_none_or(|(k, _)| k != kid) {
+                return Recrypted::Again;
+            }
+            let s = {
+                let c = self.lock();
+                if !c.reupload.is_empty() {
+                    return Recrypted::Stop;
+                }
+                match c.items.get(id) {
+                    Some(s) if !s.gone && !c.missing.contains(id) && retired(&ring, &s.kid) => {
+                        s.clone()
+                    }
+                    _ => return Recrypted::Done,
+                }
+            };
+            // Con la clave de su `kid`, nunca otra.
+            let Some(old) = key_of(&ring, &s.kid) else {
+                return Recrypted::Done;
+            };
+            let sealed = open(&old, id, s.blob.as_deref().unwrap_or_default())
+                .and_then(|b| seal(key, id, &b));
+            let blob = match sealed {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "nido: tablero: {id} no se recifra ({})",
+                        blob_error_kind(&e)
+                    );
+                    return Recrypted::Skip;
+                }
+            };
+            tries += 1;
+            match self.hub.board_put(id, s.v, kid, &blob).await {
+                Ok(st) => {
+                    let item = BoardItem {
+                        id: id.into(),
+                        v: st.v,
+                        kid: kid.into(),
+                        blob: Some(blob),
+                        gone: false,
+                        at: st.at,
+                    };
+                    self.change(epoch, |c| c.apply(item));
+                    return Recrypted::Wrote;
+                }
+                Err(BoardError::Conflict(current)) if current.gone => {
+                    if current.v > 0 {
+                        self.change(epoch, |c| c.bury(&current));
+                    } else {
+                        self.not_in_hub(epoch, id);
+                    }
+                    return Recrypted::Done;
+                }
+                Err(BoardError::Conflict(current)) => {
+                    // Lo de ahora, a la copia: la vuelta siguiente lo mira.
+                    self.change(epoch, |c| c.apply(current));
+                    if tries >= MAX_TRIES {
+                        return Recrypted::Skip;
+                    }
+                }
+                Err(BoardError::Busy) => tokio::time::sleep(self.gap * BUSY_GAPS).await,
+                Err(e @ (BoardError::TooBig | BoardError::Bad(_) | BoardError::Full)) => {
+                    eprintln!("nido: tablero: {id} no se recifra ({e})");
+                    return Recrypted::Skip;
+                }
+                Err(BoardError::Hub(e)) => {
+                    eprintln!("nido: tablero: recifrado parado ({e}); sigue al volver el hub");
+                    return Recrypted::Stop;
+                }
+            }
+        }
+    }
+
+    /// Lo que hace la tarea del llavero cada vez (`spawn_upkeep`): ordena el llavero (retira
+    /// las activas que no son la actual, poda lápidas), y con hub recifra lo cifrado con claves
+    /// retiradas; si acaba, quita las retiradas que ya no usa nadie (`drop_unused_keys`).
+    pub async fn upkeep<H: KeyHolder>(self: &Arc<Self>, holder: &Arc<H>) {
+        if holder.keychain().tidy_board_keys() {
+            holder.keys_changed();
+        }
+        if !self.hub.status.borrow().connected {
+            return;
+        }
+        let keys: Keys = {
+            let h = holder.clone();
+            Arc::new(move || h.keychain().board_keys())
+        };
+        if self.recrypt(&keys).await {
+            self.drop_unused_keys(holder.as_ref()).await;
+        }
+    }
+
+    /// Quita del llavero las retiradas que no usa ningún objeto (decisión 9; ver
+    /// `Group::drop_unused_board_keys`). Si hay alguna candidata, antes se pone al día con el
+    /// hub: lo que haya escrito con ella un dispositivo con el llavero viejo tiene que estar en
+    /// la copia. Sin poder sincronizar, o si se vacía la copia mientras tanto, no se quita nada.
+    ///
+    /// Los `kid` en uso se sacan de la copia y se suelta antes de ir al grupo (que se coge
+    /// antes que la copia, ver `clear`): una escritura con la clave vieja que llegue justo en
+    /// ese momento es lo que cubren los 30 días.
+    async fn drop_unused_keys<H: KeyHolder>(self: &Arc<Self>, holder: &H) {
+        let group = holder.keychain();
+        if group.droppable_board_keys(&self.kids_in_use()).is_empty() {
+            return;
+        }
+        let epoch = self.epoch();
+        // El error ya lo apunta la sincronización de `spawn` si se repite.
+        if self.sync().await.is_err() || self.epoch() != epoch {
+            return;
+        }
+        let in_use = self.kids_in_use();
+        if self.epoch() != epoch {
+            return;
+        }
+        let dropped = group.drop_unused_board_keys(&in_use);
+        if !dropped.is_empty() {
+            eprintln!(
+                "nido: tablero: fuera del llavero, retiradas y sin objetos: {}",
+                dropped.join(", ")
+            );
+            holder.keys_changed();
+        }
+    }
+
     /// Sincroniza y, con `probe`, mira si el hub se quedó sin tablero; luego sigue con la
     /// resubida que faltara. Los errores se apuntan (sin repetir el mismo seguido).
     pub async fn refresh(self: &Arc<Self>, keys: &Keys, probe: bool) {
@@ -1726,6 +1994,45 @@ pub fn spawn_with(
             if connected {
                 cache.refresh(&keys, probe).await;
             }
+        }
+    });
+}
+
+/// La tarea del llavero: cada vez que cambia el grupo o la copia, al conectar con el hub y cada
+/// `SYNC_EVERY`, `BoardCache::upkeep`. Va aparte de `spawn`, que atiende una cosa cada vez:
+/// recifrar 2000 objetos a ritmo lleva más de una hora, y mientras tanto la copia tiene que
+/// seguir al día (es la que dice si otro nido ya recifró algo).
+pub fn spawn_upkeep<H: KeyHolder>(cache: Arc<BoardCache>, holder: Arc<H>) {
+    spawn_upkeep_with(cache, holder, SYNC_EVERY);
+}
+
+/// `spawn_upkeep`, cada `every` (para las pruebas).
+pub fn spawn_upkeep_with<H: KeyHolder>(cache: Arc<BoardCache>, holder: Arc<H>, every: Duration) {
+    tokio::spawn(async move {
+        let mut group = holder.keychain().subscribe();
+        let mut copy = cache.subscribe();
+        let mut status = cache.hub.status.subscribe();
+        // El primer tic, ya.
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                r = group.changed() => if r.is_err() { return },
+                r = copy.changed() => if r.is_err() { return },
+                r = status.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    if !status.borrow_and_update().connected {
+                        continue;
+                    }
+                }
+                _ = tick.tick() => {}
+            }
+            // Vistos, y soltados antes de usar el grupo (`clear` avisa con él cogido).
+            let _ = *group.borrow_and_update();
+            let _ = *copy.borrow_and_update();
+            cache.upkeep(&holder).await;
         }
     });
 }
@@ -3891,5 +4198,398 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // ---------- El recifrado y la poda del llavero (Tarea 9) ----------
+
+    const K_NEW: [u8; 32] = [0x33; 32];
+    const DAY_MS: u64 = 24 * 3600 * 1000;
+
+    /// Bytes que no son ningún objeto que conozcamos (de una versión futura): se recifran tal
+    /// cual.
+    const FUTURE: &[u8] = br#"{"t":"futuro","x":[1,2,3],"by":"web"}"#;
+
+    /// Lo que hay en el hub para `id`: su `kid`, su `v` y su texto descifrado con `key`.
+    fn hub_bytes(board: &Mutex<fake::Board>, key: &[u8; 32], id: &str) -> (String, i64, Vec<u8>) {
+        let b = board.lock().unwrap();
+        let item = &b.items[id];
+        let bytes = open(key, id, item.blob.as_deref().unwrap()).unwrap();
+        (item.kid.clone(), item.v, bytes)
+    }
+
+    /// Sin hub: se quita y se espera a que se corte.
+    async fn offline(r: &Rig) {
+        let mut status = r.hub.status.subscribe();
+        r.hub.set_url(None, None).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Un llavero que se puede cambiar a mitad.
+    fn shared(ring: Keyring) -> (Arc<Mutex<Keyring>>, Keys) {
+        let ring = Arc::new(Mutex::new(ring));
+        let r = ring.clone();
+        (ring, Arc::new(move || r.lock().unwrap().clone()))
+    }
+
+    /// Lo cifrado con una clave retirada se recifra con la actual, uno a uno y a ritmo: los
+    /// bytes tal cual (un tipo que no conocemos también), con compare-and-set. Lo que no tiene su
+    /// clave en el llavero, o no se descifra con ella, no se toca. Lo que ya va con la actual,
+    /// tampoco.
+    #[tokio::test]
+    async fn retired_objects_are_recrypted_with_the_current_key() {
+        let r = rig(fake::Board::default()).await;
+        let (p, g, fut, nokey, broken, fine) = (bid(1), bid(2), bid(3), bid(4), bid(5), bid(6));
+        r.write(&K_OLD, &p, &project("uno"));
+        r.write(&K_OLD, &g, &goal("nota"));
+        let blob = seal(&K_OLD, &fut, FUTURE).unwrap();
+        r.board
+            .lock()
+            .unwrap()
+            .write(&fut, Some((&kid(&K_OLD), &blob)));
+        r.write(&K_NEW, &nokey, &project("sin clave"));
+        // Dice ir con la vieja, pero no se descifra con ella.
+        let bad = seal_object(&K_CUR, &broken, &project("roto")).unwrap();
+        r.board
+            .lock()
+            .unwrap()
+            .write(&broken, Some((&kid(&K_OLD), &bad)));
+        r.write(&K_CUR, &fine, &project("ya está"));
+        r.cache.sync().await.unwrap();
+        let before = r.writes().len();
+        assert!(r.cache.recrypt(&keys()).await, "acabado");
+        let w = r.board.lock().unwrap().writes.clone();
+        let mut ids: Vec<String> = w[before..].iter().map(|w| w.2.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![p.clone(), g.clone(), fut.clone()],
+            "una vez cada uno"
+        );
+        for pair in w[before..].windows(2) {
+            assert!(pair[1].0 - pair[0].0 >= GAP - Duration::from_millis(5));
+        }
+        let cur = kid(&K_CUR);
+        assert_eq!(on_hub(&r.board, &K_CUR, &p), project("uno"));
+        assert_eq!(on_hub(&r.board, &K_CUR, &g), goal("nota"));
+        assert_eq!(
+            hub_bytes(&r.board, &K_CUR, &fut),
+            (cur.clone(), 2, FUTURE.to_vec())
+        );
+        // En la copia, como en el hub.
+        for id in [&p, &g, &fut] {
+            let s = r.cache.item(id).unwrap();
+            assert_eq!((s.kid.as_str(), s.v), (cur.as_str(), 2));
+        }
+        assert_eq!(r.cache.item(&nokey).unwrap().v, 1);
+        assert_eq!(r.cache.item(&broken).unwrap().kid, kid(&K_OLD));
+        assert_eq!(r.cache.item(&fine).unwrap().v, 1);
+        // Otra vez: nada que hacer.
+        assert!(r.cache.recrypt(&keys()).await);
+        assert_eq!(r.writes().len(), before + 3);
+    }
+
+    /// Un 409 a mitad: si lo de ahora sigue con una clave retirada, se recifra eso (lo del
+    /// otro); si ya va con la actual, está hecho. Uno que otro borró queda borrado.
+    #[tokio::test]
+    async fn a_conflict_while_recrypting_is_retried_on_the_current_object() {
+        let r = rig(fake::Board::default()).await;
+        let (still_old, now_new, deleted) = (bid(1), bid(2), bid(3));
+        for id in [&still_old, &now_new, &deleted] {
+            r.write(&K_OLD, id, &goal(""));
+        }
+        r.cache.sync().await.unwrap();
+        {
+            let mut b = r.board.lock().unwrap();
+            b.clash(
+                &still_old,
+                Some(sealed(&K_OLD, &still_old, &goal("del otro"))),
+            );
+            b.clash(&now_new, Some(sealed(&K_CUR, &now_new, &goal("del otro"))));
+            b.clash(&deleted, None);
+        }
+        assert!(r.cache.recrypt(&keys()).await);
+        let mut w = r.writes();
+        w.sort();
+        assert_eq!(
+            w,
+            vec![
+                ("put".into(), still_old.clone(), 1),
+                ("put".into(), still_old.clone(), 2),
+                ("put".into(), now_new.clone(), 1),
+                ("put".into(), deleted.clone(), 1),
+            ]
+        );
+        assert_eq!(on_hub(&r.board, &K_CUR, &still_old), goal("del otro"));
+        assert_eq!(on_hub(&r.board, &K_CUR, &now_new), goal("del otro"));
+        assert_eq!(r.cache.item(&still_old).unwrap().kid, kid(&K_CUR));
+        assert_eq!(r.cache.item(&now_new).unwrap().v, 2);
+        assert!(r.cache.item(&deleted).unwrap().gone);
+    }
+
+    /// Con el freno del hub (429), espera y sigue con el mismo.
+    #[tokio::test]
+    async fn the_recrypt_waits_out_the_brake() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_OLD, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        r.board.lock().unwrap().busy = 1;
+        assert!(r.cache.recrypt(&keys()).await);
+        let w = r.board.lock().unwrap().writes.clone();
+        assert_eq!(w.len(), 2);
+        assert!(w[1].0 - w[0].0 >= GAP * BUSY_GAPS - Duration::from_millis(5));
+        assert_eq!(on_hub(&r.board, &K_CUR, &bid(1)), project("uno"));
+    }
+
+    /// Si se vacía la copia a mitad (el equipo sale del grupo), no sigue; sin hub, tampoco.
+    #[tokio::test]
+    async fn a_clear_or_a_lost_hub_stops_the_recrypt() {
+        let r = rig(fake::Board::default()).await;
+        for n in 1..=3 {
+            r.write(&K_OLD, &bid(n), &project("x"));
+        }
+        r.cache.sync().await.unwrap();
+        let cache = r.cache.clone();
+        r.board.lock().unwrap().on_write = Some(Box::new(move |n| {
+            if n == 1 {
+                cache.clear();
+            }
+        }));
+        assert!(!r.cache.recrypt(&keys()).await, "parado");
+        assert_eq!(r.writes().len(), 1);
+        assert!(r.cache.ids().is_empty());
+
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_OLD, &bid(1), &project("x"));
+        r.cache.sync().await.unwrap();
+        offline(&r).await;
+        assert!(!r.cache.recrypt(&keys()).await, "sin hub");
+        assert_eq!(r.cache.item(&bid(1)).unwrap().kid, kid(&K_OLD));
+    }
+
+    /// Si cambia la clave actual a mitad, se sigue con la nueva, y lo ya recifrado con la de
+    /// antes (que ahora está retirada) también pasa a la nueva.
+    #[tokio::test]
+    async fn a_new_key_midway_starts_again_with_it() {
+        let r = rig(fake::Board::default()).await;
+        for n in 1..=3 {
+            r.write(&K_OLD, &bid(n), &project(&format!("p{n}")));
+        }
+        r.cache.sync().await.unwrap();
+        let (ring, keys) = shared(keyring());
+        let ring2 = ring.clone();
+        r.board.lock().unwrap().on_write = Some(Box::new(move |n| {
+            if n == 1 {
+                let mut r = ring2.lock().unwrap();
+                for k in r.keys.iter_mut() {
+                    k.retired.get_or_insert(4);
+                }
+                r.keys.push(BoardKey::from_raw(&K_NEW, 5));
+            }
+        }));
+        assert!(r.cache.recrypt(&keys).await);
+        assert_eq!(ring.lock().unwrap().current().unwrap().kid, kid(&K_NEW));
+        for n in 1..=3 {
+            assert_eq!(on_hub(&r.board, &K_NEW, &bid(n)), project(&format!("p{n}")));
+            assert_eq!(r.cache.item(&bid(n)).unwrap().kid, kid(&K_NEW));
+        }
+    }
+
+    /// Mientras falte algo por resubir, no se recifra (la resubida ya cifra con la actual, y
+    /// las dos a la vez pasarían del ritmo).
+    #[tokio::test]
+    async fn no_recrypt_while_reuploading() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_OLD, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        r.cache.lock().reupload.insert(bid(1));
+        assert!(!r.cache.recrypt(&keys()).await);
+        assert!(r.writes().is_empty());
+    }
+
+    /// Los `kid` en uso: todo lo que no es lápida, también lo que no está en el hub, lo que falta
+    /// por resubir y lo ilegible.
+    #[tokio::test]
+    async fn kids_in_use_count_everything_but_tombstones() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_OLD, &bid(1), &project("uno"));
+        r.write(&K_NEW, &bid(2), &project("sin clave"));
+        r.write(&K_CUR, &bid(3), &project("tres"));
+        r.board.lock().unwrap().write(&bid(3), None);
+        r.cache.sync().await.unwrap();
+        {
+            let mut c = r.cache.lock();
+            let stored = |k: &[u8; 32]| Stored {
+                v: 1,
+                kid: kid(k),
+                blob: Some("AAAA".into()),
+                gone: false,
+                at: 1,
+            };
+            c.items.insert(bid(4), stored(&[0x44; 32]));
+            c.missing.insert(bid(4));
+            c.items.insert(bid(5), stored(&[0x55; 32]));
+            c.reupload.insert(bid(5));
+        }
+        let want: BTreeSet<String> = [&K_OLD, &K_NEW, &[0x44; 32], &[0x55; 32]]
+            .into_iter()
+            .map(kid)
+            .collect();
+        assert_eq!(r.cache.kids_in_use(), want);
+    }
+
+    /// Un grupo con el llavero en disco y las claves dadas.
+    fn group_with(dir: &std::path::Path, keys: Vec<BoardKey>) -> Arc<crate::group::Group> {
+        let g = crate::group::Group::load(dir.join("data/group.json"), [1u8; 32]);
+        g.merge(&crate::group::State {
+            keys,
+            ..Default::default()
+        });
+        Arc::new(g)
+    }
+
+    fn raw(k: &BoardKey) -> [u8; 32] {
+        B64.decode(&k.key).unwrap().try_into().unwrap()
+    }
+
+    /// Tras quitar un dispositivo (rotar), la clave nueva es la actual y la tarea del llavero
+    /// acaba recifrándolo todo con ella.
+    #[tokio::test]
+    async fn after_a_rotation_everything_ends_up_recrypted() {
+        let r = rig(fake::Board::default()).await;
+        let now = crate::group::now_ms();
+        let group = group_with(r.dir.path(), vec![BoardKey::from_raw(&K_OLD, now - 1000)]);
+        for n in 1..=3 {
+            r.write(&K_OLD, &bid(n), &project(&format!("p{n}")));
+        }
+        let blob = seal(&K_OLD, &bid(4), FUTURE).unwrap();
+        r.board
+            .lock()
+            .unwrap()
+            .write(&bid(4), Some((&kid(&K_OLD), &blob)));
+        r.cache.sync().await.unwrap();
+        let new = group.rotate_board_key().unwrap();
+        assert_eq!(group.board_keys().current(), Some(&new));
+        spawn_upkeep_with(r.cache.clone(), group.clone(), LONG);
+        let board = r.board.clone();
+        let new_kid = new.kid.clone();
+        until("todo recifrado", || {
+            let b = board.lock().unwrap();
+            b.items.values().all(|i| i.kid == new_kid)
+        })
+        .await;
+        for n in 1..=3 {
+            assert_eq!(
+                on_hub(&r.board, &raw(&new), &bid(n)),
+                project(&format!("p{n}"))
+            );
+        }
+        assert_eq!(hub_bytes(&r.board, &raw(&new), &bid(4)).2, FUTURE.to_vec());
+        // La vieja sigue (retirada hace nada).
+        assert!(group.board_keys().keys.iter().any(|k| k.kid == kid(&K_OLD)));
+    }
+
+    /// La poda: tras ponerse al día con el hub, se quita la retirada de más de 30 días sin
+    /// objetos. Ni la de 29 días, ni una de 31 con objetos que no se pueden recifrar (no se
+    /// descifran), ni una con objetos que no están en el hub.
+    #[tokio::test]
+    async fn retired_keys_without_objects_go_after_30_days() {
+        let r = rig(fake::Board::default()).await;
+        let now = crate::group::now_ms();
+        let retired = |k: &[u8; 32], days: u64| {
+            let mut b = BoardKey::from_raw(k, now - 60 * DAY_MS);
+            b.retired = Some(now - days * DAY_MS);
+            b.at = now - days * DAY_MS;
+            b
+        };
+        let (k31, k29, kbroken, kmissing) = ([0x41; 32], [0x42; 32], [0x43; 32], [0x44; 32]);
+        let group = group_with(
+            r.dir.path(),
+            vec![
+                BoardKey::from_raw(&K_CUR, now - 1000),
+                retired(&k31, 31),
+                retired(&k29, 29),
+                retired(&kbroken, 31),
+                retired(&kmissing, 31),
+            ],
+        );
+        // Dice ir con `kbroken`, pero no se descifra con ella: no se puede recifrar.
+        let bad = seal_object(&K_CUR, &bid(1), &project("roto")).unwrap();
+        r.board
+            .lock()
+            .unwrap()
+            .write(&bid(1), Some((&kid(&kbroken), &bad)));
+        r.cache.sync().await.unwrap();
+        {
+            let mut c = r.cache.lock();
+            let (k, b) = sealed(&kmissing, &bid(2), &project("perdido"));
+            c.items.insert(
+                bid(2),
+                Stored {
+                    v: 1,
+                    kid: k,
+                    blob: Some(b),
+                    gone: false,
+                    at: 1,
+                },
+            );
+            c.missing.insert(bid(2));
+        }
+        // Lo que hay en el hub y la copia aún no tiene también cuenta: por eso se sincroniza
+        // antes de decidir.
+        let k31_obj = sealed(&k31, &bid(3), &project("recién llegado"));
+        let gets = r.board.lock().unwrap().gets.len();
+        r.board
+            .lock()
+            .unwrap()
+            .write(&bid(3), Some((&k31_obj.0, &k31_obj.1)));
+        // La primera pasada no ve el objeto nuevo (la copia no lo tiene): no lo recifra, pero la
+        // poda sí lo ve al sincronizar.
+        r.cache.upkeep(&group).await;
+        assert!(
+            r.board.lock().unwrap().gets.len() > gets,
+            "se sincroniza antes"
+        );
+        let have: BTreeSet<String> = group
+            .board_keys()
+            .keys
+            .iter()
+            .map(|k| k.kid.clone())
+            .collect();
+        for k in [&K_CUR, &k29, &kbroken, &kmissing, &k31] {
+            assert!(have.contains(&kid(k)), "{} se queda", kid(k));
+        }
+        // Recifrado lo que trajo la sincronización, la de 31 días ya no tiene objetos.
+        r.cache.upkeep(&group).await;
+        assert_eq!(r.cache.item(&bid(3)).unwrap().kid, kid(&K_CUR));
+        let have: BTreeSet<String> = group
+            .board_keys()
+            .keys
+            .iter()
+            .map(|k| k.kid.clone())
+            .collect();
+        assert!(
+            !have.contains(&kid(&k31)),
+            "la de 31 días sin objetos se va"
+        );
+        for k in [&K_CUR, &k29, &kbroken, &kmissing] {
+            assert!(have.contains(&kid(k)), "{} se queda", kid(k));
+        }
+    }
+
+    /// Sin poder ponerse al día con el hub, no se quita nada.
+    #[tokio::test]
+    async fn no_pruning_without_the_hub() {
+        let r = rig(fake::Board::default()).await;
+        let now = crate::group::now_ms();
+        let mut old = BoardKey::from_raw(&K_OLD, now - 60 * DAY_MS);
+        old.retired = Some(now - 40 * DAY_MS);
+        old.at = now - 40 * DAY_MS;
+        let group = group_with(r.dir.path(), vec![BoardKey::from_raw(&K_CUR, now), old]);
+        offline(&r).await;
+        r.cache.upkeep(&group).await;
+        assert_eq!(group.board_keys().keys.len(), 2);
     }
 }

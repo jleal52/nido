@@ -2000,8 +2000,20 @@ impl AppState {
     }
 }
 
+/// El llavero del tablero, para la tarea del llavero: lo que se retire o se quite aquí se cuenta
+/// al resto del grupo.
+impl crate::board::KeyHolder for AppState {
+    fn keychain(&self) -> &crate::group::Group {
+        &self.group
+    }
+    fn keys_changed(&self) {
+        self.group_dirty.notify_one();
+    }
+}
+
 impl AppState {
-    /// Lo que el grupo ha dado de baja, fuera también de aquí.
+    /// Lo que el grupo ha dado de baja, fuera también de aquí (sin cambiar la clave del tablero:
+    /// ya la cambió el equipo que lo quitó).
     fn apply_group(&self) {
         for key in self.group.removed_devices() {
             let mut phones = self.phones.lock().expect("teléfonos");
@@ -2361,6 +2373,8 @@ pub fn spawn_scanner(state: Arc<AppState>) {
         let st = state.clone();
         crate::board::spawn(state.board.clone(), move || st.group.board_keys());
     }
+    // El llavero: recifrar lo cifrado con claves retiradas y quitar las que no usa nadie.
+    crate::board::spawn_upkeep(state.board.clone(), state.clone());
     // Las cuentas de Claude: lo que gasta cada una, mirado de vez en cuando.
     state.accounts.spawn(state.paths.home.clone());
     // Tras un cambio automático de cuenta, las sesiones paradas por el límite siguen con la nueva.
