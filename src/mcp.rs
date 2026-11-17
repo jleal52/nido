@@ -1235,6 +1235,24 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
+    /// Las que van sin permiso (`claude::NIDO_TOOLS`) son herramientas de este MCP, con su
+    /// nombre de Claude (`mcp__nido__<nombre>`); y las que actúan sobre otras sesiones no están.
+    #[test]
+    fn the_tools_without_permission_are_ours_and_none_acts_on_other_sessions() {
+        let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
+        for t in crate::claude::NIDO_TOOLS {
+            let name = t.strip_prefix("mcp__nido__").expect(t);
+            assert!(names.contains(&name), "{t} no es de nido mcp");
+        }
+        for t in ["open", "answer", "close", "start", "stop"] {
+            assert!(names.contains(&t), "{t}");
+            assert!(
+                !crate::claude::NIDO_TOOLS.contains(&format!("mcp__nido__{t}").as_str()),
+                "{t} tiene que pedir permiso"
+            );
+        }
+    }
+
     /// Devuelve lo que se le dé y apunta lo que le piden.
     struct Fake {
         reply: Result<Value, String>,

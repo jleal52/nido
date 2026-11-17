@@ -600,31 +600,29 @@ async fn mcp_api_end_to_end() {
     guard.extend(nido::claude::secrets_rules(&paths.state.join("secrets")));
     let n = guard.len();
     assert_eq!(argv[1..1 + n], guard, "{argv:?}");
-    assert_eq!(
-        &argv[1 + n..21 + n],
-        [
-            "--dangerously-load-development-channels",
-            "server:nido",
-            "--allowedTools",
-            "mcp__nido__sessions",
-            "mcp__nido__read",
-            "mcp__nido__send",
-            "mcp__nido__alert",
-            "mcp__nido__secret",
-            "mcp__nido__clipboard",
-            "mcp__nido__send_file",
-            "mcp__nido__plan_set",
-            "mcp__nido__plan_task",
-            "mcp__nido__plan_get",
-            "mcp__nido__plan_clear",
-            "mcp__nido__board",
-            "mcp__nido__project",
-            "mcp__nido__objective",
-            "mcp__nido__join",
-            "mcp__nido__leave",
-            "--session-id"
-        ]
-    );
+    let want = [
+        "--dangerously-load-development-channels",
+        "server:nido",
+        "--allowedTools",
+        "mcp__nido__sessions",
+        "mcp__nido__read",
+        "mcp__nido__send",
+        "mcp__nido__alert",
+        "mcp__nido__secret",
+        "mcp__nido__clipboard",
+        "mcp__nido__send_file",
+        "mcp__nido__plan_set",
+        "mcp__nido__plan_task",
+        "mcp__nido__plan_get",
+        "mcp__nido__plan_clear",
+        "mcp__nido__board",
+        "mcp__nido__project",
+        "mcp__nido__objective",
+        "mcp__nido__join",
+        "mcp__nido__leave",
+        "--session-id",
+    ];
+    assert_eq!(&argv[1 + n..1 + n + want.len()], want, "{argv:?}");
     assert!(argv.windows(2).any(|w| w == ["-n", "work"]), "{argv:?}");
     assert!(
         argv.windows(2).any(|w| w == ["--model", "haiku"]),

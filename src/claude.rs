@@ -454,9 +454,10 @@ const ALLOWED_OPTS: [&str; 2] = ["--allowedTools", "--allowed-tools"];
 /// Las herramientas de nido que no piden permiso: las que miran y hablan, y las que piden y
 /// mandan cosas al usuario (`secret` lo controla su diálogo; `clipboard` y `send_file` solo le
 /// mandan algo a él), las del plan de tareas (solo tocan el de la propia sesión) y las del
-/// tablero de la cuenta (`board`, `project`, `objective`, `join` y `leave`: lo decidió el
-/// usuario, como las del plan; cambian y borran, en cascada, el tablero que comparten los
-/// equipos, la web y la app, pero no tocan sesiones). Las que actúan sobre otras sesiones
+/// tablero de la cuenta (`board`, `project`, `objective`, `join` y `leave`), para que Claude
+/// lleve su objetivo sin interrumpir al usuario a cada paso; no tocan sesiones. El riesgo que se
+/// acepta con ellas: una sesión engañada puede cambiar o borrar, en cascada y sin vuelta atrás,
+/// el tablero que comparten los equipos, la web y la app. Las que actúan sobre otras sesiones
 /// (`open`, `answer`, `close`, `start`, `stop`) pasan por el permiso de Claude como cualquier
 /// otra (en modo auto, lo decide su clasificador): una sesión engañada (un mensaje con
 /// instrucciones metidas) no puede abrir, parar o arrancar sesiones ni aprobar sus preguntas sin
