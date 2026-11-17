@@ -4,6 +4,7 @@ pub mod accounts;
 #[cfg(unix)]
 pub mod attach;
 pub mod auth;
+pub mod board;
 pub mod browse;
 pub mod claude;
 pub mod claude_store;
