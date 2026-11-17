@@ -2033,13 +2033,16 @@ impl AppState {
                 .unwrap_or_default();
             self.rotate_if_given(&given);
             let mut phones = self.phones.lock().expect("teléfonos");
-            let id = phones
+            let (id, given) = phones
                 .list()
                 .iter()
                 .find(|p| p.key == key)
-                .map(|p| p.id.clone());
+                .map(|p| (Some(p.id.clone()), p.board_kids.clone()))
+                .unwrap_or_default();
             let removed = phones.remove_by_key(&key);
             drop(phones);
+            // Otra vez, con lo apuntado justo al quitarlo (ver `rotate_if_given`).
+            self.rotate_if_given(&given);
             if let Err(e) = &removed {
                 eprintln!("nido: no se pudo guardar la baja de un dispositivo: {e}");
             }
@@ -2061,8 +2064,14 @@ impl AppState {
     /// Se mira por `kid`, no por horas: no depende de los relojes de los equipos ni de empates en
     /// el mismo milisegundo, y una retirada nunca vuelve a ser activa. En una baja normal, que
     /// llega con su rotación, la actual es la nueva, que no se le dio: no se rota dos veces. Tras
-    /// rotar aquí, la actual tampoco está entre ellas: no se repite. Se llama antes de quitarlo
-    /// de `phones`: si el proceso cae entre medias, lo apuntado sigue en el disco.
+    /// rotar aquí, la actual tampoco está entre ellas: no se repite.
+    ///
+    /// Se llama dos veces por dispositivo quitado. Antes de quitarlo de `phones`, para que si el
+    /// proceso cae entre medias lo apuntado siga en el disco. Y después, con lo que tenía apuntado
+    /// en el mismo cerrojo con que se quita: una petición que apuntó entre la primera mirada y la
+    /// baja en `phones` (con una instantánea de antes de la baja) también se ve, y una posterior
+    /// ya no encuentra su `Phone` y recibe 403. También lo usa `remove_phone`, por si el grupo ya
+    /// traía la baja y no rota.
     ///
     /// Si no se puede guardar, no rota (`rotate_board_key` no da una clave que no está en el
     /// disco) y queda debida en memoria (`board_rotation_owed`), para el siguiente `apply_group`.
@@ -2079,11 +2088,13 @@ impl AppState {
             return;
         }
         match self.group.rotate_after_removal() {
-            Ok(_) => {
+            Ok(rotated) => {
                 self.board_rotation_owed.store(false, Ordering::SeqCst);
-                eprintln!(
-                    "nido: un dispositivo quitado en el grupo tenía la clave actual del tablero: rotada"
-                );
+                if rotated.is_some() {
+                    eprintln!(
+                        "nido: cambiada la clave del tablero que pudo llevarse un dispositivo quitado"
+                    );
+                }
             }
             Err(e) => {
                 self.board_rotation_owed.store(true, Ordering::SeqCst);
@@ -4364,19 +4375,23 @@ fn said_rotated(rotated: Option<crate::group::BoardKey>) {
 /// cambia la clave del tablero (`said_rotated`); por aquí pasa también el que se sale solo
 /// (`api_remove_me`).
 fn remove_phone(st: &AppState, id: &str) -> Response {
-    let key = st
-        .phones
-        .lock()
-        .expect("teléfonos")
-        .list()
-        .iter()
-        .find(|p| p.id == id)
-        .map(|p| p.key.clone());
     // Fuera de aquí antes de rotar: que no pueda pedir la clave nueva entre medias.
-    let removed = st.phones.lock().expect("teléfonos").remove(id);
+    let (key, given, removed) = {
+        let mut phones = st.phones.lock().expect("teléfonos");
+        let (key, given) = phones
+            .list()
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (Some(p.key.clone()), p.board_kids.clone()))
+            .unwrap_or_default();
+        (key, given, phones.remove(id))
+    };
     if let Some(k) = &key {
         let (_, rotated) = st.group.remove_device_rotating(k);
         said_rotated(rotated);
+        // Si el grupo ya traía su baja (de otro equipo, sin aplicar aún), no ha rotado: rota si
+        // se llevó la actual.
+        st.rotate_if_given(&given);
         st.group_dirty.notify_one();
     }
     // Sus sesiones del hub, fuera también; aunque no se haya podido guardar la baja, de la
@@ -6070,6 +6085,26 @@ mod tests {
         assert_eq!(ring.keys.len(), 2);
         a.apply_group();
         assert_eq!(a.group.board_keys(), ring, "una sola vez");
+    }
+
+    /// Quitarlo a mano aquí cuando el grupo ya traía su baja (sin aplicar aún): la baja no
+    /// rota, porque ya estaba, pero se llevó la actual: se rota igual.
+    #[tokio::test]
+    async fn removing_here_a_device_already_removed_elsewhere_rotates_what_it_took() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        b.group.merge(&a.group.snapshot());
+        b.group.remove_device_rotating(&phone.key);
+        let (_, _, body) = board_keys_with(&a, &phone.token).await;
+        let k1 = body["current"].as_str().unwrap().to_owned();
+        assert!(a.group.merge(&b.group.snapshot()));
+        assert_eq!(remove_phone(&a, &phone.id).status(), StatusCode::NO_CONTENT);
+        let ring = a.group.board_keys();
+        assert_ne!(ring.current().unwrap().kid, k1);
+        assert_eq!(ring.keys.len(), 2);
+        a.apply_group();
+        assert_eq!(a.group.board_keys(), ring, "no rota otra vez");
     }
 
     /// Una baja normal, que llega con su rotación: D tenía la de antes, no la nueva. No se rota

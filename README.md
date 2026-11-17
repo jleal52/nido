@@ -337,8 +337,9 @@ with them. There are usually few (nido warns above 16), but there is no fixed ma
 that still encrypts something is not removed. If there is no active key yet, nido makes one and
 saves it before answering. Only a paired phone or browser that the group still knows can ask for it
 (`403` with the token in `~/.config/nido/token`, or for a device removed from the group, even from
-another computer; `401` with a token that belongs to no one). Errors: `503` if the new key could
-not be saved (no key is given); try again. The answer carries `Cache-Control: no-store`.
+another computer; `401` with a token that belongs to no one). Errors: `503` if something could
+not be saved (the new key, or which keys this device has), and no key is given; try again. The
+answer carries `Cache-Control: no-store`.
 
 The hub account, `{"name", "lang"}` (either can be `null` until the account is first opened),
 comes in `GET /api/v1/info` (`"account"`, or `null` if the hub hasn't told it yet), in the

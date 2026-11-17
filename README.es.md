@@ -321,8 +321,9 @@ ser pocas (nido avisa por encima de 16), pero no hay un máximo fijo: una retira
 hay algo cifrado no se quita. Si aún no hay ninguna activa, nido la crea y la guarda antes de
 contestar. Solo un teléfono o un navegador emparejado que el grupo sigue conociendo puede pedirlo
 (`403` con el token de `~/.config/nido/token`, o para un dispositivo quitado del grupo, aunque sea
-desde otro equipo; `401` con un token que no es de nadie). Errores: `503` si no se pudo guardar la
-clave nueva (no se da ninguna); se puede reintentar. La respuesta lleva `Cache-Control: no-store`.
+desde otro equipo; `401` con un token que no es de nadie). Errores: `503` si no se pudo guardar algo
+(la clave nueva, o qué claves tiene este dispositivo), y no se da ninguna; se puede reintentar. La
+respuesta lleva `Cache-Control: no-store`.
 
 La cuenta del hub, `{"name", "lang"}` (cualquiera de los dos puede ser `null` mientras no se haya
 abierto), va en `GET /api/v1/info` (`"account"`, o `null` si el hub aún no la ha dicho), en la
