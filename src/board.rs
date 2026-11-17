@@ -417,10 +417,9 @@ pub enum ObjectiveState {
 
 // ---------- La copia del tablero ----------
 
-/// Cada cuánto se sincroniza aunque no llegue ningún aviso.
+/// Cada cuánto se sincroniza aunque no llegue ningún aviso, y se mira si el hub se ha quedado
+/// sin tablero (`probe`).
 pub const SYNC_EVERY: Duration = Duration::from_secs(5 * 60);
-/// Cada cuántas de esas se mira además si el hub se ha quedado sin tablero (`probe`): una hora.
-const PROBE_EVERY: u32 = 12;
 /// Lo que se espera entre dos escrituras de la resubida: 20 por minuto. El hub frena a 120 por
 /// minuto y conexión y a 3000 por hora y cuenta, y la resubida tiene que dejar sitio a lo que se
 /// edita a mano (1200 por hora).
@@ -739,6 +738,25 @@ impl BoardCache {
         }
     }
 
+    /// Deja `id` como lápida en la copia (si no lo es ya).
+    async fn bury(self: &Arc<Self>, epoch: u64, id: &str) {
+        let changed = {
+            let mut c = self.lock();
+            match c.items.get_mut(id) {
+                Some(s) if self.epoch() == epoch && !s.gone => {
+                    s.gone = true;
+                    s.blob = None;
+                    s.kid.clear();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.save().await;
+        }
+    }
+
     /// Vacía la copia, en memoria y en el disco, y para lo que estuviera en marcha (cuando este
     /// equipo sale del grupo). No usa el grupo: se llama con él cogido.
     pub fn clear(&self) {
@@ -823,12 +841,19 @@ impl BoardCache {
                     changed |= c.apply(item);
                 }
                 changed
+            } else if current_key(keys).is_none() {
+                // Sin clave con que subirla, se deja la copia como está: el próximo sondeo.
+                return Ok(());
             } else {
-                // Se sube lo que se puede leer (con su clave); lo demás no volvería nunca al hub.
-                c.items.retain(|id, s| {
-                    !s.gone && s.blob.is_some() && reupload_blob(keys, id, s).is_some()
-                });
-                c.reupload = c.items.keys().cloned().collect();
+                // Se sube lo que se puede leer con su clave. Lo demás se queda en la copia (es lo
+                // único que queda de ello), pero no se sube; las lápidas ya no hacen falta.
+                c.items.retain(|_, s| !s.gone);
+                c.reupload = c
+                    .items
+                    .iter()
+                    .filter(|(id, s)| reupload_blob(keys, id, s).is_some())
+                    .map(|(id, _)| id.clone())
+                    .collect();
                 // El hub está vacío: la próxima, desde el principio.
                 c.next = 0;
                 eprintln!(
@@ -874,9 +899,8 @@ impl BoardCache {
                 };
                 let blob = c.items.get(&id).and_then(|s| reupload_blob(&keys, &id, s));
                 if blob.is_none() {
-                    // Ya no se puede leer (otro llavero): no se sube.
+                    // Ya no se puede leer (otro llavero): no se sube, pero se queda en la copia.
                     c.reupload.remove(&id);
-                    c.items.remove(&id);
                     continue;
                 }
                 (id, blob)
@@ -1092,6 +1116,9 @@ impl BoardCache {
                     let cv = current.v;
                     self.applied(epoch, current.clone()).await;
                     if gone {
+                        // El hub no lo tiene (o ya es una lápida): aquí también, borrado, aunque
+                        // su lápida (`v: 0` si no existe) pierda frente a lo que tenía la copia.
+                        self.bury(epoch, id).await;
                         return Ok(());
                     }
                     if tries >= MAX_TRIES {
@@ -1131,8 +1158,9 @@ impl BoardCache {
 
 /// Mantiene la copia al día mientras haya conexión con el hub: al conectar (lo primero, un `get`,
 /// que es lo que hace que el hub avise en esa conexión), con cada aviso del hub y cada
-/// `SYNC_EVERY`. Al conectar, si cambia la cuenta y una vez por hora, mira además si el hub se
-/// quedó sin tablero (`probe`): el hub no avisa de eso. `keys` da el llavero del grupo cada vez.
+/// `SYNC_EVERY`. Al conectar, si cambia la cuenta y cada `SYNC_EVERY`, mira además si el hub se
+/// quedó sin tablero (`probe`): el hub no avisa de eso, y cuanto antes se vea, menos fácil es que
+/// alguien empiece a llenar un tablero vacío (con un objeto en el hub ya no se resube). `keys` da el llavero del grupo cada vez.
 pub fn spawn(cache: Arc<BoardCache>, keys: impl Fn() -> Keyring + Send + Sync + 'static) {
     tokio::spawn(async move {
         let mut status = cache.hub.status.subscribe();
@@ -1142,7 +1170,6 @@ pub fn spawn(cache: Arc<BoardCache>, keys: impl Fn() -> Keyring + Send + Sync + 
         let mut tick = tokio::time::interval_at(start, SYNC_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (mut connected, mut account) = (false, None);
-        let mut ticks = 0u32;
         loop {
             let probe = tokio::select! {
                 r = status.changed() => {
@@ -1171,10 +1198,7 @@ pub fn spawn(cache: Arc<BoardCache>, keys: impl Fn() -> Keyring + Send + Sync + 
                     }
                     false
                 }
-                _ = tick.tick() => {
-                    ticks = ticks.wrapping_add(1);
-                    ticks.is_multiple_of(PROBE_EVERY)
-                }
+                _ = tick.tick() => true,
             };
             if connected {
                 cache.refresh(&keys(), probe).await;
@@ -2117,6 +2141,20 @@ mod tests {
         assert_eq!(s.v, 2);
         r.cache.remove(&id).await.unwrap();
         assert_eq!(r.writes(), vec![("del".into(), id.clone(), 1)]);
+        // Uno que el hub ni tiene (409 con `v: 0`): borrado también en la copia.
+        let lost = bid(11);
+        r.write(&K_CUR, &lost, &project("perdido"));
+        r.cache.sync().await.unwrap();
+        r.board.lock().unwrap().items.remove(&lost);
+        r.cache.remove(&lost).await.unwrap();
+        assert!(r.cache.item(&lost).unwrap().gone);
+        assert!(
+            r.cache
+                .decrypted(&keyring())
+                .objects
+                .iter()
+                .all(|e| e.id != lost)
+        );
         // Uno vivo: se borra.
         let other = bid(10);
         r.write(&K_CUR, &other, &project("y"));
@@ -2256,11 +2294,12 @@ mod tests {
         // La del 409 se queda como la dejó el otro, sin volver a intentarlo.
         assert_eq!(on_hub(&r.board, &K_CUR, &cur), project("de otro"));
         assert_eq!(r.cache.item(&cur).unwrap().v, 1);
-        // Lo que no se podía subir (sin clave, la lápida) ya no está en la copia.
+        // Lo que no se podía subir (sin clave) se queda en la copia; la lápida, no.
         assert_eq!(
             r.cache.ids(),
-            vec![old.clone(), cur.clone(), unknown.clone()]
+            vec![old.clone(), cur.clone(), unknown.clone(), no_key.clone()]
         );
+        assert_eq!(r.cache.item(&no_key).unwrap().v, 1);
 
         // Ya hay objetos: otra vez, nada.
         r.cache.sync().await.unwrap();
@@ -2291,6 +2330,76 @@ mod tests {
         tokio::time::sleep(GAP * 3).await;
         assert!(empty.writes().is_empty());
         assert!(empty.board.lock().unwrap().gets.is_empty());
+    }
+
+    /// Sin clave actual no se resube ni se toca la copia: se vuelve a mirar en el próximo sondeo.
+    #[tokio::test]
+    async fn no_reupload_without_a_key() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        let next = r.cache.next();
+        r.board.lock().unwrap().items.clear();
+        r.cache.probe(&Keyring { keys: vec![] }).await.unwrap();
+        tokio::time::sleep(GAP * 3).await;
+        assert!(r.writes().is_empty());
+        assert_eq!(r.cache.ids(), vec![bid(1)]);
+        assert_eq!(r.cache.pending_reupload(), 0);
+        assert_eq!(r.cache.next(), next);
+        // Con la clave, sí.
+        r.cache.probe(&keyring()).await.unwrap();
+        until(&r.cache, |c| c.pending_reupload() == 0).await;
+        assert_eq!(on_hub(&r.board, &K_CUR, &bid(1)), project("uno"));
+    }
+
+    /// Una resubida cortada (se cae la conexión) sigue al volver el hub, desde donde se quedó.
+    #[tokio::test]
+    async fn a_cut_reupload_goes_on_after_reconnecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = Arc::new(Mutex::new(fake::Board::default()));
+        let rec = fake::board(board.clone()).await;
+        let hub = fake::nido(dir.path(), rec.addr).await;
+        // Lento, para que la conexión se caiga entre la primera escritura y la segunda.
+        let cache = BoardCache::load_with(
+            dir.path().join("data/board.json"),
+            hub.clone(),
+            Duration::from_millis(800),
+        );
+        for n in 1..=3 {
+            let (k, b) = sealed(&K_CUR, &bid(n), &project(&format!("p{n}")));
+            board.lock().unwrap().write(&bid(n), Some((&k, &b)));
+        }
+        cache.sync().await.unwrap();
+        board.lock().unwrap().items.clear();
+        let mut status = hub.status.subscribe();
+        spawn(cache.clone(), keyring);
+        let first = async {
+            while board.lock().unwrap().writes.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("no empezó la resubida");
+        rec.tell(fake::Tell::Hangup);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        // Lo que falta, en el disco.
+        let saved = BoardCache::load_with(cache.path.clone(), hub.clone(), GAP);
+        let left = saved.pending_reupload();
+        assert!(left >= 1, "{left}");
+        until(&cache, |c| c.pending_reupload() == 0).await;
+        for n in 1..=3 {
+            assert_eq!(on_hub(&board, &K_CUR, &bid(n)), project(&format!("p{n}")));
+        }
+        let w = board.lock().unwrap().writes.clone();
+        assert!(
+            w.windows(2)
+                .any(|p| p[1].0 - p[0].0 > Duration::from_secs(1)),
+            "sin corte"
+        );
     }
 
     /// Con el freno del hub (429), la resubida espera y sigue con el mismo.
