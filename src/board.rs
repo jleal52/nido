@@ -18,6 +18,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// El id de una clave del tablero (`hex(SHA-256("nido-board-kid" || clave))[0..16]`).
 pub use crate::group::board_kid as kid;
@@ -152,8 +153,11 @@ fn hex(b: &[u8]) -> String {
 
 // ---------- Los objetos (el texto que va cifrado) ----------
 //
-// Los campos desconocidos se ignoran al leer, para que versiones futuras puedan añadir cosas.
-// Ojo: al reescribir un objeto se pierden; quien lo reescriba (Tarea 8) lo tiene que saber.
+// Los campos desconocidos (de versiones futuras) no rompen la lectura y se conservan: van a
+// `extra` y se vuelven a escribir tal cual, así que un nido viejo que cambia el estado de un
+// objetivo no borra lo que añadió una versión nueva. `t` no llega a `extra`: lo consume el
+// `tag` de `Object` antes de leer la variante, y al escribir lo pone él delante (quien rellene
+// `extra` a mano no debe meter `t` ni un campo conocido: saldría dos veces).
 
 /// Un objeto del tablero, por su `t`. Un `t` que no se conoce (de una versión futura) se lee
 /// como `Unknown` en vez de fallar, y quien sincroniza se lo salta: así un tipo nuevo no rompe
@@ -181,6 +185,9 @@ pub struct Project {
     /// Quién lo cambió: `"<equipo>/<sesión>"`, `"web"`, `"app"` o `"Cuco"`.
     #[serde(default)]
     pub by: String,
+    /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Un objetivo de un proyecto.
@@ -201,6 +208,9 @@ pub struct Objective {
     pub changed: u64,
     #[serde(default)]
     pub by: String,
+    /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Una sesión que trabaja en un objetivo. Es de una sesión con un objetivo: una sesión en dos
@@ -223,6 +233,9 @@ pub struct Link {
     pub changed: u64,
     #[serde(default)]
     pub by: String,
+    /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// La sesión de un enlace.
@@ -235,6 +248,9 @@ pub struct LinkSession {
     /// Cómo se ve: `"<equipo>/<sesión>"`.
     #[serde(default)]
     pub name: String,
+    /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Cuánto va hecho del plan de una sesión (como `plan::Summary`, sin lo que solo es de la
@@ -253,6 +269,9 @@ pub struct PlanSummary {
     pub blocked: usize,
     #[serde(default)]
     pub failed: usize,
+    /// Los campos que no conocemos, tal cual, para no perderlos al reescribir.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// El estado de un proyecto. Uno que no se conoce (de una versión futura) se guarda tal cual en
@@ -408,6 +427,11 @@ mod tests {
         assert_eq!(ob.state, ObjectiveState::Doing);
         assert_eq!(ob.order, 1.5);
         assert_eq!(ob.note, "falta el horno");
+        // Lo desconocido queda en `extra`, sin `t` ni los campos que sí se conocen.
+        assert_eq!(
+            Value::Object(ob.extra),
+            serde_json::json!({"color": "verde", "tags": ["a", {"b": 1}]})
+        );
         // Lo que falta y tiene valor por omisión.
         let o: Object = serde_json::from_str(
             r#"{"t":"project","name":"Casa","state":"active","created":1,"changed":1}"#,
@@ -422,7 +446,84 @@ mod tests {
                 created: 1,
                 changed: 1,
                 by: String::new(),
+                extra: Map::new(),
             })
+        );
+    }
+
+    /// Un nido viejo que reescribe un objeto no borra lo que añadió una versión nueva: los
+    /// campos desconocidos (también dentro de `session` y `plan`) vuelven tal cual, y `t` sale una
+    /// sola vez.
+    #[test]
+    fn unknown_fields_survive_a_rewrite() {
+        let text = r#"{"t":"link","objective":"o1","session":{"machine":"m1","id":"ab12cd34","name":"n","host":{"os":"linux"}},"plan":{"title":"Obra","done":1,"total":2,"active":0,"blocked":0,"failed":0,"skipped":3},"copied":5,"closed":null,"created":1,"changed":2,"by":"web","color":"verde","tags":["a",{"b":1}],"zz":1.25}"#;
+        let mut o: Object = serde_json::from_str(text).unwrap();
+        let Object::Link(link) = &mut o else {
+            panic!("{o:?}")
+        };
+        assert!(!link.extra.contains_key("t"));
+        assert_eq!(link.extra.len(), 3);
+        assert_eq!(
+            link.session.extra["host"],
+            serde_json::json!({"os": "linux"})
+        );
+        assert_eq!(link.plan.as_ref().unwrap().extra["skipped"], 3);
+        // Sin cambios, vuelve el mismo texto (los desconocidos van al final, por orden).
+        assert_eq!(serde_json::to_string(&o).unwrap(), text);
+        // Con un cambio, cambia solo eso.
+        let Object::Link(link) = &mut o else {
+            unreachable!()
+        };
+        link.closed = Some(9);
+        link.changed = 3;
+        let out = serde_json::to_string(&o).unwrap();
+        assert_eq!(out.matches(r#""t":"#).count(), 1, "{out}");
+        let mut want: Value = serde_json::from_str(text).unwrap();
+        want["closed"] = 9.into();
+        want["changed"] = 3.into();
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), want);
+
+        // Un objetivo al que se le cambia el estado.
+        let text = r#"{"t":"objective","project":"p","name":"n","desc":"","state":"doing","note":"","order":2.0,"created":1,"changed":1,"by":"app","due":1763400000000,"labels":["x"]}"#;
+        let mut o: Object = serde_json::from_str(text).unwrap();
+        assert_eq!(serde_json::to_string(&o).unwrap(), text);
+        let Object::Objective(ob) = &mut o else {
+            panic!("{o:?}")
+        };
+        ob.state = ObjectiveState::Done;
+        let out: Value = serde_json::to_value(&o).unwrap();
+        assert_eq!(out["state"], "done");
+        assert_eq!(out["due"], 1763400000000u64);
+        assert_eq!(out["labels"], serde_json::json!(["x"]));
+        assert_eq!(out["t"], "objective");
+
+        // Y un proyecto, con un estado desconocido además.
+        let text = r#"{"t":"project","name":"Casa","desc":"","state":"paused","created":1,"changed":2,"by":"app","color":"verde","zona":{"a":[1,2]}}"#;
+        let o: Object = serde_json::from_str(text).unwrap();
+        assert_eq!(serde_json::to_string(&o).unwrap(), text);
+    }
+
+    /// Un `t` repetido no es un objeto, y un campo conocido con el tipo equivocado tampoco: no
+    /// acaba en `extra`.
+    #[test]
+    fn extra_does_not_swallow_errors() {
+        assert!(
+            serde_json::from_str::<Object>(
+                r#"{"t":"project","t":"link","name":"x","state":"active","created":1,"changed":1}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Object>(
+                r#"{"t":"project","name":5,"state":"active","created":1,"changed":1}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Object>(
+                r#"{"t":"project","name":"x","state":"active","created":"ayer","changed":1}"#
+            )
+            .is_err()
         );
     }
 
@@ -469,6 +570,7 @@ mod tests {
                 machine: "m1".into(),
                 id: "ab12cd34".into(),
                 name: "portatil/obras".into(),
+                extra: Map::new(),
             },
             plan: None,
             copied: 0,
@@ -476,6 +578,7 @@ mod tests {
             created: 1,
             changed: 2,
             by: "Cuco".into(),
+            extra: Map::new(),
         });
         let v = serde_json::to_value(&link).unwrap();
         assert_eq!(
