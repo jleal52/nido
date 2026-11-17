@@ -570,6 +570,105 @@ const TOOLS: &[Tool] = &[
         about: "Remove your plan (when the work is over or the plan no longer applies).",
         args: &[],
     },
+    Tool {
+        any_of: &[],
+        name: "board",
+        about: "The user's projects and objectives: the board of their nido account, shared \
+                with the nido web and app. Returns compact text: each project with its \
+                objectives (in order), their state and note, the sessions working on each one \
+                (with their plan's progress) and the plan totals. Ids are shown as #<first 8 \
+                hex>; the board tools take an id (or its first 8 or more hex) or the exact \
+                name (case-insensitive). Archived projects are left out unless archived is \
+                true or you ask for one with project.",
+        args: &[
+            opt(
+                "project",
+                "string",
+                "Only this project (its id or name), with the descriptions.",
+            ),
+            opt("archived", "boolean", "Also show the archived projects."),
+        ],
+    },
+    Tool {
+        any_of: &[],
+        name: "project",
+        about: "Create, change or delete a project of the board. Without id it creates one \
+                (name required; state active by default). With id (the project's id or name) \
+                it changes the fields given, or deletes it with delete: true, together with \
+                its objectives and their links (to keep it, set state archived instead). Names \
+                are unique. Returns {ok, id, name, state}, or {ok, deleted, objectives, links}.",
+        args: &[
+            opt(
+                "id",
+                "string",
+                "The project to change or delete: its id or name. Without it, a new one.",
+            ),
+            opt("name", "string", "Its name (short, one line)."),
+            opt("desc", "string", "A description (\"\" removes it)."),
+            opt("state", "string", "active or archived."),
+            opt(
+                "delete",
+                "boolean",
+                "Delete it, with its objectives and their links.",
+            ),
+        ],
+    },
+    Tool {
+        any_of: &[],
+        name: "objective",
+        about: "Create, change or delete an objective of a project. Without id it creates one \
+                in project (name required; state pending; at the end unless order is given). \
+                With id (the objective's id or name, looked up in project if given, else in \
+                all projects) it changes the fields given, or deletes it with delete: true, \
+                with its links. Names are unique within a project. Returns {ok, id, project, \
+                name, state, order}, or {ok, deleted, links}.",
+        args: &[
+            opt(
+                "id",
+                "string",
+                "The objective to change or delete: its id or name. Without it, a new one.",
+            ),
+            opt(
+                "project",
+                "string",
+                "Its project: id or name. Required to create one.",
+            ),
+            opt("name", "string", "Its name (short, one line)."),
+            opt("desc", "string", "A description (\"\" removes it)."),
+            opt(
+                "state",
+                "string",
+                "pending, doing, blocked, done or dropped.",
+            ),
+            opt(
+                "note",
+                "string",
+                "A short note on how it goes, shown on the board (\"\" removes it).",
+            ),
+            opt(
+                "order",
+                "number",
+                "Its place in the project (lower first). To put it between two others, use \
+                 the mean of theirs.",
+            ),
+            opt("delete", "boolean", "Delete it, with its links."),
+        ],
+    },
+    Tool {
+        any_of: &[],
+        name: "join",
+        about: "Say that this session works on an objective of the board: the user sees it \
+                there, with your plan's progress. Does nothing if it already does. Call leave \
+                when you stop working on it. Returns {ok, objective, name, link, already}.",
+        args: &[req("objective", "string", "The objective: its id or name.")],
+    },
+    Tool {
+        any_of: &[],
+        name: "leave",
+        about: "Say that this session no longer works on an objective (removes its link). \
+                Returns {ok, objective, removed}.",
+        args: &[req("objective", "string", "The objective: its id or name.")],
+    },
 ];
 
 const INSTRUCTIONS: &str = "nido manages the user's terminal sessions (mostly Claude Code) on \
@@ -602,7 +701,11 @@ user a text to copy or a file. If what to copy is in a file or comes out of a co
 copy it into `text`, it would go through the conversation.
 
 With plan_set and plan_task you keep a plan of phases and tasks that the user sees live in the \
-nido web and app.";
+nido web and app.
+
+The user's projects and objectives are on the board: `board` shows it, and `project` and \
+`objective` create, change and delete them. When you work on one of its objectives, `join` it \
+(the user then sees your plan's progress there), and `leave` it when you stop.";
 
 const OUTSIDE: &str = "This Claude session is not running inside nido: no nido tools here.";
 
@@ -666,6 +769,7 @@ fn bad_value(a: &Arg, v: &Value) -> Option<String> {
             Some(format!("`{k}` must not be empty"))
         }
         "boolean" if !v.is_boolean() => Some(format!("`{k}` must be a boolean")),
+        "number" if !v.is_number() => Some(format!("`{k}` must be a number")),
         "integer" if !v.is_u64() => Some(format!("`{k}` must be an integer >= 0")),
         "array" if !v.is_array() => Some(format!("`{k}` must be an array")),
         _ => None,
@@ -1220,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_the_sixteen_tools() {
+    fn lists_the_tools() {
         let mut st = State::for_tests(Some("abc12345"));
         let out = handle(
             &mut st,
@@ -1249,7 +1353,12 @@ mod tests {
                 "plan_set",
                 "plan_task",
                 "plan_get",
-                "plan_clear"
+                "plan_clear",
+                "board",
+                "project",
+                "objective",
+                "join",
+                "leave"
             ]
         );
         for t in tools {
@@ -1309,6 +1418,62 @@ mod tests {
                 .contains("nido clip")
         );
         assert_eq!(tools[11]["inputSchema"]["required"], json!(["path"]));
+    }
+
+    /// Las del tablero: sus argumentos, y `order` es un número real.
+    #[test]
+    fn the_board_tools_and_their_schemas() {
+        let schema = |name: &str| schema(TOOLS.iter().find(|t| t.name == name).unwrap());
+        // Las claves salen ordenadas (el `Map` de serde_json): se comparan ordenadas.
+        let props = |name: &str| -> Vec<String> {
+            schema(name)["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let sorted = |l: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = l.iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(props("board"), sorted(&["project", "archived"]));
+        assert_eq!(schema("board")["properties"]["archived"]["type"], "boolean");
+        assert_eq!(
+            props("project"),
+            sorted(&["id", "name", "desc", "state", "delete"])
+        );
+        assert_eq!(
+            props("objective"),
+            sorted(&[
+                "id", "project", "name", "desc", "state", "note", "order", "delete"
+            ])
+        );
+        assert_eq!(schema("objective")["properties"]["order"]["type"], "number");
+        assert_eq!(
+            schema("objective")["properties"]["delete"]["type"],
+            "boolean"
+        );
+        for t in ["board", "project", "objective"] {
+            assert_eq!(schema(t)["required"], json!([]), "{t}");
+        }
+        for t in ["join", "leave"] {
+            assert_eq!(props(t), ["objective"]);
+            assert_eq!(schema(t)["required"], json!(["objective"]), "{t}");
+        }
+        let (mut st, f) = with(Ok(json!({"ok": true})));
+        let r = call(&mut st, "objective", json!({"id": "x", "order": "1"}));
+        assert_eq!(r["isError"], true, "{r}");
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("`order` must be a number"), "{text}");
+        assert!(f.calls.lock().unwrap().is_empty());
+        let r = call(&mut st, "objective", json!({"id": "x", "order": 1.5}));
+        assert_eq!(r["isError"], false, "{r}");
+        let r = call(&mut st, "join", json!({"objective": " "}));
+        assert_eq!(r["isError"], true, "{r}");
+        assert_eq!(f.calls.lock().unwrap().len(), 1);
+        assert!(INSTRUCTIONS.contains("`join`") && INSTRUCTIONS.contains("`board`"));
     }
 
     #[test]

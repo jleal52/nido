@@ -1147,6 +1147,189 @@ const TABLE: &[(&str, &str)] = &[
         "ese equipo no tiene planes (su nido es anterior)",
         "that machine has no plans (its nido is older)",
     ),
+    // board_tools.rs: las herramientas del tablero
+    (
+        "este equipo no está conectado a ningún hub: el tablero es de la cuenta del hub (nido hub set …)",
+        "this machine is not connected to any hub: the board belongs to the hub account (nido hub set …)",
+    ),
+    (
+        "este equipo aún no tiene id en el hub: prueba en un rato",
+        "this machine has no id in the hub yet: try again in a while",
+    ),
+    (
+        "el objeto {} no se puede leer ({}): no se cambia ni se borra",
+        "object {0} can't be read ({1}): it is neither changed nor deleted",
+    ),
+    ("{} no es un proyecto", "{0} is not a project"),
+    ("{} no es un objetivo", "{0} is not an objective"),
+    ("{} no es de ese proyecto", "{0} is not in that project"),
+    (
+        "el id {} es el principio de varios: {}; da más cifras",
+        "id {0} is the start of several: {1}; give more digits",
+    ),
+    ("no hay ningún proyecto «{}»", "there is no project “{0}”"),
+    (
+        "no hay ningún proyecto «{}»; los que hay: {}",
+        "there is no project “{0}”; these are: {1}",
+    ),
+    ("no hay ningún objetivo «{}»", "there is no objective “{0}”"),
+    (
+        "no hay ningún objetivo «{}»; los que hay: {}",
+        "there is no objective “{0}”; these are: {1}",
+    ),
+    (
+        "no hay ningún objetivo «{}» en «{}»",
+        "there is no objective “{0}” in “{1}”",
+    ),
+    (
+        "no hay ningún objetivo «{}» en «{}»; los que hay: {}",
+        "there is no objective “{0}” in “{1}”; these are: {2}",
+    ),
+    (
+        "hay {} proyectos «{}»: {}; usa el id",
+        "there are {0} projects “{1}”: {2}; use the id",
+    ),
+    (
+        "hay {} objetivos «{}»: {}; usa el id",
+        "there are {0} objectives “{1}”: {2}; use the id",
+    ),
+    (
+        "ya hay un proyecto «{}» ({}): usa otro nombre",
+        "there is already a project “{0}” ({1}): use another name",
+    ),
+    (
+        "ya hay un objetivo «{}» ({}): usa otro nombre",
+        "there is already an objective “{0}” ({1}): use another name",
+    ),
+    (
+        "el objeto cambió a la vez en otro sitio varias veces seguidas: prueba otra vez",
+        "the object was changed elsewhere at the same time, several times in a row: try again",
+    ),
+    (
+        "el tablero de la cuenta está lleno: borra objetivos o proyectos que ya no hagan falta",
+        "the account's board is full: delete objectives or projects that are no longer needed",
+    ),
+    (
+        "el objeto es demasiado grande para el hub: acorta la descripción o la nota",
+        "the object is too big for the hub: shorten the description or the note",
+    ),
+    (
+        "demasiadas escrituras en el tablero: prueba en un rato",
+        "too many writes to the board: try again in a while",
+    ),
+    (
+        "el hub no acepta la petición del tablero ({})",
+        "the hub does not accept the board request ({0})",
+    ),
+    ("el hub no contestó", "the hub did not answer"),
+    (
+        "respuesta del tablero no válida",
+        "invalid answer from the board",
+    ),
+    (
+        "no hay clave del tablero: prueba otra vez",
+        "there is no board key: try again",
+    ),
+    (
+        "el objeto {} ya no está en el tablero",
+        "object {0} is no longer on the board",
+    ),
+    (
+        "demasiado grande: {} bytes (como mucho {}); acorta la descripción o la nota",
+        "too big: {0} bytes (at most {1}); shorten the description or the note",
+    ),
+    (
+        "no se pudo cifrar el objeto ({})",
+        "could not encrypt the object ({0})",
+    ),
+    (
+        "{} (el borrado se quedó a medias: vuelve a pedirlo para acabar)",
+        "{0} (the deletion was left halfway: ask again to finish it)",
+    ),
+    ("el nombre está vacío", "the name is empty"),
+    (
+        "el nombre no puede llevar saltos de línea",
+        "the name cannot contain line breaks",
+    ),
+    (
+        "el nombre es demasiado largo (como mucho {} caracteres)",
+        "the name is too long (at most {0} characters)",
+    ),
+    (
+        "estado de proyecto desconocido «{}»: active o archived",
+        "unknown project state “{0}”: active or archived",
+    ),
+    (
+        "estado de objetivo desconocido «{}»: pending, doing, blocked, done o dropped",
+        "unknown objective state “{0}”: pending, doing, blocked, done or dropped",
+    ),
+    ("para borrar hace falta id", "to delete, give id"),
+    (
+        "para crear un proyecto hace falta name (o id, para cambiar uno)",
+        "to create a project, give name (or id, to change one)",
+    ),
+    (
+        "para crear un objetivo hace falta project (o id, para cambiar uno)",
+        "to create an objective, give project (or id, to change one)",
+    ),
+    (
+        "para crear un objetivo hace falta name (o id, para cambiar uno)",
+        "to create an objective, give name (or id, to change one)",
+    ),
+    (
+        "delete va solo, sin otros cambios",
+        "delete goes alone, without other changes",
+    ),
+    (
+        "nada que cambiar: da name, desc, state o delete",
+        "nothing to change: give name, desc, state or delete",
+    ),
+    (
+        "nada que cambiar: da name, desc, state, note, order o delete",
+        "nothing to change: give name, desc, state, note, order or delete",
+    ),
+    ("order tiene que ser un número", "order must be a number"),
+    // El texto de `board` (solo las etiquetas: lo que escribió el usuario va tal cual)
+    ("sin su clave", "without its key"),
+    ("no se descifra", "does not decrypt"),
+    ("no es un objeto", "not an object"),
+    ("de un tipo que no se conoce", "of an unknown type"),
+    ("no está en el hub", "not in the hub"),
+    ("sin plan", "no plan"),
+    ("1 bloqueada", "1 blocked"),
+    ("{} bloqueadas", "{0} blocked"),
+    ("1 fallida", "1 failed"),
+    ("{} fallidas", "{0} failed"),
+    ("descripción: ", "description: "),
+    ("nota: ", "note: "),
+    ("cerrada", "closed"),
+    (
+        "1 proyecto archivado sin enseñar (archived: true para verlo)",
+        "1 archived project not shown (archived: true to see it)",
+    ),
+    (
+        "{} proyectos archivados sin enseñar (archived: true para verlos)",
+        "{0} archived projects not shown (archived: true to see them)",
+    ),
+    ("No se puede leer 1 objeto:", "1 object can't be read:"),
+    (
+        "No se pueden leer {} objetos:",
+        "{0} objects can't be read:",
+    ),
+    ("(no se puede leer)", "(unreadable)"),
+    ("  … y {} más", "  … and {0} more"),
+    (
+        "El tablero está vacío: crea un proyecto con `project`.",
+        "The board is empty: create a project with `project`.",
+    ),
+    (
+        "… se omiten {} objetivos y {} proyectos: pide uno con `project`",
+        "… {0} objectives and {1} projects left out: ask for one with `project`",
+    ),
+    (
+        "sin poder hablar con el hub: {}; es la copia de este equipo",
+        "could not talk to the hub: {0}; this is this machine's copy",
+    ),
 ];
 
 #[cfg(test)]
@@ -1306,6 +1489,40 @@ mod tests {
         assert_eq!(
             english("la sesión ya no existe"),
             "the session no longer exists"
+        );
+    }
+
+    /// Los de las herramientas del tablero: los errores y las etiquetas de `board`.
+    #[test]
+    fn board_tool_messages() {
+        assert_eq!(
+            english("no hay ningún objetivo «Docs» en «Web»; los que hay: «A», «B»"),
+            "there is no objective “Docs” in “Web”; these are: «A», «B»"
+        );
+        assert_eq!(
+            english("hay 2 proyectos «web»: «Web» aa, «web» bb; usa el id"),
+            "there are 2 projects “web”: «Web» aa, «web» bb; use the id"
+        );
+        assert_eq!(
+            english("el objeto ee no se puede leer (sin su clave): no se cambia ni se borra"),
+            "object ee can't be read (without its key): it is neither changed nor deleted"
+        );
+        assert_eq!(
+            english(
+                "demasiadas escrituras en el tablero: prueba en un rato (el borrado se quedó a \
+                 medias: vuelve a pedirlo para acabar)"
+            ),
+            "too many writes to the board: try again in a while (the deletion was left halfway: \
+             ask again to finish it)"
+        );
+        assert_eq!(english("3 bloqueadas"), "3 blocked");
+        assert_eq!(
+            english("… se omiten 12 objetivos y 3 proyectos: pide uno con `project`"),
+            "… 12 objectives and 3 projects left out: ask for one with `project`"
+        );
+        assert_eq!(
+            english("sin poder hablar con el hub: el hub no contestó; es la copia de este equipo"),
+            "could not talk to the hub: the hub did not answer; this is this machine's copy"
         );
     }
 
