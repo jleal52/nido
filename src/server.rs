@@ -72,9 +72,10 @@ pub struct AppState {
     /// El grupo de equipos y el aviso de que hay que sincronizarlo.
     pub group: crate::group::Group,
     group_dirty: Notify,
-    /// Una rotación de la clave del tablero que debe `apply_group` (un dispositivo quitado tenía
-    /// la actual) y que no se pudo guardar: se reintenta en el siguiente.
-    board_rotation_owed: std::sync::atomic::AtomicBool,
+    /// Las claves del tablero que había que cambiar (un dispositivo quitado tenía la actual) y
+    /// no se pudo, por no poder guardar: el siguiente `apply_group` rota si la actual sigue
+    /// siendo una de ellas (`retry_owed`).
+    board_rotation_owed: std::sync::Mutex<Vec<String>>,
     /// Las peticiones de otros equipos ya atendidas (`e2e::MODE_PEER`), para no repetirlas.
     peer_replays: e2e::PeerReplays,
     /// Dónde estaba la conversación de cada sesión al encolarle un mensaje (`send`), para saber
@@ -2019,8 +2020,7 @@ impl AppState {
     /// Lo que el grupo ha dado de baja, fuera también de aquí (sin cambiar la clave del tablero:
     /// ya la cambió el equipo que lo quitó).
     fn apply_group(&self) {
-        // La rotación que quedó debida, si la hay.
-        self.rotate_if_given(&[]);
+        self.retry_owed();
         for key in self.group.removed_devices() {
             let given = self
                 .phones
@@ -2032,6 +2032,8 @@ impl AppState {
                 .map(|p| p.board_kids.clone())
                 .unwrap_or_default();
             self.rotate_if_given(&given);
+            #[cfg(test)]
+            tests::run_apply_group_hook(self);
             let mut phones = self.phones.lock().expect("teléfonos");
             let (id, given) = phones
                 .list()
@@ -2059,7 +2061,7 @@ impl AppState {
     /// baja, antes de que esta llegara (`api_board_keys`): la primera, creada aquí con el llavero
     /// vacío, o una que llegó aquí antes que la baja. Esa clave es posterior a la baja, así que
     /// `rotation_due` no la rotaría. Se rota si la actual está entre las activas que se le dieron
-    /// (`board_kids`), o si quedó debida una rotación anterior que no se pudo guardar.
+    /// (`board_kids`, que junta todas las activas que se le dieron y solo poda las retiradas).
     ///
     /// Se mira por `kid`, no por horas: no depende de los relojes de los equipos ni de empates en
     /// el mismo milisegundo, y una retirada nunca vuelve a ser activa. En una baja normal, que
@@ -2074,22 +2076,19 @@ impl AppState {
     /// traía la baja y no rota.
     ///
     /// Si no se puede guardar, no rota (`rotate_board_key` no da una clave que no está en el
-    /// disco) y queda debida en memoria (`board_rotation_owed`), para el siguiente `apply_group`.
-    /// Tras un reinicio con la rotación aún debida, se pierde: es el único hueco que queda, y
-    /// solo con el disco fallando.
+    /// disco) y la actual queda adeudada en memoria (`board_rotation_owed`), para `retry_owed`.
+    /// Tras un reinicio con la rotación aún adeudada, se pierde: es el único hueco que queda, y
+    /// solo con el disco fallando. No mira lo adeudado: así, con el disco fallando, cada baja
+    /// intenta solo lo suyo.
     fn rotate_if_given(&self, given: &[String]) {
-        use std::sync::atomic::Ordering;
-        let holds_current = self
-            .group
-            .board_keys()
-            .current()
-            .is_some_and(|k| given.contains(&k.kid));
-        if !holds_current && !self.board_rotation_owed.load(Ordering::SeqCst) {
+        let Some(current) = self.group.board_keys().current().map(|k| k.kid.clone()) else {
+            return;
+        };
+        if !given.contains(&current) {
             return;
         }
         match self.group.rotate_after_removal() {
             Ok(rotated) => {
-                self.board_rotation_owed.store(false, Ordering::SeqCst);
                 if rotated.is_some() {
                     eprintln!(
                         "nido: cambiada la clave del tablero que pudo llevarse un dispositivo quitado"
@@ -2097,11 +2096,38 @@ impl AppState {
                 }
             }
             Err(e) => {
-                self.board_rotation_owed.store(true, Ordering::SeqCst);
+                let mut owed = self.board_rotation_owed.lock().expect("deuda");
+                if !owed.contains(&current) {
+                    owed.push(current);
+                }
                 eprintln!(
-                    "nido: no se pudo guardar la rotación de la clave del tablero tras una baja ({e}); se reintentará"
+                    "nido: no se pudo guardar el cambio de la clave del tablero tras una baja ({e}); se reintentará"
                 );
             }
+        }
+    }
+
+    /// Reintenta la rotación adeudada (`rotate_if_given`), una vez por `apply_group`: solo si la
+    /// actual sigue siendo una de las adeudadas. Si ya no (otro equipo rotó, o se rotó aquí por
+    /// otra baja), la deuda está pagada y no se rota de más.
+    fn retry_owed(&self) {
+        let mut owed = self.board_rotation_owed.lock().expect("deuda");
+        if owed.is_empty() {
+            return;
+        }
+        let current = self.group.board_keys().current().map(|k| k.kid.clone());
+        if !current.is_some_and(|c| owed.contains(&c)) {
+            owed.clear();
+            return;
+        }
+        match self.group.rotate_after_removal() {
+            Ok(_) => {
+                owed.clear();
+                eprintln!("nido: cambiada la clave del tablero que quedó pendiente tras una baja");
+            }
+            Err(e) => eprintln!(
+                "nido: sigue sin poder guardarse el cambio de la clave del tablero ({e}); se reintentará"
+            ),
         }
     }
 
@@ -2954,11 +2980,20 @@ async fn api_board_keys(
         Err(KeysRefused::NotInGroup) => return error(StatusCode::FORBIDDEN, BOARD_KEYS_DENIED),
         Err(KeysRefused::NoKey) => return error(StatusCode::SERVICE_UNAVAILABLE, BOARD_KEY_NONE),
     };
-    let noted = st
-        .phones
-        .lock()
-        .expect("teléfonos")
-        .note_board_kids(&device_id, ring.active_kids());
+    // Lo que ya está retirado o borrado no puede volver a ser la actual: se poda de lo apuntado.
+    let dead: Vec<String> = st
+        .group
+        .snapshot()
+        .keys
+        .iter()
+        .filter(|k| k.removed || k.retired.is_some())
+        .map(|k| k.kid.clone())
+        .collect();
+    let noted =
+        st.phones
+            .lock()
+            .expect("teléfonos")
+            .note_board_kids(&device_id, ring.active_kids(), &dead);
     match noted {
         Ok(true) => {}
         Ok(false) => return error(StatusCode::FORBIDDEN, BOARD_KEYS_DENIED),
@@ -4866,6 +4901,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
+    /// Lo que corre en `apply_group` entre la primera mirada a `board_kids` y la baja en
+    /// `phones`.
+    type ApplyGroupHook = Box<dyn Fn(&AppState)>;
+
+    thread_local! {
+        /// El gancho de `apply_group` (las pruebas son de un solo hilo: el mismo que la llama).
+        static APPLY_GROUP_HOOK: std::cell::RefCell<Option<ApplyGroupHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_apply_group_hook(st: &AppState) {
+        APPLY_GROUP_HOOK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(st);
+            }
+        });
+    }
+
+    fn set_apply_group_hook(f: ApplyGroupHook) {
+        APPLY_GROUP_HOOK.with(|h| *h.borrow_mut() = Some(f));
+    }
+
     #[test]
     fn a_stop_time_from_before_the_last_run_is_forgotten() {
         let since = crate::mcp_api::since;
@@ -5496,7 +5553,7 @@ mod tests {
             .add(&[2u8; 32], "web", None)
             .unwrap();
         // El fichero temporal de `phones.json` es una carpeta: no se puede guardar.
-        std::fs::create_dir_all(tmp.path().join("data").join("phones.tmp")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("data").join("phones.json.tmp")).unwrap();
         assert_eq!(
             remove_phone(&st, &phone.id).status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -5948,7 +6005,7 @@ mod tests {
         let key = st.group.ensure_board_key().unwrap();
         // Como en `a_removal_that_cannot_be_saved_still_tells_the_hub`: `phones.json` no se
         // puede guardar.
-        let blocker = tmp.path().join("data").join("phones.tmp");
+        let blocker = tmp.path().join("data").join("phones.json.tmp");
         std::fs::create_dir_all(&blocker).unwrap();
         let (code, _, body) = board_keys_with(&st, &phone.token).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -5958,6 +6015,21 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         let noted = crate::e2e::Phones::load(tmp.path().join("data/phones.json"));
         assert_eq!(noted.list()[0].board_kids, vec![key.kid]);
+    }
+
+    /// Tras rotar, lo apuntado es la nueva: la retirada se poda, porque ya no puede ser la
+    /// actual.
+    #[tokio::test]
+    async fn the_noted_board_kids_follow_rotations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        st.group.ensure_board_key().unwrap();
+        board_keys_with(&st, &phone.token).await;
+        let new = st.group.rotate_board_key().unwrap();
+        board_keys_with(&st, &phone.token).await;
+        let noted = st.phones.lock().unwrap().list()[0].board_kids.clone();
+        assert_eq!(noted, vec![new.kid]);
     }
 
     /// Quitado con el llavero vacío: 403, y no se crea ninguna clave.
@@ -6105,6 +6177,68 @@ mod tests {
         assert_eq!(ring.keys.len(), 2);
         a.apply_group();
         assert_eq!(a.group.board_keys(), ring, "no rota otra vez");
+    }
+
+    /// La segunda mirada de `apply_group`: una petición con una instantánea de antes de la baja
+    /// apunta la clave justo entre la primera mirada y la baja en `phones` (el gancho). Se ve
+    /// con lo que se copia al quitarlo, y se rota.
+    #[tokio::test]
+    async fn a_note_between_the_two_looks_of_apply_group_is_seen() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        b.group.merge(&a.group.snapshot());
+        b.group.remove_device_rotating(&phone.key);
+        assert!(a.group.merge(&b.group.snapshot()));
+        let id = phone.id.clone();
+        let k1 = Arc::new(std::sync::Mutex::new(None));
+        let seen = k1.clone();
+        set_apply_group_hook(Box::new(move |st: &AppState| {
+            let k = st.group.ensure_board_key().unwrap();
+            st.phones
+                .lock()
+                .unwrap()
+                .note_board_kids(&id, vec![k.kid.clone()], &[])
+                .unwrap();
+            *seen.lock().unwrap() = Some(k.kid);
+        }));
+        a.apply_group();
+        APPLY_GROUP_HOOK.with(|h| *h.borrow_mut() = None);
+        let k1 = k1.lock().unwrap().clone().expect("el gancho corrió");
+        assert!(a.phones.lock().unwrap().list().is_empty());
+        let ring = a.group.board_keys();
+        assert_ne!(
+            ring.current().unwrap().kid,
+            k1,
+            "rotada en la segunda mirada"
+        );
+        assert_eq!(ring.keys.len(), 2);
+    }
+
+    /// Lo que se debe de una rotación que no se pudo guardar se reintenta una vez por
+    /// `apply_group`, aunque haya muchos dispositivos quitados, y no se rota si la actual ya no
+    /// es la adeudada (otro equipo rotó entre medias).
+    #[tokio::test]
+    async fn an_owed_rotation_is_dropped_if_someone_else_rotated() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        b.group.merge(&a.group.snapshot());
+        b.group.remove_device_rotating(&phone.key);
+        let (_, _, body) = board_keys_with(&a, &phone.token).await;
+        let k1 = body["current"].as_str().unwrap().to_owned();
+        assert!(a.group.merge(&b.group.snapshot()));
+        let blocker = t1.path().join("data/group.json.tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        a.apply_group();
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(a.group.board_keys().current().unwrap().kid, k1, "debida");
+        // Otro equipo rota antes del reintento.
+        let other = a.group.rotate_board_key().unwrap();
+        a.apply_group();
+        let ring = a.group.board_keys();
+        assert_eq!(ring.current(), Some(&other), "no rota de más");
+        assert_eq!(ring.keys.len(), 2);
     }
 
     /// Una baja normal, que llega con su rotación: D tenía la de antes, no la nueva. No se rota

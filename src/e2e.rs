@@ -185,8 +185,11 @@ impl Identity {
                     x25519: k.x25519.clone(),
                     ed25519: Some(B64.encode(seed)),
                 };
-                write_private(path, &serde_json::to_vec_pretty(&file).expect("json"))
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                crate::sys::write_private_atomic(
+                    path,
+                    &serde_json::to_vec_pretty(&file).expect("json"),
+                )
+                .map_err(|e| format!("{}: {e}", path.display()))?;
                 seed
             }
         };
@@ -206,23 +209,6 @@ impl Identity {
 /// La pública de una privada X25519.
 fn x25519_public(private: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private)).to_bytes()
-}
-
-/// Escribe un fichero que solo puede leer el usuario (0600), de una vez.
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let mut f = crate::sys::private(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true),
-    )
-    .open(&tmp)?;
-    std::io::Write::write_all(&mut f, data)?;
-    std::fs::rename(&tmp, path)
 }
 
 // ---------- Teléfonos emparejados ----------
@@ -273,7 +259,9 @@ impl Phones {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        write_private(&self.path, &serde_json::to_vec_pretty(&self.list)?)
+        // Lleva los tokens: 0600, entero o nada, y en el disco (`board_kids` tiene que
+        // sobrevivir a un reinicio).
+        crate::sys::write_private_atomic(&self.path, &serde_json::to_vec_pretty(&self.list)?)
     }
 
     pub fn views(&self) -> Vec<PhoneView> {
@@ -349,12 +337,30 @@ impl Phones {
     }
 
     /// Apunta qué claves activas del tablero se le dan (`board_kids`), y lo guarda si cambió.
-    /// `Ok(false)` si ya no está (lo acaban de quitar). Si no se puede guardar, queda como estaba,
-    /// para volver a intentarlo en la siguiente petición.
-    pub fn note_board_kids(&mut self, id: &str, kids: Vec<String>) -> std::io::Result<bool> {
+    /// Se junta con lo que ya tenía: dos peticiones a la vez con una rotación entre medias
+    /// podrían apuntar la vieja después de la nueva. Solo se quita lo que está en `dead` (las
+    /// retiradas o borradas, según una lectura del llavero hecha antes): una retirada no vuelve
+    /// a ser la actual. Lo dado ahora se queda siempre. `Ok(false)` si ya no está (lo acaban de
+    /// quitar). Si no se puede guardar, queda como estaba, para volver a intentarlo en la
+    /// siguiente petición.
+    pub fn note_board_kids(
+        &mut self,
+        id: &str,
+        given: Vec<String>,
+        dead: &[String],
+    ) -> std::io::Result<bool> {
         let Some(i) = self.list.iter().position(|p| p.id == id) else {
             return Ok(false);
         };
+        let mut kids: Vec<String> = self.list[i]
+            .board_kids
+            .iter()
+            .filter(|k| !dead.contains(k))
+            .cloned()
+            .chain(given)
+            .collect();
+        kids.sort();
+        kids.dedup();
         if self.list[i].board_kids == kids {
             return Ok(true);
         }
@@ -1314,6 +1320,48 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// Lo apuntado se junta con lo de antes (dos peticiones a la vez con una rotación entre
+    /// medias no dejan solo la vieja): solo se quita lo que se sabe retirado o borrado.
+    #[test]
+    fn the_board_kids_add_up_and_only_dead_ones_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut phones = Phones::load(dir.path().join("phones.json"));
+        let p = phones.add(&[1u8; 32], "tel", None).unwrap();
+        let kids = |v: &[&str]| v.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        let noted = |phones: &Phones| phones.list()[0].board_kids.clone();
+        phones.note_board_kids(&p.id, kids(&["b"]), &[]).unwrap();
+        // La petición vieja apunta después, con la de antes de rotar: quedan las dos.
+        phones.note_board_kids(&p.id, kids(&["a"]), &[]).unwrap();
+        assert_eq!(noted(&phones), kids(&["a", "b"]));
+        phones
+            .note_board_kids(&p.id, kids(&["c"]), &kids(&["a", "x"]))
+            .unwrap();
+        assert_eq!(noted(&phones), kids(&["b", "c"]));
+        // Lo dado ahora no se quita aunque salga como retirado (no puede: se da por activo).
+        phones
+            .note_board_kids(&p.id, kids(&["c"]), &kids(&["b"]))
+            .unwrap();
+        assert_eq!(noted(&phones), kids(&["c"]));
+    }
+
+    /// `phones.json` lleva los tokens: 0600, también si quedó un temporal de antes con otros
+    /// permisos (el `write_private` de antes lo abría sin crearlo y conservaba su modo).
+    #[cfg(unix)]
+    #[test]
+    fn the_phones_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phones.json");
+        let tmp = dir.path().join("phones.json.tmp");
+        std::fs::write(&tmp, b"de antes").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut phones = Phones::load(path.clone());
+        phones.add(&[1u8; 32], "tel", None).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!tmp.exists());
+    }
+
     /// Lo que se le dio del llavero se guarda con el teléfono, sobrevive a reemparejarlo, y un
     /// `phones.json` de antes (sin el campo) se lee igual.
     #[test]
@@ -1324,12 +1372,17 @@ mod tests {
         let p = phones.add(&[1u8; 32], "tel", None).unwrap();
         assert!(p.board_kids.is_empty());
         let kids = vec!["00112233aabbccdd".to_owned()];
-        assert!(phones.note_board_kids(&p.id, kids.clone()).unwrap());
-        assert!(!phones.note_board_kids("no-esta", kids.clone()).unwrap());
+        assert!(phones.note_board_kids(&p.id, kids.clone(), &[]).unwrap());
+        assert!(
+            !phones
+                .note_board_kids("no-esta", kids.clone(), &[])
+                .unwrap()
+        );
         assert_eq!(Phones::load(path.clone()).list()[0].board_kids, kids);
         let again = phones.add(&[1u8; 32], "tel", None).unwrap();
         assert_eq!(again.board_kids, kids, "reemparejado, sigue teniéndolas");
         // Un fichero de antes.
+        let path = dir.path().join("antes.json");
         let old = serde_json::json!([{"id": "a1", "name": "tel", "key": "k", "token": "t",
             "added": 1}]);
         std::fs::write(&path, old.to_string()).unwrap();
