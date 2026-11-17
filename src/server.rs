@@ -4148,8 +4148,9 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
 /// cifre desde ahora no lo lee quien se fue, y la tarea del llavero (`board::spawn_upkeep`)
 /// recifra lo de antes. Solo donde se quita: al enterarse de que lo quitó otro equipo
 /// (`apply_group`) no, que ese ya rotó. Con el llavero vacío no hay nada que cambiar: quien se
-/// fue no tenía ninguna clave. Si no se puede guardar, queda pendiente y la reintenta la tarea
-/// del llavero (`BoardCache::upkeep`) hasta que sale.
+/// fue no tenía ninguna clave. Si no se puede guardar, la baja queda en el estado y la tarea del
+/// llavero (`BoardCache::upkeep`, aquí o en otro equipo) rota en cuanto pueda
+/// (`Group::rotate_if_due`).
 fn rotate_board_key(st: &AppState) {
     match st.group.rotate_after_removal() {
         Ok(Some(k)) => eprintln!("nido: la clave del tablero ha cambiado ({})", k.kid),
@@ -4170,13 +4171,15 @@ fn remove_phone(st: &AppState, id: &str) -> Response {
         .iter()
         .find(|p| p.id == id)
         .map(|p| p.key.clone());
-    if let Some(k) = &key {
-        if st.group.remove_device(k) {
-            rotate_board_key(st);
-        }
+    let in_group = key.as_ref().is_some_and(|k| st.group.remove_device(k));
+    // Fuera de aquí antes de rotar: que no pueda pedir la clave nueva entre medias.
+    let removed = st.phones.lock().expect("teléfonos").remove(id);
+    if in_group {
+        rotate_board_key(st);
+    }
+    if key.is_some() {
         st.group_dirty.notify_one();
     }
-    let removed = st.phones.lock().expect("teléfonos").remove(id);
     // Sus sesiones del hub, fuera también; aunque no se haya podido guardar la baja, de la
     // memoria ya ha salido.
     if key.is_some() {
@@ -5425,7 +5428,13 @@ mod tests {
             let blob = crate::board::seal(&raw(&old), id, text).unwrap();
             board.lock().unwrap().write(id, Some((&old.kid, &blob)));
         }
-        st.board.sync().await.unwrap();
+        // La copia, con un hueco corto entre escrituras (no los 6 s de verdad).
+        let cache = crate::board::BoardCache::load_with(
+            tmp.path().join("data/board-prueba.json"),
+            st.hub.clone(),
+            Duration::from_millis(50),
+        );
+        cache.sync().await.unwrap();
         st.group.add_device(&[1u8; 32], "tel");
         let phone = st
             .phones
@@ -5439,8 +5448,7 @@ mod tests {
         );
         let new = st.group.board_keys().current().cloned().unwrap();
         assert_ne!(new.kid, old.kid);
-        crate::board::spawn_upkeep_with(st.board.clone(), st.clone(), Duration::from_secs(3600));
-        // Dos escrituras, a 6 s una de otra.
+        crate::board::spawn_upkeep_with(cache.clone(), st.clone(), Duration::from_secs(3600));
         let wait = async {
             while !board
                 .lock()
@@ -5452,7 +5460,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        tokio::time::timeout(Duration::from_secs(30), wait)
+        tokio::time::timeout(Duration::from_secs(10), wait)
             .await
             .expect("todo recifrado");
         for (id, text) in &texts {

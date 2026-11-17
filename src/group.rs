@@ -347,9 +347,10 @@ pub struct Group {
     many_keys_said: Mutex<Option<Instant>>,
     /// Y de claves propias de más de un día por delante (un reloj adelantado).
     future_key_said: Mutex<Option<Instant>>,
-    /// Una baja cuya rotación no se pudo guardar: se reintenta (`retry_pending_rotation`) hasta
-    /// que salga. Solo en memoria: si no se pudo guardar, la baja tampoco está en el disco.
-    rotation_pending: std::sync::atomic::AtomicBool,
+    /// Y de más de `MAX_BOARD_KEYS` claves con secreto (`tidy_board_keys`).
+    many_live_said: Mutex<Option<Instant>>,
+    /// Y de una rotación pendiente que no se puede guardar (`rotate_if_due`).
+    rotation_said: Mutex<Option<Instant>>,
     /// Lo que se hace cuando este equipo sale del grupo (vaciar la copia del tablero).
     on_leave: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
@@ -392,7 +393,8 @@ impl Group {
             bad_key_said: Mutex::new(None),
             many_keys_said: Mutex::new(None),
             future_key_said: Mutex::new(None),
-            rotation_pending: Default::default(),
+            many_live_said: Mutex::new(None),
+            rotation_said: Mutex::new(None),
             on_leave: std::sync::OnceLock::new(),
         }
     }
@@ -760,53 +762,79 @@ impl Group {
     /// no cambia nada.
     pub fn rotate_board_key(&self) -> std::io::Result<BoardKey> {
         let raw = random_key()?;
-        self.change_saved(|st| {
-            for k in st
-                .keys
-                .iter_mut()
-                .filter(|k| !k.removed && k.retired.is_none())
-            {
-                let t = now_ms().max(k.at.saturating_add(1));
-                k.retired = Some(t);
-                k.at = t;
-            }
-            let k = BoardKey::from_raw(&raw, next_key_at(st));
-            st.keys.push(k.clone());
-            k
-        })
+        self.change_saved(|st| rotate_in(st, &raw, now_ms()))
     }
 
-    /// La rotación tras quitar un equipo o un dispositivo: lo que se cifre desde ahora no lo lee
-    /// quien se fue. Con el llavero vacío no hay nada que cambiar (quien se fue no tenía ninguna
-    /// clave): `None`. Si no se puede guardar, queda pendiente y se reintenta
-    /// (`retry_pending_rotation`).
+    /// La rotación tras quitar un equipo o un dispositivo, donde se quita: lo que se cifre desde
+    /// ahora no lo lee quien se fue. Siempre que haya llavero, aunque la actual sea más nueva que
+    /// la baja (la de un reloj adelantado). Con el llavero vacío no hay nada que cambiar (quien
+    /// se fue no tenía ninguna clave): `None`. Si no se puede guardar, la baja queda en el estado
+    /// y la rotación la hace después `rotate_if_due`, aquí o en otro equipo.
     pub fn rotate_after_removal(&self) -> std::io::Result<Option<BoardKey>> {
-        use std::sync::atomic::Ordering;
         if self.board_keys().keys.is_empty() {
-            self.rotation_pending.store(false, Ordering::SeqCst);
             return Ok(None);
         }
-        match self.rotate_board_key() {
-            Ok(k) => {
-                self.rotation_pending.store(false, Ordering::SeqCst);
-                Ok(Some(k))
-            }
+        self.rotate_board_key().map(Some)
+    }
+
+    /// Rota si toca (`rotation_due`): hay una baja posterior a la clave actual. Es la rotación
+    /// pendiente, sacada del estado: sobrevive a un reinicio, y la hace cualquier equipo si el
+    /// que quitó no llegó a hacerla (se cayó, no pudo guardar). La nueva lleva un `at` posterior
+    /// a la baja (`next_key_at`), así que después ya no toca, y en el caso normal (quien quita
+    /// rota) nadie rota dos veces. Si dos equipos rotan a la vez, una de las dos queda como
+    /// actual en todos y la otra se retira (`retire_stale`). Si no se puede guardar, se apunta
+    /// (con freno) y se intenta la próxima vez.
+    ///
+    /// Un límite conocido: si otro equipo rota por otra baja antes de enterarse de esta, su clave
+    /// es posterior a esta baja y aquí ya no toca rotar. Lo quitado aquí pudo pedirle esa clave
+    /// a ese equipo mientras tanto (solo en ese rato, antes de que se enterara de la baja).
+    pub fn rotate_if_due(&self) -> Option<BoardKey> {
+        if !rotation_due(&self.state.lock().expect("grupo"), now_ms()) {
+            return None;
+        }
+        let raw = match random_key() {
+            Ok(r) => r,
             Err(e) => {
-                self.rotation_pending.store(true, Ordering::SeqCst);
-                Err(e)
+                self.say_rotation(&e);
+                return None;
+            }
+        };
+        let now = now_ms();
+        let r = self.change_saved(|st| rotation_due(st, now).then(|| rotate_in(st, &raw, now)));
+        match r {
+            Ok(k) => k,
+            Err(e) => {
+                self.say_rotation(&e);
+                None
             }
         }
     }
 
-    /// Reintenta la rotación de una baja que no se pudo guardar, si hay una pendiente.
-    pub fn retry_pending_rotation(&self) -> Option<std::io::Result<Option<BoardKey>>> {
-        self.rotation_pending
-            .load(std::sync::atomic::Ordering::SeqCst)
-            .then(|| self.rotate_after_removal())
+    fn say_rotation(&self, e: &std::io::Error) {
+        if quietly(&self.rotation_said, KEY_WARN_QUIET) {
+            eprintln!(
+                "nido: no se pudo cambiar la clave del tablero tras una baja ({e}); se reintentará"
+            );
+        }
+    }
+
+    /// Cuántos equipos vivos tiene el grupo (este incluido), al menos 1.
+    pub fn live_member_count(&self) -> usize {
+        self.snapshot().live_members().count().max(1)
+    }
+
+    /// ¿Se avisó de que hay más de `MAX_BOARD_KEYS` claves?
+    #[cfg(test)]
+    pub fn warned_many_keys(&self) -> bool {
+        self.many_live_said.lock().unwrap().is_some()
     }
 
     /// Quita una clave del llavero (en todo el grupo). La lápida se queda sin el secreto: para
     /// ganar al juntar le bastan `kid`, `at` y `removed`. Devuelve si estaba.
+    ///
+    /// Solo para las pruebas: en nido, una clave se quita con `drop_unused_board_keys`, que mira
+    /// que no la use ningún objeto y que lleve 30 días retirada (decisión 9).
+    #[cfg(test)]
     pub fn drop_board_key(&self, kid: &str) -> bool {
         let mut found = false;
         self.change(|st| {
@@ -828,7 +856,9 @@ impl Group {
     /// - poda las lápidas de más de `KEY_TOMB_LIFE_MS` y, si pasan de `MAX_KEY_ENTRIES`, las
     ///   más viejas;
     /// - avisa (con freno) de las claves de más de un día por delante: los demás equipos las
-    ///   descartan.
+    ///   descartan;
+    /// - avisa (con freno) si hay más de `MAX_BOARD_KEYS` claves con secreto: no se quita
+    ///   ninguna por eso, solo a los 30 días (ver `drop_unused_board_keys`).
     ///
     /// Devuelve si retiró alguna, que es lo que hay que contar al resto del grupo. Podar lápidas
     /// no se cuenta: no llega a los demás (juntar es una unión) y ellos podan las mismas.
@@ -839,6 +869,13 @@ impl Group {
             retired = retire_stale(st, now);
             prune_tombstones(st, now);
         });
+        let live = self.board_keys().keys.len();
+        if live > MAX_BOARD_KEYS && quietly(&self.many_live_said, KEY_WARN_QUIET) {
+            eprintln!(
+                "nido: el llavero del tablero tiene {live} claves (se esperan como mucho \
+                 {MAX_BOARD_KEYS}); las retiradas se quitan a los 30 días, si no tienen objetos"
+            );
+        }
         let future = future_keys(&self.snapshot(), now);
         if !future.is_empty() && quietly(&self.future_key_said, KEY_WARN_QUIET) {
             eprintln!(
@@ -890,13 +927,6 @@ impl Group {
                  ellas un dispositivo con el llavero viejo no se podrá leer)",
                 early.len(),
                 early.join(", ")
-            );
-        }
-        let live = self.board_keys().keys.len();
-        if live > MAX_BOARD_KEYS && quietly(&self.many_keys_said, KEY_WARN_QUIET) {
-            eprintln!(
-                "nido: el llavero del tablero tiene {live} claves (se esperan como mucho \
-                 {MAX_BOARD_KEYS}); las retiradas se quitan a los 30 días, si no tienen objetos"
             );
         }
         dropped.extend(early);
@@ -999,18 +1029,75 @@ fn retire_stale(st: &mut State, now: u64) -> bool {
     let Some(current) = Keyring::of(st).current().map(|k| k.kid.clone()) else {
         return false;
     };
+    let t0 = clock(st, now);
     let mut retired = false;
     for k in st
         .keys
         .iter_mut()
         .filter(|k| !k.removed && k.retired.is_none() && k.kid != current)
     {
-        let t = now.max(k.at.saturating_add(1));
+        let t = t0.max(k.at.saturating_add(1));
         k.retired = Some(t);
         k.at = t;
         retired = true;
     }
     retired
+}
+
+/// Rota: retira las activas (las ya retiradas conservan su fecha) y añade una nueva con `raw`,
+/// que pasa a ser la actual. Devuelve la nueva.
+fn rotate_in(st: &mut State, raw: &[u8; 32], now: u64) -> BoardKey {
+    let t0 = clock(st, now);
+    for k in st
+        .keys
+        .iter_mut()
+        .filter(|k| !k.removed && k.retired.is_none())
+    {
+        let t = t0.max(k.at.saturating_add(1));
+        k.retired = Some(t);
+        k.at = t;
+    }
+    let k = BoardKey::from_raw(raw, next_key_at_with(st, now));
+    st.keys.push(k.clone());
+    k
+}
+
+/// Las bajas (de equipos y de dispositivos) que cuentan para rotar: las de hasta un día por
+/// delante de `now`. Una más lejana (un reloj muy adelantado) no se mira hasta que entre: si no,
+/// la clave nueva tendría que ser de ese futuro, y los demás equipos la descartarían.
+fn removals(st: &State, now: u64) -> impl Iterator<Item = u64> + '_ {
+    let horizon = now.saturating_add(KEY_FUTURE_MS);
+    let members = st.members.iter().filter(|m| m.removed).map(|m| m.at);
+    let devices = st.devices.iter().filter(|d| d.removed).map(|d| d.at);
+    members.chain(devices).filter(move |at| *at <= horizon)
+}
+
+/// ¿Toca rotar? Si hay una baja posterior a la clave actual: quien la hizo no llegó a rotar
+/// (o no pudo guardarlo). Sin clave actual, no (no hay qué rotar; si llega una clave anterior a
+/// una baja, entonces sí).
+fn rotation_due(st: &State, now: u64) -> bool {
+    let Some(current) = Keyring::of(st).current().map(|k| k.at) else {
+        return false;
+    };
+    removals(st, now).any(|at| at > current)
+}
+
+/// La hora con que se sella una retirada o una clave nueva: `now`, o lo más nuevo que se ha
+/// visto en el estado si es posterior (hasta un día por delante). Así un reloj atrasado no sella
+/// una retirada antes de tiempo (la poda se adelantaría lo que vaya atrasado) ni crea una clave
+/// anterior a una baja (`rotation_due` volvería a tocar sin fin).
+fn clock(st: &State, now: u64) -> u64 {
+    let horizon = now.saturating_add(KEY_FUTURE_MS);
+    let seen = st
+        .keys
+        .iter()
+        .map(|k| k.at)
+        .chain(st.members.iter().map(|m| m.at))
+        .chain(st.devices.iter().map(|d| d.at))
+        .filter(|at| *at <= horizon)
+        .max()
+        .unwrap_or(0);
+    now.max(seen)
 }
 
 /// ¿Es una lápida que ya se puede podar por vieja?
@@ -1109,13 +1196,19 @@ fn future_keys(st: &State, now: u64) -> Vec<String> {
 /// La hora de una clave nueva: posterior a la de todas las que hay, para que gane al juntar
 /// aunque algún reloj vaya adelantado.
 fn next_key_at(st: &State) -> u64 {
+    next_key_at_with(st, now_ms())
+}
+
+/// `next_key_at` con la hora dada: también posterior o igual a toda baja (`clock`), para que
+/// después de rotar ya no toque (`rotation_due`).
+fn next_key_at_with(st: &State, now: u64) -> u64 {
     let last = st
         .keys
         .iter()
         .map(|k| k.at.saturating_add(1))
         .max()
         .unwrap_or(0);
-    now_ms().max(last)
+    clock(st, now).max(last)
 }
 
 fn clean(n: &str) -> String {
@@ -2220,7 +2313,10 @@ mod tests {
         assert!(g.droppable_board_keys(&BTreeSet::new()).is_empty());
         assert!(g.drop_unused_board_keys(&BTreeSet::new()).is_empty());
         assert_eq!(g.board_keys().keys.len(), 21);
-        assert!(g.many_keys_said.lock().unwrap().is_some(), "se avisa");
+        // El aviso es de `tidy_board_keys` (lo llama la tarea del llavero en cada pasada).
+        assert!(!g.warned_many_keys());
+        assert!(!g.tidy_board_keys());
+        assert!(g.warned_many_keys(), "se avisa");
     }
 
     /// Por encima del tope duro (`MAX_BOARD_KEYS_HARD`) sí se quitan las retiradas sin objetos
@@ -2258,31 +2354,162 @@ mod tests {
         assert_eq!(g2.board_keys().keys.len(), n as usize + 1);
     }
 
-    /// Una rotación tras una baja que no se puede guardar queda pendiente, y se reintenta hasta
-    /// que sale. Sin llavero no hay nada que rotar.
+    /// Un grupo con una clave de hace un rato (anterior a cualquier baja de ahora) y un
+    /// dispositivo.
+    fn keyed(path: &std::path::Path, own: u8) -> (Group, BoardKey) {
+        let g = Group::load(path.to_owned(), [own; 32]);
+        let k = real_key(now_ms() - 60_000, None);
+        g.merge(&keys_state(vec![k.clone()]));
+        g.add_device(&[7u8; 32], "tel");
+        (g, k)
+    }
+
+    /// Una rotación tras una baja que no se puede guardar se hace después (`rotate_if_due`),
+    /// cuando se puede. Sin llavero no hay nada que rotar.
     #[test]
     fn a_failed_rotation_is_retried() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("group.json");
-        let g = Group::load(path.clone(), [1u8; 32]);
-        assert!(g.rotate_after_removal().unwrap().is_none(), "sin llavero");
-        assert!(g.retry_pending_rotation().is_none());
-        let old = g.ensure_board_key().unwrap();
+        let empty = Group::load(dir.path().join("vacío.json"), [1u8; 32]);
+        empty.add_device(&[7u8; 32], "tel");
+        assert!(empty.remove_device(&B64.encode([7u8; 32])));
+        assert!(
+            empty.rotate_after_removal().unwrap().is_none(),
+            "sin llavero"
+        );
+        assert!(empty.rotate_if_due().is_none());
+        let (g, old) = keyed(&path, 1);
         // En el sitio del fichero, una carpeta que no se pisa: no se puede guardar.
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("dentro"), b"x").unwrap();
+        assert!(g.remove_device(&B64.encode([7u8; 32])));
         assert!(g.rotate_after_removal().is_err());
         assert_eq!(g.board_keys().current(), Some(&old));
-        assert!(matches!(g.retry_pending_rotation(), Some(Err(_))));
-        // Arreglado el disco, el reintento sale, y ya no queda nada pendiente.
+        assert!(g.rotate_if_due().is_none(), "sigue sin disco");
+        // Arreglado el disco, sale, y ya no queda nada pendiente.
         std::fs::remove_dir_all(&path).unwrap();
-        let Some(Ok(Some(new))) = g.retry_pending_rotation() else {
-            panic!("se reintenta")
-        };
+        let new = g.rotate_if_due().expect("se reintenta");
         assert_ne!(new.kid, old.kid);
         assert_eq!(g.board_keys().current(), Some(&new));
-        assert!(g.retry_pending_rotation().is_none());
+        assert!(g.rotate_if_due().is_none());
+    }
+
+    /// La rotación pendiente sale del estado: sobrevive a un reinicio (la baja se guardó y la
+    /// rotación no llegó a hacerse).
+    #[test]
+    fn a_pending_rotation_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.json");
+        let (g, old) = keyed(&path, 1);
+        assert!(g.remove_device(&B64.encode([7u8; 32])));
+        drop(g);
+        let g = Group::load(path.clone(), [1u8; 32]);
+        let new = g.rotate_if_due().expect("pendiente tras reiniciar");
+        assert_ne!(new.kid, old.kid);
+        assert!(g.rotate_if_due().is_none());
+        let again = Group::load(path, [1u8; 32]);
+        assert!(
+            again.rotate_if_due().is_none(),
+            "y ya no, también en el disco"
+        );
+    }
+
+    /// Si quien quitó no rotó, rota otro equipo al enterarse; y el primero, al recibir esa clave,
+    /// ya no.
+    #[test]
+    fn another_machine_rotates_if_the_remover_did_not() {
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, old) = keyed(&d1.path().join("group.json"), 1);
+        let b = Group::load(d2.path().join("group.json"), [2u8; 32]);
+        b.merge(&a.snapshot());
+        assert!(a.remove_device(&B64.encode([7u8; 32])));
+        assert!(b.merge(&a.snapshot()));
+        let new = b.rotate_if_due().expect("rota el otro");
+        assert_ne!(new.kid, old.kid);
+        assert!(a.merge(&b.snapshot()));
+        assert!(a.rotate_if_due().is_none());
+        assert_eq!(a.board_keys(), b.board_keys());
+    }
+
+    /// El caso normal: quien quita rota, y nadie más (ni él otra vez). También con la baja un
+    /// rato por delante de nuestro reloj (el de quien quitó iba adelantado): la clave nueva es
+    /// posterior a la baja, y la retirada de la vieja, también.
+    #[test]
+    fn the_normal_case_does_not_rotate_twice() {
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, _) = keyed(&d1.path().join("group.json"), 1);
+        let b = Group::load(d2.path().join("group.json"), [2u8; 32]);
+        b.merge(&a.snapshot());
+        assert!(a.remove_device(&B64.encode([7u8; 32])));
+        let new = a.rotate_after_removal().unwrap().unwrap();
+        assert!(a.rotate_if_due().is_none());
+        b.merge(&a.snapshot());
+        assert!(b.rotate_if_due().is_none());
+        assert_eq!(b.board_keys().current(), Some(&new));
+
+        // Una baja de un reloj adelantado una hora.
+        let ahead = now_ms() + 3600 * 1000;
+        let mut st = a.snapshot();
+        st.devices.push(device("otro", ahead, true));
+        assert!(b.merge(&st));
+        let newer = b.rotate_if_due().expect("toca: es posterior a la actual");
+        assert!(newer.at >= ahead);
+        let was = b
+            .snapshot()
+            .keys
+            .into_iter()
+            .find(|k| k.kid == new.kid)
+            .unwrap();
+        assert!(was.retired.unwrap() >= ahead, "la retirada, tampoco antes");
+        assert!(b.rotate_if_due().is_none());
+    }
+
+    /// Dos equipos rotan a la vez por la misma baja: al juntarse, los dos tienen la misma actual,
+    /// la otra se retira y ya no toca rotar.
+    #[test]
+    fn two_rotations_at_once_settle() {
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, _) = keyed(&d1.path().join("group.json"), 1);
+        let b = Group::load(d2.path().join("group.json"), [2u8; 32]);
+        assert!(a.remove_device(&B64.encode([7u8; 32])));
+        b.merge(&a.snapshot());
+        let ka = a.rotate_if_due().unwrap();
+        let kb = b.rotate_if_due().unwrap();
+        assert_ne!(ka.kid, kb.kid);
+        a.merge(&b.snapshot());
+        b.merge(&a.snapshot());
+        a.tidy_board_keys();
+        b.tidy_board_keys();
+        a.merge(&b.snapshot());
+        b.merge(&a.snapshot());
+        assert_eq!(a.board_keys(), b.board_keys());
+        let current = a.board_keys().current().cloned().unwrap();
+        assert!(current == ka || current == kb);
+        let actives = a
+            .board_keys()
+            .keys
+            .iter()
+            .filter(|k| k.retired.is_none())
+            .count();
+        assert_eq!(actives, 1);
+        assert!(a.rotate_if_due().is_none() && b.rotate_if_due().is_none());
+    }
+
+    /// Con el llavero vacío no se rota; cuando llega una clave anterior a la baja, sí.
+    #[test]
+    fn an_empty_keyring_rotates_when_a_key_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        g.add_device(&[7u8; 32], "tel");
+        assert!(g.remove_device(&B64.encode([7u8; 32])));
+        assert!(g.rotate_if_due().is_none());
+        let old = real_key(now_ms() - 60_000, None);
+        g.merge(&keys_state(vec![old.clone()]));
+        let new = g
+            .rotate_if_due()
+            .expect("llegó una clave de antes de la baja");
+        assert_ne!(new.kid, old.kid);
     }
 
     /// Una clave propia con `at` de más de un día por delante (un reloj adelantado) se ve: los
