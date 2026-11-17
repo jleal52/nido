@@ -711,7 +711,8 @@ pub struct BoardCache {
     /// Que `spawn` mire cuanto antes si el hub se ha quedado sin tablero (una escritura vio que
     /// el hub no tiene un objeto de la copia).
     probe_wanted: tokio::sync::Notify,
-    /// Cuándo fue la última escritura del recifrado: entre dos, `gap` (como la resubida).
+    /// Cuándo acabó la última escritura del recifrado: hasta la siguiente, `gap` (como la
+    /// resubida).
     recrypt_last: Mutex<Option<tokio::time::Instant>>,
     /// Sube con cada cambio de la copia.
     revision: watch::Sender<u64>,
@@ -1682,13 +1683,13 @@ impl BoardCache {
             .collect()
     }
 
-    /// Espera lo que falte para que pase `gap` desde la última escritura del recifrado.
+    /// Espera lo que falte para que pase `gap` desde que acabó la última escritura del
+    /// recifrado (la apunta `recrypt_one` al volver del hub, salga como salga).
     async fn recrypt_pace(&self) {
         let last = *self.recrypt_last.lock().expect("tablero");
         if let Some(t) = last {
             tokio::time::sleep_until(t + self.gap).await;
         }
-        *self.recrypt_last.lock().expect("tablero") = Some(tokio::time::Instant::now());
     }
 
     /// Recifra con la clave actual lo que la copia tiene cifrado con claves retiradas (decisión
@@ -1801,7 +1802,9 @@ impl BoardCache {
                 }
             };
             tries += 1;
-            match self.hub.board_put(id, s.v, kid, &blob).await {
+            let r = self.hub.board_put(id, s.v, kid, &blob).await;
+            *self.recrypt_last.lock().expect("tablero") = Some(tokio::time::Instant::now());
+            match r {
                 Ok(st) => {
                     let item = BoardItem {
                         id: id.into(),
