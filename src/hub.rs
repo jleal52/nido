@@ -2319,6 +2319,8 @@ pub(crate) mod fake {
         pub too_big: std::collections::BTreeSet<String>,
         /// Los ids que el hub no acepta (400).
         pub bad: std::collections::BTreeSet<String>,
+        /// Lo menos que da como `next`: un hub cuyo reloj avanzó sin nada nuevo que enseñar.
+        pub floor: i64,
         /// Lo que se hace al recibir cada lectura (con cuántas van, contándola) y cada escritura
         /// (con cuántas van): para cortar algo a medias en las pruebas.
         pub on_get: Option<Box<dyn FnMut(usize) + Send>>,
@@ -2339,6 +2341,7 @@ pub(crate) mod fake {
                 limit: 2000,
                 too_big: Default::default(),
                 bad: Default::default(),
+                floor: 0,
                 on_get: None,
                 on_write: None,
             }
@@ -2424,7 +2427,13 @@ pub(crate) mod fake {
             rows.sort_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
             let more = rows.len() > self.page;
             rows.truncate(self.page);
-            let next = rows.iter().map(|i| i.at).max().unwrap_or(0).max(since);
+            let next = rows
+                .iter()
+                .map(|i| i.at)
+                .max()
+                .unwrap_or(0)
+                .max(since)
+                .max(self.floor);
             let after = rows
                 .last()
                 .filter(|_| more)

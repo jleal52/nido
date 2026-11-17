@@ -447,8 +447,12 @@ pub const REUPLOAD_GAP: Duration = Duration::from_secs(3);
 const BUSY_GAPS: u32 = 20;
 /// Cuántas veces se intenta una escritura que choca (409) antes de dejarlo.
 pub const MAX_TRIES: usize = 3;
-/// Lo más a menudo que se guarda la copia en el disco: es entera, y con fsync.
-const SAVE_GAP: Duration = Duration::from_secs(1);
+/// Lo que espera la copia para ir al disco desde el primer cambio sin guardar: lo que cambie
+/// mientras tanto va en la misma escritura (es entera, y con fsync).
+#[cfg(not(test))]
+const SAVE_GAP: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const SAVE_GAP: Duration = Duration::from_millis(200);
 /// Lo que se espera para confirmar que el hub está de verdad vacío antes de resubir: una cuenta
 /// recién hecha o un hub recién arrancado pueden estar llenándose en ese momento.
 #[cfg(not(test))]
@@ -697,9 +701,9 @@ pub struct BoardCache {
     /// Para que las pruebas paren `refresh` entre la sincronización y el sondeo.
     #[cfg(test)]
     hold: tokio::sync::Mutex<()>,
-    /// Cuántas veces se ha escrito la copia en el disco.
+    /// Cuándo se ha escrito la copia en el disco, cada vez.
     #[cfg(test)]
-    disk_writes: std::sync::atomic::AtomicUsize,
+    disk_writes: Mutex<Vec<std::time::Instant>>,
 }
 
 /// La clave del llavero con este `kid` (nunca otra).
@@ -850,19 +854,22 @@ impl BoardCache {
         self.revision.send_modify(|r| *r += 1);
     }
 
-    /// La copia cambió: se guardará pronto (`saver`). Con `seen`, cambió algo que se ve (los
-    /// objetos) y se avisa; si solo avanzó `next`, no.
+    /// La copia cambió. Con `seen`, cambió algo que se ve (los objetos): se avisa, y se guardará
+    /// al final del hueco (`saver`). Si solo avanzó `next`, ni lo uno ni lo otro: queda en `dirty`
+    /// y va al disco con el próximo cambio de verdad (o al parar, `flush`); perderlo solo hace
+    /// releer un poco más la próxima vez.
     fn mark(self: &Arc<Self>, seen: bool) {
         self.dirty.store(true, Ordering::SeqCst);
-        self.start_saver();
-        self.saver.notify_one();
         if seen {
+            self.start_saver();
+            self.saver.notify_one();
             self.bump();
         }
     }
 
-    /// La tarea que guarda la copia: al primer cambio, enseguida; los que llegan mientras tanto,
-    /// juntos, como mucho una vez cada `SAVE_GAP`. Acaba al soltar la copia.
+    /// La tarea que guarda la copia: el primer cambio abre un hueco de `SAVE_GAP`, y al acabar
+    /// se guarda todo lo que haya cambiado (una edición y la sincronización del aviso del hub que
+    /// la sigue, en una sola escritura). Acaba al soltar la copia.
     fn start_saver(self: &Arc<Self>) {
         if self.saving.swap(true, Ordering::SeqCst) {
             return;
@@ -876,10 +883,9 @@ impl BoardCache {
         rt.spawn(async move {
             loop {
                 wake.notified().await;
+                tokio::time::sleep(SAVE_GAP).await;
                 let Some(cache) = me.upgrade() else { return };
                 cache.flush().await;
-                drop(cache);
-                tokio::time::sleep(SAVE_GAP).await;
             }
         });
     }
@@ -906,7 +912,10 @@ impl BoardCache {
     /// Escribe `body` en `board.json`. Con `disk` cogido.
     fn write(&self, body: &[u8]) {
         #[cfg(test)]
-        self.disk_writes.fetch_add(1, Ordering::SeqCst);
+        self.disk_writes
+            .lock()
+            .expect("tablero")
+            .push(std::time::Instant::now());
         if let Err(e) = crate::sys::write_private_atomic(&self.path, body) {
             eprintln!("nido: no se pudo guardar la copia del tablero: {e}");
             self.dirty.store(true, Ordering::SeqCst);
@@ -1019,12 +1028,29 @@ impl BoardCache {
                 true
             }));
         }
-        let (changed, moved) = {
+        let (changed, moved, lost) = {
             let mut c = self.lock();
             if self.epoch() != epoch {
                 return Ok(false);
             }
+            // Con otro hub, la lectura es completa: lo vivo que no trae no está en ese hub. Se
+            // marca, y el sondeo decide si se resube (hub vacío) o sale de la copia.
+            let lost: Vec<String> = if same_hub {
+                vec![]
+            } else {
+                let read_ids: BTreeSet<&str> = read.items.iter().map(|i| i.id.as_str()).collect();
+                c.items
+                    .iter()
+                    .filter(|(id, s)| {
+                        !s.gone && !read_ids.contains(id.as_str()) && !c.reupload.contains(*id)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
             let mut changed = false;
+            for id in &lost {
+                changed |= c.missing.insert(id.clone());
+            }
             for item in read.items {
                 changed |= c.apply(item);
             }
@@ -1038,18 +1064,22 @@ impl BoardCache {
             } else {
                 false
             };
-            (changed, moved)
+            (changed, moved, !lost.is_empty())
         };
         if changed || moved {
             self.mark(changed);
+        }
+        if lost {
+            self.probe_wanted.notify_one();
         }
         Ok(changed)
     }
 
     /// Una lectura completa (desde 0), y fuera de la copia lo que el hub no tiene (salvo lo que
     /// falta por resubir): para lo que se marcó como que no está en el hub, con un hub que sí
-    /// tiene tablero.
-    async fn prune(self: &Arc<Self>, epoch: u64) -> Result<(), BoardError> {
+    /// tiene tablero. Solo sale lo que se puede leer: lo que no tiene su clave en el llavero
+    /// (puede llegar en una rotación) se queda, marcado como que no está en el hub.
+    async fn prune(self: &Arc<Self>, epoch: u64, keys: &Keyring) -> Result<(), BoardError> {
         let _one = self.syncing.lock().await;
         let read = self.read_all(0).await?;
         let on_hub: BTreeSet<String> = read.items.iter().map(|i| i.id.clone()).collect();
@@ -1057,10 +1087,21 @@ impl BoardCache {
         self.change(epoch, |c| {
             let before = c.clone();
             let keep = c.reupload.clone();
+            let no_key: BTreeSet<String> = c
+                .items
+                .iter()
+                .filter(|(id, s)| {
+                    !s.gone
+                        && !on_hub.contains(*id)
+                        && !keep.contains(*id)
+                        && key_of(keys, &s.kid).is_none()
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
             c.items
-                .retain(|id, _| on_hub.contains(id) || keep.contains(id));
+                .retain(|id, _| on_hub.contains(id) || keep.contains(id) || no_key.contains(id));
             gone = before.items.len() - c.items.len();
-            c.missing.clear();
+            c.missing = no_key;
             for item in read.items {
                 c.apply(item);
             }
@@ -1075,7 +1116,12 @@ impl BoardCache {
 
     /// Junta lo que dio una lectura del sondeo y, si hay objetos marcados como que no están en
     /// el hub, los repasa (`prune`).
-    async fn probed(self: &Arc<Self>, epoch: u64, items: Vec<BoardItem>) -> Result<(), BoardError> {
+    async fn probed(
+        self: &Arc<Self>,
+        epoch: u64,
+        items: Vec<BoardItem>,
+        keys: &Keys,
+    ) -> Result<(), BoardError> {
         let (changed, missing) = {
             let mut c = self.lock();
             if self.epoch() != epoch {
@@ -1091,7 +1137,7 @@ impl BoardCache {
             self.mark(true);
         }
         if missing {
-            self.prune(epoch).await?;
+            self.prune(epoch, &keys()).await?;
         }
         Ok(())
     }
@@ -1111,7 +1157,7 @@ impl BoardCache {
         let empty = |p: &crate::hub::BoardPage| p.items.is_empty() && !p.more && !p.reset;
         let page = self.hub.board_get(0, None).await?;
         if !empty(&page) {
-            self.probed(epoch, page.items).await?;
+            self.probed(epoch, page.items, keys).await?;
             self.resume_reupload(keys);
             return Ok(());
         }
@@ -1121,7 +1167,7 @@ impl BoardCache {
         }
         let page = self.hub.board_get(0, None).await?;
         if !empty(&page) {
-            self.probed(epoch, page.items).await?;
+            self.probed(epoch, page.items, keys).await?;
             self.resume_reupload(keys);
             return Ok(());
         }
@@ -1535,6 +1581,12 @@ impl BoardCache {
 /// hub no avisa: al conectar, si cambia la cuenta (nombre, idioma o `ref`), cada `SYNC_EVERY` y
 /// cuando una escritura ve que el hub no tiene un objeto de la copia. `keys` da el llavero del
 /// grupo cada vez.
+///
+/// Se atiende una cosa cada vez: mientras dura un `refresh` no se miran los avisos ni el tic. Y
+/// el sondeo va dentro, con lo que tarda: confirmar que el hub está vacío espera `EMPTY_CONFIRM`
+/// (un minuto), y el repaso de lo marcado (`prune`) es una lectura completa. Lo que llegue
+/// mientras tanto no se pierde: los avisos y las conexiones se juntan (`watch`) y se atienden al
+/// acabar.
 pub fn spawn(cache: Arc<BoardCache>, keys: impl Fn() -> Keyring + Send + Sync + 'static) {
     spawn_with(cache, keys, SYNC_EVERY);
 }
@@ -2400,6 +2452,16 @@ mod tests {
             .unwrap_or_else(|_| panic!("no llegó: {what}"));
     }
 
+    /// Cuántas veces se ha escrito la copia en el disco.
+    fn saved(c: &BoardCache) -> usize {
+        c.disk_writes.lock().unwrap().len()
+    }
+
+    /// La copia como está en el disco, sin guardar antes.
+    fn disk(r: &Rig) -> Arc<BoardCache> {
+        BoardCache::load_with(r.cache.path.clone(), r.hub.clone(), GAP)
+    }
+
     fn unreadable(c: &BoardCache) -> Vec<(String, Unreadable)> {
         c.decrypted(&keyring()).unreadable
     }
@@ -2821,16 +2883,19 @@ mod tests {
         assert_eq!((s.v, s.kid.as_str()), (1, kid(&K_CUR).as_str()));
     }
 
-    /// Lo que se escribe en el disco: la primera vez enseguida, y luego todo junto, como mucho
-    /// una vez cada `SAVE_GAP`. Vaciar se escribe ya.
+    /// Lo que se escribe en el disco: al final del hueco (`SAVE_GAP`) que abre el primer cambio,
+    /// con lo que llegue mientras tanto; entre dos escrituras pasa al menos `SAVE_GAP` (la
+    /// máquina cargada solo lo alarga). Vaciar se escribe ya.
     #[tokio::test]
-    async fn the_copy_is_saved_at_most_once_a_second() {
+    async fn the_copy_is_saved_at_the_end_of_the_gap() {
         let r = rig(fake::Board::default()).await;
         let id = bid(1);
         r.write(&K_CUR, &id, &goal(""));
+        let t0 = std::time::Instant::now();
         r.cache.sync().await.unwrap();
-        let saved = || r.cache.disk_writes.load(Ordering::SeqCst);
-        until("el primer guardado", || saved() == 1).await;
+        until("el primer guardado", || saved(&r.cache) == 1).await;
+        let first = r.cache.disk_writes.lock().unwrap()[0];
+        assert!(first - t0 >= SAVE_GAP, "se guardó al empezar el hueco");
         for n in 0..5 {
             r.cache
                 .update(&keyring(), &id, |o| {
@@ -2841,14 +2906,64 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(saved(), 1, "cada escritura guardó");
-        until("el segundo guardado", || saved() == 2).await;
-        tokio::time::sleep(SAVE_GAP + Duration::from_millis(300)).await;
-        assert_eq!(saved(), 2);
-        let disk = r.on_disk().await;
-        assert_eq!(disk.item(&id), r.cache.item(&id));
+        let last = r.cache.item(&id);
+        until("lo último, en el disco", || disk(&r).item(&id) == last).await;
+        let at = r.cache.disk_writes.lock().unwrap().clone();
+        assert!(at.len() >= 2, "{at:?}");
+        for w in at.windows(2) {
+            assert!(w[1] - w[0] >= SAVE_GAP, "dos guardados seguidos: {at:?}");
+        }
         r.cache.clear();
-        assert_eq!(saved(), 3, "vaciar se escribe ya");
+        assert_eq!(saved(&r.cache), at.len() + 1, "vaciar se escribe ya");
+    }
+
+    /// Una edición y el aviso que le sigue (cuya sincronización solo mueve `next`): un guardado.
+    #[tokio::test]
+    async fn an_edit_and_its_notice_are_saved_once() {
+        let mut r = rig(fake::Board::default()).await;
+        let id = bid(1);
+        r.write(&K_CUR, &id, &goal(""));
+        spawn_with(r.cache.clone(), keyring, LONG);
+        // Al conectar, la sincronización y el sondeo.
+        assert_eq!(r.rec.next("board").await["op"], "get");
+        assert_eq!(r.rec.next("board").await["op"], "get");
+        until("el primer guardado", || saved(&r.cache) == 1).await;
+        // Con el guardador ya en reposo.
+        tokio::time::sleep(SAVE_GAP * 2).await;
+        let gets = r.board.lock().unwrap().gets.len();
+        r.cache
+            .update(&keyring(), &id, |o| {
+                if let Object::Objective(g) = o {
+                    g.note = "nueva".into();
+                }
+            })
+            .await
+            .unwrap();
+        let at = r.cache.item(&id).unwrap().at;
+        until("la sincronización del aviso", || r.cache.next() == at).await;
+        assert_eq!(r.board.lock().unwrap().gets.len(), gets + 1);
+        until("el guardado", || saved(&r.cache) == 2).await;
+        tokio::time::sleep(SAVE_GAP * 3).await;
+        assert_eq!(saved(&r.cache), 2, "la edición y su aviso, un guardado");
+        assert_eq!(disk(&r).item(&id), r.cache.item(&id));
+    }
+
+    /// Un tic que solo mueve `next` no guarda: va con el próximo cambio de verdad (o al parar).
+    #[tokio::test]
+    async fn a_tick_that_only_moves_next_does_not_save() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        spawn_with(r.cache.clone(), keyring, Duration::from_millis(50));
+        until("el primer guardado", || saved(&r.cache) == 1).await;
+        let floor = r.cache.next() + 1000;
+        r.board.lock().unwrap().floor = floor;
+        until("el tic", || r.cache.next() == floor).await;
+        tokio::time::sleep(SAVE_GAP * 3).await;
+        assert_eq!(saved(&r.cache), 1, "solo se movió next");
+        assert!(disk(&r).next() < floor);
+        r.cache.create(&keyring(), &project("dos")).await.unwrap();
+        until("el guardado", || saved(&r.cache) == 2).await;
+        assert!(disk(&r).next() >= floor);
     }
 
     /// La resubida (decisión 8): una lectura completa sin nada (ni lápidas), confirmada al rato,
@@ -2927,20 +3042,21 @@ mod tests {
         );
         assert!(unreadable(&r.cache).contains(&(no_key.clone(), Unreadable::NotInHub)));
 
-        // Ya hay objetos: nada que subir, y lo que el hub no tiene sale de la copia.
+        // Ya hay objetos: nada que subir. Lo que el hub no tiene saldría de la copia, pero el que
+        // no tiene su clave se queda (puede llegar), marcado.
         r.cache.sync().await.unwrap();
         r.cache.probe(&keys()).await.unwrap();
         tokio::time::sleep(GAP * 3).await;
         assert_eq!(r.board.lock().unwrap().writes.len(), 3);
         assert_eq!(
             r.cache.ids(),
-            vec![old.clone(), cur.clone(), unknown.clone()]
+            vec![old.clone(), cur.clone(), unknown.clone(), no_key.clone()]
         );
-        assert!(
-            unreadable(&r.cache)
-                .iter()
-                .all(|u| u.1 != Unreadable::NotInHub)
-        );
+        let not_in_hub: Vec<_> = unreadable(&r.cache)
+            .into_iter()
+            .filter(|u| u.1 == Unreadable::NotInHub)
+            .collect();
+        assert_eq!(not_in_hub, vec![(no_key.clone(), Unreadable::NotInHub)]);
     }
 
     /// Si en el rato de confirmar alguien escribe, no hay resubida.
@@ -3008,7 +3124,7 @@ mod tests {
         r.cache.flush().await;
         let next = r.cache.next();
         r.board.lock().unwrap().items.clear();
-        let saved = r.cache.disk_writes.load(Ordering::SeqCst);
+        let before = saved(&r.cache);
         let rev = *r.cache.subscribe().borrow();
         let none: Keys = Arc::new(|| Keyring { keys: vec![] });
         r.cache.probe(&none).await.unwrap();
@@ -3017,7 +3133,7 @@ mod tests {
         assert_eq!(r.cache.ids(), vec![bid(1)]);
         assert_eq!(r.cache.pending_reupload(), 0);
         assert_eq!(r.cache.next(), next);
-        assert_eq!(r.cache.disk_writes.load(Ordering::SeqCst), saved);
+        assert_eq!(saved(&r.cache), before);
         assert_eq!(*r.cache.subscribe().borrow(), rev);
         // Con la clave, sí.
         r.cache.probe(&keys()).await.unwrap();
@@ -3324,6 +3440,55 @@ mod tests {
         assert_eq!(last, (0, None));
         assert_eq!(r.cache.ids(), vec![bid(1), bid(2)]);
         assert_eq!(r.cache.lock().hub, r.hub.url());
+    }
+
+    /// Con otro hub, lo que la copia tiene y ese hub no queda marcado como que no está en el hub,
+    /// y se pide un sondeo, que decide: si el hub tiene tablero, fuera de la copia, salvo lo que
+    /// no se puede leer (sin su clave), que se queda marcado; si no tiene nada, se resube.
+    #[tokio::test]
+    async fn another_hub_leaves_what_it_lacks_to_the_probe() {
+        let r = rig(fake::Board::default()).await;
+        let (cur, alien, other) = (bid(1), bid(2), bid(3));
+        r.write(&K_CUR, &cur, &project("uno"));
+        r.write(&[0x33; 32], &alien, &project("ajena"));
+        r.cache.sync().await.unwrap();
+        r.cache.lock().hub = Some("https://otro.example".into());
+        r.board.lock().unwrap().items.clear();
+        r.write(&K_CUR, &other, &project("tres"));
+        r.cache.sync().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), r.cache.probe_wanted.notified())
+            .await
+            .expect("no se pidió el sondeo");
+        assert_eq!(
+            unreadable(&r.cache),
+            vec![
+                (cur.clone(), Unreadable::NotInHub),
+                (alien.clone(), Unreadable::NotInHub)
+            ]
+        );
+        r.cache.probe(&keys()).await.unwrap();
+        assert_eq!(r.cache.ids(), vec![alien.clone(), other.clone()]);
+        assert_eq!(
+            unreadable(&r.cache),
+            vec![(alien.clone(), Unreadable::NotInHub)]
+        );
+        assert!(r.writes().is_empty());
+
+        // Otro hub más, sin nada: se vuelve a subir lo que se puede leer.
+        r.cache.lock().hub = Some("https://vacio.example".into());
+        r.board.lock().unwrap().items.clear();
+        r.cache.sync().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), r.cache.probe_wanted.notified())
+            .await
+            .expect("no se pidió el sondeo");
+        r.cache.probe(&keys()).await.unwrap();
+        until("la resubida", || r.cache.pending_reupload() == 0).await;
+        assert_eq!(r.writes(), vec![("put".into(), other.clone(), 0)]);
+        assert_eq!(on_hub(&r.board, &K_CUR, &other), project("tres"));
+        assert_eq!(
+            unreadable(&r.cache),
+            vec![(alien.clone(), Unreadable::NotInHub)]
+        );
     }
 
     /// Un equipo que sale del grupo vacía su copia, en memoria y en el disco.
