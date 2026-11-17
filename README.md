@@ -328,6 +328,17 @@ not offer sessions (an older hub that doesn't answer counts as that, after 30 se
 this computer reached the hub's session limit, `502` for any other error from the hub. An older
 nido, without this endpoint, answers `404`.
 
+`GET /api/v1/board/keys`: the keyring of the projects board, which the web app and the phone app
+use to encrypt and decrypt the board themselves: `{"current": "<kid>", "keys": [{"kid", "key",
+"retired"}]}`, where `key` is the 32-byte key in standard base64 (with padding) and `current` is the
+`kid` to encrypt with. It lists every key that still has its secret, sorted by `kid`: the active
+one and the retired ones (`"retired": true`), which are still needed to read what was encrypted
+with them; there can be up to 64. If there is no active key yet, nido makes one and saves it before
+answering. Only a paired phone or browser that the group still knows can ask for it (`403` with the
+token in `~/.config/nido/token`, or for a device removed from the group, even from another
+computer). Errors: `503` if the new key could not be saved (no key is given). The answer carries
+`Cache-Control: no-store`.
+
 The hub account, `{"name", "lang"}` (either can be `null` until the account is first opened),
 comes in `GET /api/v1/info` (`"account"`, or `null` if the hub hasn't told it yet), in the
 information a device gets when it pairs or connects (`"account"`, or nothing) and in every list

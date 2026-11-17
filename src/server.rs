@@ -2438,6 +2438,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/push/test", post(api_push_test))
         .route("/api/v1/voice/token", post(api_voice_token))
         .route("/api/v1/hub/session", post(api_hub_session))
+        .route("/api/v1/board/keys", get(api_board_keys))
         // La memoria de la voz: cada ruta tiene que mirar `paired_device` antes que nada y estar
         // en `memory_routes()` de las pruebas, que comprueban que el token de este equipo no vale.
         .route("/api/v1/voice/memory", get(api_voice_memory))
@@ -2755,6 +2756,81 @@ async fn api_hub_session(
             error(status, e.message())
         }
     }
+}
+
+const BOARD_KEYS_DENIED: &str =
+    "solo un teléfono o una web emparejados pueden pedir las claves del tablero";
+const BOARD_KEY_UNSAVED: &str = "no se pudo guardar la clave del tablero; prueba otra vez";
+
+/// Una clave del llavero tal como la recibe un dispositivo. Sin `Debug`: lleva el secreto.
+#[derive(Serialize)]
+struct DeviceBoardKey<'a> {
+    kid: &'a str,
+    /// Los 32 bytes, en base64 estándar con relleno (como van en el llavero).
+    key: &'a str,
+    retired: bool,
+}
+
+/// `GET /api/v1/board/keys`: el llavero del tablero para la web y la app, que cifran y descifran
+/// el tablero ellas mismas: `{"current": "<kid>", "keys": [{"kid", "key", "retired"}]}`. Van las
+/// claves con secreto, activas y retiradas (con estas aún puede haber objetos cifrados), por
+/// `kid`; las lápidas no. Si no hay ninguna activa, la crea, y solo la da si quedó guardada
+/// (503 si no).
+///
+/// Solo para un dispositivo emparejado que el grupo sigue conociendo: uno quitado desde otro
+/// equipo conserva su token en `phones` hasta que aquí corre `apply_group`, y en ese rato no
+/// tiene que llevarse ninguna clave. Se decide y se contesta con la misma instantánea del grupo:
+/// la baja y la rotación van en un solo cambio, así que si en ella sigue estando, sus claves son
+/// las de antes de quitarlo. La respuesta lleva `Cache-Control: no-store`, y no se registra.
+async fn api_board_keys(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let device_key = crate::auth::bearer(&headers).and_then(|t| {
+        st.phones
+            .lock()
+            .expect("teléfonos")
+            .by_token(t)
+            .map(|p| p.key.clone())
+    });
+    let Some(device_key) = device_key.filter(|k| st.group.snapshot().device(k).is_some()) else {
+        return error(StatusCode::FORBIDDEN, BOARD_KEYS_DENIED);
+    };
+    let ensured = {
+        let st = st.clone();
+        tokio::task::spawn_blocking(move || st.group.ensure_board_key()).await
+    };
+    match ensured {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            eprintln!("nido: no se pudo guardar la clave del tablero: {e}");
+            return error(StatusCode::SERVICE_UNAVAILABLE, BOARD_KEY_UNSAVED);
+        }
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, BOARD_KEY_UNSAVED),
+    }
+    let snapshot = st.group.snapshot();
+    if snapshot.device(&device_key).is_none() {
+        return error(StatusCode::FORBIDDEN, BOARD_KEYS_DENIED);
+    }
+    let ring = crate::group::Keyring::of(&snapshot);
+    let Some(current) = ring.current() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, BOARD_KEY_UNSAVED);
+    };
+    let keys: Vec<DeviceBoardKey> = ring
+        .keys
+        .iter()
+        .filter(|k| !k.removed && !k.key.is_empty())
+        .map(|k| DeviceBoardKey {
+            kid: &k.kid,
+            key: &k.key,
+            retired: k.retired.is_some(),
+        })
+        .collect();
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "current": current.kid, "keys": keys })),
+    )
+        .into_response()
 }
 
 /// Si pide un dispositivo emparejado (con su token), no el token de este equipo.
@@ -5517,6 +5593,207 @@ mod tests {
         assert!(b.phones.lock().unwrap().list().is_empty(), "quitado aquí");
         assert_eq!(b.group.board_keys(), a.group.board_keys());
         assert_eq!(b.group.board_keys().keys.len(), 2);
+    }
+
+    // ---------- El llavero para los dispositivos (`GET /api/v1/board/keys`) ----------
+
+    /// Un dispositivo emparejado aquí y apuntado en el grupo, como queda al emparejarse.
+    fn board_device(st: &AppState, n: u8) -> crate::e2e::Phone {
+        st.group.add_device(&[n; 32], "tel");
+        st.phones
+            .lock()
+            .unwrap()
+            .add(&[n; 32], "tel", None)
+            .unwrap()
+    }
+
+    /// `GET /api/v1/board/keys` con ese token: el código, `Cache-Control` y el cuerpo.
+    async fn board_keys_with(
+        st: &Arc<AppState>,
+        token: &str,
+    ) -> (StatusCode, Option<String>, serde_json::Value) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let r = api_board_keys(State(st.clone()), headers).await;
+        let status = r.status();
+        let cache = r
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap().to_owned());
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (status, cache, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Un 403 que no lleva nada del llavero.
+    fn denied_without_keys(code: StatusCode, body: &serde_json::Value) {
+        assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body,
+            &json!({"error": "only a paired phone or browser can get the board keys"})
+        );
+    }
+
+    /// Un dispositivo emparejado recibe el llavero como dice el contrato: la actual por su `kid`
+    /// y cada clave con `kid`, `key` (base64 estándar, 32 bytes) y `retired`. Sin caché.
+    #[tokio::test]
+    async fn a_paired_device_gets_the_board_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        let key = st.group.ensure_board_key().unwrap();
+        let (code, cache, body) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(
+            body,
+            json!({
+                "current": key.kid,
+                "keys": [{"kid": key.kid, "key": key.key, "retired": false}],
+            })
+        );
+        let raw = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            body["keys"][0]["key"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw.len(), 32);
+        assert_eq!(crate::group::board_kid(&raw), key.kid);
+    }
+
+    /// Las retiradas que aún tienen secreto salen, con `retired: true` (el dispositivo las
+    /// necesita para leer lo cifrado con ellas); las lápidas no. En orden de `kid`.
+    #[tokio::test]
+    async fn retired_keys_go_and_tombstones_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        let gone = st.group.ensure_board_key().unwrap();
+        let old = st.group.rotate_board_key().unwrap();
+        let new = st.group.rotate_board_key().unwrap();
+        assert!(st.group.drop_board_key(&gone.kid));
+        let (code, _, body) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let mut want = vec![
+            json!({"kid": old.kid, "key": old.key, "retired": true}),
+            json!({"kid": new.kid, "key": new.key, "retired": false}),
+        ];
+        want.sort_by(|a, b| a["kid"].as_str().cmp(&b["kid"].as_str()));
+        assert_eq!(body, json!({"current": new.kid, "keys": want}));
+        assert!(!body.to_string().contains(&gone.kid), "ni la lápida");
+    }
+
+    /// Ni el token de este equipo ni uno que no es de nadie: 403, sin claves, y no se crea
+    /// ninguna.
+    #[tokio::test]
+    async fn only_a_paired_device_gets_the_board_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        board_device(&st, 1);
+        for token in ["local", "no-es-de-nadie", ""] {
+            let (code, _, body) = board_keys_with(&st, token).await;
+            denied_without_keys(code, &body);
+        }
+        assert!(st.group.snapshot().keys.is_empty(), "no se crea ninguna");
+        // Con una clave ya hecha, tampoco.
+        st.group.ensure_board_key().unwrap();
+        let (code, _, body) = board_keys_with(&st, "local").await;
+        denied_without_keys(code, &body);
+    }
+
+    /// Por la API de verdad: la ruta está, y el token de este equipo no vale. Uno que no es de
+    /// nadie ni llega: el guardián contesta 401 antes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_board_keys_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, token) = memory_server(tmp.path()).await;
+        st.group.add_device(&[1u8; 32], "tel");
+        let (code, r) = memory_call(addr, &token, "GET", "/api/v1/board/keys", None).await;
+        assert_eq!(code, 200, "{r}");
+        let current = st.group.board_keys().current().unwrap().kid.clone();
+        assert_eq!(r["current"], json!(current));
+        let (code, r) = memory_call(addr, "local", "GET", "/api/v1/board/keys", None).await;
+        assert_eq!(code, 403, "{r}");
+        assert!(r.get("keys").is_none());
+        let (code, _) = memory_call(addr, "nadie", "GET", "/api/v1/board/keys", None).await;
+        assert_eq!(code, 401);
+    }
+
+    /// Quitado del grupo (desde otro equipo, p. ej.) pero con su token aún en `phones`, porque
+    /// `apply_group` no ha corrido: 403, ni la clave de antes. Tampoco uno que nunca estuvo en
+    /// el grupo.
+    #[tokio::test]
+    async fn a_device_removed_from_the_group_gets_no_board_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        st.group.ensure_board_key().unwrap();
+        assert_eq!(board_keys_with(&st, &phone.token).await.0, StatusCode::OK);
+        assert!(st.group.remove_device(&phone.key));
+        assert!(
+            st.phones
+                .lock()
+                .unwrap()
+                .id_by_token(&phone.token)
+                .is_some()
+        );
+        let (code, _, body) = board_keys_with(&st, &phone.token).await;
+        denied_without_keys(code, &body);
+        // Solo en `phones`.
+        let stray = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[2u8; 32], "otro", None)
+            .unwrap();
+        let (code, _, body) = board_keys_with(&st, &stray.token).await;
+        denied_without_keys(code, &body);
+    }
+
+    /// Con el llavero vacío, la primera petición crea la clave y la guarda (en el grupo y en el
+    /// disco) antes de darla; la segunda da la misma.
+    #[tokio::test]
+    async fn the_first_request_makes_and_saves_the_board_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        assert!(st.group.snapshot().keys.is_empty());
+        let (code, _, first) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::OK, "{first}");
+        let ring = st.group.board_keys();
+        assert_eq!(ring.keys.len(), 1);
+        let key = &ring.keys[0];
+        assert_eq!(
+            first,
+            json!({
+                "current": key.kid,
+                "keys": [{"kid": key.kid, "key": key.key, "retired": false}],
+            })
+        );
+        let saved = crate::group::Group::load(tmp.path().join("data/group.json"), [9u8; 32]);
+        assert_eq!(saved.board_keys().current(), Some(key));
+        let (code, _, second) = board_keys_with(&st, &phone.token).await;
+        assert_eq!((code, second), (StatusCode::OK, first));
+    }
+
+    /// Si la clave nueva no se puede guardar, no se da: 503 sin ninguna clave, y el llavero
+    /// sigue vacío.
+    #[tokio::test]
+    async fn a_board_key_that_cannot_be_saved_is_not_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        // El temporal de `group.json` es una carpeta: no se puede guardar.
+        std::fs::create_dir_all(tmp.path().join("data/group.json.tmp")).unwrap();
+        let (code, _, body) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(
+            body,
+            json!({"error": "the board key could not be saved; try again"})
+        );
+        assert!(st.group.snapshot().keys.is_empty());
     }
 
     // ---------- La memoria de la voz ----------

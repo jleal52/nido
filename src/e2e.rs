@@ -299,12 +299,16 @@ impl Phones {
             .any(|p| crate::auth::ct_eq(given, &p.token))
     }
 
-    /// El dispositivo de ese token (para que se dé de baja él mismo).
-    pub fn id_by_token(&self, given: &str) -> Option<String> {
+    /// El dispositivo de ese token (comparación en tiempo constante).
+    pub fn by_token(&self, given: &str) -> Option<&Phone> {
         self.list
             .iter()
             .find(|p| crate::auth::ct_eq(given, &p.token))
-            .map(|p| p.id.clone())
+    }
+
+    /// El id del dispositivo de ese token (para que se dé de baja él mismo).
+    pub fn id_by_token(&self, given: &str) -> Option<String> {
+        self.by_token(given).map(|p| p.id.clone())
     }
 
     /// Apunta un teléfono (o lo renueva, si ya estaba con esa clave). Devuelve su token y su

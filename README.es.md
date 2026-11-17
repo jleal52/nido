@@ -312,6 +312,17 @@ sesiones (un hub anterior que no contesta cuenta como eso, a los 30 segundos), `
 equipo llegó al límite de sesiones del hub, `502` para cualquier otro error del hub. Un nido
 anterior, sin esta ruta, contesta `404`.
 
+`GET /api/v1/board/keys`: el llavero del tablero de proyectos, con el que la web y la app cifran y
+descifran el tablero ellas mismas: `{"current": "<kid>", "keys": [{"kid", "key", "retired"}]}`,
+donde `key` es la clave de 32 bytes en base64 estándar (con relleno) y `current` es el `kid` con
+el que se cifra. Lleva todas las claves que aún tienen su secreto, por orden de `kid`: la activa y
+las retiradas (`"retired": true`), que siguen haciendo falta para leer lo cifrado con ellas; puede
+haber hasta 64. Si aún no hay ninguna activa, nido la crea y la guarda antes de contestar. Solo un
+teléfono o un navegador emparejado que el grupo sigue conociendo puede pedirlo (`403` con el token
+de `~/.config/nido/token`, o para un dispositivo quitado del grupo, aunque sea desde otro equipo).
+Errores: `503` si no se pudo guardar la clave nueva (no se da ninguna). La respuesta lleva
+`Cache-Control: no-store`.
+
 La cuenta del hub, `{"name", "lang"}` (cualquiera de los dos puede ser `null` mientras no se haya
 abierto), va en `GET /api/v1/info` (`"account"`, o `null` si el hub aún no la ha dicho), en la
 información que recibe un dispositivo al emparejarse o conectar (`"account"`, o nada) y en cada

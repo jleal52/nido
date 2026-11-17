@@ -298,6 +298,15 @@ const TABLE: &[(&str, &str)] = &[
         "solo un teléfono o una web emparejados pueden pedir una sesión del hub",
         "only a paired phone or browser can ask for a hub session",
     ),
+    // El llavero del tablero (`GET /api/v1/board/keys`)
+    (
+        "solo un teléfono o una web emparejados pueden pedir las claves del tablero",
+        "only a paired phone or browser can get the board keys",
+    ),
+    (
+        "no se pudo guardar la clave del tablero; prueba otra vez",
+        "the board key could not be saved; try again",
+    ),
     // La memoria de la voz (voice_memory.rs y `/api/v1/voice/memory`)
     (
         "solo un teléfono o una web emparejados pueden usar la memoria de la voz",
