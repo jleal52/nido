@@ -51,8 +51,10 @@ pub const KEEP_CLOSED: u64 = 30 * 24 * 3600 * 1000;
 const CLEAN_EVERY: u64 = 3600 * 1000;
 /// Lo que se espera tras un 429 (ms).
 const BUSY_WAIT: u64 = 60_000;
-/// Lo más que se escribe en una pasada; lo demás, en la siguiente.
-const MAX_WRITES: usize = 50;
+/// Lo más que se escribe de una vez; lo demás, tras `BUSY_WAIT`. Una limpieza grande (un
+/// registro perdido cierra todos los enlaces de este equipo) va así a 20 por minuto, como mucho
+/// 1200 por hora: deja cupo del freno del hub para lo demás.
+const MAX_WRITES: usize = 20;
 
 /// El estado de la tarea: está en `AppState`, pero la tarea la lanza `spawn_scanner`.
 #[derive(Default)]
@@ -479,6 +481,7 @@ async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>
     let (mut again, mut closed, mut removed) = (false, 0, 0);
     for (n, t) in tasks.into_iter().enumerate() {
         if n >= MAX_WRITES {
+            p.lock().busy_until = now + BUSY_WAIT;
             again = true;
             break;
         }
@@ -1014,6 +1017,60 @@ mod tests {
         pass(&w.st, T0 + 3 * GAP).await;
         assert_eq!(w.writes(), n + 1);
         assert_eq!(w.stored(&l).unwrap()["plan"], summary("Migrar", 2, 2, 0));
+    }
+
+    /// Borrada sin conexión: el cierre queda pendiente, con la hora del borrado, y se hace al
+    /// volver.
+    #[tokio::test]
+    async fn a_session_deleted_offline_is_closed_on_return() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        let l = join(&w, &w.s).await;
+        let mut status = w.st.hub.status.subscribe();
+        w.rec.tell(crate::hub::fake::Tell::Hangup);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        let before = now_ms();
+        crate::server::delete_session(&w.st, &w.s.id).await.unwrap();
+        let after = now_ms();
+        let n = w.writes();
+        pass(&w.st, after + 1000).await;
+        assert_eq!(w.writes(), n);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        pass(&w.st, after + 5 * GAP).await;
+        let closed = w.stored(&l).unwrap()["closed"].as_u64().expect("cerrado");
+        assert!((before..=after).contains(&closed));
+    }
+
+    /// Muchos de golpe: `MAX_WRITES` y luego se espera.
+    #[tokio::test]
+    async fn a_big_cleanup_goes_in_batches() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        for n in 0..MAX_WRITES + 5 {
+            put_link(&w, &format!("{n:032x}"), &o, "este", "dead0000", json!({}));
+        }
+        w.st.board.sync().await.unwrap();
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n + MAX_WRITES);
+        pass(&w.st, T0 + GAP).await;
+        assert_eq!(w.writes(), n + MAX_WRITES, "esperando");
+        pass(&w.st, T0 + BUSY_WAIT).await;
+        assert_eq!(w.writes(), n + MAX_WRITES + 5);
+        let open = w
+            .live("link")
+            .into_iter()
+            .filter(|(_, v)| v["closed"].is_null())
+            .count();
+        assert_eq!(open, 0);
     }
 
     /// Con un 429 se espera antes de volver a escribir.
