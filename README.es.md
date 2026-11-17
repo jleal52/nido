@@ -177,6 +177,9 @@ Cada Claude que lanza nido tiene el servidor MCP de nido (`nido mcp`), con estas
   `plan_clear` lo borra. El plan se guarda con la sesión (sigue tras reiniciar y tras `/clear`) y
   se va con `nido rm`. Ids de hasta 64 letras, dígitos, `.`, `_` o `-`, únicos en el plan; como
   mucho 50 fases y 500 tareas.
+- `board`, `project`, `objective`, `join` y `leave`: el tablero de proyectos de tu cuenta del hub,
+  que las sesiones pueden leer y cambiar, y a cuyos objetivos se pueden apuntar (ver
+  [El tablero de proyectos](#el-tablero-de-proyectos)).
 
 Lo que nido cambia en tu configuración de Claude:
 
@@ -285,6 +288,80 @@ nido alerts      # las alertas de las sesiones de todos los equipos del grupo qu
 `claude mcp remove -s user nido` (y, en cada perfil,
 `CLAUDE_CONFIG_DIR=<perfil> claude mcp remove -s user nido`).
 
+### El tablero de proyectos
+
+Tu cuenta del hub tiene un tablero de proyectos que comparten los equipos del grupo, la web y la
+app: proyectos, cada uno con sus objetivos (en orden, con un estado y una nota), y las sesiones que
+trabajan en cada objetivo (enlaces), con lo que llevan de su plan. Cada proyecto, objetivo o
+enlace es un documento aparte en el hub, cifrado por los clientes con una clave del llavero del
+grupo (más abajo): el hub solo guarda y reparte lo que no puede leer. De cada uno ve un id al azar,
+su versión, con qué clave se cifró, su tamaño y cuándo cambió (y que se borró), pero ni su tipo ni
+su contenido. Sin hub no hay tablero.
+
+Las herramientas (van sin preguntar, ver arriba):
+
+- `board`: el tablero en texto compacto: cada proyecto con sus objetivos, su estado y su nota, las
+  sesiones que trabajan en cada uno con lo que llevan de su plan, y los totales del plan. Los
+  proyectos archivados no salen salvo que se pidan (`archived`, o `project` para uno, con sus
+  descripciones). Si no se puede hablar con el hub, enseña la copia de este equipo y lo dice.
+- `project`: crea un proyecto (`name`; `state` es `active` si no se dice), lo cambia (`id` y los
+  campos que cambian: `name`, `desc`, `state`, que es `active` o `archived`) o, con `delete`, lo
+  borra junto con sus objetivos y sus enlaces. Los nombres de los proyectos no se repiten.
+- `objective`: crea un objetivo en un `project` (`name`; `state` es `pending`; al final si no se
+  da `order`), lo cambia (`id` y los campos: `name`, `desc`, `state`, `note`, `order`) o, con
+  `delete`, lo borra con sus enlaces. Los estados son `pending`, `doing`, `blocked`, `done` y
+  `dropped`. `order` es un número real: para meter un objetivo entre dos, la media de los suyos.
+  Los nombres no se repiten dentro de un proyecto.
+- `join`: apunta la sesión que llama a un objetivo, para que salga ahí con lo que lleva de su
+  plan. Si ya lo estaba, nada; si su enlace estaba cerrado, lo vuelve a abrir.
+- `leave`: quita los enlaces de la sesión que llama con un objetivo (se borran, no se cierran).
+
+Un proyecto o un objetivo se nombra por su id, por sus primeras 8 cifras hex o más (`board` los
+enseña como `#1a2b3c4d`; el `#` es opcional) o por su nombre exacto, sin mirar mayúsculas. Un
+objetivo por nombre se busca en `project` si se da, y si no en todos los proyectos. Un nombre o un
+principio de id que valen para varios dan error con los candidatos. Cada cambio apunta quién lo
+hizo como `<equipo>/<sesión>`. Como el resto de las herramientas, contestan en inglés (las lee
+Claude); los nombres que escribiste van tal cual. Lo que no se puede leer (sin su clave, o de un
+tipo que este nido no conoce) sale por su id, y nunca se cambia ni se borra.
+
+Cada equipo copia el resumen del plan de sus sesiones (el título, y cuántas tareas hay hechas, en
+total, activas, bloqueadas y fallidas) a sus enlaces: como mucho una vez cada 30 segundos por
+sesión, y solo si cambió (`copied` dice cuándo). Una sesión parada sigue con sus enlaces abiertos.
+Al quitar una sesión, sus enlaces se cierran (`closed`) con su último resumen, y un enlace cerrado
+se borra a los 30 días. Un equipo solo toca los enlaces de sus sesiones: ni los de otros equipos,
+ni los que no puede leer, ni aquellos cuyo objetivo falta (puede volver, por ejemplo mientras se
+vuelve a subir el tablero); esos se van al borrar su objetivo.
+
+**Cuidado con el registro de sesiones**: nido cierra los enlaces de toda sesión de este equipo que
+no esté en su registro (`sessions.json` en la carpeta de datos, más abajo). Si se pierde ese
+fichero, o nido arranca con otra carpeta de datos (por ejemplo al cambiar `XDG_DATA_HOME` o
+`NIDO_HOME` en un servicio), cierra todos los enlaces de este equipo. Nada los vuelve a abrir
+solo: las sesiones tienen que volver a hacer `join`, y los enlaces cerrados se borran a los 30
+días.
+
+Cada nido guarda una copia del tablero en `board.json`, en su carpeta de datos
+(`~/.local/share/nido`, `$XDG_DATA_HOME/nido` o `$NIDO_HOME/data`; en Windows,
+`%USERPROFILE%\.local\share\nido`), cifrada tal y como la da el hub. Si el hub no tiene nada
+del tablero (una lectura completa no da nada, ni borrados, dos veces con un minuto entre medias) y
+la copia tiene algo, nido vuelve a subir su copia, con la clave actual, de objeto en objeto (unos
+20 por minuto); si otro equipo de la cuenta se adelantó, se queda lo suyo. Así vuelve el tablero
+cuando se reinicia un hub sin MongoDB, y cuando se parte un grupo de dos equipos y el hub deja la
+cuenta al que se quitó (con uno a cada lado, puede): el que se queda recibe una cuenta nueva,
+vacía.
+
+El llavero es del grupo (se sincroniza con el resto del grupo, cifrado de extremo a extremo), y la
+web y la app se lo piden a su nido (`GET /api/v1/board/keys`, en [La API](#la-api)). La primera
+clave se crea cuando hace falta. La clave cambia cada vez que se quita un equipo o un dispositivo
+del grupo (también con cada «Cerrar sesión» de la web, que quita ese navegador), para que quien se
+fue no lea lo que se cifre desde entonces. La vieja queda retirada, y nido recifra con la actual
+solo los objetos que siguen cifrados con una retirada, poco a poco (unos 10 por minuto entre
+todos los equipos). Una clave retirada se guarda al menos 30 días, y mientras algún objeto la use:
+así, un dispositivo con el llavero viejo que escriba con ella mientras los equipos están apagados
+no deja nada ilegible. nido avisa en su registro por encima de 16 claves; por encima de 64 quita
+antes de tiempo, con un aviso, las retiradas más viejas que no usa ningún objeto. Una clave con la
+que aún hay algo cifrado no se quita nunca. Un equipo que sale del grupo vacía su llavero y su
+copia del tablero.
+
 ## La API
 
 Solo se atiende en este equipo (`127.0.0.1`), con `Authorization: Bearer <token>`: el de
@@ -320,8 +397,9 @@ descifran el tablero ellas mismas: `{"current": "<kid>", "keys": [{"kid", "key",
 donde `key` es la clave de 32 bytes en base64 estándar (con relleno) y `current` es el `kid` con
 el que se cifra. Lleva todas las claves que aún tienen su secreto, por orden de `kid`: la activa y
 las retiradas (`"retired": true`), que siguen haciendo falta para leer lo cifrado con ellas. Suelen
-ser pocas (nido avisa por encima de 16), pero no hay un máximo fijo: una retirada con la que aún
-hay algo cifrado no se quita. Si aún no hay ninguna activa, nido la crea y la guarda antes de
+ser pocas (nido avisa por encima de 16, y por encima de 64 quita antes de tiempo las retiradas más
+viejas que no cifran nada), pero no hay un máximo fijo: una retirada con la que aún hay algo
+cifrado no se quita. Si aún no hay ninguna activa, nido la crea y la guarda antes de
 contestar. Solo un teléfono o un navegador emparejado que el grupo sigue conociendo puede pedirlo
 (`403` con el token de `~/.config/nido/token`, o para un dispositivo quitado del grupo, aunque sea
 desde otro equipo; `401` con un token que no es de nadie). Errores: `503` si no se pudo guardar algo
