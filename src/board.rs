@@ -912,14 +912,14 @@ impl BoardCache {
     /// Escribe `body` en `board.json`. Con `disk` cogido.
     fn write(&self, body: &[u8]) {
         #[cfg(test)]
-        self.disk_writes
-            .lock()
-            .expect("tablero")
-            .push(std::time::Instant::now());
+        let started = std::time::Instant::now();
         if let Err(e) = crate::sys::write_private_atomic(&self.path, body) {
             eprintln!("nido: no se pudo guardar la copia del tablero: {e}");
             self.dirty.store(true, Ordering::SeqCst);
         }
+        // Se apunta ya escrita (y renombrada): quien la cuenta puede leerla del disco.
+        #[cfg(test)]
+        self.disk_writes.lock().expect("tablero").push(started);
     }
 
     /// Cambia la copia con `f` si no se vació mientras tanto (`epoch`); si `f` dice que cambió
@@ -2908,6 +2908,8 @@ mod tests {
         }
         let last = r.cache.item(&id);
         until("lo último, en el disco", || disk(&r).item(&id) == last).await;
+        // Con `disk`, ninguna escritura a medias: ya está apuntada.
+        drop(r.cache.disk.lock().unwrap());
         let at = r.cache.disk_writes.lock().unwrap().clone();
         assert!(at.len() >= 2, "{at:?}");
         for w in at.windows(2) {
@@ -2962,8 +2964,9 @@ mod tests {
         assert_eq!(saved(&r.cache), 1, "solo se movió next");
         assert!(disk(&r).next() < floor);
         r.cache.create(&keyring(), &project("dos")).await.unwrap();
-        until("el guardado", || saved(&r.cache) == 2).await;
-        assert!(disk(&r).next() >= floor);
+        until("next, en el disco", || disk(&r).next() >= floor).await;
+        drop(r.cache.disk.lock().unwrap());
+        assert_eq!(saved(&r.cache), 2);
     }
 
     /// La resubida (decisión 8): una lectura completa sin nada (ni lápidas), confirmada al rato,
