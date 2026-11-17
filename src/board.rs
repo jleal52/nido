@@ -1619,6 +1619,33 @@ impl BoardCache {
     /// de la copia, sin más (marcarlo como que no está en el hub lo volvería a subir si el hub
     /// se quedó sin tablero), y se pide un sondeo.
     pub async fn remove(self: &Arc<Self>, keys: &Keyring, id: &str) -> Result<(), EditError> {
+        self.remove_if(keys, id, None::<fn(&Object) -> bool>)
+            .await
+            .map(drop)
+    }
+
+    /// Como `remove`, pero solo si `when` vale para el objeto como está: el de la copia y, tras
+    /// cada choque (409), el de ahora. Uno que no se puede leer no se borra. Devuelve si se borró
+    /// (o ya lo estaba): `false` si `when` no vale.
+    pub async fn remove_when(
+        self: &Arc<Self>,
+        keys: &Keyring,
+        id: &str,
+        when: impl Fn(&Object) -> bool + Sync,
+    ) -> Result<bool, EditError> {
+        self.remove_if(keys, id, Some(when)).await
+    }
+
+    async fn remove_if<P: Fn(&Object) -> bool + Sync>(
+        self: &Arc<Self>,
+        keys: &Keyring,
+        id: &str,
+        when: Option<P>,
+    ) -> Result<bool, EditError> {
+        let holds = |s: &Stored| {
+            when.as_ref()
+                .is_none_or(|f| read(keys, id, s).is_ok_and(|o| f(&o)))
+        };
         let epoch = self.epoch();
         let (mut v, pending) = {
             let mut c = self.lock();
@@ -1626,7 +1653,10 @@ impl BoardCache {
                 return Err(EditError::Missing);
             };
             if s.gone {
-                return Ok(());
+                return Ok(true);
+            }
+            if !holds(s) {
+                return Ok(false);
             }
             let v = s.v;
             let pending = c.reupload.remove(id);
@@ -1636,7 +1666,7 @@ impl BoardCache {
         let Some(pending) = pending else {
             // No está en el hub ni se va a subir: basta con quitarlo de aquí.
             self.change(epoch, |c| c.forget(id));
-            return Ok(());
+            return Ok(true);
         };
         if pending {
             let blob = self
@@ -1646,15 +1676,21 @@ impl BoardCache {
                 .and_then(|s| reupload_blob(keys, id, s));
             let Some((kid, blob)) = blob else {
                 self.change(epoch, |c| c.forget(id));
-                return Ok(());
+                return Ok(true);
             };
             match self.hub.board_put(id, 0, &kid, &blob).await {
                 Ok(st) => v = st.v,
                 Err(BoardError::Conflict(current)) if current.gone => {
                     self.change(epoch, |c| c.bury(&current));
-                    return Ok(());
+                    return Ok(true);
                 }
-                Err(BoardError::Conflict(current)) => v = current.v,
+                Err(BoardError::Conflict(current)) => {
+                    self.change(epoch, |c| c.apply(current.clone()));
+                    if !holds(&Stored::from(&current)) {
+                        return Ok(false);
+                    }
+                    v = current.v;
+                }
                 Err(e) => {
                     // Sigue faltando por subir.
                     self.change(epoch, |c| {
@@ -1670,7 +1706,7 @@ impl BoardCache {
             match self.hub.board_del(id, v).await {
                 Ok(st) => {
                     self.change(epoch, |c| c.bury(&tombstone(id, st)));
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(BoardError::Conflict(current)) if current.gone => {
                     if current.v > 0 {
@@ -1679,10 +1715,13 @@ impl BoardCache {
                         self.change(epoch, |c| c.forget(id));
                         self.probe_wanted.notify_one();
                     }
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(BoardError::Conflict(current)) => {
                     self.change(epoch, |c| c.apply(current.clone()));
+                    if !holds(&Stored::from(&current)) {
+                        return Ok(false);
+                    }
                     if tries >= MAX_TRIES {
                         return Err(EditError::Board(BoardError::Conflict(current)));
                     }

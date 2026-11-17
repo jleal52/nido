@@ -23,7 +23,9 @@
 //! borra quien borra el objetivo (`objective`, `project`).
 //!
 //! Sin conexión no se hace nada y no se pierde nada: lo pendiente es «lo que hay ahora frente a
-//! lo que tiene el enlace», que se mira al volver. Con un 429 se espera `BUSY_WAIT`.
+//! lo que tiene el enlace», que se mira al volver. Con un 429 se espera `BUSY_WAIT`; con otro
+//! error del hub, `HUB_WAIT`. Las subidas van antes que los cierres y los borrados, y de una vez
+//! se piden como mucho `MAX_WRITES` escrituras.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -51,9 +53,14 @@ pub const KEEP_CLOSED: u64 = 30 * 24 * 3600 * 1000;
 const CLEAN_EVERY: u64 = 3600 * 1000;
 /// Lo que se espera tras un 429 (ms).
 const BUSY_WAIT: u64 = 60_000;
-/// Lo más que se escribe de una vez; lo demás, tras `BUSY_WAIT`. Una limpieza grande (un
-/// registro perdido cierra todos los enlaces de este equipo) va así a 20 por minuto, como mucho
-/// 1200 por hora: deja cupo del freno del hub para lo demás.
+/// Lo que se espera tras otro error del hub (sin conexión a medias, un 503, sin clave): unas
+/// vueltas, sin volver a leer ni a pedir en cada una (ms).
+const HUB_WAIT: u64 = 30_000;
+/// Lo más que se pide escribir al hub de una vez (peticiones de verdad: un `update` que choca
+/// hace varias); lo demás, tras `BUSY_WAIT`. Una limpieza grande (un registro perdido cierra
+/// todos los enlaces de este equipo) va así a unas 20 por minuto, como mucho unas 1200 por hora:
+/// deja cupo del freno del hub para lo demás. Se cuentan todas las del nido mientras tanto, y
+/// la última tarea puede pasarse en `MAX_TRIES - 1`.
 const MAX_WRITES: usize = 20;
 
 /// El estado de la tarea: está en `AppState`, pero la tarea la lanza `spawn_scanner`.
@@ -64,6 +71,9 @@ pub struct Progress {
     wake: tokio::sync::Notify,
     /// Una pasada a la vez.
     one: tokio::sync::Mutex<()>,
+    /// Cuántas veces se ha leído (descifrado) la copia.
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -77,6 +87,9 @@ struct Inner {
     /// Lo que vio el último repaso: la revisión de la copia y la huella del registro. `None`:
     /// hay que volver a repasar.
     seen: Option<(u64, u64)>,
+    /// Las sesiones que tenían algún enlace abierto en el último repaso (vale mientras sea la
+    /// revisión de `seen`): el plan de otra no hace leer la copia.
+    linked: HashSet<String>,
     /// Cuándo toca el próximo repaso aunque no cambie nada (ms).
     next_clean: u64,
     /// Hasta cuándo no se escribe, tras un 429 (ms).
@@ -219,7 +232,17 @@ impl Progress {
         !i.closing.is_empty()
             || i.seen != Some(seen)
             || now >= i.next_clean
-            || i.dirty.iter().any(|s| due(i.last.get(s), now))
+            || i.dirty
+                .iter()
+                .any(|s| i.linked.contains(s) && due(i.last.get(s), now))
+    }
+
+    /// Fuera los cierres pendientes de hace `KEEP_CLOSED` o más: sus enlaces, si quedan, ya se
+    /// cierran por no estar la sesión en el registro (y se borran enseguida).
+    fn expire(&self, now: u64) {
+        self.lock()
+            .closing
+            .retain(|_, c| now.saturating_sub(c.at) < KEEP_CLOSED);
     }
 
     /// Qué hacer con cada enlace de este equipo (`mine`), con los resúmenes de ahora (`plans`:
@@ -424,6 +447,7 @@ fn close(o: &mut Object, machine: &str, session: &str, c: &Closing, now: u64) {
 pub async fn pass(st: &Arc<AppState>, now: u64) {
     let p = &st.progress;
     let _one = p.one.lock().await;
+    p.expire(now);
     let machine = {
         let s = st.hub.status.borrow();
         if !s.connected {
@@ -445,6 +469,8 @@ pub async fn pass(st: &Arc<AppState>, now: u64) {
     }
     // Lo que cambie desde aquí se queda para la próxima.
     let taken = std::mem::take(&mut p.lock().dirty);
+    #[cfg(test)]
+    p.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let read = {
         let (st, keys, machine) = (st.clone(), keys.clone(), machine.clone());
         let sessions: HashSet<String> = before.into_keys().collect();
@@ -457,19 +483,22 @@ pub async fn pass(st: &Arc<AppState>, now: u64) {
     // El registro, después de leer: una sesión que se borra entretanto ya no está (y no se le
     // sube un plan vacío), y una que se crea y se une entretanto ya está (y no se cierra).
     let (names, _) = registry(st, &host).await;
-    let tasks = p.decide(&mine, &plans, &names, now);
+    let mut tasks = p.decide(&mine, &plans, &names, now);
+    // Primero las subidas: no esperan tras una limpieza grande (orden estable).
+    tasks.sort_by_key(|t| !matches!(t.job, Job::Copy { .. }));
     {
         let mut i = p.lock();
         i.seen = Some((rev, fp));
         i.next_clean = now + CLEAN_EVERY;
         // Las borradas que ya no tienen enlaces abiertos, hechas (o no tenían ninguno). Una que
         // se borra mientras tanto aún los tiene: se queda.
-        let open: HashSet<&str> = mine
+        let open: HashSet<String> = mine
             .iter()
             .filter(|m| m.closed.is_none())
-            .map(|m| m.session.as_str())
+            .map(|m| m.session.clone())
             .collect();
-        i.closing.retain(|s, _| open.contains(s.as_str()));
+        i.closing.retain(|s, _| open.contains(s));
+        i.linked = open;
     }
     run(st, &keys, &machine, tasks, now).await;
 }
@@ -479,8 +508,9 @@ pub async fn pass(st: &Arc<AppState>, now: u64) {
 async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>, now: u64) {
     let p = &st.progress;
     let (mut again, mut closed, mut removed) = (false, 0, 0);
-    for (n, t) in tasks.into_iter().enumerate() {
-        if n >= MAX_WRITES {
+    let start = st.hub.board_writes();
+    for t in tasks {
+        if st.hub.board_writes().saturating_sub(start) >= MAX_WRITES as u64 {
             p.lock().busy_until = now + BUSY_WAIT;
             again = true;
             break;
@@ -502,7 +532,28 @@ async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>
                 .update(keys, &t.link, |o| close(o, machine, session, closing, now))
                 .await
                 .map(drop),
-            Job::Remove => st.board.remove(keys, &t.link).await,
+            Job::Remove => {
+                // Solo si sigue siendo el que se leyó y, tras cada choque, si sigue cerrado hace
+                // 30 días: uno que se vuelve a abrir (`join`) entretanto no se borra.
+                let same = st.board.item(&t.link).map(|s| s.v) == Some(t.v);
+                let gone = |o: &Object| {
+                    matches!(o, Object::Link(l) if l.session.machine == machine
+                        && l.closed.is_some_and(|c| now.saturating_sub(c) >= KEEP_CLOSED))
+                };
+                let r = if same {
+                    st.board.remove_when(keys, &t.link, gone).await
+                } else {
+                    Ok(false)
+                };
+                match r {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        again = true;
+                        continue;
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         };
         // Si hay que parar y si falta algo (que la próxima pasada vuelva a mirar).
         let (stop, pending) = match r {
@@ -522,6 +573,7 @@ async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>
             }
             Err(e @ (EditError::Board(BoardError::Hub(_)) | EditError::NoKey)) => {
                 p.say(format!("no se pudieron poner al día los enlaces ({e})"));
+                p.lock().busy_until = now + HUB_WAIT;
                 (true, true)
             }
             // Choca una y otra vez: en la próxima.
@@ -587,13 +639,26 @@ impl Progress {
     fn forget_all(&self) {
         *self.lock() = Inner::default();
     }
+
+    /// Si ya se ha leído la copia alguna vez.
+    fn has_read(&self) -> bool {
+        self.lock().seen.is_some()
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn closing_len(&self) -> usize {
+        self.lock().closing.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::board;
-    use crate::board_tools::tests::{World, session, world};
+    use crate::board_tools::tests::{World, session, state, world};
     use crate::registry::Session;
     use serde_json::{Value, json};
 
@@ -774,6 +839,10 @@ mod tests {
         // Con el reloj de verdad: el cierre lleva la hora del borrado.
         let t0 = now_ms();
         pass(&w.st, t0).await;
+        // Los dos enlaces, a la vez.
+        for l in [&l1, &l2] {
+            assert_eq!(w.stored(l).unwrap()["plan"], summary("Migrar", 1, 2, 0));
+        }
         set_plan(&w, &w.s.id, "Migrar", &["done", "done"]);
         let before = now_ms();
         crate::server::delete_session(&w.st, &w.s.id).await.unwrap();
@@ -1101,8 +1170,15 @@ mod tests {
         goal(&w).await;
         let l = join(&w, &w.s).await;
         spawn_with(w.st.clone(), Duration::from_secs(3600));
-        // El primer tic, ya: que pase antes del cambio.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // El primer tic, ya: que acabe antes del cambio (si no, no se prueba el despertar).
+        let first = async {
+            while !w.st.progress.has_read() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("no hubo primer tic");
         set_plan(&w, &w.s.id, "Migrar", &["done"]);
         let wait = async {
             while w.stored(&l).unwrap()["plan"].is_null() {
@@ -1112,5 +1188,233 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), wait)
             .await
             .expect("no subió el resumen");
+    }
+
+    /// El blob de `v` para `id`, con la clave actual: `(kid, blob)`.
+    fn sealed(w: &World, id: &str, v: Value) -> (String, String) {
+        let (kid, raw) = w.key();
+        (
+            kid,
+            board::seal(&raw, id, v.to_string().as_bytes()).unwrap(),
+        )
+    }
+
+    /// Un enlace que otro vuelve a abrir justo antes de borrarlo (un 409) no se borra.
+    #[tokio::test]
+    async fn a_link_reopened_meanwhile_is_not_removed() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let l = "1".repeat(32);
+        put_link(&w, &l, &o, "este", "dead0000", json!({"closed": T0}));
+        w.st.board.sync().await.unwrap();
+        let reopened = json!({"t": "link", "objective": o,
+            "session": {"machine": "este", "id": "dead0000", "name": "Otro/vieja"},
+            "plan": null, "copied": 0, "closed": null, "created": 1, "changed": 3, "by": "web"});
+        let other = sealed(&w, &l, reopened);
+        w.board.lock().unwrap().clash(&l, Some(other));
+        pass(&w.st, T0 + KEEP_CLOSED).await;
+        let v = w.stored(&l).expect("no se borra");
+        assert_eq!(v["closed"], Value::Null);
+    }
+
+    /// Un 409 que cierra el enlace o lo pasa a otra sesión o a otro equipo: ni el resumen ni el
+    /// cierre lo reabren ni lo pisan.
+    #[tokio::test]
+    async fn a_clash_that_closes_or_moves_the_link_is_respected() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let l1 = join(&w, &w.s).await;
+        let (l2, l3) = ("2".repeat(32), "3".repeat(32));
+        put_link(&w, &l2, &o, "este", &w.s.id, json!({}));
+        put_link(&w, &l3, &o, "este", "dead0000", json!({}));
+        w.st.board.sync().await.unwrap();
+        let link = |session: &str, machine: &str, closed: Value| {
+            json!({"t": "link", "objective": o,
+                "session": {"machine": machine, "id": session, "name": "Otro/vieja"},
+                "plan": null, "copied": 0, "closed": closed, "created": 1, "changed": 3,
+                "by": "web"})
+        };
+        let c1 = sealed(&w, &l1, link(&w.s.id, "este", json!(5)));
+        let c2 = sealed(&w, &l2, link("otra0000", "este", Value::Null));
+        let c3 = sealed(&w, &l3, link("dead0000", "mac", Value::Null));
+        {
+            let mut b = w.board.lock().unwrap();
+            b.clash(&l1, Some(c1));
+            b.clash(&l2, Some(c2));
+            b.clash(&l3, Some(c3));
+        }
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        pass(&w.st, T0).await;
+        let v1 = w.stored(&l1).unwrap();
+        assert_eq!((&v1["closed"], &v1["plan"]), (&json!(5), &Value::Null));
+        let v2 = w.stored(&l2).unwrap();
+        assert_eq!(
+            (&v2["session"]["id"], &v2["plan"]),
+            (&json!("otra0000"), &Value::Null)
+        );
+        let v3 = w.stored(&l3).unwrap();
+        assert_eq!(
+            (&v3["session"]["machine"], &v3["closed"]),
+            (&json!("mac"), &Value::Null)
+        );
+    }
+
+    /// Con el hub caído (un 503) también se espera un rato, sin volver a leer ni pedir en cada
+    /// tic.
+    #[tokio::test]
+    async fn on_a_hub_error_it_waits_a_little() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        let l = join(&w, &w.s).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        w.board.lock().unwrap().down = 1;
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n + 1);
+        let reads = w.st.progress.reads();
+        crate::server::plan_changed(&w.st, &w.s.id);
+        pass(&w.st, T0 + 10_000).await;
+        assert_eq!(
+            (w.writes(), w.st.progress.reads()),
+            (n + 1, reads),
+            "esperando"
+        );
+        pass(&w.st, T0 + 30_000).await;
+        assert_eq!(w.writes(), n + 2);
+        assert_eq!(w.stored(&l).unwrap()["plan"], summary("Migrar", 1, 1, 0));
+    }
+
+    /// Las subidas del resumen van antes que una limpieza grande.
+    #[tokio::test]
+    async fn uploads_go_before_a_big_cleanup() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        for n in 0..MAX_WRITES + 5 {
+            put_link(&w, &format!("{n:032x}"), &o, "este", "dead0000", json!({}));
+        }
+        // El último de todos por id.
+        let mine = "f".repeat(32);
+        put_link(&w, &mine, &o, "este", &w.s.id, json!({}));
+        w.st.board.sync().await.unwrap();
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        pass(&w.st, T0).await;
+        assert_eq!(w.stored(&mine).unwrap()["plan"], summary("Migrar", 1, 1, 0));
+    }
+
+    /// El tope cuenta las peticiones de verdad: un 409 hace dos.
+    #[tokio::test]
+    async fn the_cap_counts_real_requests() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let ids: Vec<String> = (0..MAX_WRITES).map(|n| format!("{n:032x}")).collect();
+        for id in &ids {
+            put_link(&w, id, &o, "este", "dead0000", json!({}));
+        }
+        w.st.board.sync().await.unwrap();
+        for id in &ids[..5] {
+            let again = sealed(
+                &w,
+                id,
+                json!({"t": "link", "objective": o,
+                    "session": {"machine": "este", "id": "dead0000", "name": "Otro/vieja"},
+                    "created": 1, "changed": 2}),
+            );
+            w.board.lock().unwrap().clash(id, Some(again));
+        }
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n + MAX_WRITES);
+    }
+
+    /// Una sesión sin enlaces no hace leer la copia por cambiar su plan.
+    #[tokio::test]
+    async fn a_session_without_links_does_not_make_it_read() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        set_plan(&w, &w.s.id, "Migrar", &["pending"]);
+        pass(&w.st, T0).await;
+        let reads = w.st.progress.reads();
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        pass(&w.st, T0 + GAP).await;
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        pass(&w.st, T0 + 2 * GAP).await;
+        assert_eq!(w.st.progress.reads(), reads);
+        // Si se une, sí (la copia cambia).
+        let l = join(&w, &w.s).await;
+        pass(&w.st, T0 + 3 * GAP).await;
+        assert_eq!(w.stored(&l).unwrap()["plan"], summary("Migrar", 1, 1, 0));
+    }
+
+    /// Lo que no se arregla reintentando (un 413) se prueba una vez, y otra cuando cambia lo
+    /// que se quiere escribir.
+    #[tokio::test]
+    async fn what_cannot_be_written_is_not_retried_until_it_changes() {
+        let _limit = limit();
+        let w = world().await;
+        goal(&w).await;
+        let l = join(&w, &w.s).await;
+        w.board.lock().unwrap().too_big.insert(l.clone());
+        set_plan(&w, &w.s.id, "Migrar", &["pending"]);
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n + 1);
+        for k in 1..4 {
+            set_plan(&w, &w.s.id, "Migrar", &["pending"]);
+            pass(&w.st, T0 + k * GAP).await;
+        }
+        assert_eq!(w.writes(), n + 1);
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        pass(&w.st, T0 + 5 * GAP).await;
+        assert_eq!(w.writes(), n + 2);
+    }
+
+    /// Un plan que no se puede leer del disco no borra el resumen del enlace.
+    #[tokio::test]
+    async fn an_unreadable_plan_keeps_the_summary() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let l = "1".repeat(32);
+        put_link(
+            &w,
+            &l,
+            &o,
+            "este",
+            &w.s.id,
+            json!({"plan": summary("a", 1, 2, 0)}),
+        );
+        w.st.board.sync().await.unwrap();
+        // Un directorio donde va el fichero: leerlo falla (y no es «no hay»).
+        let dir =
+            w.st.paths
+                .state
+                .join("sessions")
+                .join(&w.s.id)
+                .join("plan.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::server::plan_changed(&w.st, &w.s.id);
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n);
+        assert_eq!(w.stored(&l).unwrap()["plan"], summary("a", 1, 2, 0));
+    }
+
+    /// Los cierres pendientes no se guardan para siempre: tampoco sin hub.
+    #[tokio::test]
+    async fn pending_closes_expire_even_without_a_hub() {
+        let _limit = limit();
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        st.progress.session_deleted("dead0000", T0, None);
+        pass(&st, T0 + KEEP_CLOSED - 1).await;
+        assert_eq!(st.progress.closing_len(), 1);
+        pass(&st, T0 + KEEP_CLOSED).await;
+        assert_eq!(st.progress.closing_len(), 0);
     }
 }

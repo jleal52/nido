@@ -382,6 +382,9 @@ pub struct Hub {
     /// se manda siempre). Va con `control`: se cogen en ese orden.
     sent: Mutex<Sent>,
     next_req: AtomicU64,
+    /// Cuántas escrituras del tablero (`board_put`, `board_del`) se han pedido: para que quien
+    /// escribe mucho de una vez se pueda medir (`board_progress`).
+    board_writes: AtomicU64,
 }
 
 impl Hub {
@@ -404,6 +407,7 @@ impl Hub {
             control: Default::default(),
             sent: Default::default(),
             next_req: AtomicU64::new(1),
+            board_writes: AtomicU64::new(0),
         })
     }
 
@@ -771,6 +775,7 @@ impl Hub {
         body.insert("v".into(), v.into());
         body.insert("kid".into(), kid.into());
         body.insert("blob".into(), blob.into());
+        self.board_writes.fetch_add(1, Ordering::SeqCst);
         stamp(&self.board_ask(body).await?)
     }
 
@@ -780,7 +785,13 @@ impl Hub {
         body.insert("op".into(), "del".into());
         body.insert("id".into(), id.into());
         body.insert("v".into(), v.into());
+        self.board_writes.fetch_add(1, Ordering::SeqCst);
         stamp(&self.board_ask(body).await?)
+    }
+
+    /// Cuántas escrituras del tablero ha pedido este nido desde que arrancó (salgan como salgan).
+    pub fn board_writes(&self) -> u64 {
+        self.board_writes.load(Ordering::SeqCst)
     }
 
     /// Si es `{"account":{"name","lang"}}`, la cuenta de este nido: al estado (y, si cambió, avisa
@@ -2344,6 +2355,8 @@ pub(crate) mod fake {
         >,
         /// Las próximas escrituras que dan 429.
         pub busy: usize,
+        /// Las próximas escrituras que dan 503 (el hub sin MongoDB).
+        pub down: usize,
         /// Lo que se ha pedido leer: `(since, after)`.
         pub gets: Vec<(i64, Option<String>)>,
         /// Las escrituras que han llegado: cuándo, `op`, id y `v`.
@@ -2373,6 +2386,7 @@ pub(crate) mod fake {
                 reset: false,
                 clashes: Default::default(),
                 busy: 0,
+                down: 0,
                 gets: vec![],
                 writes: vec![],
                 limit: 2000,
@@ -2504,6 +2518,10 @@ pub(crate) mod fake {
                 self.busy -= 1;
                 return serde_json::json!({ "status": 429,
                     "error": "demasiadas escrituras en el tablero: prueba en un rato" });
+            }
+            if self.down > 0 {
+                self.down -= 1;
+                return serde_json::json!({ "status": 503, "error": "error del hub" });
             }
             if let Some(other) = self.clashes.get_mut(&id).and_then(|q| q.pop_front()) {
                 self.write(&id, other.as_ref().map(|(k, b)| (k.as_str(), b.as_str())));

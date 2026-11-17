@@ -1355,7 +1355,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn state(dir: &Path) -> Arc<AppState> {
+    pub(crate) fn state(dir: &Path) -> Arc<AppState> {
         let paths = crate::launch::Paths {
             runtime: dir.join("run"),
             data: dir.join("data"),
