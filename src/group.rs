@@ -821,9 +821,13 @@ impl Group {
     /// actual en todos y la otra se retira (`retire_stale`). Si no se puede guardar, se apunta
     /// (con freno) y se intenta la próxima vez.
     ///
-    /// Un límite conocido: si otro equipo rota por otra baja antes de enterarse de esta, su clave
-    /// es posterior a esta baja y aquí ya no toca rotar. Lo quitado aquí pudo pedirle esa clave
-    /// a ese equipo mientras tanto (solo en ese rato, antes de que se enterara de la baja).
+    /// Solo mira horas: no ve una clave posterior a la baja que lo quitado se llevó de un equipo
+    /// que aún no sabía de ella (la primera, creada allí con el llavero vacío, o la de otro equipo
+    /// que rotó por otra baja antes de enterarse de esta). Eso lo cubre, en el equipo que se la
+    /// dio, `AppState::apply_group` (server.rs): cada dispositivo lleva apuntados los `kid` de
+    /// las activas que se le dieron (`Phone::board_kids`) y, al quitarlo, se rota si la actual
+    /// está entre ellas. Lo que queda sin cubrir: que esa rotación no se pueda guardar y nido se
+    /// reinicie antes de reintentarla (va en memoria).
     pub fn rotate_if_due(&self) -> Option<BoardKey> {
         if !rotation_due(&self.state.lock().expect("grupo"), now_ms()) {
             return None;

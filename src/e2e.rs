@@ -242,6 +242,11 @@ pub struct Phone {
     #[serde(default)]
     pub handle: Option<String>,
     pub added: u64,
+    /// Los `kid` de las claves activas del tablero que se le dieron aquí la última vez
+    /// (`GET /api/v1/board/keys`). Si lo quitan en otro equipo, `apply_group` rota la clave
+    /// actual si está entre estas: pudo llevársela después de su baja (ver `api_board_keys`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub board_kids: Vec<String>,
 }
 
 /// Lo que se puede enseñar de un teléfono (sin claves ni token).
@@ -320,6 +325,13 @@ impl Phones {
         handle: Option<String>,
     ) -> std::io::Result<Phone> {
         let k = B64.encode(key);
+        // Al renovarlo, lo que se le dio del llavero sigue en sus manos.
+        let board_kids = self
+            .list
+            .iter()
+            .find(|p| p.key == k)
+            .map(|p| p.board_kids.clone())
+            .unwrap_or_default();
         self.list.retain(|p| p.key != k);
         let phone = Phone {
             id: hex(&random::<6>()),
@@ -329,10 +341,29 @@ impl Phones {
             push_key: B64.encode(random::<32>()),
             handle,
             added: unix_now(),
+            board_kids,
         };
         self.list.push(phone.clone());
         self.save()?;
         Ok(phone)
+    }
+
+    /// Apunta qué claves activas del tablero se le dan (`board_kids`), y lo guarda si cambió.
+    /// `Ok(false)` si ya no está (lo acaban de quitar). Si no se puede guardar, queda como estaba,
+    /// para volver a intentarlo en la siguiente petición.
+    pub fn note_board_kids(&mut self, id: &str, kids: Vec<String>) -> std::io::Result<bool> {
+        let Some(i) = self.list.iter().position(|p| p.id == id) else {
+            return Ok(false);
+        };
+        if self.list[i].board_kids == kids {
+            return Ok(true);
+        }
+        let before = std::mem::replace(&mut self.list[i].board_kids, kids);
+        if let Err(e) = self.save() {
+            self.list[i].board_kids = before;
+            return Err(e);
+        }
+        Ok(true)
     }
 
     /// El teléfono avisa de su handle en el hub al conectar (por si cambió).
@@ -1282,6 +1313,33 @@ async fn run_flow(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Lo que se le dio del llavero se guarda con el teléfono, sobrevive a reemparejarlo, y un
+    /// `phones.json` de antes (sin el campo) se lee igual.
+    #[test]
+    fn the_board_kids_given_to_a_phone_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phones.json");
+        let mut phones = Phones::load(path.clone());
+        let p = phones.add(&[1u8; 32], "tel", None).unwrap();
+        assert!(p.board_kids.is_empty());
+        let kids = vec!["00112233aabbccdd".to_owned()];
+        assert!(phones.note_board_kids(&p.id, kids.clone()).unwrap());
+        assert!(!phones.note_board_kids("no-esta", kids.clone()).unwrap());
+        assert_eq!(Phones::load(path.clone()).list()[0].board_kids, kids);
+        let again = phones.add(&[1u8; 32], "tel", None).unwrap();
+        assert_eq!(again.board_kids, kids, "reemparejado, sigue teniéndolas");
+        // Un fichero de antes.
+        let old = serde_json::json!([{"id": "a1", "name": "tel", "key": "k", "token": "t",
+            "added": 1}]);
+        std::fs::write(&path, old.to_string()).unwrap();
+        let phones = Phones::load(path.clone());
+        assert_eq!(phones.list().len(), 1);
+        assert!(phones.list()[0].board_kids.is_empty());
+        // Sin claves dadas, el campo no se escribe.
+        let text = serde_json::to_string(&phones.list()[0]).unwrap();
+        assert!(!text.contains("board_kids"), "{text}");
+    }
 
     struct TestHost {
         id: Identity,

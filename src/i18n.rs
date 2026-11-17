@@ -307,6 +307,14 @@ const TABLE: &[(&str, &str)] = &[
         "no se pudo guardar la clave del tablero; prueba otra vez",
         "the board key could not be saved; try again",
     ),
+    (
+        "el llavero del tablero no tiene ninguna clave activa; prueba otra vez",
+        "the board keyring has no active key; try again",
+    ),
+    (
+        "no se pudo apuntar qué claves del tablero tiene este dispositivo; prueba otra vez",
+        "could not note which board keys this device has; try again",
+    ),
     // La memoria de la voz (voice_memory.rs y `/api/v1/voice/memory`)
     (
         "solo un teléfono o una web emparejados pueden usar la memoria de la voz",
