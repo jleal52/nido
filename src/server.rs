@@ -2861,6 +2861,28 @@ const BOARD_KEY_NONE: &str =
 const BOARD_KIDS_UNSAVED: &str =
     "no se pudo apuntar qué claves del tablero tiene este dispositivo; prueba otra vez";
 
+/// Que el llavero del tablero tenga clave actual: si no hay ninguna activa, crea la primera.
+/// Crearla guarda en el disco (con fsync): fuera del runtime, y solo si hace falta. Si no se
+/// pudo guardar, el mensaje del error (503). Lo usan `GET /api/v1/board/keys` y las
+/// herramientas del MCP que escriben en el tablero (`board_tools`).
+pub(crate) async fn ensure_board_key(st: &Arc<AppState>) -> Result<(), &'static str> {
+    if st.group.board_keys().current().is_some() {
+        return Ok(());
+    }
+    let st = st.clone();
+    match tokio::task::spawn_blocking(move || st.group.ensure_board_key()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            eprintln!("nido: no se pudo guardar la clave del tablero: {e}");
+            Err(BOARD_KEY_UNSAVED)
+        }
+        Err(e) => {
+            eprintln!("nido: falló la tarea que crea la clave del tablero: {e}");
+            Err(BOARD_KEY_UNSAVED)
+        }
+    }
+}
+
 /// Una clave del llavero tal como la recibe un dispositivo. Sin `Debug`: lleva el secreto.
 #[derive(Serialize)]
 struct DeviceBoardKey {
@@ -2960,20 +2982,8 @@ async fn api_board_keys(
     else {
         return error(StatusCode::FORBIDDEN, BOARD_KEYS_DENIED);
     };
-    // Crearla guarda en el disco (con fsync): fuera del runtime, y solo si hace falta.
-    if st.group.board_keys().current().is_none() {
-        let st = st.clone();
-        match tokio::task::spawn_blocking(move || st.group.ensure_board_key()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                eprintln!("nido: no se pudo guardar la clave del tablero: {e}");
-                return error(StatusCode::SERVICE_UNAVAILABLE, BOARD_KEY_UNSAVED);
-            }
-            Err(e) => {
-                eprintln!("nido: falló la tarea que crea la clave del tablero: {e}");
-                return error(StatusCode::SERVICE_UNAVAILABLE, BOARD_KEY_UNSAVED);
-            }
-        }
+    if let Err(msg) = ensure_board_key(&st).await {
+        return error(StatusCode::SERVICE_UNAVAILABLE, msg);
     }
     let ring = match board_keys_for(&st.group.snapshot(), &device_key) {
         Ok(r) => r,
