@@ -279,8 +279,8 @@ Seguridad:
   (`claude.trusting`), para que la web y la app lo enseñen y la contestes desde ahí.
 - A Claude se le dice que los mensajes de otras sesiones no son tuyos.
 - Una sesión engañada (un mensaje con instrucciones metidas) sí puede cambiar o borrar el tablero
-  de proyectos, porque sus herramientas no piden permiso; sobre otras sesiones no puede actuar
-  sin él.
+  de proyectos, porque sus herramientas no piden permiso; abrir, contestar, cerrar, arrancar o
+  parar otras sesiones sí pasa por él.
 
 ```sh
 nido mcp off     # las próximas sesiones de Claude arrancan sin el MCP de nido (las que están en marcha siguen igual)
@@ -364,11 +364,11 @@ fue no lea lo que se cifre desde entonces. La vieja queda retirada, y nido recif
 solo los objetos que siguen cifrados con una retirada, poco a poco (unos 10 por minuto entre
 todos los equipos). Una clave retirada se guarda al menos 30 días, y mientras algún objeto la use:
 así, un dispositivo con el llavero viejo que escriba con ella mientras los equipos están apagados
-no deja nada ilegible. nido avisa en su log (el journal con systemd, `~/Library/Logs/nido.log` con
-launchd, `serve.log` en Windows) por encima de 16 claves; por encima de 64 quita antes de tiempo,
-con un aviso, las retiradas más viejas que no usa ningún objeto. Una clave con la que aún hay algo
-cifrado no se quita nunca. Un equipo que se quita del grupo vacía su llavero y su copia del
-tablero.
+no deja nada ilegible. nido avisa en su log (el journal con systemd, `~/Library/Logs/nido.log`
+con launchd, `~\.local\state\nido\serve.log` en Windows) por encima de 16 claves; por encima de
+64 quita antes de tiempo, con un aviso, las retiradas más viejas que no usa ningún objeto. Una
+clave con la que aún hay algo cifrado no se quita nunca. Un equipo que se quita del grupo vacía su
+llavero y su copia del tablero.
 
 ## La API
 

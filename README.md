@@ -295,7 +295,8 @@ Security:
   so the web and the app can show it and you can answer it there.
 - Claude is told that messages from other sessions don't come from you.
 - A tricked session (a message with instructions slipped in) can change or delete the projects
-  board, because its tools don't ask for permission; it can't act on other sessions without it.
+  board, because its tools don't ask for permission; opening, answering, closing, starting or
+  stopping other sessions still does.
 
 ```sh
 nido mcp off     # the next Claude sessions start without nido's MCP (running ones stay as they are)
@@ -380,10 +381,10 @@ is retired, and nido re-encrypts with the current key only the objects still enc
 retired one, slowly (about 10 per minute among all the computers). A retired key is kept at least
 30 days, and as long as some object uses it: that way a device with the old keyring that writes
 with it while the computers are off doesn't leave anything unreadable. nido warns in its log (the
-journal with systemd, `~/Library/Logs/nido.log` with launchd, `serve.log` on Windows) above 16
-keys; above 64 it removes early, with a warning, the oldest retired keys that no object uses. A
-key that still encrypts something is never removed. A computer removed from the group empties its
-keyring and its copy of the board.
+journal with systemd, `~/Library/Logs/nido.log` with launchd, `~\.local\state\nido\serve.log` on
+Windows) above 16 keys; above 64 it removes early, with a warning, the oldest retired keys that no
+object uses. A key that still encrypts something is never removed. A computer removed from the
+group empties its keyring and its copy of the board.
 
 ## The API
 
