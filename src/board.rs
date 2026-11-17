@@ -873,10 +873,15 @@ impl BoardCache {
     fn mark(self: &Arc<Self>, seen: bool) {
         self.dirty.store(true, Ordering::SeqCst);
         if seen {
-            self.start_saver();
-            self.saver.notify_one();
+            self.save_soon();
             self.bump();
         }
+    }
+
+    /// Que se guarde al final del hueco (`saver`), sin avisar de nada.
+    fn save_soon(self: &Arc<Self>) {
+        self.start_saver();
+        self.saver.notify_one();
     }
 
     /// La tarea que guarda la copia: el primer cambio abre un hueco de `SAVE_GAP`, y al acabar
@@ -1072,7 +1077,7 @@ impl BoardCache {
                 true
             }));
         }
-        let (changed, moved, lost) = {
+        let (changed, moved, other, lost) = {
             let mut c = self.lock();
             if self.epoch() != epoch {
                 return Ok(false);
@@ -1111,10 +1116,15 @@ impl BoardCache {
             } else {
                 false
             };
-            (changed, moved, !lost.is_empty())
+            (changed, moved, other, !lost.is_empty())
         };
         if changed || moved {
             self.mark(changed);
+        }
+        // Otra cuenta sin nada nuevo que enseñar: su `ref` y su `next` van al disco igual, que
+        // si no un corte brusco obliga a otra lectura completa.
+        if other && !changed {
+            self.save_soon();
         }
         if lost {
             self.probe_wanted.notify_one();
@@ -1130,8 +1140,16 @@ impl BoardCache {
         let _one = self.syncing.lock().await;
         let read = self.read_all(0, None).await?;
         let on_hub: BTreeSet<String> = read.items.iter().map(|i| i.id.clone()).collect();
-        let mut gone = 0;
+        let (mut gone, mut other) = (0, false);
         self.change(epoch, |c| {
+            // Lo leído es de otra cuenta que la de la copia: no dice qué falta en la suya. No se
+            // toca nada, y el sondeo se pone antes al día con esa cuenta (`sync`).
+            if let (Some(read), Some(saved)) = (&read.account_ref, &c.account_ref)
+                && read != saved
+            {
+                other = true;
+                return false;
+            }
             let before = c.clone();
             let keep = c.reupload.clone();
             let no_key: BTreeSet<String> = c
@@ -1155,6 +1173,9 @@ impl BoardCache {
             c.next = c.next.max(read.next);
             *c != before
         });
+        if other {
+            self.probe_wanted.notify_one();
+        }
         if gone > 0 {
             eprintln!("nido: tablero: {gone} objetos que el hub ya no tiene, fuera de la copia");
         }
@@ -1196,6 +1217,12 @@ impl BoardCache {
     /// el equipo quitado). Lo que no se puede leer con su clave no se sube y queda marcado como
     /// que no está en el hub. Si el hub tiene algo, lo junta (y repasa lo marcado). Solo se
     /// apunta y se guarda si cambia algo.
+    ///
+    /// Sus `get` desde 0 no miran la `ref`, y no hace falta. Va justo después de un `sync`, que
+    /// ya se puso al día con la cuenta de ahora. Si aun así fuera otra: juntar lo que trae
+    /// (gana lo más nuevo) no quita nada y es lo que traerá la próxima sincronización; el repaso
+    /// sí la mira (`prune`); y un hub vacío es vacío en cualquier cuenta, y lo que se resube va a
+    /// la cuenta en la que está ahora este nido, que es la que tiene que tenerlo.
     pub async fn probe(self: &Arc<Self>, keys: &Keys) -> Result<(), BoardError> {
         if !self.lock().has_objects() {
             return Ok(());
@@ -3609,6 +3636,58 @@ mod tests {
         r.cache.sync().await.unwrap();
         let last = r.board.lock().unwrap().gets.last().cloned().unwrap();
         assert_eq!(last, (next, None));
+    }
+
+    /// Otra cuenta con los mismos objetos: no cambia nada que se vea, pero la `ref` y el `next`
+    /// nuevos van al disco al final del hueco, sin esperar a otro cambio (si no, tras un corte
+    /// brusco habría otra lectura completa).
+    #[tokio::test]
+    async fn another_account_with_nothing_new_is_saved() {
+        let r = rig(with_ref(REF_A)).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        // El guardado de esa, hecho: el guardador, en reposo.
+        until("el primer guardado", || saved(&r.cache) == 1).await;
+        let rev = *r.cache.subscribe().borrow();
+        r.board.lock().unwrap().account_ref = Some(REF_B.into());
+        assert!(!r.cache.sync().await.unwrap());
+        assert_eq!(
+            *r.cache.subscribe().borrow(),
+            rev,
+            "no cambió nada que se vea"
+        );
+        until("la ref nueva, en el disco", || {
+            disk(&r).lock().account_ref.as_deref() == Some(REF_B)
+        })
+        .await;
+        assert_eq!(disk(&r).next(), r.cache.next());
+    }
+
+    /// El repaso (`prune`) con una lectura de otra cuenta que la de la copia no toca nada: pide
+    /// un sondeo, cuya sincronización se pone antes al día con esa cuenta.
+    #[tokio::test]
+    async fn prune_leaves_another_account_to_the_probe() {
+        let r = rig(with_ref(REF_A)).await;
+        let (cur, other) = (bid(1), bid(2));
+        r.write(&K_CUR, &cur, &project("uno"));
+        r.write(&K_CUR, &other, &project("dos"));
+        r.cache.sync().await.unwrap();
+        {
+            let mut b = r.board.lock().unwrap();
+            b.items.remove(&cur);
+            b.account_ref = Some(REF_B.into());
+        }
+        r.cache.lock().missing.insert(cur.clone());
+        r.cache.probe(&keys()).await.unwrap();
+        assert_eq!(r.cache.ids(), vec![cur.clone(), other.clone()]);
+        assert_eq!(
+            unreadable(&r.cache),
+            vec![(cur.clone(), Unreadable::NotInHub)]
+        );
+        assert_eq!(r.cache.lock().account_ref.as_deref(), Some(REF_A));
+        tokio::time::timeout(Duration::from_secs(1), r.cache.probe_wanted.notified())
+            .await
+            .expect("no se pidió el sondeo");
     }
 
     /// La primera `ref`, con la copia vacía: una lectura, sin marcar nada ni pedir sondeo.
