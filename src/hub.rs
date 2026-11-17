@@ -2202,9 +2202,12 @@ pub(crate) mod fake {
         pub page: usize,
         /// Que la próxima primera página con `since > 0` diga `reset`.
         pub reset: bool,
-        /// Lo que escribe otro justo antes de cada una de las próximas escrituras (su `kid` y su
-        /// blob; `None`, una lápida): la nuestra choca (409).
-        pub clash: std::collections::VecDeque<Option<(String, String)>>,
+        /// Por id, lo que escribe otro justo antes de cada una de las próximas escrituras de ese
+        /// objeto (su `kid` y su blob; `None`, una lápida): la nuestra choca (409). Ver `clash`.
+        pub clashes: std::collections::BTreeMap<
+            String,
+            std::collections::VecDeque<Option<(String, String)>>,
+        >,
         /// Las próximas escrituras que dan 429.
         pub busy: usize,
         /// Lo que se ha pedido leer: `(since, after)`.
@@ -2220,7 +2223,7 @@ pub(crate) mod fake {
                 clock: BOARD_T0,
                 page: 100,
                 reset: false,
-                clash: Default::default(),
+                clashes: Default::default(),
                 busy: 0,
                 gets: vec![],
                 writes: vec![],
@@ -2232,6 +2235,11 @@ pub(crate) mod fake {
         fn tick(&mut self) -> i64 {
             self.clock += BOARD_TICK;
             self.clock
+        }
+
+        /// Que otro escriba `other` en `id` justo antes de nuestra próxima escritura de `id`.
+        pub fn clash(&mut self, id: &str, other: Option<(String, String)>) {
+            self.clashes.entry(id.into()).or_default().push_back(other);
         }
 
         /// Otro escribe `id` (un blob, o una lápida con `None`): da el objeto como queda.
@@ -2310,7 +2318,7 @@ pub(crate) mod fake {
                 return serde_json::json!({ "status": 429,
                     "error": "demasiadas escrituras en el tablero: prueba en un rato" });
             }
-            if let Some(other) = self.clash.pop_front() {
+            if let Some(other) = self.clashes.get_mut(&id).and_then(|q| q.pop_front()) {
                 self.write(&id, other.as_ref().map(|(k, b)| (k.as_str(), b.as_str())));
             }
             let current = self.items.get(&id).cloned().unwrap_or(BoardItem {

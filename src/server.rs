@@ -56,6 +56,8 @@ pub struct AppState {
     alert_throttle: std::sync::Mutex<AlertThrottle>,
     /// La conexión con el hub: móviles sin VPN y avisos.
     pub hub: Arc<hub::Hub>,
+    /// La copia de este nido del tablero de la cuenta (`<data>/board.json`), al día con el hub.
+    pub board: Arc<crate::board::BoardCache>,
     /// Lo que `scan` ve pasar (terminó, te necesita), para avisar al móvil.
     alerts: tokio::sync::mpsc::UnboundedSender<Alert>,
     alerts_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Alert>>>,
@@ -609,6 +611,12 @@ impl AppState {
             .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
         let phones = e2e::Phones::load(paths.data.join("phones.json"));
         let group = crate::group::Group::load(paths.data.join("group.json"), identity.public);
+        let board = crate::board::BoardCache::load(paths.data.join("board.json"), hub.clone());
+        // El equipo que sale del grupo no se lleva el tablero (decisión 8 de los proyectos).
+        {
+            let board = board.clone();
+            group.on_leave(move || board.clear());
+        }
         // Los dispositivos emparejados antes de haber grupo, también en él.
         for p in phones.list() {
             if !group.snapshot().devices.iter().any(|d| d.key == p.key)
@@ -646,6 +654,7 @@ impl AppState {
             finished_pushed: Default::default(),
             alert_throttle: Default::default(),
             hub,
+            board,
             alerts,
             alerts_rx: std::sync::Mutex::new(Some(alerts_rx)),
             identity,
@@ -2347,6 +2356,11 @@ pub fn spawn_scanner(state: Arc<AppState>) {
     }
     // La conexión con el hub (si hay uno configurado).
     hub::spawn(state.hub.clone(), state.clone());
+    // La copia del tablero, al día con el hub mientras haya conexión.
+    {
+        let st = state.clone();
+        crate::board::spawn(state.board.clone(), move || st.group.board_keys());
+    }
     // Las cuentas de Claude: lo que gasta cada una, mirado de vez en cuando.
     state.accounts.spawn(state.paths.home.clone());
     // Tras un cambio automático de cuenta, las sesiones paradas por el límite siguen con la nueva.

@@ -12,6 +12,9 @@
 //! `aes-gcm`. El id va en `aad` para que un blob no se pueda pasar a otro objeto; la cuenta no,
 //! porque al juntar dos cuentas los objetos pasan a la que queda y se tienen que seguir leyendo.
 //! `tests/data/board_vectors.json` fija todo esto para la web y la app.
+//!
+//! Abajo, `BoardCache`: la copia de este nido del tablero del hub (`data/board.json`), que se
+//! sincroniza por la conexión con el hub (`hub::Hub::board_get`…).
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -19,6 +22,15 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::watch;
+
+use crate::group::Keyring;
+use crate::hub::{BoardError, BoardItem, Hub};
 
 /// El id de una clave del tablero: `hex(SHA-256("nido-board-kid" || clave))[0..16]`.
 pub fn kid(key: &[u8; 32]) -> String {
@@ -401,6 +413,774 @@ pub enum ObjectiveState {
     Dropped,
     #[serde(untagged)]
     Other(String),
+}
+
+// ---------- La copia del tablero ----------
+
+/// Cada cuánto se sincroniza aunque no llegue ningún aviso.
+pub const SYNC_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Cada cuántas de esas se mira además si el hub se ha quedado sin tablero (`probe`): una hora.
+const PROBE_EVERY: u32 = 12;
+/// Lo que se espera entre dos escrituras de la resubida: 20 por minuto. El hub frena a 120 por
+/// minuto y conexión y a 3000 por hora y cuenta, y la resubida tiene que dejar sitio a lo que se
+/// edita a mano (1200 por hora).
+pub const REUPLOAD_GAP: Duration = Duration::from_secs(3);
+/// Con el freno del hub (429), la resubida espera esto en huecos de `REUPLOAD_GAP` (un minuto).
+const BUSY_GAPS: u32 = 20;
+/// Cuántas veces se intenta una escritura que choca (409) antes de dejarlo.
+pub const MAX_TRIES: usize = 3;
+/// Cada cuántos objetos resubidos se guarda la copia.
+const SAVE_EVERY: usize = 20;
+
+/// Un objeto en la copia, como lo da el hub (sin su id, que es la clave).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stored {
+    pub v: i64,
+    #[serde(default)]
+    pub kid: String,
+    #[serde(default)]
+    pub blob: Option<String>,
+    #[serde(default)]
+    pub gone: bool,
+    #[serde(default)]
+    pub at: i64,
+}
+
+impl From<&BoardItem> for Stored {
+    fn from(i: &BoardItem) -> Self {
+        Self {
+            v: i.v,
+            kid: i.kid.clone(),
+            blob: i.blob.clone(),
+            gone: i.gone,
+            at: i.at,
+        }
+    }
+}
+
+/// Lo que se guarda en `data/board.json`.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+struct Copy {
+    /// El `since` de la próxima sincronización.
+    #[serde(default)]
+    next: i64,
+    #[serde(default)]
+    items: BTreeMap<String, Stored>,
+    /// Los que faltan por volver a subir a un hub que se quedó sin tablero (decisión 8).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    reupload: BTreeSet<String>,
+}
+
+/// Por qué un objeto de la copia no se puede leer. No lleva nada de lo descifrado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unreadable {
+    /// Su `kid` no está en el llavero.
+    NoKey,
+    /// El blob no se descifra con la clave de su `kid` (o no es un blob).
+    Broken,
+    /// Se descifra, pero no es un objeto.
+    NotAnObject,
+    /// Es un objeto de un tipo que no conocemos (de una versión futura).
+    Unknown,
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Unreadable::NoKey => "sin su clave",
+            Unreadable::Broken => "no se descifra",
+            Unreadable::NotAnObject => "no es un objeto",
+            Unreadable::Unknown => "de un tipo que no se conoce",
+        })
+    }
+}
+
+/// Un objeto legible del tablero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub id: String,
+    pub v: i64,
+    pub object: Object,
+}
+
+/// La copia descifrada: lo legible y, aparte, lo que no se puede leer (que se conserva tal cual).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Decrypted {
+    pub objects: Vec<Entry>,
+    pub unreadable: Vec<(String, Unreadable)>,
+}
+
+/// Por qué no salió un cambio del tablero.
+#[derive(Debug)]
+pub enum EditError {
+    /// No hay clave actual en el llavero con la que cifrar.
+    NoKey,
+    /// El objeto no está (o está borrado).
+    Missing,
+    /// El objeto no se puede leer: no se reescribe.
+    Unreadable(Unreadable),
+    /// No se pudo cifrar (demasiado grande, un `order` que no es finito…).
+    Blob(BlobError),
+    /// Lo que dijo el hub; con `Conflict`, tras `MAX_TRIES` choques.
+    Board(BoardError),
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EditError::NoKey => write!(f, "no hay clave del tablero"),
+            EditError::Missing => write!(f, "el objeto no está en el tablero"),
+            EditError::Unreadable(u) => write!(f, "el objeto no se puede leer ({u})"),
+            // `BadObject` puede llevar trozos del texto: solo su nombre.
+            EditError::Blob(e @ BlobError::TooBig(_)) => write!(f, "{e}"),
+            EditError::Blob(e) => write!(f, "no se pudo cifrar el objeto ({})", blob_error_kind(e)),
+            EditError::Board(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
+/// El nombre de un error del blob, para los registros: nunca su texto, que en `BadObject` puede
+/// llevar trozos de lo descifrado.
+pub fn blob_error_kind(e: &BlobError) -> &'static str {
+    match e {
+        BlobError::TooBig(_) => "demasiado grande",
+        BlobError::BadId => "id no válido",
+        BlobError::Random(_) => "sin números al azar",
+        BlobError::BadBlob => "blob mal formado",
+        BlobError::Version(_) => "versión desconocida",
+        BlobError::Open => "no se descifra",
+        BlobError::BadObject(_) => "objeto no válido",
+    }
+}
+
+/// La copia de este nido del tablero de la cuenta: los objetos tal y como los da el hub (cifrados)
+/// y hasta dónde se ha leído, en `data/board.json`.
+pub struct BoardCache {
+    path: PathBuf,
+    hub: Arc<Hub>,
+    copy: Mutex<Copy>,
+    /// Que los guardados (y el vaciado) vayan de uno en uno y en orden.
+    disk: Mutex<()>,
+    /// Una sincronización a la vez.
+    syncing: tokio::sync::Mutex<()>,
+    /// Sube al vaciar la copia: lo que estaba en marcha (sincronizar, resubir, escribir) ya no
+    /// la toca.
+    epoch: AtomicU64,
+    /// Si hay una resubida en marcha.
+    reuploading: AtomicBool,
+    /// Lo que se espera entre dos escrituras de la resubida.
+    gap: Duration,
+    /// Sube con cada cambio de la copia.
+    revision: watch::Sender<u64>,
+    /// El último error al sincronizar que se apuntó, para no repetirlo cada vez.
+    said: Mutex<Option<String>>,
+}
+
+impl Copy {
+    /// Junta un objeto que da el hub. Gana el de `v` mayor o marca más nueva: dentro de una
+    /// cuenta, `v` solo sube; al pasar a otra cuenta (resubida, cuentas juntadas) la `v` puede
+    /// volver a empezar, pero la marca es nueva. Lo que ya se tiene (mismo `v` y marca, como lo
+    /// del solape) no cambia nada. Uno que faltaba por resubir ya está en el hub: se toma tal
+    /// cual y deja de faltar. Devuelve si cambió algo.
+    fn apply(&mut self, item: BoardItem) -> bool {
+        let pending = self.reupload.remove(&item.id);
+        let newer = match self.items.get(&item.id) {
+            None => true,
+            Some(cur) => pending || item.v > cur.v || item.at > cur.at,
+        };
+        if newer {
+            let stored = Stored::from(&item);
+            self.items.insert(item.id, stored);
+        }
+        newer || pending
+    }
+
+    /// Si hay objetos propios (no lápidas) que se podrían volver a subir.
+    fn has_objects(&self) -> bool {
+        self.items.values().any(|s| !s.gone && s.blob.is_some())
+    }
+}
+
+/// La clave del llavero con este `kid` (nunca otra).
+fn key_of(keys: &Keyring, kid: &str) -> Option<[u8; 32]> {
+    let k = keys.keys.iter().find(|k| k.kid == kid && !k.removed)?;
+    B64.decode(&k.key).ok()?.try_into().ok()
+}
+
+/// La clave con que se cifra ahora: su `kid` y sus bytes.
+fn current_key(keys: &Keyring) -> Option<(String, [u8; 32])> {
+    let k = keys.current()?;
+    Some((k.kid.clone(), key_of(keys, &k.kid)?))
+}
+
+/// Lee el objeto `id` de la copia con la clave de su `kid`.
+fn read(keys: &Keyring, id: &str, s: &Stored) -> Result<Object, Unreadable> {
+    let key = key_of(keys, &s.kid).ok_or(Unreadable::NoKey)?;
+    let blob = s.blob.as_deref().ok_or(Unreadable::Broken)?;
+    match open_object(&key, id, blob) {
+        Ok(Object::Unknown) => Err(Unreadable::Unknown),
+        Ok(o) => Ok(o),
+        Err(BlobError::BadObject(_)) => Err(Unreadable::NotAnObject),
+        Err(_) => Err(Unreadable::Broken),
+    }
+}
+
+/// Lo que se vuelve a subir de `s`: su `kid` y su blob. Los bytes descifrados van tal cual, sin
+/// pasar por `Object` (así un tipo que no conocemos no se pierde), cifrados con la clave actual
+/// si es otra; con la misma, el blob de siempre. Si no se descifra con la clave de su `kid`, nada.
+fn reupload_blob(keys: &Keyring, id: &str, s: &Stored) -> Option<(String, String)> {
+    let blob = s.blob.as_deref()?;
+    let bytes = open(&key_of(keys, &s.kid)?, id, blob).ok()?;
+    match current_key(keys) {
+        Some((kid, key)) if kid != s.kid => Some((kid, seal(&key, id, &bytes).ok()?)),
+        _ => Some((s.kid.clone(), blob.to_owned())),
+    }
+}
+
+impl BoardCache {
+    pub fn load(path: PathBuf, hub: Arc<Hub>) -> Arc<Self> {
+        Self::load_with(path, hub, REUPLOAD_GAP)
+    }
+
+    /// `load`, con otro ritmo para la resubida (para las pruebas).
+    pub fn load_with(path: PathBuf, hub: Arc<Hub>, gap: Duration) -> Arc<Self> {
+        // Es una copia: si no se entiende, se empieza de cero y se vuelve a bajar.
+        let copy = match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+                eprintln!("nido: la copia del tablero no se entiende ({e}); se empieza de cero");
+                Copy::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Copy::default(),
+            Err(e) => {
+                eprintln!("nido: no se pudo leer la copia del tablero ({e}); se empieza de cero");
+                Copy::default()
+            }
+        };
+        Arc::new(Self {
+            path,
+            hub,
+            copy: Mutex::new(copy),
+            disk: Mutex::new(()),
+            syncing: tokio::sync::Mutex::new(()),
+            epoch: AtomicU64::new(0),
+            reuploading: AtomicBool::new(false),
+            gap,
+            revision: watch::Sender::new(0),
+            said: Mutex::new(None),
+        })
+    }
+
+    /// Avisa de cada cambio de la copia. Quien la escuche no debe tener el valor leído (`borrow`)
+    /// mientras usa el grupo: `clear` avisa con el grupo cogido.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    /// El `since` de la próxima sincronización.
+    pub fn next(&self) -> i64 {
+        self.lock().next
+    }
+
+    /// El objeto `id` de la copia, como lo dio el hub.
+    pub fn item(&self, id: &str) -> Option<Stored> {
+        self.lock().items.get(id).cloned()
+    }
+
+    /// Los ids de la copia (lápidas incluidas), en orden.
+    pub fn ids(&self) -> Vec<String> {
+        self.lock().items.keys().cloned().collect()
+    }
+
+    /// Cuántos faltan por resubir.
+    pub fn pending_reupload(&self) -> usize {
+        self.lock().reupload.len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Copy> {
+        self.copy.lock().expect("tablero")
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    fn bump(&self) {
+        self.revision.send_modify(|r| *r += 1);
+    }
+
+    /// Escribe la copia en el disco. Con `disk` cogido, y la copia se lee después de cogerlo:
+    /// así uno que guarda tarde no pisa lo que guardó otro (o un vaciado) con algo más viejo.
+    fn write_now(&self) {
+        let _disk = self.disk.lock().expect("tablero");
+        let body = serde_json::to_vec(&*self.lock()).expect("la copia se escribe");
+        if let Err(e) = crate::sys::write_private_atomic(&self.path, &body) {
+            eprintln!("nido: no se pudo guardar la copia del tablero: {e}");
+        }
+    }
+
+    /// Guarda la copia (fuera del hilo de las tareas: puede ser grande) y avisa del cambio.
+    async fn save(self: &Arc<Self>) {
+        let me = self.clone();
+        let _ = tokio::task::spawn_blocking(move || me.write_now()).await;
+        self.bump();
+    }
+
+    /// Junta lo que dio el hub en una escritura, si la copia no se vació mientras tanto; si
+    /// cambió algo, la guarda.
+    async fn applied(self: &Arc<Self>, epoch: u64, item: BoardItem) {
+        let changed = {
+            let mut c = self.lock();
+            self.epoch() == epoch && c.apply(item)
+        };
+        if changed {
+            self.save().await;
+        }
+    }
+
+    /// Vacía la copia, en memoria y en el disco, y para lo que estuviera en marcha (cuando este
+    /// equipo sale del grupo). No usa el grupo: se llama con él cogido.
+    pub fn clear(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        {
+            let _disk = self.disk.lock().expect("tablero");
+            let body = {
+                let mut c = self.lock();
+                *c = Copy::default();
+                serde_json::to_vec(&*c).expect("la copia se escribe")
+            };
+            if let Err(e) = crate::sys::write_private_atomic(&self.path, &body) {
+                eprintln!("nido: no se pudo vaciar la copia del tablero: {e}");
+            }
+        }
+        self.bump();
+    }
+
+    /// Se pone al día con el hub desde el `since` guardado, página a página: mientras haya
+    /// `more`, con el mismo `since` y el `after` de la anterior. Solo al acabar se guarda `next`
+    /// (que nunca baja); si se corta a medias, la próxima empieza otra vez desde el guardado. Con
+    /// `reset`, se vacía la copia y se empieza desde 0. Devuelve si cambió algo.
+    pub async fn sync(self: &Arc<Self>) -> Result<bool, BoardError> {
+        let _one = self.syncing.lock().await;
+        let epoch = self.epoch();
+        let mut since = self.next();
+        let mut after: Option<String> = None;
+        let mut changed = false;
+        let mut was_reset = false;
+        loop {
+            let page = self.hub.board_get(since, after.as_deref()).await?;
+            let mut c = self.lock();
+            if self.epoch() != epoch {
+                // Se vació mientras tanto: lo de antes ya no vale.
+                return Ok(false);
+            }
+            if page.reset {
+                if after.is_some() || was_reset {
+                    return Err(BoardError::Hub("reset fuera de sitio".into()));
+                }
+                *c = Copy::default();
+                drop(c);
+                (since, was_reset, changed) = (0, true, true);
+                continue;
+            }
+            for item in page.items {
+                changed |= c.apply(item);
+            }
+            if !page.more {
+                if page.next > c.next {
+                    c.next = page.next;
+                    changed = true;
+                }
+                break;
+            }
+            after = page.after;
+        }
+        if changed {
+            self.save().await;
+        }
+        Ok(changed)
+    }
+
+    /// Mira si el hub se ha quedado sin tablero teniendo esta copia: una lectura completa
+    /// (`since = 0`) que no da nada, ni lápidas. Entonces la vuelve a subir (decisión 8): el
+    /// hub perdió lo que tenía (uno sin MongoDB que se reinició) o la cuenta es nueva (al partir
+    /// un grupo de dos, la cuenta se la puede quedar el equipo quitado). Si da algo, lo junta.
+    pub async fn probe(self: &Arc<Self>, keys: &Keyring) -> Result<(), BoardError> {
+        if !self.lock().has_objects() {
+            return Ok(());
+        }
+        let epoch = self.epoch();
+        let page = self.hub.board_get(0, None).await?;
+        let changed = {
+            let mut c = self.lock();
+            if self.epoch() != epoch {
+                return Ok(());
+            }
+            if !page.items.is_empty() || page.more || page.reset {
+                let mut changed = false;
+                for item in page.items {
+                    changed |= c.apply(item);
+                }
+                changed
+            } else {
+                // Se sube lo que se puede leer (con su clave); lo demás no volvería nunca al hub.
+                c.items.retain(|id, s| {
+                    !s.gone && s.blob.is_some() && reupload_blob(keys, id, s).is_some()
+                });
+                c.reupload = c.items.keys().cloned().collect();
+                // El hub está vacío: la próxima, desde el principio.
+                c.next = 0;
+                eprintln!(
+                    "nido: el hub no tiene tablero; se vuelven a subir {} objetos de la copia",
+                    c.reupload.len()
+                );
+                true
+            }
+        };
+        if changed {
+            self.save().await;
+        }
+        self.resume_reupload(keys.clone());
+        Ok(())
+    }
+
+    /// Sigue con la resubida, si falta algo y no está ya en marcha.
+    fn resume_reupload(self: &Arc<Self>, keys: Keyring) {
+        if self.lock().reupload.is_empty() || self.reuploading.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            me.reupload(keys).await;
+            me.reuploading.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// La resubida, de uno en uno y a ritmo (`gap`), con `v = 0`. Un 409 es que otro nido de la
+    /// casa se adelantó: cuenta como hecho y se queda lo suyo. Con el freno del hub, espera y
+    /// sigue; sin hub, lo deja para la próxima conexión (lo que falta está en `board.json`).
+    async fn reupload(self: &Arc<Self>, keys: Keyring) {
+        let epoch = self.epoch();
+        let (mut done, mut first) = (0usize, true);
+        loop {
+            let (id, blob) = {
+                let mut c = self.lock();
+                if self.epoch() != epoch {
+                    return;
+                }
+                let Some(id) = c.reupload.first().cloned() else {
+                    break;
+                };
+                let blob = c.items.get(&id).and_then(|s| reupload_blob(&keys, &id, s));
+                if blob.is_none() {
+                    // Ya no se puede leer (otro llavero): no se sube.
+                    c.reupload.remove(&id);
+                    c.items.remove(&id);
+                    continue;
+                }
+                (id, blob)
+            };
+            let Some((kid, blob)) = blob else { continue };
+            if !std::mem::take(&mut first) {
+                tokio::time::sleep(self.gap).await;
+            }
+            let r = self.hub.board_put(&id, 0, &kid, &blob).await;
+            {
+                let mut c = self.lock();
+                if self.epoch() != epoch {
+                    return;
+                }
+                match r {
+                    Ok(st) => {
+                        c.apply(BoardItem {
+                            id: id.clone(),
+                            v: st.v,
+                            kid,
+                            blob: Some(blob),
+                            gone: false,
+                            at: st.at,
+                        });
+                    }
+                    Err(BoardError::Conflict(current)) => {
+                        c.apply(current);
+                    }
+                    Err(BoardError::Busy) => {
+                        drop(c);
+                        tokio::time::sleep(self.gap * BUSY_GAPS).await;
+                        continue;
+                    }
+                    Err(BoardError::TooBig) => {
+                        eprintln!("nido: tablero: {id} no cabe en el hub; no se vuelve a subir");
+                        c.reupload.remove(&id);
+                    }
+                    Err(BoardError::Full) => {
+                        eprintln!("nido: tablero: la cuenta está llena; se deja la resubida");
+                        c.reupload.clear();
+                    }
+                    Err(BoardError::Hub(e)) => {
+                        eprintln!("nido: tablero: resubida parada ({e}); sigue al volver el hub");
+                        drop(c);
+                        self.save().await;
+                        return;
+                    }
+                }
+            }
+            done += 1;
+            if done.is_multiple_of(SAVE_EVERY) {
+                self.save().await;
+            }
+        }
+        self.save().await;
+        if done > 0 {
+            eprintln!("nido: tablero: resubida acabada ({done} escrituras)");
+        }
+    }
+
+    /// Los objetos de la copia, descifrados cada uno con la clave de su `kid`. Lo que no se puede
+    /// leer va aparte y se conserva tal cual; las lápidas no salen.
+    pub fn decrypted(&self, keys: &Keyring) -> Decrypted {
+        let c = self.lock();
+        let mut d = Decrypted::default();
+        for (id, s) in c.items.iter().filter(|(_, s)| !s.gone) {
+            match read(keys, id, s) {
+                Ok(object) => d.objects.push(Entry {
+                    id: id.clone(),
+                    v: s.v,
+                    object,
+                }),
+                Err(why) => d.unreadable.push((id.clone(), why)),
+            }
+        }
+        d
+    }
+
+    /// Crea un objeto nuevo con la clave actual. Devuelve su id.
+    pub async fn create(
+        self: &Arc<Self>,
+        keys: &Keyring,
+        obj: &Object,
+    ) -> Result<String, EditError> {
+        let (kid, key) = current_key(keys).ok_or(EditError::NoKey)?;
+        let epoch = self.epoch();
+        let id = new_id().map_err(|e| EditError::Blob(BlobError::Random(e)))?;
+        let blob = seal_object(&key, &id, obj).map_err(EditError::Blob)?;
+        let st = self
+            .hub
+            .board_put(&id, 0, &kid, &blob)
+            .await
+            .map_err(EditError::Board)?;
+        self.applied(
+            epoch,
+            BoardItem {
+                id: id.clone(),
+                v: st.v,
+                kid,
+                blob: Some(blob),
+                gone: false,
+                at: st.at,
+            },
+        )
+        .await;
+        Ok(id)
+    }
+
+    /// Cambia el objeto `id`: `f` recibe el objeto leído (con la clave de su `kid`) y lo cambia,
+    /// así se conserva lo que no conocemos, en `extra`. Se escribe con la clave actual. Si choca
+    /// (409), se vuelve a aplicar `f` sobre el objeto como está, hasta `MAX_TRIES` escrituras en
+    /// total. Lo que no se puede leer no se reescribe. Devuelve el objeto como quedó.
+    pub async fn update(
+        self: &Arc<Self>,
+        keys: &Keyring,
+        id: &str,
+        f: impl Fn(&mut Object),
+    ) -> Result<Object, EditError> {
+        let (kid, key) = current_key(keys).ok_or(EditError::NoKey)?;
+        let epoch = self.epoch();
+        let (mut stored, mut v) = {
+            let c = self.lock();
+            let s = c.items.get(id).filter(|s| !s.gone).cloned();
+            let s = s.ok_or(EditError::Missing)?;
+            // Uno que falta por resubir no está en el hub.
+            let v = if c.reupload.contains(id) { 0 } else { s.v };
+            (s, v)
+        };
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let mut obj = read(keys, id, &stored).map_err(EditError::Unreadable)?;
+            f(&mut obj);
+            let blob = seal_object(&key, id, &obj).map_err(EditError::Blob)?;
+            match self.hub.board_put(id, v, &kid, &blob).await {
+                Ok(st) => {
+                    let item = BoardItem {
+                        id: id.into(),
+                        v: st.v,
+                        kid,
+                        blob: Some(blob),
+                        gone: false,
+                        at: st.at,
+                    };
+                    self.applied(epoch, item).await;
+                    return Ok(obj);
+                }
+                Err(BoardError::Conflict(current)) => {
+                    // El mismo blob: era nuestra escritura repetida, ya hecha.
+                    let ours = !current.gone && current.blob.as_deref() == Some(blob.as_str());
+                    self.applied(epoch, current.clone()).await;
+                    if ours {
+                        return Ok(obj);
+                    }
+                    if current.gone {
+                        return Err(EditError::Missing);
+                    }
+                    if tries >= MAX_TRIES {
+                        return Err(EditError::Board(BoardError::Conflict(current)));
+                    }
+                    v = current.v;
+                    stored = Stored::from(&current);
+                }
+                Err(e) => return Err(EditError::Board(e)),
+            }
+        }
+    }
+
+    /// Borra el objeto `id` (el hub deja una lápida). Un borrado que ya estaba hecho (un 409 con
+    /// la lápida: lo borró otro, o es el nuestro repetido tras un corte) cuenta como hecho; uno
+    /// que choca con un cambio se vuelve a intentar sobre la versión de ahora, hasta `MAX_TRIES`.
+    pub async fn remove(self: &Arc<Self>, id: &str) -> Result<(), EditError> {
+        let epoch = self.epoch();
+        // `None`: uno que faltaba por resubir, que no está en el hub: basta con no subirlo.
+        let v = {
+            let mut c = self.lock();
+            let Some(s) = c.items.get(id) else {
+                return Err(EditError::Missing);
+            };
+            if s.gone {
+                return Ok(());
+            }
+            let v = s.v;
+            if c.reupload.remove(id) {
+                c.items.remove(id);
+                None
+            } else {
+                Some(v)
+            }
+        };
+        let Some(mut v) = v else {
+            self.save().await;
+            return Ok(());
+        };
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            match self.hub.board_del(id, v).await {
+                Ok(st) => {
+                    let item = BoardItem {
+                        id: id.into(),
+                        v: st.v,
+                        kid: String::new(),
+                        blob: None,
+                        gone: true,
+                        at: st.at,
+                    };
+                    self.applied(epoch, item).await;
+                    return Ok(());
+                }
+                Err(BoardError::Conflict(current)) => {
+                    let gone = current.gone;
+                    let cv = current.v;
+                    self.applied(epoch, current.clone()).await;
+                    if gone {
+                        return Ok(());
+                    }
+                    if tries >= MAX_TRIES {
+                        return Err(EditError::Board(BoardError::Conflict(current)));
+                    }
+                    v = cv;
+                }
+                Err(e) => return Err(EditError::Board(e)),
+            }
+        }
+    }
+
+    /// Sincroniza y, con `probe`, mira si el hub se quedó sin tablero; luego sigue con la
+    /// resubida que faltara. Los errores se apuntan (sin repetir el mismo seguido).
+    pub async fn refresh(self: &Arc<Self>, keys: &Keyring, probe: bool) {
+        let mut r = self.sync().await.map(|_| ());
+        if r.is_ok() && probe {
+            r = self.probe(keys).await;
+        }
+        let mut said = self.said.lock().expect("tablero");
+        match r {
+            Ok(()) => {
+                *said = None;
+                drop(said);
+                self.resume_reupload(keys.clone());
+            }
+            Err(e) => {
+                let e = e.to_string();
+                if said.as_deref() != Some(e.as_str()) {
+                    eprintln!("nido: tablero: no se pudo sincronizar ({e})");
+                    *said = Some(e);
+                }
+            }
+        }
+    }
+}
+
+/// Mantiene la copia al día mientras haya conexión con el hub: al conectar (lo primero, un `get`,
+/// que es lo que hace que el hub avise en esa conexión), con cada aviso del hub y cada
+/// `SYNC_EVERY`. Al conectar, si cambia la cuenta y una vez por hora, mira además si el hub se
+/// quedó sin tablero (`probe`): el hub no avisa de eso. `keys` da el llavero del grupo cada vez.
+pub fn spawn(cache: Arc<BoardCache>, keys: impl Fn() -> Keyring + Send + Sync + 'static) {
+    tokio::spawn(async move {
+        let mut status = cache.hub.status.subscribe();
+        status.mark_changed();
+        let mut notices = cache.hub.board_notices();
+        let start = tokio::time::Instant::now() + SYNC_EVERY;
+        let mut tick = tokio::time::interval_at(start, SYNC_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let (mut connected, mut account) = (false, None);
+        let mut ticks = 0u32;
+        loop {
+            let probe = tokio::select! {
+                r = status.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    let (now, acct) = {
+                        let s = status.borrow_and_update();
+                        (s.connected, s.account.clone())
+                    };
+                    let fresh = now && !connected;
+                    // Otra cuenta (no la primera que se sabe): puede venir con el tablero vacío.
+                    let moved = now && account.is_some() && acct.is_some() && acct != account;
+                    connected = now;
+                    if acct.is_some() {
+                        account = acct;
+                    }
+                    if !fresh && !moved {
+                        continue;
+                    }
+                    true
+                }
+                r = notices.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    false
+                }
+                _ = tick.tick() => {
+                    ticks = ticks.wrapping_add(1);
+                    ticks.is_multiple_of(PROBE_EVERY)
+                }
+            };
+            if connected {
+                cache.refresh(&keys(), probe).await;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1063,5 +1843,555 @@ mod tests {
                 c["name"]
             );
         }
+    }
+
+    // ---------- La copia del tablero ----------
+
+    use crate::group::BoardKey;
+    use crate::hub::fake;
+
+    /// Lo que se espera entre dos escrituras de la resubida en las pruebas.
+    const GAP: Duration = Duration::from_millis(60);
+
+    const K_OLD: [u8; 32] = [0x11; 32];
+    const K_CUR: [u8; 32] = [0x22; 32];
+
+    fn bid(n: u8) -> String {
+        format!("{n:032x}")
+    }
+
+    /// El llavero: `K_OLD` retirada y `K_CUR` la actual.
+    fn keyring() -> Keyring {
+        let mut old = BoardKey::from_raw(&K_OLD, 1);
+        old.retired = Some(2);
+        Keyring {
+            keys: vec![old, BoardKey::from_raw(&K_CUR, 3)],
+        }
+    }
+
+    fn project(name: &str) -> Object {
+        Object::Project(Project {
+            name: name.into(),
+            desc: String::new(),
+            state: ProjectState::Active,
+            created: 1,
+            changed: 1,
+            by: "web".into(),
+            extra: Map::new(),
+        })
+    }
+
+    fn goal(note: &str) -> Object {
+        let mut extra = Map::new();
+        extra.insert("color".into(), "verde".into());
+        Object::Objective(Objective {
+            project: bid(1),
+            name: "Azulejos".into(),
+            desc: String::new(),
+            state: ObjectiveState::Pending,
+            note: note.into(),
+            order: 1.0,
+            created: 1,
+            changed: 1,
+            by: "web".into(),
+            extra,
+        })
+    }
+
+    /// `obj` cifrado para `id` con `key`: su `kid` y su blob.
+    fn sealed(key: &[u8; 32], id: &str, obj: &Object) -> (String, String) {
+        (kid(key), seal_object(key, id, obj).unwrap())
+    }
+
+    /// Lo que hay en el hub de mentira para `id`, descifrado con `key`.
+    fn on_hub(board: &Mutex<fake::Board>, key: &[u8; 32], id: &str) -> Object {
+        let b = board.lock().unwrap();
+        let item = &b.items[id];
+        open_object(key, id, item.blob.as_deref().unwrap()).unwrap()
+    }
+
+    struct Rig {
+        dir: tempfile::TempDir,
+        board: Arc<Mutex<fake::Board>>,
+        rec: fake::Recorder,
+        hub: Arc<Hub>,
+        cache: Arc<BoardCache>,
+    }
+
+    /// Un nido conectado a un hub de mentira con el tablero `b`, y su copia (vacía).
+    async fn rig(b: fake::Board) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let board = Arc::new(Mutex::new(b));
+        let rec = fake::board(board.clone()).await;
+        let hub = fake::nido(dir.path(), rec.addr).await;
+        let cache = BoardCache::load_with(dir.path().join("data/board.json"), hub.clone(), GAP);
+        Rig {
+            dir,
+            board,
+            rec,
+            hub,
+            cache,
+        }
+    }
+
+    impl Rig {
+        fn write(&self, key: &[u8; 32], id: &str, obj: &Object) -> BoardItem {
+            let (k, b) = sealed(key, id, obj);
+            self.board.lock().unwrap().write(id, Some((&k, &b)))
+        }
+
+        fn writes(&self) -> Vec<(String, String, i64)> {
+            self.board
+                .lock()
+                .unwrap()
+                .writes
+                .iter()
+                .map(|w| (w.1.clone(), w.2.clone(), w.3))
+                .collect()
+        }
+    }
+
+    /// Espera (como mucho 10 s) a que la copia cumpla `ok`.
+    async fn until(cache: &BoardCache, ok: impl Fn(&BoardCache) -> bool) {
+        let mut rev = cache.subscribe();
+        let wait = async {
+            while !ok(cache) {
+                let _ = tokio::time::timeout(Duration::from_millis(50), rev.changed()).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("la copia no llegó a lo esperado");
+    }
+
+    /// Página a página con el cursor del hub, y al acabar se guarda `next`, también en el disco.
+    /// La siguiente empieza desde ahí, y lo del solape que ya se tiene no cuenta como cambio.
+    #[tokio::test]
+    async fn sync_follows_the_pages_and_keeps_next() {
+        let r = rig(fake::Board {
+            page: 2,
+            ..Default::default()
+        })
+        .await;
+        for n in 1..=5 {
+            r.write(&K_CUR, &bid(n), &project(&format!("p{n}")));
+        }
+        assert!(r.cache.sync().await.unwrap());
+        assert_eq!(r.cache.ids(), (1..=5).map(bid).collect::<Vec<_>>());
+        let clock = r.board.lock().unwrap().clock;
+        assert_eq!(r.cache.next(), clock);
+        let gets = r.board.lock().unwrap().gets.clone();
+        assert_eq!(gets.len(), 3, "{gets:?}");
+        assert!(gets.iter().all(|g| g.0 == 0), "el mismo since: {gets:?}");
+        assert_eq!(gets[0].1, None);
+        let items: Vec<BoardItem> = r.board.lock().unwrap().items.values().cloned().collect();
+        assert_eq!(
+            gets[1].1.as_deref(),
+            Some(format!("{}:{}", items[1].at, items[1].id).as_str())
+        );
+        assert_eq!(
+            gets[2].1.as_deref(),
+            Some(format!("{}:{}", items[3].at, items[3].id).as_str())
+        );
+
+        // En el disco, lo mismo.
+        let again = BoardCache::load_with(r.cache.path.clone(), r.hub.clone(), GAP);
+        assert_eq!(again.ids(), r.cache.ids());
+        assert_eq!(again.next(), clock);
+        assert_eq!(again.item(&bid(3)), r.cache.item(&bid(3)));
+
+        // La siguiente, desde `next`: lo del solape (aquí, todo) ya se tiene.
+        let before = r.board.lock().unwrap().gets.len();
+        assert!(!r.cache.sync().await.unwrap());
+        let first = r.board.lock().unwrap().gets[before].clone();
+        assert_eq!(first, (clock, None));
+        assert_eq!(r.cache.next(), clock);
+        // Algo nuevo.
+        let six = r.write(&K_CUR, &bid(6), &project("p6"));
+        assert!(r.cache.sync().await.unwrap());
+        assert_eq!(r.cache.item(&bid(6)).unwrap().v, six.v);
+        assert_eq!(r.cache.next(), six.at);
+    }
+
+    /// Con `reset` se vacía la copia y se empieza desde 0: lo que ya no está en el hub (una
+    /// lápida caducada) desaparece.
+    #[tokio::test]
+    async fn a_reset_empties_the_copy_and_starts_over() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.write(&K_CUR, &bid(2), &project("dos"));
+        r.cache.sync().await.unwrap();
+        let old_next = r.cache.next();
+        {
+            let mut b = r.board.lock().unwrap();
+            b.items.remove(&bid(2));
+            b.reset = true;
+        }
+        let three = r.write(&K_CUR, &bid(3), &project("tres"));
+        assert!(r.cache.sync().await.unwrap());
+        assert_eq!(r.cache.ids(), vec![bid(1), bid(3)]);
+        assert_eq!(r.cache.next(), three.at);
+        let gets = r.board.lock().unwrap().gets.clone();
+        assert_eq!(&gets[gets.len() - 2..], &[(old_next, None), (0, None)]);
+    }
+
+    /// Un 409 trae el objeto como está: se vuelve a aplicar el cambio sobre él (con lo que
+    /// cambió el otro y lo que no conocemos, en `extra`) y se escribe con la clave actual.
+    #[tokio::test]
+    async fn a_conflict_is_reapplied_on_the_current_object() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(7);
+        r.write(&K_OLD, &id, &goal(""));
+        r.cache.sync().await.unwrap();
+        let theirs = sealed(&K_CUR, &id, &goal("del otro"));
+        r.board.lock().unwrap().clash(&id, Some(theirs));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let out = r
+            .cache
+            .update(&keyring(), &id, |o| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if let Object::Objective(g) = o {
+                    g.state = ObjectiveState::Done;
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let now = on_hub(&r.board, &K_CUR, &id);
+        assert_eq!(out, now);
+        let Object::Objective(g) = now else {
+            panic!("{now:?}")
+        };
+        assert_eq!(g.state, ObjectiveState::Done);
+        assert_eq!(g.note, "del otro");
+        assert_eq!(g.extra["color"], "verde");
+        assert_eq!(
+            r.writes(),
+            vec![("put".into(), id.clone(), 1), ("put".into(), id.clone(), 2)]
+        );
+        let stored = r.cache.item(&id).unwrap();
+        assert_eq!((stored.v, stored.kid.as_str()), (3, kid(&K_CUR).as_str()));
+    }
+
+    /// Tras `MAX_TRIES` choques seguidos, se deja con el error; la copia se queda con lo último
+    /// que dijo el hub.
+    #[tokio::test]
+    async fn three_conflicts_give_up() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(7);
+        r.write(&K_CUR, &id, &goal(""));
+        r.cache.sync().await.unwrap();
+        for n in 0..MAX_TRIES {
+            let theirs = sealed(&K_CUR, &id, &goal(&format!("otro {n}")));
+            r.board.lock().unwrap().clash(&id, Some(theirs));
+        }
+        let e = r
+            .cache
+            .update(&keyring(), &id, |o| {
+                if let Object::Objective(g) = o {
+                    g.state = ObjectiveState::Done;
+                }
+            })
+            .await
+            .unwrap_err();
+        let EditError::Board(BoardError::Conflict(cur)) = e else {
+            panic!("{e:?}")
+        };
+        assert_eq!(cur.v, 1 + MAX_TRIES as i64);
+        assert_eq!(r.writes().len(), MAX_TRIES);
+        assert_eq!(r.cache.item(&id).unwrap().v, cur.v);
+    }
+
+    /// Un borrado que otro ya hizo (o uno repetido tras un corte): 409 con la lápida, y cuenta
+    /// como hecho. Uno ya borrado en la copia no pide nada.
+    #[tokio::test]
+    async fn a_repeated_delete_counts_as_done() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(9);
+        r.write(&K_CUR, &id, &project("x"));
+        r.cache.sync().await.unwrap();
+        r.board.lock().unwrap().write(&id, None);
+        r.cache.remove(&id).await.unwrap();
+        let s = r.cache.item(&id).unwrap();
+        assert!(s.gone && s.blob.is_none(), "{s:?}");
+        assert_eq!(s.v, 2);
+        r.cache.remove(&id).await.unwrap();
+        assert_eq!(r.writes(), vec![("del".into(), id.clone(), 1)]);
+        // Uno vivo: se borra.
+        let other = bid(10);
+        r.write(&K_CUR, &other, &project("y"));
+        r.cache.sync().await.unwrap();
+        r.cache.remove(&other).await.unwrap();
+        assert!(r.board.lock().unwrap().items[&other].gone);
+        assert!(r.cache.item(&other).unwrap().gone);
+    }
+
+    /// Cada objeto se descifra con la clave de su `kid` (nunca probando las demás). Lo que no se
+    /// lee se lista aparte, y no se reescribe.
+    #[tokio::test]
+    async fn unreadable_objects_are_listed_and_never_rewritten() {
+        let r = rig(fake::Board::default()).await;
+        let (ok_old, ok_cur, unknown, no_key, wrong_kid, broken, gone) =
+            (bid(1), bid(2), bid(3), bid(4), bid(5), bid(6), bid(7));
+        r.write(&K_OLD, &ok_old, &project("vieja"));
+        r.write(&K_CUR, &ok_cur, &project("actual"));
+        let future = seal(&K_CUR, &unknown, br#"{"t":"milestone","name":"x"}"#).unwrap();
+        r.board
+            .lock()
+            .unwrap()
+            .write(&unknown, Some((&kid(&K_CUR), &future)));
+        r.write(&[0x33; 32], &no_key, &project("ajena"));
+        // Cifrado con la actual, pero con el `kid` de la vieja: no se prueba con otra.
+        let blob = seal_object(&K_CUR, &wrong_kid, &project("mal")).unwrap();
+        r.board
+            .lock()
+            .unwrap()
+            .write(&wrong_kid, Some((&kid(&K_OLD), &blob)));
+        r.board
+            .lock()
+            .unwrap()
+            .write(&broken, Some((&kid(&K_CUR), "QUJD")));
+        r.write(&K_CUR, &gone, &project("borrado"));
+        r.board.lock().unwrap().write(&gone, None);
+        r.cache.sync().await.unwrap();
+
+        let d = r.cache.decrypted(&keyring());
+        let ids: Vec<&str> = d.objects.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec![ok_old.as_str(), ok_cur.as_str()]);
+        assert_eq!(d.objects[0].object, project("vieja"));
+        assert_eq!(d.objects[1].v, 1);
+        assert_eq!(
+            d.unreadable,
+            vec![
+                (unknown.clone(), Unreadable::Unknown),
+                (no_key.clone(), Unreadable::NoKey),
+                (wrong_kid.clone(), Unreadable::Broken),
+                (broken.clone(), Unreadable::Broken),
+            ]
+        );
+        for id in [&unknown, &no_key, &wrong_kid, &broken] {
+            let e = r.cache.update(&keyring(), id, |_| {}).await.unwrap_err();
+            assert!(matches!(e, EditError::Unreadable(_)), "{id}: {e:?}");
+        }
+        let e = r.cache.update(&keyring(), &gone, |_| {}).await.unwrap_err();
+        assert!(matches!(e, EditError::Missing), "{e:?}");
+        assert!(r.writes().is_empty(), "{:?}", r.writes());
+        // Sin clave actual no se escribe nada.
+        let none = Keyring { keys: vec![] };
+        let e = r.cache.update(&none, &ok_cur, |_| {}).await.unwrap_err();
+        assert!(matches!(e, EditError::NoKey), "{e:?}");
+    }
+
+    /// Crear: id nuevo, `v = 0`, con la clave actual.
+    #[tokio::test]
+    async fn create_writes_with_the_current_key() {
+        let r = rig(fake::Board::default()).await;
+        let id = r.cache.create(&keyring(), &project("nuevo")).await.unwrap();
+        assert!(is_id(&id), "{id}");
+        assert_eq!(r.writes(), vec![("put".into(), id.clone(), 0)]);
+        assert_eq!(on_hub(&r.board, &K_CUR, &id), project("nuevo"));
+        let s = r.cache.item(&id).unwrap();
+        assert_eq!((s.v, s.kid.as_str()), (1, kid(&K_CUR).as_str()));
+    }
+
+    /// La resubida (decisión 8): una lectura completa sin nada (ni lápidas) teniendo copia. Se
+    /// sube con `v = 0` lo que se puede leer, con la clave actual y los bytes tal cual (también
+    /// un tipo que no conocemos), a ritmo; un 409 es que otro se adelantó y cuenta como hecho.
+    #[tokio::test]
+    async fn the_copy_goes_back_up_to_an_empty_hub() {
+        let r = rig(fake::Board::default()).await;
+        let (old, cur, unknown, no_key, gone) = (bid(1), bid(2), bid(3), bid(4), bid(5));
+        r.write(&K_OLD, &old, &project("vieja"));
+        r.write(&K_CUR, &cur, &project("actual"));
+        let future = br#"{"t":"milestone","name":"x"}"#;
+        let fb = seal(&K_CUR, &unknown, future).unwrap();
+        r.board
+            .lock()
+            .unwrap()
+            .write(&unknown, Some((&kid(&K_CUR), &fb)));
+        r.write(&[0x33; 32], &no_key, &project("ajena"));
+        r.write(&K_CUR, &gone, &project("borrado"));
+        r.board.lock().unwrap().write(&gone, None);
+        r.cache.sync().await.unwrap();
+
+        // Con objetos en el hub, nada.
+        r.cache.probe(&keyring()).await.unwrap();
+        assert!(r.writes().is_empty());
+
+        // El hub se queda sin nada; otro nido de la casa se adelanta con `cur`.
+        let theirs = sealed(&K_CUR, &cur, &project("de otro"));
+        {
+            let mut b = r.board.lock().unwrap();
+            b.items.clear();
+            b.clash(&cur, Some(theirs));
+        }
+        r.cache.probe(&keyring()).await.unwrap();
+        until(&r.cache, |c| c.pending_reupload() == 0).await;
+        let w = r.board.lock().unwrap().writes.clone();
+        let sent: Vec<(&str, &str, i64)> = w
+            .iter()
+            .map(|w| (w.1.as_str(), w.2.as_str(), w.3))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                ("put", old.as_str(), 0),
+                ("put", cur.as_str(), 0),
+                ("put", unknown.as_str(), 0)
+            ]
+        );
+        for pair in w.windows(2) {
+            let gap = pair[1].0 - pair[0].0;
+            assert!(gap >= GAP - Duration::from_millis(5), "{gap:?}");
+        }
+        // La de la clave retirada, con la actual y lo mismo dentro.
+        assert_eq!(on_hub(&r.board, &K_CUR, &old), project("vieja"));
+        assert_eq!(r.board.lock().unwrap().items[&old].kid, kid(&K_CUR));
+        // El tipo desconocido, byte a byte.
+        let b = r.board.lock().unwrap().items[&unknown].clone();
+        assert_eq!(
+            open(&K_CUR, &unknown, b.blob.as_deref().unwrap()).unwrap(),
+            future
+        );
+        // La del 409 se queda como la dejó el otro, sin volver a intentarlo.
+        assert_eq!(on_hub(&r.board, &K_CUR, &cur), project("de otro"));
+        assert_eq!(r.cache.item(&cur).unwrap().v, 1);
+        // Lo que no se podía subir (sin clave, la lápida) ya no está en la copia.
+        assert_eq!(
+            r.cache.ids(),
+            vec![old.clone(), cur.clone(), unknown.clone()]
+        );
+
+        // Ya hay objetos: otra vez, nada.
+        r.cache.sync().await.unwrap();
+        r.cache.probe(&keyring()).await.unwrap();
+        tokio::time::sleep(GAP * 3).await;
+        assert_eq!(r.board.lock().unwrap().writes.len(), 3);
+    }
+
+    /// Sin resubida si el hub tiene algo (aunque sea una lápida), ni sin copia propia.
+    #[tokio::test]
+    async fn no_reupload_without_an_empty_hub_and_an_own_copy() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        {
+            let mut b = r.board.lock().unwrap();
+            b.items.clear();
+            b.write(&bid(2), None);
+        }
+        r.cache.probe(&keyring()).await.unwrap();
+        tokio::time::sleep(GAP * 3).await;
+        assert!(r.writes().is_empty());
+        assert_eq!(r.cache.pending_reupload(), 0);
+
+        // Sin copia: ni se mira.
+        let empty = rig(fake::Board::default()).await;
+        empty.cache.probe(&keyring()).await.unwrap();
+        tokio::time::sleep(GAP * 3).await;
+        assert!(empty.writes().is_empty());
+        assert!(empty.board.lock().unwrap().gets.is_empty());
+    }
+
+    /// Con el freno del hub (429), la resubida espera y sigue con el mismo.
+    #[tokio::test]
+    async fn the_reupload_waits_out_the_brake() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        {
+            let mut b = r.board.lock().unwrap();
+            b.items.clear();
+            b.busy = 1;
+        }
+        r.cache.probe(&keyring()).await.unwrap();
+        until(&r.cache, |c| c.pending_reupload() == 0).await;
+        let w = r.board.lock().unwrap().writes.clone();
+        assert_eq!(w.len(), 2);
+        assert!(w[1].0 - w[0].0 >= GAP * BUSY_GAPS - Duration::from_millis(5));
+        assert_eq!(on_hub(&r.board, &K_CUR, &bid(1)), project("uno"));
+    }
+
+    /// Con la conexión: lo primero, un `get`; con un aviso del hub, otra sincronización. Y al
+    /// reconectar, otra vez un `get`.
+    #[tokio::test]
+    async fn the_notice_and_each_connection_bring_a_sync() {
+        let mut r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        spawn(r.cache.clone(), keyring);
+        until(&r.cache, |c| c.item(&bid(1)).is_some()).await;
+        // Al conectar, la sincronización y el sondeo del hub vacío (los dos, `get`).
+        assert_eq!(r.rec.next("board").await["since"], 0);
+        assert_eq!(r.rec.next("board").await["since"], 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let gets = r.board.lock().unwrap().gets.len();
+        assert_eq!(gets, 2);
+        let two = r.write(&K_CUR, &bid(2), &project("dos"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            r.cache.item(&bid(2)).is_none(),
+            "sin aviso no se sincroniza"
+        );
+        r.rec.tell(fake::Tell::Send(
+            serde_json::json!({ "board": { "at": two.at } }),
+        ));
+        until(&r.cache, |c| c.item(&bid(2)).is_some()).await;
+        assert_eq!(r.board.lock().unwrap().gets.len(), gets + 1);
+
+        r.rec.tell(fake::Tell::Hangup);
+        let mut status = r.hub.status.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        r.write(&K_CUR, &bid(3), &project("tres"));
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        until(&r.cache, |c| c.item(&bid(3)).is_some()).await;
+    }
+
+    /// Un equipo que sale del grupo vacía su copia, en memoria y en el disco.
+    #[tokio::test]
+    async fn a_removed_nido_empties_its_copy() {
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        assert!(r.cache.next() > 0);
+        let group = crate::group::Group::load(r.dir.path().join("data/group.json"), [1u8; 32]);
+        group.set_self("yo", "yo");
+        group.add_member("otro", &B64.encode([2u8; 32]), "otro");
+        group.ensure_board_key().unwrap();
+        let cache = r.cache.clone();
+        group.on_leave(move || cache.clear());
+        // El otro cuenta que a este lo quitaron.
+        let mut st = group.snapshot();
+        for m in st.members.iter_mut().filter(|m| m.key == group.own_key) {
+            m.removed = true;
+            m.at += 1000;
+        }
+        assert!(group.merge(&st));
+        assert!(group.board_keys().keys.is_empty());
+        assert!(r.cache.ids().is_empty());
+        assert_eq!(r.cache.next(), 0);
+        let again = BoardCache::load_with(r.cache.path.clone(), r.hub.clone(), GAP);
+        assert!(again.ids().is_empty());
+        assert_eq!(again.next(), 0);
+    }
+
+    /// `board.json` solo para el usuario, como `group.json`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_board_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let r = rig(fake::Board::default()).await;
+        r.write(&K_CUR, &bid(1), &project("uno"));
+        r.cache.sync().await.unwrap();
+        let mode = std::fs::metadata(&r.cache.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

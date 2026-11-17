@@ -322,6 +322,8 @@ pub struct Group {
     bad_key_said: Mutex<Option<Instant>>,
     /// Y de un llavero que pasa de `MAX_BOARD_KEYS`.
     many_keys_said: Mutex<Option<Instant>>,
+    /// Lo que se hace cuando este equipo sale del grupo (vaciar la copia del tablero).
+    on_leave: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Group {
@@ -361,7 +363,15 @@ impl Group {
             revision: watch::Sender::new(0),
             bad_key_said: Mutex::new(None),
             many_keys_said: Mutex::new(None),
+            on_leave: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Lo que hay que hacer cuando este equipo sale del grupo: se llama al enterarse, con el
+    /// grupo cogido y antes de guardarlo, así que no puede usar el grupo. Si se corta antes de
+    /// guardarlo, al volver a enterarse se llama otra vez. Solo vale el primero que se ponga.
+    pub fn on_leave(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_leave.set(Box::new(f));
     }
 
     /// Avisa de cada cambio del grupo: el valor es la revisión, que solo sube.
@@ -372,39 +382,11 @@ impl Group {
     /// Guarda el estado cambiado. Se llama con el estado bloqueado; la revisión la sube después
     /// quien llama (`bump`), ya sin él.
     ///
-    /// Solo para el usuario (0600): lleva el llavero del tablero. Un temporal que quedara de
-    /// antes se quita primero, porque los permisos solo se ponen al crear el fichero. Se escribe
-    /// entero en el disco (`sync_all`) antes de renombrarlo, y luego la carpeta, para que una
-    /// clave que ya se ha dado no se pierda en un corte de luz.
+    /// Solo para el usuario (0600): lleva el llavero del tablero. Se escribe entero en el disco
+    /// antes de renombrarlo (`sys::write_private_atomic`), para que una clave que ya se ha dado
+    /// no se pierda en un corte de luz.
     fn save(&self, st: &State) -> std::io::Result<()> {
-        use std::io::Write;
-        let tmp = self.path.with_extension("json.tmp");
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let body = serde_json::to_vec_pretty(st)?;
-        let _ = std::fs::remove_file(&tmp);
-        let written = (|| {
-            let mut f =
-                crate::sys::private(std::fs::OpenOptions::new().write(true).create_new(true))
-                    .open(&tmp)?;
-            f.write_all(&body)?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, &self.path)
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        written?;
-        // La carpeta, para que el renombrado también quede en el disco. Si el sistema no deja
-        // (Windows, algunos montajes), el fichero ya está escrito: no es un fallo.
-        #[cfg(unix)]
-        if let Some(dir) = self.path.parent()
-            && let Ok(d) = std::fs::File::open(dir)
-        {
-            let _ = d.sync_all();
-        }
-        Ok(())
+        crate::sys::write_private_atomic(&self.path, &serde_json::to_vec_pretty(st)?)
     }
 
     /// Guarda, y si no se puede lo apunta: el cambio ya está en memoria y se volverá a intentar
@@ -488,8 +470,12 @@ impl Group {
                     me.removed = false;
                     me.at = now_ms();
                 }
-                // El tablero sigue a la casa: el equipo que sale no se lleva sus claves.
+                // El tablero sigue a la casa: el equipo que sale no se lleva sus claves ni su
+                // copia (que no podría volver a subir a otra cuenta).
                 st.keys.clear();
+                if let Some(f) = self.on_leave.get() {
+                    f();
+                }
             }
             self.check_key_count(&st);
             self.save_or_say(&st);

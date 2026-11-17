@@ -12,6 +12,39 @@ pub fn private(opts: &mut OpenOptions) -> &mut OpenOptions {
     opts
 }
 
+/// Escribe `path` entero o nada, solo para el usuario (0600): a un temporal al lado
+/// (`<nombre>.tmp`), que se escribe en el disco (`sync_all`) y se renombra encima; luego la
+/// carpeta, para que el renombrado también quede en el disco. Un temporal que quedara de antes
+/// se quita primero, porque los permisos solo se ponen al crear el fichero.
+pub fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!("{name}.tmp"));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let written = (|| {
+        let mut f = private(OpenOptions::new().write(true).create_new(true)).open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    // Si el sistema no deja (Windows, algunos montajes), el fichero ya está escrito: no es un
+    // fallo.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
 /// Un directorio solo para el usuario (0700).
 pub fn private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
