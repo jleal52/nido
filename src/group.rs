@@ -7,7 +7,7 @@
 //! dos estados es quedarse, en cada entrada, con la más reciente. Así da igual el orden en que se
 //! sincronicen los equipos. Se sincroniza por el hub, con Noise de nido a nido (ver `e2e.rs`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,10 +24,22 @@ const KEY_WARN_QUIET: Duration = Duration::from_secs(3600);
 /// Lo más que se acepta por delante de nuestro reloj en una clave que llega: con un `at` del
 /// futuro lejano ganaría al juntar para siempre.
 const KEY_FUTURE_MS: u64 = 24 * 3600 * 1000;
-/// Cuántas entradas (lápidas incluidas) se esperan como mucho en el llavero: el `State` entero
-/// viaja en un mensaje Noise de 65535 bytes, y cada una ocupa unos 140. Aquí solo se avisa si se
-/// pasa; podar las borradas y las retiradas sin uso es de la Tarea 9.
-pub const MAX_BOARD_KEYS: usize = 16;
+const DAY_MS: u64 = 24 * 3600 * 1000;
+/// Lo que tiene que llevar retirada una clave para poder quitarla, si ya no la usa ningún objeto
+/// (decisión 9): un dispositivo con el llavero viejo que escriba con ella mientras los equipos
+/// están apagados no deja nada ilegible.
+pub const KEY_RETIRED_LIFE_MS: u64 = 30 * DAY_MS;
+/// Lo que dura la lápida de una clave quitada: lo que tarda en llegar a todos los equipos, y
+/// mientras tanto no deja que vuelva la clave viva de uno que aún no se ha enterado.
+pub const KEY_TOMB_LIFE_MS: u64 = 30 * DAY_MS;
+/// Cuántas claves con secreto (la actual y las retiradas) se guardan como mucho (decisión 10):
+/// el `State` entero viaja en un mensaje Noise de 65535 bytes, y cada una ocupa unos 140. Si hay
+/// más, las retiradas sin objetos se quitan antes de sus 30 días (la retirada antes primero);
+/// una con objetos no se quita nunca, y entonces solo se avisa.
+pub const MAX_BOARD_KEYS: usize = 8;
+/// Cuántas entradas del llavero, lápidas incluidas, se guardan como mucho: si hay más, se podan
+/// las lápidas más viejas antes de sus 30 días. Si aun así hay más (claves con objetos), se avisa.
+pub const MAX_KEY_ENTRIES: usize = 2 * MAX_BOARD_KEYS;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -320,8 +332,10 @@ pub struct Group {
     revision: watch::Sender<u64>,
     /// Cuándo se avisó por última vez de una clave que llegó mal (para no llenar el registro).
     bad_key_said: Mutex<Option<Instant>>,
-    /// Y de un llavero que pasa de `MAX_BOARD_KEYS`.
+    /// Y de un llavero que pasa de `MAX_KEY_ENTRIES` o de `MAX_BOARD_KEYS`.
     many_keys_said: Mutex<Option<Instant>>,
+    /// Y de claves propias de más de un día por delante (un reloj adelantado).
+    future_key_said: Mutex<Option<Instant>>,
     /// Lo que se hace cuando este equipo sale del grupo (vaciar la copia del tablero).
     on_leave: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
@@ -363,6 +377,7 @@ impl Group {
             revision: watch::Sender::new(0),
             bad_key_said: Mutex::new(None),
             many_keys_said: Mutex::new(None),
+            future_key_said: Mutex::new(None),
             on_leave: std::sync::OnceLock::new(),
         }
     }
@@ -398,11 +413,13 @@ impl Group {
         }
     }
 
-    /// Avisa (con freno) si el llavero pasa del tope.
+    /// Avisa (con freno) si el llavero pasa del tope de entradas. El de claves con secreto lo
+    /// mira la poda (`drop_unused_board_keys`): tras una rotación se pasa un momento, hasta que
+    /// la poda quita las que sobran.
     fn check_key_count(&self, st: &State) {
-        if st.keys.len() > MAX_BOARD_KEYS && quietly(&self.many_keys_said, KEY_WARN_QUIET) {
+        if st.keys.len() > MAX_KEY_ENTRIES && quietly(&self.many_keys_said, KEY_WARN_QUIET) {
             eprintln!(
-                "nido: el llavero del tablero tiene {} entradas (se esperan como mucho {MAX_BOARD_KEYS})",
+                "nido: el llavero del tablero tiene {} entradas (se esperan como mucho {MAX_KEY_ENTRIES})",
                 st.keys.len()
             );
         }
@@ -458,6 +475,7 @@ impl Group {
         if !heard(&st) {
             return false;
         }
+        let other = without_old_tombs(&st, other, now_ms());
         let changed = st.merge(&other);
         if changed {
             if st
@@ -660,7 +678,9 @@ impl Group {
         });
     }
 
-    pub fn remove_device(&self, key_b64: &str) {
+    /// Da de baja un dispositivo en el grupo. Devuelve si estaba (y no dado ya de baja).
+    pub fn remove_device(&self, key_b64: &str) -> bool {
+        let mut found = false;
         self.change(|st| {
             for d in st
                 .devices
@@ -669,8 +689,10 @@ impl Group {
             {
                 d.removed = true;
                 d.at = now_ms();
+                found = true;
             }
         });
+        found
     }
 
     /// ¿Está autorizado en el grupo? Devuelve su nombre.
@@ -752,6 +774,69 @@ impl Group {
             }
         });
         found
+    }
+
+    /// Ordena el llavero, sin mirar el tablero (lo hace cualquier equipo, cada vez que cambia el
+    /// grupo):
+    /// - retira toda clave activa que no sea la actual: dos primeras claves hechas a la vez, dos
+    ///   rotaciones a la vez o la clave de un reloj adelantado dejan más de una activa, y lo
+    ///   cifrado con las que no son la actual se recifra (`board::BoardCache::recrypt`);
+    /// - poda las lápidas de más de `KEY_TOMB_LIFE_MS` y, si pasan de `MAX_KEY_ENTRIES`, las
+    ///   más viejas;
+    /// - avisa (con freno) de las claves de más de un día por delante: los demás equipos las
+    ///   descartan.
+    ///
+    /// Devuelve si retiró alguna, que es lo que hay que contar al resto del grupo. Podar lápidas
+    /// no se cuenta: no llega a los demás (juntar es una unión) y ellos podan las mismas.
+    pub fn tidy_board_keys(&self) -> bool {
+        let now = now_ms();
+        let mut retired = false;
+        self.change(|st| {
+            retired = retire_stale(st, now);
+            prune_tombstones(st, now);
+        });
+        let future = future_keys(&self.snapshot(), now);
+        if !future.is_empty() && quietly(&self.future_key_said, KEY_WARN_QUIET) {
+            eprintln!(
+                "nido: el llavero del tablero tiene claves de más de un día por delante (¿el reloj \
+                 va adelantado?); los demás equipos las descartan: {}",
+                future.join(", ")
+            );
+        }
+        retired
+    }
+
+    /// Las retiradas que ya se pueden quitar si ningún objeto usa su `kid` (`in_use`): ver
+    /// `drop_unused_board_keys`. Para saber si hace falta mirar el tablero antes.
+    pub fn droppable_board_keys(&self, in_use: &BTreeSet<String>) -> Vec<String> {
+        droppable(&self.state.lock().expect("grupo"), in_use, now_ms())
+    }
+
+    /// Quita del llavero (en todo el grupo) las claves retiradas que no usa ningún objeto
+    /// (`in_use`: los `kid` de la copia del tablero recién puesta al día) y llevan más de
+    /// `KEY_RETIRED_LIFE_MS` retiradas (decisión 9); y, si hay más de `MAX_BOARD_KEYS` claves,
+    /// también las más viejas de las retiradas sin objetos, aunque no lleven 30 días (decisión
+    /// 10). Ni la actual ni una con objetos. Se decide y se quita con el mismo cerrojo. Devuelve
+    /// las quitadas.
+    pub fn drop_unused_board_keys(&self, in_use: &BTreeSet<String>) -> Vec<String> {
+        let now = now_ms();
+        let mut dropped = vec![];
+        self.change(|st| {
+            dropped = droppable(st, in_use, now);
+            for k in st.keys.iter_mut().filter(|k| dropped.contains(&k.kid)) {
+                k.removed = true;
+                k.key.clear();
+                k.at = now.max(k.at.saturating_add(1));
+            }
+        });
+        let live = self.board_keys().keys.len();
+        if live > MAX_BOARD_KEYS && quietly(&self.many_keys_said, KEY_WARN_QUIET) {
+            eprintln!(
+                "nido: el llavero del tablero tiene {live} claves (se esperan como mucho \
+                 {MAX_BOARD_KEYS}); las que sobran aún tienen objetos"
+            );
+        }
+        dropped
     }
 
     // ---------- invitar ----------
@@ -842,6 +927,104 @@ pub fn parse_invite(code: &str) -> Result<InviteCode, String> {
         hub,
         id,
     })
+}
+
+/// Retira las claves activas que no son la actual (ver `Group::tidy_board_keys`). Como al rotar,
+/// la retirada lleva un `at` posterior, para que gane al juntar. Devuelve si retiró alguna.
+fn retire_stale(st: &mut State, now: u64) -> bool {
+    let Some(current) = Keyring::of(st).current().map(|k| k.kid.clone()) else {
+        return false;
+    };
+    let mut retired = false;
+    for k in st
+        .keys
+        .iter_mut()
+        .filter(|k| !k.removed && k.retired.is_none() && k.kid != current)
+    {
+        let t = now.max(k.at.saturating_add(1));
+        k.retired = Some(t);
+        k.at = t;
+        retired = true;
+    }
+    retired
+}
+
+/// ¿Es una lápida que ya se puede podar por vieja?
+fn old_tomb(k: &BoardKey, now: u64) -> bool {
+    k.removed && k.at.saturating_add(KEY_TOMB_LIFE_MS) < now
+}
+
+/// Poda las lápidas viejas y, si el llavero pasa de `MAX_KEY_ENTRIES`, las más viejas que
+/// sobren (por `at` y `kid`, para que todos los equipos poden las mismas).
+fn prune_tombstones(st: &mut State, now: u64) {
+    st.keys.retain(|k| !old_tomb(k, now));
+    let over = st.keys.len().saturating_sub(MAX_KEY_ENTRIES);
+    if over > 0 {
+        let mut tombs: Vec<(u64, String)> = st
+            .keys
+            .iter()
+            .filter(|k| k.removed)
+            .map(|k| (k.at, k.kid.clone()))
+            .collect();
+        tombs.sort();
+        let gone: BTreeSet<String> = tombs.into_iter().take(over).map(|t| t.1).collect();
+        st.keys.retain(|k| !gone.contains(&k.kid));
+    }
+}
+
+/// `other` sin las lápidas viejas de claves que no tenemos: ya las podamos (o las podaríamos
+/// al momento), y si entraran, cada sincronización con un equipo que aún las tenga las traería
+/// otra vez. Una lápida de una clave que sí tenemos entra igual: le quita el secreto.
+fn without_old_tombs<'a>(
+    st: &State,
+    other: std::borrow::Cow<'a, State>,
+    now: u64,
+) -> std::borrow::Cow<'a, State> {
+    let skip = |k: &BoardKey| old_tomb(k, now) && !st.keys.iter().any(|x| x.kid == k.kid);
+    if !other.keys.iter().any(skip) {
+        return other;
+    }
+    let mut other = other.into_owned();
+    other.keys.retain(|k| !skip(k));
+    std::borrow::Cow::Owned(other)
+}
+
+/// Las retiradas que se pueden quitar ya (ver `Group::drop_unused_board_keys`): sin objetos y
+/// con más de 30 días retiradas, y las que sobren del tope, la retirada antes primero.
+fn droppable(st: &State, in_use: &BTreeSet<String>, now: u64) -> Vec<String> {
+    let ring = Keyring::of(st);
+    let current = ring.current().map(|k| k.kid.clone());
+    let mut free: Vec<&BoardKey> = ring
+        .keys
+        .iter()
+        .filter(|k| {
+            k.retired.is_some() && Some(&k.kid) != current.as_ref() && !in_use.contains(&k.kid)
+        })
+        .collect();
+    free.sort_by(|a, b| (a.retired, &a.kid).cmp(&(b.retired, &b.kid)));
+    let mut excess = ring.keys.len().saturating_sub(MAX_BOARD_KEYS);
+    let mut out = vec![];
+    for k in free {
+        let old = k
+            .retired
+            .is_some_and(|r| r.saturating_add(KEY_RETIRED_LIFE_MS) < now);
+        if old || excess > 0 {
+            out.push(k.kid.clone());
+            excess = excess.saturating_sub(1);
+        }
+    }
+    out
+}
+
+/// Las claves del llavero de más de un día por delante de `now`: los demás equipos las
+/// descartan (`fitting_keys`), y `next_key_at` arrastra su `at` a las que se creen aquí.
+fn future_keys(st: &State, now: u64) -> Vec<String> {
+    let horizon = now.saturating_add(KEY_FUTURE_MS);
+    st.keys
+        .iter()
+        .filter(|k| k.at > horizon)
+        .map(|k| k.kid.clone())
+        .collect()
 }
 
 /// La hora de una clave nueva: posterior a la de todas las que hay, para que gane al juntar
@@ -1517,10 +1700,11 @@ mod tests {
         forged.at = 20;
         let mut liar = BoardKey::generate(10).unwrap();
         liar.kid = "0123456789abcdef".into();
+        // Reciente: una lápida de hace más de 30 días de una clave que no se tiene ni entra.
         let tomb = BoardKey {
             kid: "fedcba9876543210".into(),
             key: String::new(),
-            at: 10,
+            at: now_ms(),
             retired: None,
             removed: true,
         };
@@ -1692,5 +1876,269 @@ mod tests {
             assert!(!out.contains(&k.key), "se ve la clave: {out}");
             assert!(out.contains(&k.kid), "el kid sí: {out}");
         }
+    }
+
+    // ---------- el llavero se ordena (Tarea 9) ----------
+
+    const DAY: u64 = 24 * 3600 * 1000;
+
+    /// Una clave de verdad (pasa `fits`), creada en `at` y retirada en `retired`.
+    fn real_key(at: u64, retired: Option<u64>) -> BoardKey {
+        let mut k = BoardKey::generate(at).unwrap();
+        if let Some(r) = retired {
+            k.retired = Some(r);
+            k.at = r;
+        }
+        k
+    }
+
+    fn kids(keys: &[BoardKey], f: impl Fn(&BoardKey) -> bool) -> Vec<String> {
+        let mut v: Vec<String> = keys
+            .iter()
+            .filter(|k| f(k))
+            .map(|k| k.kid.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Toda activa que no es la actual se retira: dos primeras claves hechas a la vez, dos
+    /// rotaciones a la vez. Las ya retiradas no se vuelven a sellar, y repetirlo no cambia nada.
+    #[test]
+    fn every_active_key_but_the_current_is_retired() {
+        let now = now_ms();
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let a = real_key(now - 10, None);
+        let b = real_key(now - 10, None);
+        let older = real_key(now - 20, None);
+        let retired = real_key(now - 5 * DAY, Some(now - 4 * DAY));
+        assert!(g.merge(&keys_state(vec![
+            a.clone(),
+            b.clone(),
+            older.clone(),
+            retired.clone()
+        ])));
+        let current = g.board_keys().current().cloned().unwrap();
+        assert_eq!(current.kid, a.kid.clone().min(b.kid.clone()));
+        let mut rx = g.subscribe();
+        rx.borrow_and_update();
+        assert!(g.tidy_board_keys(), "retira: hay que contarlo al grupo");
+        assert!(rx.has_changed().unwrap());
+        let st = g.snapshot();
+        assert_eq!(
+            kids(&st.keys, |k| k.retired.is_none()),
+            vec![current.kid.clone()]
+        );
+        for k in st.keys.iter().filter(|k| k.kid != current.kid) {
+            assert!(k.retired.is_some(), "{k:?}");
+        }
+        let again = st.keys.iter().find(|k| k.kid == retired.kid).unwrap();
+        assert_eq!(again, &retired, "la ya retirada sigue igual");
+        let other = if a.kid == current.kid { &b } else { &a };
+        let now_retired = st.keys.iter().find(|k| k.kid == other.kid).unwrap();
+        assert!(now_retired.at > other.at, "la retirada gana al juntar");
+        assert_eq!(g.board_keys().current(), Some(&current));
+        // Otra vez, nada.
+        rx.borrow_and_update();
+        assert!(!g.tidy_board_keys());
+        assert!(!rx.has_changed().unwrap());
+        // Y en el otro equipo, que lo recibe, ya no queda nada que retirar.
+        let d2 = tempfile::tempdir().unwrap();
+        let g2 = Group::load(d2.path().join("group.json"), [2u8; 32]);
+        g2.merge(&g.snapshot());
+        assert!(!g2.tidy_board_keys());
+        assert_eq!(g2.snapshot().keys, g.snapshot().keys);
+    }
+
+    /// Sin clave actual (todas retiradas) no se retira nada más.
+    #[test]
+    fn with_no_current_nothing_is_retired() {
+        let now = now_ms();
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        assert!(!g.tidy_board_keys(), "llavero vacío");
+        let k = real_key(now - DAY, Some(now - 10));
+        g.merge(&keys_state(vec![k.clone()]));
+        assert!(!g.tidy_board_keys());
+        assert_eq!(g.snapshot().keys, vec![k]);
+    }
+
+    /// Una lápida de más de 30 días se poda, y la que vuelve de otro equipo no entra (si no,
+    /// cada sincronización la traería otra vez). La reciente se queda. Y una lápida vieja de una
+    /// clave que sí tenemos entra igual (quita el secreto).
+    #[test]
+    fn old_tombstones_go_and_do_not_come_back() {
+        let now = now_ms();
+        let dir = tempfile::tempdir().unwrap();
+        let cur = real_key(now - DAY, None);
+        let old = board_key("aaaaaaaaaaaaaaaa", now - 31 * DAY, None, true);
+        let recent = board_key("bbbbbbbbbbbbbbbb", now - 29 * DAY, None, true);
+        // Del disco (por la red, una lápida vieja de algo que no se tiene ya no entra).
+        let path = dir.path().join("group.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&keys_state(vec![cur.clone(), old.clone(), recent.clone()]))
+                .unwrap(),
+        )
+        .unwrap();
+        let g = Group::load(path, [1u8; 32]);
+        assert!(!g.tidy_board_keys(), "podar lápidas no se cuenta al grupo");
+        let st = g.snapshot();
+        assert_eq!(
+            kids(&st.keys, |_| true),
+            kids(&[cur.clone(), recent.clone()], |_| true)
+        );
+        // Vuelve de otro equipo: no cambia nada (juntar las ordena por `kid`).
+        assert!(!g.merge(&keys_state(vec![old.clone(), recent.clone()])));
+        let by_kid = |mut v: Vec<BoardKey>| {
+            v.sort_by(|a, b| a.kid.cmp(&b.kid));
+            v
+        };
+        assert_eq!(by_kid(g.snapshot().keys), by_kid(st.keys.clone()));
+        // Una lápida vieja de una clave viva aquí sí entra.
+        let stale = real_key(now - 40 * DAY, Some(now - 39 * DAY));
+        let mut st2 = keys_state(vec![stale.clone()]);
+        std::fs::write(
+            dir.path().join("g2.json"),
+            serde_json::to_vec(&st2).unwrap(),
+        )
+        .unwrap();
+        let g2 = Group::load(dir.path().join("g2.json"), [1u8; 32]);
+        st2.keys[0].removed = true;
+        st2.keys[0].key.clear();
+        st2.keys[0].at = now - 35 * DAY;
+        assert!(g2.merge(&st2));
+        assert!(g2.board_keys().keys.is_empty());
+    }
+
+    /// Con más de `MAX_KEY_ENTRIES` entradas, se van las lápidas más viejas aunque no tengan 30
+    /// días.
+    #[test]
+    fn too_many_tombstones_drop_the_oldest() {
+        let now = now_ms();
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let cur = real_key(now - DAY, None);
+        let mut keys = vec![cur.clone()];
+        for i in 0..20u64 {
+            keys.push(board_key(&format!("{i:016x}"), now - DAY + i, None, true));
+        }
+        assert!(g.merge(&keys_state(keys)));
+        g.tidy_board_keys();
+        let st = g.snapshot();
+        assert_eq!(st.keys.len(), MAX_KEY_ENTRIES);
+        assert!(st.keys.contains(&cur));
+        let gone: Vec<String> = (0..5u64).map(|i| format!("{i:016x}")).collect();
+        for k in &st.keys {
+            assert!(!gone.contains(&k.kid), "{} es de las más viejas", k.kid);
+        }
+    }
+
+    /// Decisión 9: una retirada se quita solo sin objetos que la usen y con más de 30 días
+    /// retirada. Ni la de 29 días, ni la de 31 con objetos, ni la actual.
+    #[test]
+    fn retired_keys_go_after_30_days_without_objects() {
+        let now = now_ms();
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let cur = real_key(now - 40 * DAY, None);
+        let unused = real_key(now - 60 * DAY, Some(now - 31 * DAY));
+        let young = real_key(now - 60 * DAY, Some(now - 29 * DAY));
+        let used = real_key(now - 60 * DAY, Some(now - 31 * DAY));
+        g.merge(&keys_state(vec![
+            cur.clone(),
+            unused.clone(),
+            young.clone(),
+            used.clone(),
+        ]));
+        let in_use: BTreeSet<String> = [used.kid.clone(), cur.kid.clone()].into();
+        assert_eq!(g.droppable_board_keys(&in_use), vec![unused.kid.clone()]);
+        let mut rx = g.subscribe();
+        rx.borrow_and_update();
+        assert_eq!(g.drop_unused_board_keys(&in_use), vec![unused.kid.clone()]);
+        assert!(rx.has_changed().unwrap());
+        let ring = g.board_keys();
+        assert_eq!(
+            kids(&ring.keys, |_| true),
+            kids(&[cur.clone(), young.clone(), used.clone()], |_| true)
+        );
+        let tomb = g
+            .snapshot()
+            .keys
+            .into_iter()
+            .find(|k| k.kid == unused.kid)
+            .unwrap();
+        assert!(tomb.removed && tomb.key.is_empty() && tomb.at > unused.at);
+        // Ya no queda nada que quitar.
+        assert!(g.droppable_board_keys(&in_use).is_empty());
+        assert!(g.drop_unused_board_keys(&in_use).is_empty());
+        // Sin objetos, la de 31 días también; la de 29, no; la actual, nunca.
+        assert_eq!(
+            g.drop_unused_board_keys(&BTreeSet::new()),
+            vec![used.kid.clone()]
+        );
+        assert_eq!(
+            kids(&g.board_keys().keys, |_| true),
+            kids(&[cur.clone(), young.clone()], |_| true)
+        );
+    }
+
+    /// Decisión 10: como mucho `MAX_BOARD_KEYS` claves con secreto. Si hay más, se van antes de
+    /// tiempo las retiradas sin objetos, la retirada antes primero; una con objetos, nunca.
+    #[test]
+    fn the_keyring_is_capped_but_never_drops_used_keys() {
+        let now = now_ms();
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        let cur = real_key(now - 1000, None);
+        let mut keys = vec![cur.clone()];
+        // Nueve retiradas de hace 1 a 9 horas: diez en total.
+        for h in 1..=9u64 {
+            keys.push(real_key(now - 10 * DAY, Some(now - h * 3600 * 1000)));
+        }
+        g.merge(&keys_state(keys.clone()));
+        // Las dos más viejas (9 h y 8 h) se usan: se va la de 7 h y la de 6 h.
+        let in_use: BTreeSet<String> = [keys[9].kid.clone(), keys[8].kid.clone()].into();
+        let dropped = g.drop_unused_board_keys(&in_use);
+        let mut want = vec![keys[7].kid.clone(), keys[6].kid.clone()];
+        want.sort();
+        let mut got = dropped.clone();
+        got.sort();
+        assert_eq!(got, want);
+        assert_eq!(g.board_keys().keys.len(), MAX_BOARD_KEYS);
+        assert_eq!(g.board_keys().current(), Some(&cur));
+        // Todas usadas: se pasa del tope, pero no se quita ninguna.
+        let all: BTreeSet<String> = keys.iter().map(|k| k.kid.clone()).collect();
+        let d2 = tempfile::tempdir().unwrap();
+        let g2 = Group::load(d2.path().join("group.json"), [2u8; 32]);
+        g2.merge(&keys_state(keys));
+        assert!(g2.drop_unused_board_keys(&all).is_empty());
+        assert_eq!(g2.board_keys().keys.len(), 10);
+    }
+
+    /// Una clave propia con `at` de más de un día por delante (un reloj adelantado) se ve: los
+    /// demás la descartan.
+    #[test]
+    fn keys_from_the_future_are_noticed() {
+        let now = now_ms();
+        let st = keys_state(vec![
+            real_key(now + 2 * DAY, None),
+            real_key(now + 3600 * 1000, None),
+        ]);
+        assert_eq!(future_keys(&st, now), vec![st.keys[0].kid.clone()]);
+        assert!(future_keys(&keys_state(vec![real_key(now, None)]), now).is_empty());
+    }
+
+    /// Quitar un dispositivo dice si cambió algo (para rotar la clave solo entonces).
+    #[test]
+    fn removing_a_device_says_if_it_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Group::load(dir.path().join("group.json"), [1u8; 32]);
+        g.add_device(&[7u8; 32], "Firefox");
+        let k = B64.encode([7u8; 32]);
+        assert!(g.remove_device(&k));
+        assert!(!g.remove_device(&k), "ya estaba quitado");
+        assert!(!g.remove_device("otro"));
     }
 }
