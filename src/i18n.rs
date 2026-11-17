@@ -1164,6 +1164,10 @@ const TABLE: &[(&str, &str)] = &[
     ("{} no es un objetivo", "{0} is not an objective"),
     ("{} no es de ese proyecto", "{0} is not in that project"),
     (
+        "{} cambió de tipo mientras se editaba",
+        "{0} changed type while being edited",
+    ),
+    (
         "el id {} es el principio de varios: {}; da más cifras",
         "id {0} is the start of several: {1}; give more digits",
     ),
@@ -1248,8 +1252,8 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("el nombre está vacío", "the name is empty"),
     (
-        "el nombre no puede llevar saltos de línea",
-        "the name cannot contain line breaks",
+        "el nombre no puede llevar saltos de línea ni caracteres invisibles",
+        "the name cannot contain line breaks or invisible characters",
     ),
     (
         "el nombre es demasiado largo (como mucho {} caracteres)",

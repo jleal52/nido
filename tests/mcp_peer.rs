@@ -623,3 +623,51 @@ async fn peer_calls_end_to_end() {
     // Un id que es exactamente el pedido gana a los nombres.
     assert_eq!(state.peer("Gemelo", "sessions", json!({})).await, no_peer);
 }
+
+/// Las herramientas del tablero llegan por la API local (`api_mcp`): en un nido sin hub, las
+/// cinco dicen que no hay hub.
+#[tokio::test]
+async fn the_board_tools_go_through_the_local_api() {
+    let _limit = nido::watchdog::limit(std::time::Duration::from_secs(60));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Sin tocar el entorno: la otra prueba de este fichero lo cambia.
+    let paths = Paths {
+        runtime: dir.join("run"),
+        data: dir.join("data"),
+        state: dir.join("state"),
+        config: dir.join("config"),
+        home: dir.to_owned(),
+        server: None,
+    };
+    let state = AppState::new(paths, Launcher::Detached, Some(TOKEN.into()), true).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let app = server::router(state).into_make_service_with_connect_info::<SocketAddr>();
+            axum::serve(listener, app).await.unwrap()
+        });
+    }
+    let caller = state
+        .registry
+        .lock()
+        .await
+        .add(session("api", dir, None))
+        .unwrap()
+        .id;
+    for (name, args) in [
+        ("board", json!({})),
+        ("project", json!({"name": "P"})),
+        ("objective", json!({"project": "P", "name": "O"})),
+        ("join", json!({"objective": "O"})),
+        ("leave", json!({"objective": "O"})),
+    ] {
+        let (status, body) = tool(addr, &caller, name, args).await;
+        assert_eq!(status, 503, "{name}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        // Sin `Accept-Language`, en inglés.
+        assert!(error.contains("not connected to any hub"), "{name}: {body}");
+    }
+}

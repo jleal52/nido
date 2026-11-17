@@ -10,7 +10,9 @@
 //!
 //! Lo que no se puede leer nunca se reescribe ni se borra, y de ello solo sale su id y por qué,
 //! nunca nada descifrado. Los mensajes se escriben en español y salen traducidos (`i18n`): los
-//! errores con `tr`, en la frontera; en el texto de `board`, solo las etiquetas fijas, nunca lo que
+//! errores con `tr`, en la frontera, y lo que cae en sus huecos (también los nombres que escribió
+//! el usuario) pasa por la tabla: un nombre que sea exactamente un mensaje de nido saldría
+//! traducido. En el texto de `board` solo se traducen las etiquetas fijas (`say`), nunca lo que
 //! escribió el usuario.
 //!
 //! Los objetos se buscan por su id (o sus primeros 8 hex o más, con `#` o sin él) o por su nombre
@@ -423,10 +425,10 @@ fn clean_name(s: &str) -> Result<String, Fail> {
     if n.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "el nombre está vacío"));
     }
-    if n.chars().any(char::is_control) {
+    if n.chars().any(breaks) {
         return Err(fail(
             StatusCode::BAD_REQUEST,
-            "el nombre no puede llevar saltos de línea",
+            "el nombre no puede llevar saltos de línea ni caracteres invisibles",
         ));
     }
     if n.chars().count() > MAX_NAME {
@@ -488,15 +490,20 @@ async fn remove(st: &AppState, keys: &Keyring, id: &str) -> Result<(), Fail> {
 /// Borra en orden, de las hojas a la raíz: si se corta, lo que queda sigue colgando de lo que no
 /// se borró, y volver a pedirlo acaba.
 async fn remove_all(st: &AppState, keys: &Keyring, ids: &[&str]) -> Result<(), Fail> {
-    for id in ids {
-        if let Err(f) = remove(st, keys, id).await {
-            return Err(Fail(
-                f.0,
-                format!(
-                    "{} (el borrado se quedó a medias: vuelve a pedirlo para acabar)",
-                    f.1
-                ),
-            ));
+    for (i, id) in ids.iter().enumerate() {
+        match remove(st, keys, id).await {
+            Ok(()) => {}
+            // Aún no se había borrado nada: no hay nada a medias.
+            Err(f) if i == 0 => return Err(f),
+            Err(f) => {
+                return Err(Fail(
+                    f.0,
+                    format!(
+                        "{} (el borrado se quedó a medias: vuelve a pedirlo para acabar)",
+                        f.1
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -564,13 +571,22 @@ pub struct View<'a> {
     pub stale: Option<&'a str>,
 }
 
-/// Un texto de otros en una línea: los caracteres de control (saltos de línea incluidos), como
-/// espacios; y como mucho `max` caracteres (con «…»).
+/// ¿Rompe una línea de `board`? Los caracteres de control (saltos de línea incluidos), los
+/// separadores de línea y de párrafo de Unicode y las marcas de dirección (las implícitas y las
+/// de incrustar, sustituir y aislar), que darían la vuelta a lo que sigue en la línea.
+fn breaks(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Un texto de otros en una línea: lo que la rompe (`breaks`), como espacios; y como mucho `max`
+/// caracteres (con «…»).
 fn oneline(s: &str, max: usize) -> String {
-    let s: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let s: String = s.chars().map(|c| if breaks(c) { ' ' } else { c }).collect();
     let s = s.trim();
     if s.chars().count() > max {
         let cut: String = s.chars().take(max).collect();
@@ -600,9 +616,9 @@ impl Done {
     }
 }
 
-/// Una etiqueta de `board` en su idioma. Van aquí y no en la tabla de `i18n`: `english` traduce
-/// también lo que cae en los huecos de otros mensajes, y un patrón como «{} fallidas» cambiaría
-/// el nombre de un objetivo («Pruebas fallidas») en un error.
+/// Una etiqueta de `board` en su idioma. Van aquí y no en la tabla de `i18n`: `english`
+/// traduce también lo que cae en los huecos de otros mensajes, y un patrón como «{} fallidas»
+/// cambiaría el nombre de un objetivo («Pruebas fallidas») en un error.
 fn say(lang: Lang, es: String, en: String) -> String {
     match lang {
         Lang::Es => es,
@@ -849,18 +865,78 @@ pub fn render(d: &Decrypted, v: &View, lang: Lang, max: usize) -> String {
         let rest = &chunks[i..];
         let p = rest.iter().filter(|(k, _)| *k == Kind::Project).count();
         let o = rest.len() - p;
-        out.push_str(&say(
-            lang,
-            format!("… se omiten {o} objetivos y {p} proyectos: pide uno con `project`"),
-            format!("… {o} objectives and {p} projects left out: ask for one with `project`"),
-        ));
+        // Con un proyecto pedido ya no hay a dónde acotar: solo cuántos faltan.
+        out.push_str(&if v.only.is_some() {
+            say(
+                lang,
+                format!("… se omiten {o} objetivos"),
+                format!("… {o} objectives left out"),
+            )
+        } else {
+            say(
+                lang,
+                format!(
+                    "… se omiten {o} objetivos y {p} proyectos: pide uno con `board` y \
+                     `project: <id>`"
+                ),
+                format!(
+                    "… {o} objectives and {p} projects left out: ask for one with `board` and \
+                     `project: <id>`"
+                ),
+            )
+        });
         out.push('\n');
     }
     out.push_str(&tail);
     out
 }
 
-// ---------- `project` ----------
+// ---------- `project` y `objective` ----------
+
+/// Qué se pide a `project` o a `objective`.
+enum Mode<'a> {
+    /// Sin `id`: uno nuevo.
+    Create,
+    /// Cambiar los campos dados del que dice `id`.
+    Change(&'a str),
+    /// Borrar el que dice `id`.
+    Delete(&'a str),
+}
+
+/// Lo que se pide, según `id`, `delete` y si se da algún campo; lo que no tiene sentido, 400.
+fn mode<'a>(
+    id: &'a Option<String>,
+    delete: bool,
+    changes: bool,
+    kind: Kind,
+) -> Result<Mode<'a>, Fail> {
+    match (given(id), delete) {
+        (None, true) => Err(fail(StatusCode::BAD_REQUEST, "para borrar hace falta id")),
+        (None, false) => Ok(Mode::Create),
+        (Some(_), true) if changes => Err(fail(
+            StatusCode::BAD_REQUEST,
+            "delete va solo, sin otros cambios",
+        )),
+        (Some(q), true) => Ok(Mode::Delete(q)),
+        (Some(_), false) if !changes => Err(fail(
+            StatusCode::BAD_REQUEST,
+            match kind {
+                Kind::Project => "nada que cambiar: da name, desc, state o delete",
+                Kind::Objective => "nada que cambiar: da name, desc, state, note, order o delete",
+            },
+        )),
+        (Some(q), false) => Ok(Mode::Change(q)),
+    }
+}
+
+/// `update` dio un objeto de otro tipo: otro cliente escribió en ese id algo que no es lo que
+/// había. No debería pasar (el id lo elige quien crea, al azar); no se dice que salió.
+fn changed_type(id: &str) -> Fail {
+    fail(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{} cambió de tipo mientras se editaba", short(id)),
+    )
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -888,69 +964,54 @@ pub async fn tool_project(st: &Arc<AppState>, s: &Session, args: Value) -> Reply
     let name = a.name.as_deref().map(clean_name).transpose()?;
     let state = given(&a.state).map(project_state).transpose()?;
     let changes = name.is_some() || a.desc.is_some() || state.is_some();
-    let Some(q) = given(&a.id) else {
-        if a.delete {
-            return Err(fail(StatusCode::BAD_REQUEST, "para borrar hace falta id"));
+    let q = match mode(&a.id, a.delete, changes, Kind::Project)? {
+        Mode::Create => {
+            let Some(name) = name else {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "para crear un proyecto hace falta name (o id, para cambiar uno)",
+                ));
+            };
+            let who = Who::of(st, s);
+            let (keys, d) = for_writing(st).await?;
+            if let Some(e) = taken(&d, &name, Kind::Project, None, None) {
+                return Err(name_taken(e, Kind::Project));
+            }
+            let now = now_ms();
+            let p = Project {
+                name,
+                desc: a.desc.unwrap_or_default(),
+                state: state.unwrap_or(ProjectState::Active),
+                created: now,
+                changed: now,
+                by: who.by,
+                extra: Map::new(),
+            };
+            let id = st
+                .board
+                .create(&keys, &Object::Project(p.clone()))
+                .await
+                .map_err(|e| edit_fail("", e))?;
+            return Ok(project_reply(&id, &p));
         }
-        let Some(name) = name else {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                "para crear un proyecto hace falta name (o id, para cambiar uno)",
-            ));
-        };
-        let who = Who::of(st, s);
-        let (keys, d) = for_writing(st).await?;
-        if let Some(e) = taken(&d, &name, Kind::Project, None, None) {
-            return Err(name_taken(e, Kind::Project));
+        Mode::Delete(q) => {
+            let (keys, d) = for_writing(st).await?;
+            let id = find(&d, q, Kind::Project, None)?.id.as_str();
+            let objs: Vec<&str> = objectives(&d)
+                .filter(|(_, o)| o.project == id)
+                .map(|(e, _)| e.id.as_str())
+                .collect();
+            let ls = links_of(&d, &objs);
+            let all: Vec<&str> = ls.iter().chain(&objs).copied().chain([id]).collect();
+            remove_all(st, &keys, &all).await?;
+            return Ok(json!({"ok": true, "deleted": id, "objectives": objs.len(),
+                "links": ls.len()}));
         }
-        let now = now_ms();
-        let p = Project {
-            name,
-            desc: a.desc.unwrap_or_default(),
-            state: state.unwrap_or(ProjectState::Active),
-            created: now,
-            changed: now,
-            by: who.by,
-            extra: Map::new(),
-        };
-        let id = st
-            .board
-            .create(&keys, &Object::Project(p.clone()))
-            .await
-            .map_err(|e| edit_fail("", e))?;
-        return Ok(project_reply(&id, &p));
+        Mode::Change(q) => q,
     };
-    if a.delete && changes {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            "delete va solo, sin otros cambios",
-        ));
-    }
-    if !a.delete && !changes {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            "nada que cambiar: da name, desc, state o delete",
-        ));
-    }
     let who = Who::of(st, s);
     let (keys, d) = for_writing(st).await?;
     let id = find(&d, q, Kind::Project, None)?.id.clone();
-    if a.delete {
-        let objs: Vec<&str> = objectives(&d)
-            .filter(|(_, o)| o.project == id)
-            .map(|(e, _)| e.id.as_str())
-            .collect();
-        let ls = links_of(&d, &objs);
-        let all: Vec<&str> = ls
-            .iter()
-            .chain(&objs)
-            .copied()
-            .chain([id.as_str()])
-            .collect();
-        remove_all(st, &keys, &all).await?;
-        return Ok(json!({"ok": true, "deleted": id, "objectives": objs.len(),
-            "links": ls.len()}));
-    }
     if let Some(e) = name
         .as_deref()
         .and_then(|n| taken(&d, n, Kind::Project, None, Some(&id)))
@@ -979,10 +1040,7 @@ pub async fn tool_project(st: &Arc<AppState>, s: &Session, args: Value) -> Reply
         .map_err(|e| edit_fail(&id, e))?;
     match obj {
         Object::Project(p) => Ok(project_reply(&id, &p)),
-        _ => Err(fail(
-            StatusCode::BAD_REQUEST,
-            format!("{} no es un proyecto", short(&id)),
-        )),
+        _ => Err(changed_type(&id)),
     }
 }
 
@@ -1031,69 +1089,57 @@ pub async fn tool_objective(st: &Arc<AppState>, s: &Session, args: Value) -> Rep
         || state.is_some()
         || a.note.is_some()
         || a.order.is_some();
-    let Some(q) = given(&a.id) else {
-        if a.delete {
-            return Err(fail(StatusCode::BAD_REQUEST, "para borrar hace falta id"));
+    let q = match mode(&a.id, a.delete, changes, Kind::Objective)? {
+        Mode::Create => {
+            let Some(pq) = given(&a.project) else {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "para crear un objetivo hace falta project (o id, para cambiar uno)",
+                ));
+            };
+            let Some(name) = name else {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "para crear un objetivo hace falta name (o id, para cambiar uno)",
+                ));
+            };
+            let who = Who::of(st, s);
+            let (keys, d) = for_writing(st).await?;
+            let pid = find(&d, pq, Kind::Project, None)?.id.clone();
+            if let Some(e) = taken(&d, &name, Kind::Objective, Some(&pid), None) {
+                return Err(name_taken(e, Kind::Objective));
+            }
+            let order = a.order.unwrap_or_else(|| {
+                objectives(&d)
+                    .filter(|(_, o)| o.project == pid)
+                    .map(|(_, o)| o.order)
+                    .filter(|o| o.is_finite())
+                    .fold(0.0, f64::max)
+                    .floor()
+                    + 1.0
+            });
+            let now = now_ms();
+            let o = Objective {
+                project: pid,
+                name,
+                desc: a.desc.unwrap_or_default(),
+                state: state.unwrap_or(ObjectiveState::Pending),
+                note: a.note.unwrap_or_default(),
+                order,
+                created: now,
+                changed: now,
+                by: who.by,
+                extra: Map::new(),
+            };
+            let id = st
+                .board
+                .create(&keys, &Object::Objective(o.clone()))
+                .await
+                .map_err(|e| edit_fail("", e))?;
+            return Ok(objective_reply(&id, &o));
         }
-        let Some(pq) = given(&a.project) else {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                "para crear un objetivo hace falta project (o id, para cambiar uno)",
-            ));
-        };
-        let Some(name) = name else {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                "para crear un objetivo hace falta name (o id, para cambiar uno)",
-            ));
-        };
-        let who = Who::of(st, s);
-        let (keys, d) = for_writing(st).await?;
-        let pid = find(&d, pq, Kind::Project, None)?.id.clone();
-        if let Some(e) = taken(&d, &name, Kind::Objective, Some(&pid), None) {
-            return Err(name_taken(e, Kind::Objective));
-        }
-        let order = a.order.unwrap_or_else(|| {
-            objectives(&d)
-                .filter(|(_, o)| o.project == pid)
-                .map(|(_, o)| o.order)
-                .filter(|o| o.is_finite())
-                .fold(0.0, f64::max)
-                .floor()
-                + 1.0
-        });
-        let now = now_ms();
-        let o = Objective {
-            project: pid,
-            name,
-            desc: a.desc.unwrap_or_default(),
-            state: state.unwrap_or(ObjectiveState::Pending),
-            note: a.note.unwrap_or_default(),
-            order,
-            created: now,
-            changed: now,
-            by: who.by,
-            extra: Map::new(),
-        };
-        let id = st
-            .board
-            .create(&keys, &Object::Objective(o.clone()))
-            .await
-            .map_err(|e| edit_fail("", e))?;
-        return Ok(objective_reply(&id, &o));
+        Mode::Delete(q) | Mode::Change(q) => q,
     };
-    if a.delete && changes {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            "delete va solo, sin otros cambios",
-        ));
-    }
-    if !a.delete && !changes {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            "nada que cambiar: da name, desc, state, note, order o delete",
-        ));
-    }
     let who = Who::of(st, s);
     let (keys, d) = for_writing(st).await?;
     let within = match given(&a.project) {
@@ -1141,14 +1187,22 @@ pub async fn tool_objective(st: &Arc<AppState>, s: &Session, args: Value) -> Rep
         .map_err(|e| edit_fail(&id, e))?;
     match obj {
         Object::Objective(o) => Ok(objective_reply(&id, &o)),
-        _ => Err(fail(
-            StatusCode::BAD_REQUEST,
-            format!("{} no es un objetivo", short(&id)),
-        )),
+        _ => Err(changed_type(&id)),
     }
 }
 
 // ---------- `join` y `leave` ----------
+
+/// El id de este equipo en el hub, que va en el enlace. Sin hub, el error de siempre; con hub,
+/// pero sin id aún (no se ha identificado nunca), que se pruebe luego.
+fn machine_of(st: &AppState, who: &Who) -> Result<String, Fail> {
+    if st.hub.url().is_none() {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, NO_HUB));
+    }
+    who.machine
+        .clone()
+        .ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, NO_HUB_ID))
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1162,24 +1216,25 @@ struct JoinArgs {
 pub async fn tool_join(st: &Arc<AppState>, s: &Session, args: Value) -> Reply {
     let a: JoinArgs = args_of(args)?;
     let who = Who::of(st, s);
+    let machine = machine_of(st, &who)?;
     let (keys, d) = for_writing(st).await?;
-    let machine = who
-        .machine
-        .clone()
-        .ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, NO_HUB_ID))?;
     let o = find(&d, &a.objective, Kind::Objective, None)?;
     let oid = o.id.clone();
     let name = name_of(&o.object).to_owned();
     let mine: Vec<(&Entry, &Link)> = session_links(&d, &machine, &who.id)
         .filter(|(_, l)| l.objective == oid)
         .collect();
-    let reply = |link: &str, already: bool| json!({"ok": true, "objective": oid, "name": name, "link": link, "already": already});
+    let reply = |link: &str, already: bool| {
+        json!({"ok": true, "objective": oid, "name": name, "link": link,
+            "already": already})
+    };
     if let Some((e, _)) = mine.iter().find(|(_, l)| l.closed.is_none()) {
         return Ok(reply(&e.id, true));
     }
     if let Some((e, _)) = mine.first() {
         let lid = e.id.clone();
-        st.board
+        let reopened = st
+            .board
             .update(&keys, &lid, |o| {
                 if let Object::Link(l) = o {
                     l.closed = None;
@@ -1188,9 +1243,13 @@ pub async fn tool_join(st: &Arc<AppState>, s: &Session, args: Value) -> Reply {
                     l.by = who.by.clone();
                 }
             })
-            .await
-            .map_err(|e| edit_fail(&lid, e))?;
-        return Ok(reply(&lid, false));
+            .await;
+        match reopened {
+            Ok(_) => return Ok(reply(&lid, false)),
+            // Otro lo borró a la vez (la limpieza de la Tarea 12): uno nuevo.
+            Err(EditError::Missing) => {}
+            Err(e) => return Err(edit_fail(&lid, e)),
+        }
     }
     let now = now_ms();
     let link = Link {
@@ -1223,13 +1282,10 @@ pub async fn tool_join(st: &Arc<AppState>, s: &Session, args: Value) -> Reply {
 pub async fn tool_leave(st: &Arc<AppState>, s: &Session, args: Value) -> Reply {
     let a: JoinArgs = args_of(args)?;
     let who = Who::of(st, s);
+    let machine = machine_of(st, &who)?;
     synced(st).await?;
     let keys = st.group.board_keys();
     let d = st.board.decrypted(&keys);
-    let machine = who
-        .machine
-        .clone()
-        .ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, NO_HUB_ID))?;
     let oid = find(&d, &a.objective, Kind::Objective, None)?.id.clone();
     let mine: Vec<&str> = session_links(&d, &machine, &who.id)
         .filter(|(_, l)| l.objective == oid)
@@ -1404,6 +1460,15 @@ mod tests {
         e.1.contains(want)
     }
 
+    fn keys(v: &Value) -> std::collections::BTreeSet<String> {
+        v.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// Los campos de un objeto nuevo: los que se conocen y `t`.
+    fn fields(known: &[&str]) -> std::collections::BTreeSet<String> {
+        known.iter().chain(&["t"]).map(|s| s.to_string()).collect()
+    }
+
     /// Crear, editar y borrar proyectos y objetivos; `board` lo enseña; borrar un proyecto se
     /// lleva sus objetivos y sus enlaces.
     #[tokio::test]
@@ -1433,6 +1498,7 @@ mod tests {
         assert_eq!(v["by"], me.as_str());
         let created = v["created"].as_u64().unwrap();
         assert!(created > 0);
+        assert_eq!(keys(&v), fields(Project::FIELDS), "sin campos de más");
         assert_eq!(v["changed"], created);
 
         // Objetivos: el proyecto por su nombre (sin mayúsculas) o por el principio de su id; van
@@ -1451,6 +1517,7 @@ mod tests {
         assert_eq!(v["state"], "pending");
         assert_eq!(v["order"], 1.0);
         assert_eq!(v["by"], me.as_str());
+        assert_eq!(keys(&v), fields(Objective::FIELDS), "sin campos de más");
         let r = w
             .call(
                 "objective",
@@ -1539,6 +1606,125 @@ mod tests {
         assert!(t.contains("vacío"), "{t}");
     }
 
+    /// Un borrado que se corta a medias lo dice, deja lo de más arriba (el objetivo y el proyecto)
+    /// y repetirlo acaba. Borrar un objetivo se lleva todos sus enlaces.
+    #[tokio::test]
+    async fn a_delete_cut_halfway_finishes_when_asked_again() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let w = world().await;
+        let p = id_of(&w.call("project", json!({"name": "P"})).await.unwrap());
+        let o = id_of(
+            &w.call("objective", json!({"project": "P", "name": "O"}))
+                .await
+                .unwrap(),
+        );
+        w.call("join", json!({"objective": "O"})).await.unwrap();
+        let link = w.live("link")[0].0.clone();
+        w.board.lock().unwrap().bad.insert(o.clone());
+        let e = w
+            .call("project", json!({"id": p, "delete": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_GATEWAY, "{}", e.1);
+        assert!(has(&e, "a medias"), "{}", e.1);
+        assert!(w.stored(&link).is_none(), "el enlace ya se borró");
+        assert!(w.stored(&o).is_some() && w.stored(&p).is_some());
+        w.board.lock().unwrap().bad.clear();
+        let r = w
+            .call("project", json!({"id": p, "delete": true}))
+            .await
+            .unwrap();
+        assert_eq!((&r["objectives"], &r["links"]), (&json!(1), &json!(0)));
+        for t in ["project", "objective", "link"] {
+            assert!(w.live(t).is_empty(), "{t}");
+        }
+
+        // Si lo primero ya falla, no hay nada a medias.
+        let p = id_of(&w.call("project", json!({"name": "Q"})).await.unwrap());
+        w.board.lock().unwrap().bad.insert(p.clone());
+        let e = w
+            .call("project", json!({"id": p, "delete": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_GATEWAY, "{}", e.1);
+        assert!(!has(&e, "a medias"), "{}", e.1);
+        w.board.lock().unwrap().bad.clear();
+
+        // Un objetivo con los enlaces de dos sesiones.
+        let other =
+            w.st.registry
+                .lock()
+                .await
+                .add(session(w._tmp.path(), "otra"))
+                .unwrap();
+        let o = id_of(
+            &w.call("objective", json!({"project": "Q", "name": "O2"}))
+                .await
+                .unwrap(),
+        );
+        w.call("join", json!({"objective": "O2"})).await.unwrap();
+        w.call_as(&other, "join", json!({"objective": "O2"}))
+            .await
+            .unwrap();
+        assert_eq!(w.live("link").len(), 2);
+        let r = w
+            .call("objective", json!({"id": "O2", "delete": true}))
+            .await
+            .unwrap();
+        assert_eq!((&r["deleted"], &r["links"]), (&json!(o), &json!(2)));
+        assert!(w.live("link").is_empty() && w.live("objective").is_empty());
+        assert_eq!(w.live("project").len(), 1);
+    }
+
+    /// Si el hub no da el tablero (un 503, o no contesta), `board` enseña la copia de este equipo
+    /// y lo dice; lo que escribe da el error.
+    #[tokio::test]
+    async fn without_the_hub_board_shows_the_copy() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let s = st
+            .registry
+            .lock()
+            .await
+            .add(session(tmp.path(), "api"))
+            .unwrap();
+        let board: FakeBoard = Default::default();
+        // 0: como el hub; 1: 503 al tablero; 2: no contesta al tablero.
+        let mode = Arc::new(AtomicU8::new(0));
+        let rec = {
+            let (board, mode) = (board.clone(), mode.clone());
+            hub::fake::recording(move |v| {
+                let req = v.get("board")?.get("req")?.as_u64()?;
+                match mode.load(Ordering::SeqCst) {
+                    0 => board.lock().unwrap().answer(v),
+                    1 => Some(hub::fake::Reply::Send(json!({"boarded": {"req": req,
+                        "status": 503, "error": "el nido no tiene cuenta"}}))),
+                    _ => Some(hub::fake::Reply::Silent),
+                }
+            })
+            .await
+        };
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        tool_project(&st, &s, json!({"name": "Copiado"}))
+            .await
+            .unwrap();
+        for m in [1, 2] {
+            mode.store(m, Ordering::SeqCst);
+            let r = i18n::scope(Lang::Es, tool_board(&st, &s, json!({})))
+                .await
+                .unwrap();
+            let t = r.as_str().unwrap();
+            assert!(t.starts_with("(sin poder hablar con el hub"), "{m}: {t}");
+            assert!(t.contains("Copiado"), "{m}: {t}");
+            let e = tool_project(&st, &s, json!({"name": "Otro"}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{m}: {}", e.1);
+        }
+    }
+
     /// `by` es la sesión que llama, con el nombre del equipo y el de la sesión; `created` no
     /// cambia al editar.
     #[tokio::test]
@@ -1600,6 +1786,10 @@ mod tests {
             json!({"machine": "este", "id": w.s.id, "name": me})
         );
         assert_eq!((&l["plan"], &l["closed"]), (&Value::Null, &Value::Null));
+        assert_eq!(keys(l), fields(Link::FIELDS), "sin campos de más");
+        let mut session_keys = fields(LinkSession::FIELDS);
+        session_keys.remove("t");
+        assert_eq!(keys(&l["session"]), session_keys);
         assert_eq!(l["by"], me.as_str());
 
         // Otra vez: nada.
@@ -1902,6 +2092,15 @@ mod tests {
 
         // Un 409 tras otro: se rinde y lo dice.
         let p = id_of(&w.call("project", json!({"name": "P"})).await.unwrap());
+        // El hub dice que es demasiado grande (413).
+        w.board.lock().unwrap().too_big.insert(p.clone());
+        let e = w
+            .call("project", json!({"id": "P", "desc": "d"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
+        assert!(has(&e, "demasiado grande para el hub"), "{}", e.1);
+        w.board.lock().unwrap().too_big.clear();
         {
             let mut b = w.board.lock().unwrap();
             let cur = b.items[&p].clone();
@@ -1921,6 +2120,9 @@ mod tests {
             ("project", json!({}), "name"),
             ("project", json!({"name": " "}), "vacío"),
             ("project", json!({"name": "a\nb"}), "saltos de línea"),
+            ("project", json!({"name": "a\u{202e}b"}), "saltos de línea"),
+            ("project", json!({"name": "a\u{2028}b"}), "saltos de línea"),
+            ("project", json!({"name": "a\u{200f}b"}), "saltos de línea"),
             ("project", json!({"name": "x".repeat(121)}), "largo"),
             ("project", json!({"name": "Q", "state": "hecho"}), "active"),
             ("project", json!({"id": "P"}), "nada que cambiar"),
@@ -2138,6 +2340,19 @@ mod tests {
         }
     }
 
+    /// Lo que escriben otros sale en una línea: sin controles, separadores de línea ni marcas de
+    /// dirección (que darían la vuelta a lo que sigue).
+    #[test]
+    fn text_of_others_stays_on_one_line() {
+        assert_eq!(oneline("a\nb\u{2028}c\u{2029}d", 50), "a b c d");
+        assert_eq!(oneline("x\u{202e}y\u{2066}z\u{2069}\u{200e}", 50), "x y z");
+        assert_eq!(oneline("abcdef", 3), "abc…");
+        for c in ['\u{200f}', '\u{202a}', '\u{2067}', '\u{7f}'] {
+            assert!(breaks(c), "{c:?}");
+        }
+        assert!(!breaks('ñ') && !breaks(' ') && !breaks('·'));
+    }
+
     /// La salida de `board`, entera (es el ejemplo del informe).
     #[test]
     fn the_board_text() {
@@ -2278,7 +2493,31 @@ No se puede leer 1 objeto:
         eprintln!("cortado: {} bytes", cut.len());
         assert!(cut.len() <= MAX_READ, "{}", cut.len());
         assert!(cut.contains("se omiten"), "{}", &cut[cut.len() - 400..]);
-        assert!(cut.contains("pide uno con `project`"));
+        assert!(
+            cut.contains("pide uno con `board` y `project: <id>`"),
+            "{cut}"
+        );
+        let en = render(&d, &view, Lang::En, MAX_READ);
+        assert!(
+            en.contains("ask for one with `board` and `project: <id>`"),
+            "{}",
+            &en[en.len() - 600..]
+        );
+        // Con un proyecto pedido, solo cuántos objetivos faltan.
+        let pid = d.objects[0].id.clone();
+        let one = View {
+            only: Some(&pid),
+            archived: false,
+            stale: None,
+        };
+        let cut = render(&d, &one, Lang::Es, 3000);
+        assert!(cut.len() <= 3000, "{}", cut.len());
+        let note = cut.lines().find(|l| l.starts_with("… se omiten")).unwrap();
+        assert!(note.ends_with(" objetivos"), "{note}");
+        assert!(
+            !note.contains("proyectos") && !note.contains("pide"),
+            "{note}"
+        );
         // Lo que no se puede leer se dice siempre, aunque no quepa la lista.
         assert!(
             cut.contains("No se pueden leer 40 objetos:"),
