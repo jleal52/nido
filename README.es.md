@@ -340,8 +340,10 @@ Al quitar una sesión, sus enlaces se cierran (`closed`) con su último resumen,
 se borra a los 30 días. Un equipo solo toca los enlaces de sus propias sesiones, y de esos ni los
 que no puede leer ni los de un objetivo que no encuentra: puede que aún no le haya llegado o que
 el tablero se esté volviendo a subir, y borrarlos entonces los perdería para siempre. Los enlaces
-de un objetivo se borran con él, lo borre quien lo borre (una sesión, la web o la app); los que se
-queden sin objetivo, nido no los limpia. Si un equipo cambia de identidad en el hub, sus enlaces
+de un objetivo se borran con él, lo borre quien lo borre (una sesión, la web o la app). Si aun así
+quedan (un objetivo borrado desde otro sitio, o un borrado que se cortó a medias), cada equipo
+borra los suyos en cuanto ve que su objetivo se borró de verdad (en su copia hay una lápida, no
+solo falta). Si un equipo cambia de identidad en el hub, sus enlaces
 viejos se quedan como están: ya no son suyos, y solo se van con su objetivo.
 
 **Cuidado con el registro de sesiones**: nido cierra los enlaces de toda sesión de este equipo que

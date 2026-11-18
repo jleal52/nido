@@ -357,8 +357,10 @@ is removed, its links are closed (`closed`) with its last summary, and a closed 
 after 30 days. A computer only touches its own sessions' links, and not even those it can't read
 or whose objective it can't find: the objective may not have reached it yet, or the board may be
 being uploaded again, and deleting the links then would lose them for good. An objective's links
-are deleted with it, whoever deletes it (a session, the web app or the phone app); nido doesn't
-clean up links left without an objective. If a computer gets a new identity on the hub, its old
+are deleted with it, whoever deletes it (a session, the web app or the phone app). If some are
+left anyway (an objective deleted from elsewhere, or a deletion cut halfway), each computer
+deletes its own as soon as it sees that their objective was really deleted (its copy has a
+tombstone, not just nothing). If a computer gets a new identity on the hub, its old
 links stay as they are: they are no longer its own, and only go away with their objective.
 
 **Careful with the session registry**: nido closes the links of every session of this computer
