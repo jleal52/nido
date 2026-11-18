@@ -3375,6 +3375,25 @@ mod tests {
         assert_eq!(r.writes().len(), 1);
     }
 
+    /// Un cambio que no cambia nada tampoco se escribe en uno que falta por resubir (sigue
+    /// faltando) ni en uno cifrado con una clave retirada (eso lo hace el recifrado).
+    #[tokio::test]
+    async fn no_change_writes_nothing_while_reuploading_or_with_a_retired_key() {
+        let r = rig(fake::Board::default()).await;
+        let (pending, old) = (bid(1), bid(2));
+        r.write(&K_CUR, &pending, &project("uno"));
+        r.write(&K_OLD, &old, &project("vieja"));
+        r.cache.sync().await.unwrap();
+        r.cache.lock().reupload.insert(pending.clone());
+        let got = r.cache.update(&keyring(), &pending, |_| {}).await.unwrap();
+        assert_eq!(got, project("uno"));
+        assert!(r.cache.lock().reupload.contains(&pending));
+        let got = r.cache.update(&keyring(), &old, |_| {}).await.unwrap();
+        assert_eq!(got, project("vieja"));
+        assert_eq!(r.cache.item(&old).unwrap().kid, kid(&K_OLD));
+        assert!(r.writes().is_empty(), "{:?}", r.writes());
+    }
+
     /// Cambiar algo que otro borró: queda borrado aquí. Cambiar algo que el hub no tiene: no se
     /// entierra, se marca como que no está en el hub y se pide un sondeo.
     #[tokio::test]
@@ -4468,8 +4487,9 @@ mod tests {
     async fn a_deleted_account(edit_first: bool) {
         let r = rig(with_ref(REF_A)).await;
         let (p, g, t) = (bid(1), bid(2), bid(3));
-        for name in ["P", "P", "P"] {
-            r.write(&K_CUR, &p, &project(name));
+        // Tres escrituras del mismo P en el hub: queda en la v3.
+        for _ in 0..3 {
+            r.write(&K_CUR, &p, &project("P"));
         }
         r.write(&K_CUR, &g, &goal("nota"));
         r.write(&K_CUR, &t, &project("T"));
@@ -4545,8 +4565,10 @@ mod tests {
         assert_eq!(r.cache.pending_reupload(), 0);
         assert_eq!(r.writes().len(), tried);
         assert_eq!(r.on_disk().await.lock().account_ref.as_deref(), Some(REF_B));
-        // Lo de después tampoco escribe: cambiar P da `Missing`, y el sondeo, aunque espere la
-        // confirmación de un hub vacío, no resube nada (el hub tiene las lápidas).
+        // Lo de después tampoco escribe: cambiar P da `Missing`, y otro sondeo no resube nada.
+        // Sale enseguida, porque en la copia ya no queda nada vivo (`has_objects` da falso); las
+        // esperas (más que `EMPTY_CONFIRM`) dan tiempo a una resubida en segundo plano, si se
+        // hubiera puesto en marcha, para que se vea aquí.
         let e = r.cache.update(&keyring(), &p, touch).await.unwrap_err();
         assert!(matches!(e, EditError::Missing), "{e:?}");
         tokio::time::sleep(EMPTY_CONFIRM * 4).await;

@@ -1216,9 +1216,10 @@ pub async fn tool_board_delete(st: &Arc<AppState>, _s: &Session, args: Value) ->
             ));
         }
     };
-    let Some(q) = given(&Some(a.id)).map(str::to_owned) else {
+    let q = a.id.trim();
+    if q.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "para borrar hace falta id"));
-    };
+    }
     let scope = given(&a.project).map(str::to_owned);
     if kind == Kind::Project && scope.is_some() {
         return Err(fail(
@@ -1229,7 +1230,7 @@ pub async fn tool_board_delete(st: &Arc<AppState>, _s: &Session, args: Value) ->
     let (keys, d) = for_writing(st).await?;
     match kind {
         Kind::Project => {
-            let id = find(&d, &q, Kind::Project, None)?.id.as_str();
+            let id = find(&d, q, Kind::Project, None)?.id.as_str();
             let objs: Vec<&str> = objectives(&d)
                 .filter(|(_, o)| o.project == id)
                 .map(|(e, _)| e.id.as_str())
@@ -1245,7 +1246,7 @@ pub async fn tool_board_delete(st: &Arc<AppState>, _s: &Session, args: Value) ->
                 Some(pq) => Some(find(&d, pq, Kind::Project, None)?.id.as_str()),
                 None => None,
             };
-            let id = find(&d, &q, Kind::Objective, within)?.id.as_str();
+            let id = find(&d, q, Kind::Objective, within)?.id.as_str();
             let ls = links_of(&d, &[id]);
             let all: Vec<&str> = ls.iter().copied().chain([id]).collect();
             remove_all(st, &keys, &all).await?;
@@ -1999,6 +2000,25 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST, "{}", e.1);
         assert!(has(&e, "no es de ese proyecto"), "{}", e.1);
+
+        // Borrar con un nombre que vale para varios, o por id fuera del proyecto dado: error, y
+        // nada escrito.
+        let items = w.board.lock().unwrap().items.clone();
+        let writes = w.writes();
+        for (args, want) in [
+            (json!({"kind": "project", "id": "web"}), "«web»"),
+            (json!({"kind": "objective", "id": "DOCS"}), "«Docs»"),
+            (
+                json!({"kind": "objective", "id": &d[..8], "project": a}),
+                "no es de ese proyecto",
+            ),
+        ] {
+            let e = w.call("board_delete", args.clone()).await.unwrap_err();
+            assert_eq!(e.0, StatusCode::BAD_REQUEST, "{args}: {}", e.1);
+            assert!(has(&e, want), "{args}: {}", e.1);
+        }
+        assert_eq!(w.writes(), writes);
+        assert_eq!(w.board.lock().unwrap().items, items);
 
         // No se crea otro con el mismo nombre (ni se renombra a uno que ya está).
         let e = w.call("project", json!({"name": "WEB"})).await.unwrap_err();

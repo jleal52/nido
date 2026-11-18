@@ -949,7 +949,12 @@ const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// entre una y otra: alguien lo tiene abierto para escribir. Claude Code que se acaba de
 /// actualizar, o, en las pruebas, el guion recién escrito mientras otro hilo lanza un proceso
 /// (su hijo hereda el descriptor hasta su `exec`).
+#[cfg(not(test))]
 const BUSY_TRIES: usize = 20;
+/// En las pruebas, más: con el servidor cargado, lo que tiene el fichero abierto puede tardar en
+/// soltarlo, y la prueba no tiene que depender de eso.
+#[cfg(test)]
+const BUSY_TRIES: usize = 200;
 const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
 
 impl ClaudeCli for Program {
@@ -2101,7 +2106,8 @@ mod tests {
     /// Un programa abierto para escribir (recién escrito: Claude Code que se acaba de actualizar,
     /// o el guion de una prueba mientras otro hilo lanza un proceso y su hijo hereda el
     /// descriptor hasta su `exec`) no se puede lanzar un momento («Text file busy»): se
-    /// reintenta, y en cuanto se cierra, va. Solo en Linux: es donde lanzar un fichero abierto
+    /// reintenta, y en cuanto se cierra, va (aquí, a los 50 ms; en las pruebas, `BUSY_TRIES` da
+    /// para 5 s). Solo en Linux: es donde lanzar un fichero abierto
     /// para escribir da «Text file busy» seguro.
     #[cfg(target_os = "linux")]
     #[test]
@@ -2123,7 +2129,7 @@ mod tests {
         let e = std::process::Command::new(&cli.path).output().unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}");
         let closer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::thread::sleep(std::time::Duration::from_millis(50));
             drop(open);
         });
         let (ok, text) = cli.run(None, &["--version"]).unwrap();
