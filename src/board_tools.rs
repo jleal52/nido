@@ -349,9 +349,13 @@ fn board_fail(e: BoardError) -> Fail {
             StatusCode::CONFLICT,
             "el objeto cambió a la vez en otro sitio varias veces seguidas: prueba otra vez",
         ),
+        // Lo que cuenta el hub: todos los objetos de la cuenta (proyectos, objetivos y enlaces),
+        // también los archivados, y las lápidas de lo borrado hasta que caducan (30 días).
         BoardError::Full => fail(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "el tablero de la cuenta está lleno: borra objetivos o proyectos que ya no hagan falta",
+            "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra proyectos u \
+             objetivos que ya no hagan falta (lo borrado sigue contando 30 días, y lo archivado \
+             cuenta igual)",
         ),
         BoardError::TooBig => fail(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1465,6 +1469,11 @@ pub(crate) mod tests {
         e.1.contains(want)
     }
 
+    /// El error de la cuenta llena, entero.
+    const FULL: &str = "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra \
+                        proyectos u objetivos que ya no hagan falta (lo borrado sigue contando 30 \
+                        días, y lo archivado cuenta igual)";
+
     fn keys(v: &Value) -> std::collections::BTreeSet<String> {
         v.as_object().unwrap().keys().cloned().collect()
     }
@@ -2083,11 +2092,25 @@ pub(crate) mod tests {
         let e = w.call("project", json!({"name": "P"})).await.unwrap_err();
         assert_eq!(e.0, StatusCode::TOO_MANY_REQUESTS, "{}", e.1);
         assert!(has(&e, "prueba en un rato"), "{}", e.1);
-        w.board.lock().unwrap().limit = 0;
-        let e = w.call("project", json!({"name": "P"})).await.unwrap_err();
-        assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
-        assert!(has(&e, "lleno"), "{}", e.1);
+        // La cuenta llena: con el `code` del hub y sin él (un hub de antes), lo mismo.
+        for uncoded in [false, true] {
+            {
+                let mut b = w.board.lock().unwrap();
+                b.limit = 0;
+                b.uncoded = uncoded;
+            }
+            let e = w.call("project", json!({"name": "P"})).await.unwrap_err();
+            assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
+            assert_eq!(e.1, FULL, "{uncoded}");
+        }
+        assert_eq!(
+            i18n::english(FULL),
+            "the account already has the most objects the board can hold: delete projects or \
+             objectives that are no longer needed (deleted ones still count for 30 days, and \
+             archived ones count too)"
+        );
         w.board.lock().unwrap().limit = 2000;
+        w.board.lock().unwrap().uncoded = false;
         let e = w
             .call("project", json!({"name": "P", "desc": "x".repeat(9000)}))
             .await
@@ -2097,14 +2120,22 @@ pub(crate) mod tests {
 
         // Un 409 tras otro: se rinde y lo dice.
         let p = id_of(&w.call("project", json!({"name": "P"})).await.unwrap());
-        // El hub dice que es demasiado grande (413).
+        // El hub dice que es demasiado grande (413), con `code` y sin él.
         w.board.lock().unwrap().too_big.insert(p.clone());
-        let e = w
-            .call("project", json!({"id": "P", "desc": "d"}))
-            .await
-            .unwrap_err();
-        assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
-        assert!(has(&e, "demasiado grande para el hub"), "{}", e.1);
+        for uncoded in [false, true] {
+            w.board.lock().unwrap().uncoded = uncoded;
+            let e = w
+                .call("project", json!({"id": "P", "desc": "d"}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
+            assert!(
+                has(&e, "demasiado grande para el hub"),
+                "{uncoded}: {}",
+                e.1
+            );
+        }
+        w.board.lock().unwrap().uncoded = false;
         w.board.lock().unwrap().too_big.clear();
         {
             let mut b = w.board.lock().unwrap();

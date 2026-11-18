@@ -1359,14 +1359,21 @@ mod tests {
     }
 
     /// Lo que no se arregla reintentando (un 413) se prueba una vez, y otra cuando cambia lo
-    /// que se quiere escribir.
+    /// que se quiere escribir: con el `code` del hub y sin él (un hub de antes).
     #[tokio::test]
     async fn what_cannot_be_written_is_not_retried_until_it_changes() {
+        for uncoded in [false, true] {
+            what_cannot_be_written(uncoded).await;
+        }
+    }
+
+    async fn what_cannot_be_written(uncoded: bool) {
         let _limit = limit();
         let w = world().await;
         goal(&w).await;
         let l = join(&w, &w.s).await;
         w.board.lock().unwrap().too_big.insert(l.clone());
+        w.board.lock().unwrap().uncoded = uncoded;
         set_plan(&w, &w.s.id, "Migrar", &["pending"]);
         let n = w.writes();
         pass(&w.st, T0).await;

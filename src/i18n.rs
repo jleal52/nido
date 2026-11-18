@@ -1210,8 +1210,12 @@ const TABLE: &[(&str, &str)] = &[
         "the object was changed elsewhere at the same time, several times in a row: try again",
     ),
     (
-        "el tablero de la cuenta está lleno: borra objetivos o proyectos que ya no hagan falta",
-        "the account's board is full: delete objectives or projects that are no longer needed",
+        "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra proyectos u \
+         objetivos que ya no hagan falta (lo borrado sigue contando 30 días, y lo archivado \
+         cuenta igual)",
+        "the account already has the most objects the board can hold: delete projects or \
+         objectives that are no longer needed (deleted ones still count for 30 days, and \
+         archived ones count too)",
     ),
     (
         "el objeto es demasiado grande para el hub: acorta la descripción o la nota",

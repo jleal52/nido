@@ -194,8 +194,12 @@ const BOARD_WAIT: Duration = Duration::from_secs(30);
 const BOARD_WAIT: Duration = Duration::from_secs(2);
 /// Peticiones del tablero sin contestar a la vez: el hub contesta 429 a la quinta.
 pub const BOARD_IN_FLIGHT: usize = 4;
-/// Cómo empieza el 413 del hub cuando la cuenta ya tiene todos los objetos que caben («la cuenta
-/// ya tiene 2000 objetos»; el otro 413 es el de un blob demasiado largo).
+/// El `code` del 413 del hub cuando la cuenta ya tiene todos los objetos que caben, y el del
+/// blob demasiado largo.
+const BOARD_CODE_FULL: &str = "full";
+const BOARD_CODE_TOO_BIG: &str = "too_big";
+/// Sin `code` (un hub de antes), cómo empieza el texto del 413 de la cuenta llena («la cuenta ya
+/// tiene 2000 objetos»; el otro 413 es el de un blob demasiado largo).
 const BOARD_FULL: &str = "la cuenta ya tiene";
 const BOARD_NO_HUB: &str = "sin conexión con el hub";
 const BOARD_SILENT: &str = "el hub no contestó";
@@ -726,14 +730,13 @@ impl Hub {
                 Ok(current) if current.fits() => Err(BoardError::Conflict(current)),
                 _ => Err(BoardError::Hub(BOARD_ODD.into())),
             },
-            Some(413)
-                if v["error"]
-                    .as_str()
-                    .is_some_and(|e| e.starts_with(BOARD_FULL)) =>
-            {
-                Err(BoardError::Full)
-            }
-            Some(413) => Err(BoardError::TooBig),
+            // Por su `code`; sin él (un hub de antes) o con uno que no se conoce, por el texto.
+            Some(413) => match v["code"].as_str() {
+                Some(BOARD_CODE_FULL) => Err(BoardError::Full),
+                Some(BOARD_CODE_TOO_BIG) => Err(BoardError::TooBig),
+                _ if error().starts_with(BOARD_FULL) => Err(BoardError::Full),
+                _ => Err(BoardError::TooBig),
+            },
             Some(429) => Err(BoardError::Busy),
             Some(400) => Err(BoardError::Bad(error())),
             Some(_) if !error().is_empty() => Err(BoardError::Hub(error())),
@@ -2051,7 +2054,8 @@ mod tests {
     }
 
     /// Cada estado del hub, su error: el 413 de la cuenta llena y el del blob largo se
-    /// distinguen por el texto, los dos 429 son `Busy` y lo demás es `Hub`.
+    /// distinguen por su `code` y, sin él (un hub de antes), por el texto; los dos 429 son `Busy`
+    /// y lo demás es `Hub`.
     #[tokio::test]
     async fn the_board_errors_from_the_hub() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2059,6 +2063,19 @@ mod tests {
         let (hub, _rec) = recorded(tmp.path(), |v| {
             let b = v.get("board")?;
             let req = b["req"].as_u64()?;
+            // Los 413 con `code`: manda el `code`, diga lo que diga el texto.
+            let coded = match b["kid"].as_str().unwrap_or_default() {
+                "code-full" => Some(("full", "account full")),
+                "code-big" => Some(("too_big", "la cuenta ya tiene 2000 objetos")),
+                "code-new-full" => Some(("otro", "la cuenta ya tiene 2000 objetos")),
+                "code-new-big" => Some(("otro", "el blob pasa de 11000 bytes")),
+                _ => None,
+            };
+            if let Some((code, error)) = coded {
+                return Some(Reply::Send(serde_json::json!({ "boarded": {
+                    "req": req, "status": 413, "error": error, "code": code,
+                }})));
+            }
             let (status, error) = match b["kid"].as_str().unwrap_or_default() {
                 "full" => (413, "la cuenta ya tiene 2000 objetos"),
                 "full5000" => (413, "la cuenta ya tiene 5000 objetos"),
@@ -2085,6 +2102,11 @@ mod tests {
         };
         assert_eq!(put("full").await, Err(BoardError::Full));
         assert_eq!(put("big").await, Err(BoardError::TooBig));
+        assert_eq!(put("code-full").await, Err(BoardError::Full));
+        assert_eq!(put("code-big").await, Err(BoardError::TooBig));
+        // Un `code` que no se conoce (de un hub de después): por el texto, como sin él.
+        assert_eq!(put("code-new-full").await, Err(BoardError::Full));
+        assert_eq!(put("code-new-big").await, Err(BoardError::TooBig));
         assert_eq!(put("rate").await, Err(BoardError::Busy));
         assert_eq!(put("many").await, Err(BoardError::Busy));
         assert_eq!(
@@ -2484,6 +2506,8 @@ pub(crate) mod fake {
         pub limit: usize,
         /// Los ids cuyo blob es «demasiado largo» (413).
         pub too_big: std::collections::BTreeSet<String>,
+        /// Los 413 sin `code`, como un hub de antes (solo con el texto).
+        pub uncoded: bool,
         /// Los ids que el hub no acepta (400).
         pub bad: std::collections::BTreeSet<String>,
         /// Lo menos que da como `next`: un hub cuyo reloj avanzó sin nada nuevo que enseñar.
@@ -2510,6 +2534,7 @@ pub(crate) mod fake {
                 writes: vec![],
                 limit: 2000,
                 too_big: Default::default(),
+                uncoded: false,
                 bad: Default::default(),
                 floor: 0,
                 account_ref: None,
@@ -2631,7 +2656,7 @@ pub(crate) mod fake {
                 return serde_json::json!({ "status": 400, "error": "el blob no es base64" });
             }
             if op == "put" && self.too_big.contains(&id) {
-                return serde_json::json!({ "status": 413, "error": "el blob pasa de 11000 bytes" });
+                return self.too_large("too_big", "el blob pasa de 11000 bytes".into());
             }
             if self.busy > 0 {
                 self.busy -= 1;
@@ -2658,8 +2683,8 @@ pub(crate) mod fake {
                     "error": "la versión no es la que hay", "current": current });
             }
             if op == "put" && v == 0 && self.items.len() >= self.limit {
-                return serde_json::json!({ "status": 413,
-                    "error": format!("la cuenta ya tiene {} objetos", self.limit) });
+                return self
+                    .too_large("full", format!("la cuenta ya tiene {} objetos", self.limit));
             }
             let item = if op == "put" {
                 let (kid, blob) = (b["kid"].as_str().unwrap(), b["blob"].as_str().unwrap());
@@ -2668,6 +2693,17 @@ pub(crate) mod fake {
                 self.write(&id, None)
             };
             serde_json::json!({ "status": 200, "v": item.v, "at": item.at })
+        }
+    }
+
+    impl Board {
+        /// Un 413 como el del hub: con su `code`, salvo con `uncoded`.
+        fn too_large(&self, code: &str, error: String) -> serde_json::Value {
+            let mut r = serde_json::json!({ "status": 413, "error": error });
+            if !self.uncoded {
+                r["code"] = code.into();
+            }
+            r
         }
     }
 
