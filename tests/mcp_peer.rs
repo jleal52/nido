@@ -209,7 +209,7 @@ async fn peer_calls_end_to_end() {
     state
         .group
         .add_member("viejo-id", &B64.encode(viejo.public), "Viejo");
-    assert!(state.group.remove_member("viejo-id"));
+    assert!(state.group.remove_member_rotating("viejo-id").0);
 
     // La sesión que llama aquí y otra de Claude, parada, con su conversación.
     let config = tmp.path().join("claude");

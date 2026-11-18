@@ -673,7 +673,8 @@ impl Group {
     }
 
     /// Da de baja un equipo en el grupo, sin rotar (eso es `remove_member_rotating`). Devuelve
-    /// si estaba.
+    /// si estaba. Solo para las pruebas: una baja de verdad tiene que cambiar la clave.
+    #[cfg(test)]
     pub fn remove_member(&self, id: &str) -> bool {
         let mut found = false;
         self.change(|st| found = mark_member_removed(st, id, now_ms()));
@@ -741,7 +742,9 @@ impl Group {
     }
 
     /// Da de baja un dispositivo en el grupo, sin rotar (eso es `remove_device_rotating`).
-    /// Devuelve si estaba (y no dado ya de baja).
+    /// Devuelve si estaba (y no dado ya de baja). Solo para las pruebas: una baja de verdad tiene
+    /// que cambiar la clave.
+    #[cfg(test)]
     pub fn remove_device(&self, key_b64: &str) -> bool {
         let mut found = false;
         self.change(|st| found = mark_device_removed(st, key_b64, now_ms()));
