@@ -914,12 +914,15 @@ enum Mode<'a> {
 }
 
 /// Borrar ya no va por `project` ni por `objective` (con `delete`, como antes): va por
-/// `board_delete`, que pide permiso. Con `delete`, 400 y lo dice, antes de mirar nada más.
+/// `board_delete`, que pide permiso. Con `delete`, 400 y lo dice, antes de mirar nada más. Lo
+/// manda sobre todo una sesión abierta antes de actualizar: su `nido mcp` es el de antes, que
+/// tiene `delete` y no tiene `board_delete` (el `nido mcp` nuevo ya no deja pasar `delete`).
 fn no_delete(delete: Option<bool>) -> Result<(), Fail> {
     match delete {
         Some(_) => Err(fail(
             StatusCode::BAD_REQUEST,
-            "para borrar, usa board_delete",
+            "para borrar, usa board_delete (si no la tienes, reinicia la sesión: llega con nido \
+             0.10.1)",
         )),
         None => Ok(()),
     }
@@ -1520,6 +1523,10 @@ pub(crate) mod tests {
     fn has(e: &Fail, want: &str) -> bool {
         e.1.contains(want)
     }
+
+    /// El error de `delete` en `project` y en `objective`, entero.
+    const NO_DELETE: &str = "para borrar, usa board_delete (si no la tienes, reinicia la sesión: \
+                             llega con nido 0.10.1)";
 
     /// El error de la cuenta llena, entero.
     const FULL: &str = "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra \
@@ -2261,6 +2268,18 @@ pub(crate) mod tests {
             assert_eq!(e.0, StatusCode::BAD_REQUEST, "{tool} {args}: {}", e.1);
             assert!(has(&e, want), "{tool} {args}: {}", e.1);
         }
+        // Lo que ve una sesión abierta antes de actualizar: su `nido mcp` es el de antes, con
+        // `delete` y sin `board_delete`.
+        let e = w
+            .call("objective", json!({"id": "O", "delete": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.1, NO_DELETE);
+        assert_eq!(
+            i18n::english(NO_DELETE),
+            "to delete, use board_delete (if you don't have it, restart the session: it comes \
+             with nido 0.10.1)"
+        );
         assert_eq!(w.writes(), writes);
     }
 

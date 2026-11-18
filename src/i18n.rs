@@ -1289,8 +1289,10 @@ const TABLE: &[(&str, &str)] = &[
         "to create an objective, give name (or id, to change one)",
     ),
     (
-        "para borrar, usa board_delete",
-        "to delete, use board_delete",
+        "para borrar, usa board_delete (si no la tienes, reinicia la sesión: llega con nido \
+         0.10.1)",
+        "to delete, use board_delete (if you don't have it, restart the session: it comes with \
+         nido 0.10.1)",
     ),
     (
         "kind tiene que ser project u objective",
