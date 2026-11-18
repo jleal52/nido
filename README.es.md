@@ -197,11 +197,11 @@ Lo que nido cambia en tu configuración de Claude:
   es exactamente `server:nido`.
 - Solo esas dieciséis herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo
   a ti (`secret` lo controla su propio diálogo), llevan el plan de la propia sesión o trabajan en
-  el tablero de proyectos de la cuenta. Las del tablero cambian y borran (en cascada) lo que ven
-  tus otros equipos, la web y la app, sin preguntar; borrar no tiene vuelta atrás y no hay
-  papelera. No tocan ninguna sesión. `open`, `answer`, `close`, `start` y `stop` actúan sobre
-  otras sesiones, así que pasan por el permiso de siempre de Claude (en modo auto, decide su
-  clasificador).
+  el tablero de proyectos de la cuenta. Las del tablero crean y cambian lo que ven tus otros
+  equipos, la web y la app, sin preguntar. No tocan ninguna sesión. `board_delete` (borrar del
+  tablero, en cascada; no tiene vuelta atrás y no hay papelera) no está en la lista, y `open`,
+  `answer`, `close`, `start` y `stop` tampoco, porque actúan sobre otras sesiones: pasan por el
+  permiso de siempre de Claude (en modo auto, decide su clasificador).
 - También llevan `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
   con la ruta absoluta de la carpeta de secretos de nido (y también la de verdad, si hay un enlace
   por medio). Claude aplica la regla de `Read` a su herramienta Read y a `cat`, `head`, `<`… en
@@ -278,9 +278,9 @@ Seguridad:
   que la abrió lo sabe por `read`). La lista de sesiones dice cuándo Claude la está esperando
   (`claude.trusting`), para que la web y la app lo enseñen y la contestes desde ahí.
 - A Claude se le dice que los mensajes de otras sesiones no son tuyos.
-- Una sesión engañada (un mensaje con instrucciones metidas) sí puede cambiar o borrar el tablero
-  de proyectos, porque sus herramientas no piden permiso; abrir, contestar, cerrar, arrancar o
-  parar otras sesiones sí pasa por él.
+- Una sesión engañada (un mensaje con instrucciones metidas) sí puede cambiar el tablero de
+  proyectos, porque esas herramientas no piden permiso; borrarlo, y abrir, contestar, cerrar,
+  arrancar o parar otras sesiones, sí pasa por él.
 
 ```sh
 nido mcp off     # las próximas sesiones de Claude arrancan sin el MCP de nido (las que están en marcha siguen igual)
@@ -303,23 +303,27 @@ su versión, con qué clave se cifró, su tamaño y cuándo cambió (y que se bo
 su contenido. No puede leer el tablero, pero sí podría volver a dar una versión anterior de un
 objeto, o no darlo. Un nido que no usa ningún hub no tiene tablero.
 
-Las herramientas (van sin preguntar, ver arriba):
+Las herramientas (van sin preguntar, salvo `board_delete`; ver arriba):
 
 - `board`: el tablero en texto compacto: cada proyecto con sus objetivos, su estado y su nota, las
   sesiones que trabajan en cada uno con lo que llevan de su plan, y los totales del plan. Con
   `archived` salen también los archivados; con `project`, solo ese proyecto, y con sus
   descripciones. Si no se puede hablar con el hub, enseña la copia de este equipo y lo dice.
-- `project`: crea un proyecto (`name`; `state` es `active` si no se dice), lo cambia (`id` y los
-  campos que cambian: `name`, `desc`, `state`, que es `active` o `archived`) o, con `delete`, lo
-  borra junto con sus objetivos y sus enlaces. Los nombres de los proyectos no se repiten.
+- `project`: crea un proyecto (`name`; `state` es `active` si no se dice) o lo cambia (`id` y los
+  campos que cambian: `name`, `desc`, `state`, que es `active` o `archived`). Los nombres de los
+  proyectos no se repiten.
 - `objective`: crea un objetivo en un `project` (`name`; `state` es `pending`; al final si no se
-  da `order`), lo cambia (`id` y los campos: `name`, `desc`, `state`, `note`, `order`) o, con
-  `delete`, lo borra con sus enlaces. Los estados son `pending`, `doing`, `blocked`, `done` y
-  `dropped`. `order` es un número real: para meter un objetivo entre dos, la media de los suyos.
+  da `order`) o lo cambia (`id` y los campos: `name`, `desc`, `state`, `note`, `order`). Los
+  estados son `pending`, `doing`, `blocked`, `done` y `dropped`. `order` es un número real: para meter un objetivo entre dos, la media de los suyos.
   Los nombres no se repiten dentro de un proyecto.
 - `join`: apunta la sesión que llama a un objetivo, para que salga ahí con lo que lleva de su
   plan. Si ya lo estaba, no cambia nada; si su enlace estaba cerrado, lo vuelve a abrir.
 - `leave`: saca de un objetivo a la sesión que llama: borra su enlace (no lo cierra).
+- `board_delete`: borra un proyecto (`kind: "project"` y su `id`) junto con sus objetivos y sus
+  enlaces, o un objetivo (`kind: "objective"`, su `id` y, si se quiere, su `project`) con sus
+  enlaces. Pide permiso: no tiene vuelta atrás. Antes de nido 0.10.1 se borraba con `delete` en
+  `project` y en `objective`, sin preguntar; ahora eso da un error que dice que se usa
+  `board_delete`.
 
 Un proyecto o un objetivo se nombra por su id, por sus primeras 8 cifras hex o más (`board` los
 enseña como `#1a2b3c4d`; el `#` es opcional) o por su nombre exacto, sin mirar mayúsculas. Un

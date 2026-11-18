@@ -1181,6 +1181,7 @@ pub async fn api_mcp(
         "objective" => crate::board_tools::tool_objective(&st, &session, args).await,
         "join" => crate::board_tools::tool_join(&st, &session, args).await,
         "leave" => crate::board_tools::tool_leave(&st, &session, args).await,
+        "board_delete" => crate::board_tools::tool_board_delete(&st, &session, args).await,
         _ => {
             let caller = Caller::local(&me, &session.id, &session.name);
             run_tool(&st, &me, &caller, &tool, args).await
@@ -1194,7 +1195,7 @@ pub async fn api_mcp(
 
 /// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert`, `secret`,
 /// `clipboard`, `send_file`, `plan_set`, `plan_task`, `plan_clear` y las del tablero: `board`,
-/// `project`, `objective`, `join` y `leave`. Esas van siempre al nido de quien las usa. Y, para
+/// `project`, `objective`, `join`, `leave` y `board_delete`. Esas van siempre al nido de quien las usa. Y, para
 /// su nido, `status` (lo que miran sus esperas) y `alerts` (las de aquí sin leer, para
 /// `nido alerts`).
 pub const PEER_TOOLS: [&str; 11] = [

@@ -454,13 +454,15 @@ const ALLOWED_OPTS: [&str; 2] = ["--allowedTools", "--allowed-tools"];
 /// Las herramientas de nido que no piden permiso: las que miran y hablan, y las que piden y
 /// mandan cosas al usuario (`secret` lo controla su diálogo; `clipboard` y `send_file` solo le
 /// mandan algo a él), las del plan de tareas (solo tocan el de la propia sesión) y las del
-/// tablero de la cuenta (`board`, `project`, `objective`, `join` y `leave`), para que Claude
-/// lleve su objetivo sin interrumpir al usuario a cada paso; no tocan sesiones. El riesgo que se
-/// acepta con ellas: una sesión engañada puede cambiar o borrar, en cascada y sin vuelta atrás,
-/// el tablero que comparten los equipos, la web y la app. Las que actúan sobre otras sesiones
-/// (`open`, `answer`, `close`, `start`, `stop`) pasan por el permiso de Claude como cualquier
-/// otra (en modo auto, lo decide su clasificador): una sesión engañada (un mensaje con
-/// instrucciones metidas) no puede abrir, parar o arrancar sesiones ni aprobar sus preguntas sin
+/// tablero de la cuenta que miran, crean y cambian (`board`, `project`, `objective`, `join` y
+/// `leave`), para que Claude lleve su objetivo sin interrumpir al usuario a cada paso; no tocan
+/// sesiones. El riesgo que se acepta con ellas: una sesión engañada puede cambiar el tablero que
+/// comparten los equipos, la web y la app (se arregla volviendo a cambiarlo; `leave` solo quita
+/// el enlace de la propia sesión). Borrar del tablero, en cascada y sin vuelta atrás, va aparte
+/// (`board_delete`) y pide permiso, como las que actúan sobre otras sesiones (`open`, `answer`,
+/// `close`, `start`, `stop`): pasan por el permiso de Claude como cualquier otra (en modo auto,
+/// lo decide su clasificador). Una sesión engañada (un mensaje con instrucciones metidas) no
+/// puede borrar el tablero, ni abrir, parar o arrancar sesiones ni aprobar sus preguntas, sin
 /// que nadie lo vea.
 pub const NIDO_TOOLS: [&str; 16] = [
     "mcp__nido__sessions",
@@ -1347,7 +1349,7 @@ mod tests {
 
     /// Las de nido, como van en la orden: el channel y las herramientas que no piden permiso
     /// (las que miran y hablan, las que mandan cosas al usuario, las del plan y las del tablero;
-    /// `open`, `answer`, `close`, `start` y `stop` no).
+    /// `open`, `answer`, `close`, `start`, `stop` y `board_delete` no).
     const FLAGS: [&str; 19] = [
         "--dangerously-load-development-channels",
         "server:nido",
@@ -1375,6 +1377,15 @@ mod tests {
         out.extend(FLAGS.iter().map(|s| s.to_string()));
         out.extend(rest.iter().map(|s| s.to_string()));
         out
+    }
+
+    /// Borrar del tablero (en cascada y sin vuelta atrás) pasa por el permiso de Claude: no está
+    /// entre las que van sin preguntar, ni ninguna otra herramienta que borre.
+    #[test]
+    fn deleting_from_the_board_asks_for_permission() {
+        assert!(!NIDO_TOOLS.contains(&"mcp__nido__board_delete"));
+        assert!(NIDO_TOOLS.iter().all(|t| !t.contains("delete")));
+        assert!(!NIDO_TOOLS.contains(&OLD_NIDO_TOOLS));
     }
 
     #[test]

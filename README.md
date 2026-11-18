@@ -202,11 +202,12 @@ What nido changes in your Claude setup:
   the list is exactly `server:nido`.
 - Only those sixteen tools run without asking: they look, talk, or ask and send things to you
   (`secret` is controlled by its own dialog), keep the session's own plan, or work on the
-  account's projects board. The board tools change and delete (cascading) what your other
-  computers, the web app and the phone app see, without asking; a deletion can't be undone, and
-  there is no trash. They don't touch any session.
-  `open`, `answer`, `close`, `start` and `stop` act on other sessions, so they go through
-  Claude's usual permission prompt (in auto mode, its classifier decides).
+  account's projects board. The board tools create and change what your other computers, the
+  web app and the phone app see, without asking. They don't touch any session. `board_delete`
+  (deleting from the board, cascading; a deletion can't be undone, and there is no trash) is not
+  on the list, and neither are `open`, `answer`, `close`, `start` and `stop`, which act on other
+  sessions: they go through Claude's usual permission prompt (in auto mode, its classifier
+  decides).
 - They also get `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
   with the absolute path of nido's secrets folder (and its real path too, if there is a link on
   the way). Claude applies the `Read` rule to its Read tool and to `cat`, `head`, `<`… in Bash,
@@ -294,9 +295,9 @@ Security:
   it from `read`). The session list says when Claude is waiting on it (`claude.trusting`),
   so the web and the app can show it and you can answer it there.
 - Claude is told that messages from other sessions don't come from you.
-- A tricked session (a message with instructions slipped in) can change or delete the projects
-  board, because its tools don't ask for permission; opening, answering, closing, starting or
-  stopping other sessions still does.
+- A tricked session (a message with instructions slipped in) can change the projects board,
+  because those tools don't ask for permission; deleting from it, and opening, answering,
+  closing, starting or stopping other sessions, still does.
 
 ```sh
 nido mcp off     # the next Claude sessions start without nido's MCP (running ones stay as they are)
@@ -319,23 +320,27 @@ id, its version, which key encrypted it, its size and when it changed (and that 
 but neither its type nor its content. It can't read the board, but it could hand out an older
 version of an object, or not hand it out at all. A nido that uses no hub has no board.
 
-The tools (they run without asking, see above):
+The tools (they run without asking, except `board_delete`; see above):
 
 - `board`: the board as compact text: each project with its objectives, their state and note, the
   sessions working on each one with their plan's progress, and the plan totals. With `archived`,
   the archived projects show too; with `project`, only that project, with its descriptions. If the
   hub can't be reached, it shows this computer's copy and says so.
-- `project`: creates a project (`name`; `state` is `active` by default), changes it (`id` and the
-  fields to change: `name`, `desc`, `state`, which is `active` or `archived`) or, with `delete`,
-  deletes it together with its objectives and their links. Project names are unique.
+- `project`: creates a project (`name`; `state` is `active` by default) or changes it (`id` and
+  the fields to change: `name`, `desc`, `state`, which is `active` or `archived`). Project names
+  are unique.
 - `objective`: creates an objective in a `project` (`name`; `state` is `pending`; at the end
-  unless `order` is given), changes it (`id` and the fields: `name`, `desc`, `state`, `note`,
-  `order`) or, with `delete`, deletes it with its links. The states are `pending`, `doing`,
-  `blocked`, `done` and `dropped`. `order` is a real number: to put an objective between two
+  unless `order` is given) or changes it (`id` and the fields: `name`, `desc`, `state`, `note`,
+  `order`). The states are `pending`, `doing`, `blocked`, `done` and `dropped`. `order` is a real number: to put an objective between two
   others, the average of their `order`s. Names are unique within a project.
 - `join`: links the calling session to an objective, so that it shows there with its plan's
   progress. If it already is, nothing changes; if its link was closed, it is opened again.
 - `leave`: takes the calling session off an objective: it deletes its link (it doesn't close it).
+- `board_delete`: deletes a project (`kind: "project"` and its `id`) together with its objectives
+  and their links, or an objective (`kind: "objective"`, its `id` and, optionally, its
+  `project`) with its links. It asks for permission: it can't be undone. Before nido 0.10.1,
+  `delete` on `project` and `objective` deleted without asking; now it gives an error that says
+  to use `board_delete`.
 
 A project or an objective is named by its id, by its first 8 or more hex digits (`board` shows
 them as `#1a2b3c4d`; the `#` is optional) or by its exact name, ignoring case. An objective by

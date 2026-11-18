@@ -20,7 +20,7 @@
 //! huérfanos (su objetivo no está o no se puede leer). Un objetivo que falta puede volver (un
 //! hub que se quedó sin tablero y se está resubiendo, una copia de otra cuenta, una clave que
 //! llega con el grupo): borrar o cerrar sus enlaces entonces los perdería para siempre. Los
-//! borra quien borra el objetivo (`objective`, `project`).
+//! borra quien borra el objetivo (`board_delete`, la web, la app).
 //!
 //! Sin conexión no se hace nada y no se pierde nada: lo pendiente es «lo que hay ahora frente a
 //! lo que tiene el enlace», que se mira al volver. Con un 429 se espera `BUSY_WAIT`; con otro
