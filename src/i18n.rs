@@ -1211,11 +1211,11 @@ const TABLE: &[(&str, &str)] = &[
     ),
     (
         "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra proyectos u \
-         objetivos que ya no hagan falta (lo borrado sigue contando 30 días, y lo archivado \
-         cuenta igual)",
-        "the account already has the most objects the board can hold: delete projects or \
-         objectives that are no longer needed (deleted ones still count for 30 days, and \
-         archived ones count too)",
+         objetivos que ya no hagan falta (lo borrado tarda en dejar sitio, y lo archivado cuenta \
+         igual)",
+        "the account has reached the maximum number of objects the board can hold: delete \
+         projects or objectives that are no longer needed (deleted ones take a while to free up \
+         space, and archived ones count too)",
     ),
     (
         "el objeto es demasiado grande para el hub: acorta la descripción o la nota",
@@ -1231,8 +1231,8 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("el hub no contestó", "the hub did not answer"),
     (
-        "el hub no tiene tablero; hace falta actualizarlo",
-        "the hub has no board; it needs to be updated",
+        "el hub no conoce el tablero (es de antes): hace falta actualizarlo",
+        "the hub does not know the board (it is an older one): it needs to be updated",
     ),
     (
         "respuesta del tablero no válida",

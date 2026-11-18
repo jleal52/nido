@@ -350,11 +350,12 @@ fn board_fail(e: BoardError) -> Fail {
             "el objeto cambió a la vez en otro sitio varias veces seguidas: prueba otra vez",
         ),
         // Lo que cuenta el hub: todos los objetos de la cuenta (proyectos, objetivos y enlaces),
-        // también los archivados, y las lápidas de lo borrado hasta que caducan (30 días).
+        // también los archivados, y las lápidas de lo borrado hasta que caducan (hoy, 30 días:
+        // docs/protocolo.md del hub, §7). El número no se dice: es del hub y puede cambiar.
         BoardError::Full => fail(
             StatusCode::PAYLOAD_TOO_LARGE,
             "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra proyectos u \
-             objetivos que ya no hagan falta (lo borrado sigue contando 30 días, y lo archivado \
+             objetivos que ya no hagan falta (lo borrado tarda en dejar sitio, y lo archivado \
              cuenta igual)",
         ),
         BoardError::TooBig => fail(
@@ -1471,8 +1472,8 @@ pub(crate) mod tests {
 
     /// El error de la cuenta llena, entero.
     const FULL: &str = "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra \
-                        proyectos u objetivos que ya no hagan falta (lo borrado sigue contando 30 \
-                        días, y lo archivado cuenta igual)";
+                        proyectos u objetivos que ya no hagan falta (lo borrado tarda en dejar \
+                        sitio, y lo archivado cuenta igual)";
 
     fn keys(v: &Value) -> std::collections::BTreeSet<String> {
         v.as_object().unwrap().keys().cloned().collect()
@@ -2105,9 +2106,9 @@ pub(crate) mod tests {
         }
         assert_eq!(
             i18n::english(FULL),
-            "the account already has the most objects the board can hold: delete projects or \
-             objectives that are no longer needed (deleted ones still count for 30 days, and \
-             archived ones count too)"
+            "the account has reached the maximum number of objects the board can hold: delete \
+             projects or objectives that are no longer needed (deleted ones take a while to free \
+             up space, and archived ones count too)"
         );
         w.board.lock().unwrap().limit = 2000;
         w.board.lock().unwrap().uncoded = false;
@@ -2259,7 +2260,9 @@ pub(crate) mod tests {
     }
 
     /// Un hub sin tablero (uno de antes) no contesta: la primera herramienta espera el plazo del
-    /// hub, y las siguientes fallan al momento con el mismo error, hasta que se reconecta.
+    /// hub, y las siguientes (las cinco) fallan al momento con el mismo error, hasta que se
+    /// reconecta. Con la copia vacía, `board` no tiene nada que enseñar en su lugar (con copia, la
+    /// enseña: `without_the_hub_board_shows_the_copy`).
     #[tokio::test]
     async fn a_hub_without_a_board_makes_us_wait_once_per_connection() {
         let _limit = crate::watchdog::limit(Duration::from_secs(60));
@@ -2277,8 +2280,8 @@ pub(crate) mod tests {
         })
         .await;
         hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
-        let missing = "el tablero no está disponible: el hub no tiene tablero; hace falta \
-                       actualizarlo";
+        let missing = "el tablero no está disponible: el hub no conoce el tablero (es de antes): \
+                       hace falta actualizarlo";
         let call = |tool: &'static str, args: Value| {
             let (st, s) = (st.clone(), s.clone());
             async move {
@@ -2287,7 +2290,9 @@ pub(crate) mod tests {
                     "project" => tool_project(&st, &s, args).await,
                     "objective" => tool_objective(&st, &s, args).await,
                     "join" => tool_join(&st, &s, args).await,
-                    _ => tool_project(&st, &s, args).await,
+                    "leave" => tool_leave(&st, &s, args).await,
+                    "board" => tool_board(&st, &s, args).await,
+                    _ => unreachable!("{tool}"),
                 }
                 .unwrap_err();
                 assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{tool}: {}", e.1);
@@ -2301,13 +2306,17 @@ pub(crate) mod tests {
             ("project", json!({"name": "P"})),
             ("objective", json!({"project": "P", "name": "O"})),
             ("join", json!({"objective": "O"})),
+            ("leave", json!({"objective": "O"})),
+            // Sin copia de este equipo que enseñar (nunca se habló con el hub), también el error.
+            ("board", json!({})),
         ] {
             assert!(call(tool, args).await < hub::BOARD_WAIT / 2, "{tool}");
         }
         rec.quiet("board", Duration::from_millis(300)).await;
         assert_eq!(
             i18n::english(missing),
-            "the board is not available: the hub has no board; it needs to be updated"
+            "the board is not available: the hub does not know the board (it is an older one): \
+             it needs to be updated"
         );
 
         // Tras reconectar, vuelve a esperar.
