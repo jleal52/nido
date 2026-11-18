@@ -203,7 +203,9 @@ What nido changes in your Claude setup:
 - Only those sixteen tools run without asking: they look, talk, or ask and send things to you
   (`secret` is controlled by its own dialog), keep the session's own plan, or work on the
   account's projects board. The board tools create and change what your other computers, the
-  web app and the phone app see, without asking. They don't touch any session. `board_delete`
+  web app and the phone app see, without asking: a change can be undone by hand, but there is no
+  history, and a tricked session could empty descriptions and notes, rename or archive. They
+  don't touch any session. `board_delete`
   (deleting from the board, cascading; a deletion can't be undone, and there is no trash) is not
   on the list, and neither are `open`, `answer`, `close`, `start` and `stop`, which act on other
   sessions: they go through Claude's usual permission prompt (in auto mode, its classifier
@@ -331,8 +333,9 @@ The tools (they run without asking, except `board_delete`; see above):
   are unique.
 - `objective`: creates an objective in a `project` (`name`; `state` is `pending`; at the end
   unless `order` is given) or changes it (`id` and the fields: `name`, `desc`, `state`, `note`,
-  `order`). The states are `pending`, `doing`, `blocked`, `done` and `dropped`. `order` is a real number: to put an objective between two
-  others, the average of their `order`s. Names are unique within a project.
+  `order`). The states are `pending`, `doing`, `blocked`, `done` and `dropped`. `order` is a
+  real number: to put an objective between two others, the average of their `order`s. Names are
+  unique within a project.
 - `join`: links the calling session to an objective, so that it shows there with its plan's
   progress. If it already is, nothing changes; if its link was closed, it is opened again.
 - `leave`: takes the calling session off an objective: it deletes its link (it doesn't close it).
@@ -360,8 +363,11 @@ being uploaded again, and deleting the links then would lose them for good. An o
 are deleted with it, whoever deletes it (a session, the web app or the phone app). If some are
 left anyway (an objective deleted from elsewhere, or a deletion cut halfway), each computer
 deletes its own as soon as it sees that their objective was really deleted (its copy has a
-tombstone, not just nothing). If a computer gets a new identity on the hub, its old
-links stay as they are: they are no longer its own, and only go away with their objective.
+tombstone, not just nothing). If the tombstone is no longer in the copy (the hub lost its board,
+the copy was rebuilt from 0, or the tombstone expired on the hub before this computer saw it),
+the link stays: without a tombstone there's no telling whether the objective will come back. If a
+computer gets a new identity on the hub, its old links stay as they are: they are no longer its
+own, and only go away with their objective (they aren't cleaned up as orphans either).
 
 **Careful with the session registry**: nido closes the links of every session of this computer
 that isn't in its registry (`sessions.json` in the data folder, below). If that file is lost, it

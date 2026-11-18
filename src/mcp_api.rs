@@ -1195,9 +1195,9 @@ pub async fn api_mcp(
 
 /// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert`, `secret`,
 /// `clipboard`, `send_file`, `plan_set`, `plan_task`, `plan_clear` y las del tablero: `board`,
-/// `project`, `objective`, `join`, `leave` y `board_delete`. Esas van siempre al nido de quien las usa. Y, para
-/// su nido, `status` (lo que miran sus esperas) y `alerts` (las de aquí sin leer, para
-/// `nido alerts`).
+/// `project`, `objective`, `join`, `leave` y `board_delete`. Esas van siempre al nido de quien
+/// las usa. Y, para su nido, `status` (lo que miran sus esperas) y `alerts` (las de aquí sin
+/// leer, para `nido alerts`).
 pub const PEER_TOOLS: [&str; 11] = [
     "sessions", "send", "read", "open", "answer", "close", "start", "stop", "status", "alerts",
     "plan_get",

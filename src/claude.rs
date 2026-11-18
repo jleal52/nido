@@ -457,8 +457,9 @@ const ALLOWED_OPTS: [&str; 2] = ["--allowedTools", "--allowed-tools"];
 /// tablero de la cuenta que miran, crean y cambian (`board`, `project`, `objective`, `join` y
 /// `leave`), para que Claude lleve su objetivo sin interrumpir al usuario a cada paso; no tocan
 /// sesiones. El riesgo que se acepta con ellas: una sesión engañada puede cambiar el tablero que
-/// comparten los equipos, la web y la app (se arregla volviendo a cambiarlo; `leave` solo quita
-/// el enlace de la propia sesión). Borrar del tablero, en cascada y sin vuelta atrás, va aparte
+/// comparten los equipos, la web y la app (vaciar descripciones y notas, renombrar, archivar).
+/// Se puede deshacer a mano, pero no hay historial de lo que había. `leave` solo quita el enlace
+/// de la propia sesión. Borrar del tablero, en cascada y sin vuelta atrás, va aparte
 /// (`board_delete`) y pide permiso, como las que actúan sobre otras sesiones (`open`, `answer`,
 /// `close`, `start`, `stop`): pasan por el permiso de Claude como cualquier otra (en modo auto,
 /// lo decide su clasificador). Una sesión engañada (un mensaje con instrucciones metidas) no

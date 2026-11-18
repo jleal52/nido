@@ -198,7 +198,9 @@ Lo que nido cambia en tu configuración de Claude:
 - Solo esas dieciséis herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo
   a ti (`secret` lo controla su propio diálogo), llevan el plan de la propia sesión o trabajan en
   el tablero de proyectos de la cuenta. Las del tablero crean y cambian lo que ven tus otros
-  equipos, la web y la app, sin preguntar. No tocan ninguna sesión. `board_delete` (borrar del
+  equipos, la web y la app, sin preguntar: un cambio se puede deshacer a mano, pero no hay
+  historial, y una sesión engañada podría vaciar descripciones y notas, renombrar o archivar.
+  No tocan ninguna sesión. `board_delete` (borrar del
   tablero, en cascada; no tiene vuelta atrás y no hay papelera) no está en la lista, y `open`,
   `answer`, `close`, `start` y `stop` tampoco, porque actúan sobre otras sesiones: pasan por el
   permiso de siempre de Claude (en modo auto, decide su clasificador).
@@ -314,8 +316,9 @@ Las herramientas (van sin preguntar, salvo `board_delete`; ver arriba):
   proyectos no se repiten.
 - `objective`: crea un objetivo en un `project` (`name`; `state` es `pending`; al final si no se
   da `order`) o lo cambia (`id` y los campos: `name`, `desc`, `state`, `note`, `order`). Los
-  estados son `pending`, `doing`, `blocked`, `done` y `dropped`. `order` es un número real: para meter un objetivo entre dos, la media de los suyos.
-  Los nombres no se repiten dentro de un proyecto.
+  estados son `pending`, `doing`, `blocked`, `done` y `dropped`. `order` es un número real: para
+  meter un objetivo entre dos, la media de los suyos. Los nombres no se repiten dentro de un
+  proyecto.
 - `join`: apunta la sesión que llama a un objetivo, para que salga ahí con lo que lleva de su
   plan. Si ya lo estaba, no cambia nada; si su enlace estaba cerrado, lo vuelve a abrir.
 - `leave`: saca de un objetivo a la sesión que llama: borra su enlace (no lo cierra).
@@ -343,8 +346,11 @@ el tablero se esté volviendo a subir, y borrarlos entonces los perdería para s
 de un objetivo se borran con él, lo borre quien lo borre (una sesión, la web o la app). Si aun así
 quedan (un objetivo borrado desde otro sitio, o un borrado que se cortó a medias), cada equipo
 borra los suyos en cuanto ve que su objetivo se borró de verdad (en su copia hay una lápida, no
-solo falta). Si un equipo cambia de identidad en el hub, sus enlaces
-viejos se quedan como están: ya no son suyos, y solo se van con su objetivo.
+solo falta). Si la lápida ya no está en la copia (el hub se quedó sin tablero, la copia se rehízo
+desde 0, o la lápida caducó en el hub antes de que este equipo la viera), el enlace se queda: sin
+lápida no se sabe si el objetivo volverá. Si un equipo cambia de identidad en el hub, sus enlaces
+viejos se quedan como están: ya no son suyos, y solo se van con su objetivo (tampoco se limpian
+como huérfanos).
 
 **Cuidado con el registro de sesiones**: nido cierra los enlaces de toda sesión de este equipo que
 no esté en su registro (`sessions.json` en la carpeta de datos, más abajo). Si se pierde ese
