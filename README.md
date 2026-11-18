@@ -316,7 +316,8 @@ sessions working on each objective (links), with their plan's progress. Each pro
 link is a separate document on the hub, encrypted by the clients with a key of the group's keyring
 (below): the hub only stores and hands out what it can't read. For each one it sees only a random
 id, its version, which key encrypted it, its size and when it changed (and that it was deleted),
-but neither its type nor its content. A nido that uses no hub has no board.
+but neither its type nor its content. It can't read the board, but it could hand out an older
+version of an object, or not hand it out at all. A nido that uses no hub has no board.
 
 The tools (they run without asking, see above):
 
@@ -352,7 +353,8 @@ after 30 days. A computer only touches its own sessions' links, and not even tho
 or whose objective it can't find: the objective may not have reached it yet, or the board may be
 being uploaded again, and deleting the links then would lose them for good. An objective's links
 are deleted with it, whoever deletes it (a session, the web app or the phone app); nido doesn't
-clean up links left without an objective.
+clean up links left without an objective. If a computer gets a new identity on the hub, its old
+links stay as they are: they are no longer its own, and only go away with their objective.
 
 **Careful with the session registry**: nido closes the links of every session of this computer
 that isn't in its registry (`sessions.json` in the data folder, below). If that file is lost, it

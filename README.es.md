@@ -300,7 +300,8 @@ trabajan en cada objetivo (enlaces), con lo que llevan de su plan. Cada proyecto
 enlace es un documento aparte en el hub, cifrado por los clientes con una clave del llavero del
 grupo (más abajo): el hub solo guarda y reparte lo que no puede leer. De cada uno ve un id al azar,
 su versión, con qué clave se cifró, su tamaño y cuándo cambió (y que se borró), pero ni su tipo ni
-su contenido. Un nido que no usa ningún hub no tiene tablero.
+su contenido. No puede leer el tablero, pero sí podría volver a dar una versión anterior de un
+objeto, o no darlo. Un nido que no usa ningún hub no tiene tablero.
 
 Las herramientas (van sin preguntar, ver arriba):
 
@@ -336,7 +337,8 @@ se borra a los 30 días. Un equipo solo toca los enlaces de sus propias sesiones
 que no puede leer ni los de un objetivo que no encuentra: puede que aún no le haya llegado o que
 el tablero se esté volviendo a subir, y borrarlos entonces los perdería para siempre. Los enlaces
 de un objetivo se borran con él, lo borre quien lo borre (una sesión, la web o la app); los que se
-queden sin objetivo, nido no los limpia.
+queden sin objetivo, nido no los limpia. Si un equipo cambia de identidad en el hub, sus enlaces
+viejos se quedan como están: ya no son suyos, y solo se van con su objetivo.
 
 **Cuidado con el registro de sesiones**: nido cierra los enlaces de toda sesión de este equipo que
 no esté en su registro (`sessions.json` en la carpeta de datos, más abajo). Si se pierde ese
