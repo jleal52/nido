@@ -105,12 +105,34 @@ struct Inner {
     said: Option<String>,
 }
 
-/// Una sesión borrada: cuándo y el último resumen de su plan (`None` si no se pudo leer: el
-/// resumen del enlace se deja como está).
+/// Una sesión borrada: cuándo y lo último que se sabe de su plan.
 #[derive(Debug, Clone, PartialEq)]
 struct Closing {
     at: u64,
-    plan: Option<Option<PlanSummary>>,
+    plan: LastPlan,
+}
+
+/// Lo último que se sabe del plan de una sesión borrada, para el cierre de sus enlaces.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LastPlan {
+    /// No se sabe: no se pudo leer, o la sesión no se borró aquí (no está en el registro, y ya).
+    /// El resumen del enlace se deja como está.
+    Unknown,
+    /// No tenía plan: el resumen del enlace se quita.
+    NoPlan,
+    /// El resumen de su plan: va al enlace, si no es el que tiene.
+    Summary(PlanSummary),
+}
+
+impl LastPlan {
+    /// Lo que se pone en el enlace: `None` si se deja el que tiene; `Some(None)`, quitarlo.
+    fn wanted(&self) -> Option<Option<&PlanSummary>> {
+        match self {
+            LastPlan::Unknown => None,
+            LastPlan::NoPlan => Some(None),
+            LastPlan::Summary(p) => Some(Some(p)),
+        }
+    }
 }
 
 /// Lo que hay que hacer con un enlace.
@@ -227,9 +249,9 @@ impl Progress {
         self.wake.notify_one();
     }
 
-    /// Se ha borrado la sesión `id` a las `at` (ms): sus enlaces se cierran, con `plan` (el
-    /// último resumen de su plan; `None` si no se pudo leer) si cambió.
-    pub fn session_deleted(&self, id: &str, at: u64, plan: Option<Option<PlanSummary>>) {
+    /// Se ha borrado la sesión `id` a las `at` (ms): sus enlaces se cierran, con `plan` (lo
+    /// último que se sabe de su plan) si cambió.
+    pub fn session_deleted(&self, id: &str, at: u64, plan: LastPlan) {
         let mut i = self.lock();
         i.dirty.remove(id);
         i.last.remove(id);
@@ -313,7 +335,7 @@ impl Progress {
             } else {
                 let closing = i.closing.get(&m.session).cloned().unwrap_or(Closing {
                     at: now,
-                    plan: None,
+                    plan: LastPlan::Unknown,
                 });
                 Job::Close {
                     session: m.session.clone(),
@@ -466,10 +488,10 @@ fn close(o: &mut Object, machine: &str, session: &str, c: &Closing, now: u64) {
         && l.closed.is_none()
     {
         l.closed = Some(c.at);
-        if let Some(plan) = &c.plan
-            && !same_plan(l.plan.as_ref(), plan.as_ref())
+        if let Some(plan) = c.plan.wanted()
+            && !same_plan(l.plan.as_ref(), plan)
         {
-            put_plan(&mut l.plan, plan.as_ref());
+            put_plan(&mut l.plan, plan);
             l.copied = c.at;
         }
         l.changed = now;
@@ -1370,7 +1392,11 @@ mod tests {
             b.clash(&l3, Some(c3));
         }
         set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        let n = w.writes();
         pass(&w.st, T0).await;
+        // Una escritura cada uno, la que choca: tras el 409 no queda nada que cambiar, y no se
+        // escribe otra vez lo mismo.
+        assert_eq!(w.writes(), n + 3);
         let v1 = w.stored(&l1).unwrap();
         assert_eq!((&v1["closed"], &v1["plan"]), (&json!(5), &Value::Null));
         let v2 = w.stored(&l2).unwrap();
@@ -1542,7 +1568,8 @@ mod tests {
         let _limit = limit();
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
-        st.progress.session_deleted("dead0000", T0, None);
+        st.progress
+            .session_deleted("dead0000", T0, LastPlan::Unknown);
         pass(&st, T0 + KEEP_CLOSED - 1).await;
         assert_eq!(st.progress.closing_len(), 1);
         pass(&st, T0 + KEEP_CLOSED).await;

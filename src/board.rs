@@ -1554,7 +1554,9 @@ impl BoardCache {
     /// así se conserva lo que no conocemos, en `extra`. Se escribe con la clave actual. Si choca
     /// (409), se vuelve a aplicar `f` sobre el objeto como está, hasta `MAX_TRIES` escrituras en
     /// total. Lo que no se puede leer no se reescribe. Uno borrado en el hub queda borrado aquí
-    /// (`Missing`); uno que el hub no tiene se marca así (`Missing`, y se pide un sondeo).
+    /// (`Missing`); uno que el hub no tiene se marca así (`Missing`, y se pide un sondeo). Si `f`
+    /// no cambia nada (de entrada, o tras un 409 que ya trae lo que se quería), no se escribe: se
+    /// devuelve tal cual (aunque esté cifrado con una clave retirada: eso lo hace el recifrado).
     /// Devuelve el objeto como quedó.
     pub async fn update(
         self: &Arc<Self>,
@@ -1578,8 +1580,12 @@ impl BoardCache {
         let mut tries = 0;
         loop {
             tries += 1;
-            let mut obj = read(keys, id, &stored).map_err(EditError::Unreadable)?;
+            let before = read(keys, id, &stored).map_err(EditError::Unreadable)?;
+            let mut obj = before.clone();
             f(&mut obj);
+            if obj == before {
+                return Ok(obj);
+            }
             let blob = seal_object(&key, id, &obj).map_err(EditError::Blob)?;
             match self.hub.board_put(id, v, &kid, &blob).await {
                 Ok(st) => {
@@ -3339,6 +3345,36 @@ mod tests {
         assert_eq!(r.cache.item(&id).unwrap().v, cur.v);
     }
 
+    /// Un cambio que no cambia nada no se escribe: ni de entrada, ni tras un 409 que ya trae lo
+    /// que se quería (otro hizo lo mismo).
+    #[tokio::test]
+    async fn an_update_that_changes_nothing_is_not_written() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(1);
+        r.write(&K_CUR, &id, &project("uno"));
+        r.cache.sync().await.unwrap();
+        let rename = |o: &mut Object| {
+            if let Object::Project(p) = o {
+                p.name = "dos".into();
+            }
+        };
+        let got = r.cache.update(&keyring(), &id, |_| {}).await.unwrap();
+        assert_eq!(got, project("uno"));
+        assert!(r.writes().is_empty(), "{:?}", r.writes());
+        // Otro lo deja como se quería justo antes: el 409 lo trae, y no hay segunda escritura.
+        r.board
+            .lock()
+            .unwrap()
+            .clash(&id, Some(sealed(&K_CUR, &id, &project("dos"))));
+        let got = r.cache.update(&keyring(), &id, rename).await.unwrap();
+        assert_eq!(got, project("dos"));
+        assert_eq!(r.writes(), vec![("put".into(), id.clone(), 1)]);
+        assert_eq!(r.cache.item(&id).unwrap().v, 2);
+        // Y lo mismo otra vez: ya está así, no se escribe.
+        r.cache.update(&keyring(), &id, rename).await.unwrap();
+        assert_eq!(r.writes().len(), 1);
+    }
+
     /// Cambiar algo que otro borró: queda borrado aquí. Cambiar algo que el hub no tiene: no se
     /// entierra, se marca como que no está en el hub y se pide un sondeo.
     #[tokio::test]
@@ -3350,15 +3386,21 @@ mod tests {
         r.cache.sync().await.unwrap();
         r.board.lock().unwrap().write(&deleted, None);
         r.board.lock().unwrap().items.remove(&lost);
+        // Un cambio de verdad: uno que no cambia nada no se escribe.
+        let touch = |o: &mut Object| {
+            if let Object::Project(p) = o {
+                p.changed += 1;
+            }
+        };
         let e = r
             .cache
-            .update(&keyring(), &deleted, |_| {})
+            .update(&keyring(), &deleted, touch)
             .await
             .unwrap_err();
         assert!(matches!(e, EditError::Missing), "{e:?}");
         let s = r.cache.item(&deleted).unwrap();
         assert!(s.gone && s.v == 2, "{s:?}");
-        let e = r.cache.update(&keyring(), &lost, |_| {}).await.unwrap_err();
+        let e = r.cache.update(&keyring(), &lost, touch).await.unwrap_err();
         assert!(matches!(e, EditError::Missing), "{e:?}");
         assert!(!r.cache.item(&lost).unwrap().gone);
         assert_eq!(
@@ -3369,7 +3411,7 @@ mod tests {
             .await
             .expect("no se pidió el sondeo");
         // Y no se vuelve a intentar escribir.
-        let e = r.cache.update(&keyring(), &lost, |_| {}).await.unwrap_err();
+        let e = r.cache.update(&keyring(), &lost, touch).await.unwrap_err();
         assert!(
             matches!(e, EditError::Unreadable(Unreadable::NotInHub)),
             "{e:?}"
