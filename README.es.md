@@ -195,15 +195,14 @@ Lo que nido cambia en tu configuración de Claude:
   mcp__nido__project mcp__nido__objective mcp__nido__join mcp__nido__leave`. Al cargar un channel
   de desarrollo, Claude enseña un aviso al arrancar: nido lo acepta por ti, pero solo si la lista
   es exactamente `server:nido`.
-- Solo esas dieciséis herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo
-  a ti (`secret` lo controla su propio diálogo), llevan el plan de la propia sesión o trabajan en
-  el tablero de proyectos de la cuenta. Las del tablero crean y cambian lo que ven tus otros
-  equipos, la web y la app, sin preguntar: un cambio se puede deshacer a mano, pero no hay
-  historial, y una sesión engañada podría vaciar descripciones y notas, renombrar o archivar.
-  No tocan ninguna sesión. `board_delete` (borrar del
-  tablero, en cascada; no tiene vuelta atrás y no hay papelera) no está en la lista, y `open`,
-  `answer`, `close`, `start` y `stop` tampoco, porque actúan sobre otras sesiones: pasan por el
-  permiso de siempre de Claude (en modo auto, decide su clasificador).
+- Solo esas dieciséis herramientas van sin preguntar: miran, hablan, o te piden o te mandan algo a
+  ti (`secret` lo controla su propio diálogo), llevan el plan de la propia sesión o trabajan en el
+  tablero de proyectos de la cuenta. Las del tablero crean y cambian lo que ven tus otros equipos,
+  la web y la app, sin preguntar: un cambio se puede deshacer a mano, pero no hay historial, y una
+  sesión engañada podría vaciar descripciones y notas, renombrar o archivar. No tocan ninguna
+  sesión. `board_delete` (borrar del tablero, en cascada; no tiene vuelta atrás y no hay papelera)
+  no está en la lista, y `open`, `answer`, `close`, `start` y `stop` tampoco, porque actúan sobre
+  otras sesiones: pasan por el permiso de siempre de Claude (en modo auto, decide su clasificador).
 - También llevan `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
   con la ruta absoluta de la carpeta de secretos de nido (y también la de verdad, si hay un enlace
   por medio). Claude aplica la regla de `Read` a su herramienta Read y a `cat`, `head`, `<`… en

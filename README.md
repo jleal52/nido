@@ -201,15 +201,14 @@ What nido changes in your Claude setup:
   development channel, Claude shows a warning at startup: nido accepts it for you, but only when
   the list is exactly `server:nido`.
 - Only those sixteen tools run without asking: they look, talk, or ask and send things to you
-  (`secret` is controlled by its own dialog), keep the session's own plan, or work on the
-  account's projects board. The board tools create and change what your other computers, the
-  web app and the phone app see, without asking: a change can be undone by hand, but there is no
-  history, and a tricked session could empty descriptions and notes, rename or archive. They
-  don't touch any session. `board_delete`
-  (deleting from the board, cascading; a deletion can't be undone, and there is no trash) is not
-  on the list, and neither are `open`, `answer`, `close`, `start` and `stop`, which act on other
-  sessions: they go through Claude's usual permission prompt (in auto mode, its classifier
-  decides).
+  (`secret` is controlled by its own dialog), keep the session's own plan, or work on the account's
+  projects board. The board tools create and change what your other computers, the web app and the
+  phone app see, without asking: a change can be undone by hand, but there is no history, and a
+  tricked session could empty descriptions and notes, rename or archive. They don't touch any
+  session. `board_delete` (deleting from the board, cascading; a deletion can't be undone, and there
+  is no trash) is not on the list, and neither are `open`, `answer`, `close`, `start` and `stop`,
+  which act on other sessions: they go through Claude's usual permission prompt (in auto mode, its
+  classifier decides).
 - They also get `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
   with the absolute path of nido's secrets folder (and its real path too, if there is a link on
   the way). Claude applies the `Read` rule to its Read tool and to `cat`, `head`, `<`… in Bash,
