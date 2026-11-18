@@ -182,6 +182,9 @@ Each Claude that nido launches gets nido's MCP server (`nido mcp`), with these t
   `session`); `plan_clear` removes it. The plan is kept with the session (it survives restarts and
   `/clear`) and goes with `nido rm`. Ids are up to 64 letters, digits, `.`, `_` or `-`, unique in
   the plan; at most 50 phases and 500 tasks.
+- `board`, `project`, `objective`, `join` and `leave`: the projects board of your hub account,
+  which sessions can read and edit, and whose objectives they can join (see
+  [The projects board](#the-projects-board)).
 
 What nido changes in your Claude setup:
 
@@ -193,13 +196,17 @@ What nido changes in your Claude setup:
   (channels are a research preview, and nido's is a development channel) and
   `--allowedTools mcp__nido__sessions mcp__nido__read mcp__nido__send mcp__nido__alert
   mcp__nido__secret mcp__nido__clipboard mcp__nido__send_file mcp__nido__plan_set
-  mcp__nido__plan_task mcp__nido__plan_get mcp__nido__plan_clear`. When it loads a development
-  channel, Claude shows a warning at startup: nido accepts it for you, but only when the list is
-  exactly `server:nido`.
-- Only those eleven tools run without asking: they look, talk, or ask and send things to you
-  (`secret` is controlled by its own dialog), or keep the session's own plan. `open`, `answer`, `close`, `start` and `stop` act
-  on other sessions, so they go through Claude's usual permission prompt (in auto mode, its
-  classifier decides).
+  mcp__nido__plan_task mcp__nido__plan_get mcp__nido__plan_clear mcp__nido__board
+  mcp__nido__project mcp__nido__objective mcp__nido__join mcp__nido__leave`. When it loads a
+  development channel, Claude shows a warning at startup: nido accepts it for you, but only when
+  the list is exactly `server:nido`.
+- Only those sixteen tools run without asking: they look, talk, or ask and send things to you
+  (`secret` is controlled by its own dialog), keep the session's own plan, or work on the
+  account's projects board. The board tools change and delete (cascading) what your other
+  computers, the web app and the phone app see, without asking; a deletion can't be undone, and
+  there is no trash. They don't touch any session.
+  `open`, `answer`, `close`, `start` and `stop` act on other sessions, so they go through
+  Claude's usual permission prompt (in auto mode, its classifier decides).
 - They also get `--disallowedTools "Read(//<state>/secrets/**)" "Edit(//<state>/secrets/**)"`,
   with the absolute path of nido's secrets folder (and its real path too, if there is a link on
   the way). Claude applies the `Read` rule to its Read tool and to `cat`, `head`, `<`… in Bash,
@@ -287,6 +294,9 @@ Security:
   it from `read`). The session list says when Claude is waiting on it (`claude.trusting`),
   so the web and the app can show it and you can answer it there.
 - Claude is told that messages from other sessions don't come from you.
+- A tricked session (a message with instructions slipped in) can change or delete the projects
+  board, because its tools don't ask for permission; opening, answering, closing, starting or
+  stopping other sessions still does.
 
 ```sh
 nido mcp off     # the next Claude sessions start without nido's MCP (running ones stay as they are)
@@ -297,6 +307,88 @@ nido alerts      # alerts from the sessions on every computer in the group that 
 `nido mcp off` doesn't remove the server from Claude's configuration. To undo that too:
 `claude mcp remove -s user nido` (and, for each profile,
 `CLAUDE_CONFIG_DIR=<profile> claude mcp remove -s user nido`).
+
+### The projects board
+
+Your hub account has a board of projects, shared by the computers in the group, the web app and
+the phone app: projects, each with its objectives (in order, with a state and a note), and the
+sessions working on each objective (links), with their plan's progress. Each project, objective or
+link is a separate document on the hub, encrypted by the clients with a key of the group's keyring
+(below): the hub only stores and hands out what it can't read. For each one it sees only a random
+id, its version, which key encrypted it, its size and when it changed (and that it was deleted),
+but neither its type nor its content. It can't read the board, but it could hand out an older
+version of an object, or not hand it out at all. A nido that uses no hub has no board.
+
+The tools (they run without asking, see above):
+
+- `board`: the board as compact text: each project with its objectives, their state and note, the
+  sessions working on each one with their plan's progress, and the plan totals. With `archived`,
+  the archived projects show too; with `project`, only that project, with its descriptions. If the
+  hub can't be reached, it shows this computer's copy and says so.
+- `project`: creates a project (`name`; `state` is `active` by default), changes it (`id` and the
+  fields to change: `name`, `desc`, `state`, which is `active` or `archived`) or, with `delete`,
+  deletes it together with its objectives and their links. Project names are unique.
+- `objective`: creates an objective in a `project` (`name`; `state` is `pending`; at the end
+  unless `order` is given), changes it (`id` and the fields: `name`, `desc`, `state`, `note`,
+  `order`) or, with `delete`, deletes it with its links. The states are `pending`, `doing`,
+  `blocked`, `done` and `dropped`. `order` is a real number: to put an objective between two
+  others, the average of their `order`s. Names are unique within a project.
+- `join`: links the calling session to an objective, so that it shows there with its plan's
+  progress. If it already is, nothing changes; if its link was closed, it is opened again.
+- `leave`: takes the calling session off an objective: it deletes its link (it doesn't close it).
+
+A project or an objective is named by its id, by its first 8 or more hex digits (`board` shows
+them as `#1a2b3c4d`; the `#` is optional) or by its exact name, ignoring case. An objective by
+name is looked for in `project` if given, otherwise in every project. A name or a prefix that
+matches several gives an error with the candidates. Every change records who made it as
+`<computer>/<session>`. Like the rest of the tools, they answer in English (Claude reads them).
+What can't be read (without its key, or of a type this nido doesn't know) is listed by its id,
+and is never changed or deleted.
+
+Each computer copies the plan summary of its sessions (title, and how many tasks are done, in
+total, active, blocked and failed) to their links: at most once every 30 seconds per session, and
+only when it changed (`copied` says when). A stopped session keeps its links open. When a session
+is removed, its links are closed (`closed`) with its last summary, and a closed link is deleted
+after 30 days. A computer only touches its own sessions' links, and not even those it can't read
+or whose objective it can't find: the objective may not have reached it yet, or the board may be
+being uploaded again, and deleting the links then would lose them for good. An objective's links
+are deleted with it, whoever deletes it (a session, the web app or the phone app); nido doesn't
+clean up links left without an objective. If a computer gets a new identity on the hub, its old
+links stay as they are: they are no longer its own, and only go away with their objective.
+
+**Careful with the session registry**: nido closes the links of every session of this computer
+that isn't in its registry (`sessions.json` in the data folder, below). If that file is lost, it
+closes every link of this computer. Nothing opens them again by itself: the sessions have to
+`join` again, and the closed links are deleted after 30 days. Don't start nido with another data
+folder either (for instance by changing `XDG_DATA_HOME` in a service): besides the registry, it
+holds the group (`group.json`, with the board's keyring) and the copy of the board, so nido would
+start without the group or the keyring, unable to read the board. If nido can't understand
+`group.json`, it sets it aside as `group.json.bad-<ms>` and starts without a group: that file
+holds the board's keys, so delete it once you no longer need it.
+
+Each nido keeps a copy of the board in `board.json`, in its data folder (`~/.local/share/nido`,
+`$XDG_DATA_HOME/nido` or `$NIDO_HOME/data`; on Windows, `%USERPROFILE%\.local\share\nido`),
+encrypted as the hub gives it. If the hub has no board at all (two full reads, a minute apart,
+without a single object or deletion) and the copy has something, nido uploads its copy again, with
+the current key, one object at a time (about 20 per minute); if another computer of the account
+got there first, that computer's version stays. That brings the board back when a hub without
+MongoDB restarts, and when a group of two computers is split: the hub may leave the account with
+the removed one, and the one that stays starts with a new, empty account, to which it uploads its
+copy.
+
+The keyring belongs to the group (it syncs with the rest of the group, end-to-end encrypted), and
+the web app and the phone app ask their nido for it (`GET /api/v1/board/keys`, in
+[The API](#the-api)). The first key is made when it is first needed. The key changes whenever a
+computer or a device is removed from the group (also with every "Sign out" of the web app, which
+removes that browser), so that whoever left can't read what is encrypted from then on. The old one
+is retired, and nido re-encrypts with the current key only the objects still encrypted with a
+retired one, slowly (about 10 per minute among all the computers). A retired key is kept at least
+30 days, and as long as some object uses it: that way a device with the old keyring that writes
+with it while the computers are off doesn't leave anything unreadable. nido warns in its log (the
+journal with systemd, `~/Library/Logs/nido.log` with launchd, `~\.local\state\nido\serve.log` on
+Windows) above 16 keys; above 64 it removes early, with a warning, the oldest retired keys that no
+object uses. A key that still encrypts something is never removed. A computer removed from the
+group empties its keyring and its copy of the board.
 
 ## The API
 
@@ -327,6 +419,20 @@ nido asks the hub for it on behalf of the calling device and returns what the hu
 not offer sessions (an older hub that doesn't answer counts as that, after 30 seconds), `429` if
 this computer reached the hub's session limit, `502` for any other error from the hub. An older
 nido, without this endpoint, answers `404`.
+
+`GET /api/v1/board/keys`: the keyring of the projects board, which the web app and the phone app
+use to encrypt and decrypt the board themselves: `{"current": "<kid>", "keys": [{"kid", "key",
+"retired"}]}`, where `key` is the 32-byte key in standard base64 (with padding) and `current` is the
+`kid` to encrypt with. It lists every key that still has its secret, sorted by `kid`: the active
+one and the retired ones (`"retired": true`), which are still needed to read what was encrypted
+with them. There are usually few (nido warns above 16, and above 64 it removes early the oldest
+retired ones that encrypt nothing), but there is no fixed maximum: a retired key that still
+encrypts something is not removed. If there is no active key yet, nido makes one and saves it
+before answering. Only a paired phone or browser that the group still knows can ask for it
+(`403` with the token in `~/.config/nido/token`, or for a device removed from the group, even from
+another computer; `401` with a token that belongs to no one). Errors: `503` if something could
+not be saved (the new key, or which keys this device has), and no key is given; try again. The
+answer carries `Cache-Control: no-store`.
 
 The hub account, `{"name", "lang"}` (either can be `null` until the account is first opened),
 comes in `GET /api/v1/info` (`"account"`, or `null` if the hub hasn't told it yet), in the

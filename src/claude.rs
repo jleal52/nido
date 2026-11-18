@@ -453,11 +453,16 @@ const NIDO_CHANNEL: &str = "server:nido";
 const ALLOWED_OPTS: [&str; 2] = ["--allowedTools", "--allowed-tools"];
 /// Las herramientas de nido que no piden permiso: las que miran y hablan, y las que piden y
 /// mandan cosas al usuario (`secret` lo controla su diálogo; `clipboard` y `send_file` solo le
-/// mandan algo a él), y las del plan de tareas (solo tocan el de la propia sesión). Las que actúan sobre otras sesiones (`open`, `answer`, `close`, `start`,
-/// `stop`) pasan por el permiso de Claude como cualquier otra (en modo auto, lo decide su
-/// clasificador): una sesión engañada (un mensaje con instrucciones metidas) no puede abrir,
-/// parar o arrancar sesiones ni aprobar sus preguntas sin que nadie lo vea.
-pub const NIDO_TOOLS: [&str; 11] = [
+/// mandan algo a él), las del plan de tareas (solo tocan el de la propia sesión) y las del
+/// tablero de la cuenta (`board`, `project`, `objective`, `join` y `leave`), para que Claude
+/// lleve su objetivo sin interrumpir al usuario a cada paso; no tocan sesiones. El riesgo que se
+/// acepta con ellas: una sesión engañada puede cambiar o borrar, en cascada y sin vuelta atrás,
+/// el tablero que comparten los equipos, la web y la app. Las que actúan sobre otras sesiones
+/// (`open`, `answer`, `close`, `start`, `stop`) pasan por el permiso de Claude como cualquier
+/// otra (en modo auto, lo decide su clasificador): una sesión engañada (un mensaje con
+/// instrucciones metidas) no puede abrir, parar o arrancar sesiones ni aprobar sus preguntas sin
+/// que nadie lo vea.
+pub const NIDO_TOOLS: [&str; 16] = [
     "mcp__nido__sessions",
     "mcp__nido__read",
     "mcp__nido__send",
@@ -469,6 +474,11 @@ pub const NIDO_TOOLS: [&str; 11] = [
     "mcp__nido__plan_task",
     "mcp__nido__plan_get",
     "mcp__nido__plan_clear",
+    "mcp__nido__board",
+    "mcp__nido__project",
+    "mcp__nido__objective",
+    "mcp__nido__join",
+    "mcp__nido__leave",
 ];
 const DENIED_OPTS: [&str; 2] = ["--disallowedTools", "--disallowed-tools"];
 /// Lo que ponía nido antes: todas sus herramientas sin permiso. Si viene en una orden (de una
@@ -1336,9 +1346,9 @@ mod tests {
     }
 
     /// Las de nido, como van en la orden: el channel y las herramientas que no piden permiso
-    /// (las que miran y hablan, y las que mandan cosas al usuario; `open`, `answer`, `close`,
-    /// `start` y `stop` no).
-    const FLAGS: [&str; 14] = [
+    /// (las que miran y hablan, las que mandan cosas al usuario, las del plan y las del tablero;
+    /// `open`, `answer`, `close`, `start` y `stop` no).
+    const FLAGS: [&str; 19] = [
         "--dangerously-load-development-channels",
         "server:nido",
         "--allowedTools",
@@ -1353,6 +1363,11 @@ mod tests {
         "mcp__nido__plan_task",
         "mcp__nido__plan_get",
         "mcp__nido__plan_clear",
+        "mcp__nido__board",
+        "mcp__nido__project",
+        "mcp__nido__objective",
+        "mcp__nido__join",
+        "mcp__nido__leave",
     ];
 
     fn flagged(program: &str, rest: &[&str]) -> Vec<String> {
@@ -1424,6 +1439,11 @@ mod tests {
                 "mcp__nido__plan_task",
                 "mcp__nido__plan_get",
                 "mcp__nido__plan_clear",
+                "mcp__nido__board",
+                "mcp__nido__project",
+                "mcp__nido__objective",
+                "mcp__nido__join",
+                "mcp__nido__leave",
                 "--allowedTools=mcp__nido__read",
                 "-c"
             ])
@@ -1446,6 +1466,11 @@ mod tests {
             "mcp__nido__plan_task",
             "mcp__nido__plan_get",
             "mcp__nido__plan_clear",
+            "mcp__nido__board",
+            "mcp__nido__project",
+            "mcp__nido__objective",
+            "mcp__nido__join",
+            "mcp__nido__leave",
         ]);
         assert_eq!(with_nido_mcp(&theirs, true), theirs);
         // Las de una orden de antes (todas sin permiso), fuera: con `=`, sola o con otras.

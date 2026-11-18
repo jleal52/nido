@@ -1,0 +1,75 @@
+{
+  "about": "nido: blobs del tablero. blob = base64(0x01 || nonce(12) || AES-256-GCM(key, nonce, plaintext, aad)), con la etiqueta de 16 bytes al final; aad = \"nido-board/1/\" || id en ASCII; kid = hex(SHA-256(\"nido-board-kid\" || key))[0..16]. key y blob en base64 estándar con relleno (ni base64url ni sin relleno: se rechazan); nonce en hex; plaintext en UTF-8. Antes de descifrar se rechaza un blob de más de 11000 caracteres, de menos de 29 bytes o cuyo primer byte no sea 0x01 (la etiqueta no lo cubre). Los de ok se descifran a su plaintext; los de bad no se deben descifrar.",
+  "bad": [
+    {
+      "blob": "AQABAgMEBQYHCAkKCzwgojn/x7Jp4ivy6MXLVE/tt+pR0kF9Ll0BivdwCCDWZHyOns4Co/dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS/qsCBlBf0qOif+4HdKDr6qbLY/SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ/2y1l4imTFop9qwrjcq23mWC+l/8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nk",
+      "id": "0123456789abcdef0123456789abcdee",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "otro id"
+    },
+    {
+      "blob": "AQABAgMEBQYHCAkKCzwgojn/x7Jp4ivy6MXLVE/tt+pR0kF9Ll0BivdwCCDWZHyOns4Co/dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS/qsCBlBf0qOif+4HdKDr6qbLY/SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ/2y1l4imTFop9qwrjcq23mWC+l/8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nk",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "name": "otra clave"
+    },
+    {
+      "blob": "AgABAgMEBQYHCAkKCzwgojn/x7Jp4ivy6MXLVE/tt+pR0kF9Ll0BivdwCCDWZHyOns4Co/dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS/qsCBlBf0qOif+4HdKDr6qbLY/SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ/2y1l4imTFop9qwrjcq23mWC+l/8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nk",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "versión 2"
+    },
+    {
+      "blob": "AQABAgMEBQYHCAkKCzwgojn/x7Jp4ivy6MXLVE/tt+pR0kF9Ll0BivdwCCDWZHyOns4Co/dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS/qsCBlBf0qOif+4HdKDr6qbLY/SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ/2y1l4imTFop9qwrjcq23mWC+l/8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nl",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "etiqueta tocada"
+    },
+    {
+      "blob": "AQABAgMEBQYHCAkKC7wgojn/x7Jp4ivy6MXLVE/tt+pR0kF9Ll0BivdwCCDWZHyOns4Co/dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS/qsCBlBf0qOif+4HdKDr6qbLY/SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ/2y1l4imTFop9qwrjcq23mWC+l/8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nk",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "cifrado tocado"
+    },
+    {
+      "blob": "AQABAgMEBQYHCAkKCzwgojn/x7Jp4ivy6MXLVA==",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "corto"
+    },
+    {
+      "blob": "AQABAgMEBQYHCAkKCzwgojn_x7Jp4ivy6MXLVE_tt-pR0kF9Ll0BivdwCCDWZHyOns4Co_dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS_qsCBlBf0qOif-4HdKDr6qbLY_SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ_2y1l4imTFop9qwrjcq23mWC-l_8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nk",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "base64url"
+    },
+    {
+      "blob": "ATAxMjM0NTY3ODk6O8BcX+CbCiZvT13h9h4zm3Llt1sPPTyuC15Ixw",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "name": "sin relleno"
+    }
+  ],
+  "ok": [
+    {
+      "aad": "nido-board/1/0123456789abcdef0123456789abcdef",
+      "blob": "AQABAgMEBQYHCAkKCzwgojn/x7Jp4ivy6MXLVE/tt+pR0kF9Ll0BivdwCCDWZHyOns4Co/dWiF2J7fRLGtR7IfcvusawUOQGOXyWloaRHL9av7AGDWkuigqK4y6NS/qsCBlBf0qOif+4HdKDr6qbLY/SJOo2vH9M1ykBRBuYXVOc1fYWqn3PZ/2y1l4imTFop9qwrjcq23mWC+l/8gbE0wUFIaNmrj2RVcDwiJ7jteMVENJZkxQRwBsFZNUPp7nk",
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "kid": "1ffd9bb07aebb8f4",
+      "name": "proyecto",
+      "nonce": "000102030405060708090a0b",
+      "plaintext": "{\"t\":\"project\",\"name\":\"Reforma del baño\",\"desc\":\"Azulejos, ducha y la luz del espejo\",\"state\":\"active\",\"created\":1763300000000,\"changed\":1763300000000,\"by\":\"app\"}"
+    },
+    {
+      "aad": "nido-board/1/fedcba9876543210fedcba9876543210",
+      "blob": "AaChoqOkpaanqKmqq9YRGzAeF6EU31DpEyj0mVVXr6ZHhOgDh16EkWdMg/Bx5x/KSqG9lTEsm84qBcAVFvcEYFYFv7SxA6uxPMvLPJR6aMJ8JCrziCgyRKkfejE9z+892pUyXA2GQEgPOczngd7JK55aZY/Bvy3dHb5xmNlCRPD6/S3k+F4h7a98ryRqlY2zqxRq9h/gq6vl8gryJLxdAt3EJT8O4Dr9d+m/GxjqQRss9ioBgHVZswDKS1GLMXNqd8dKheTDJ6AN4kpoDemL8LEhwTS6Gda0KPq2FpGU1k7x6D99ATx4iSwFBZnUNx7IBPUjoAydwZXIR5+3rci025eidj+i40wghjJYMDdKxXMkTxP+dsrQXVLVgEY2jV6+QLH3LNvpp4HvFyozz/GI",
+      "id": "fedcba9876543210fedcba9876543210",
+      "key": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=",
+      "kid": "17508fdfc79e6d74",
+      "name": "objetivo",
+      "nonce": "a0a1a2a3a4a5a6a7a8a9aaab",
+      "plaintext": "{\"t\":\"objective\",\"project\":\"0123456789abcdef0123456789abcdef\",\"name\":\"Elegir azulejos\",\"desc\":\"Muestras de la tienda, antes del viernes\",\"state\":\"doing\",\"note\":\"Quedan dos por decidir: ¿mate o brillo?\",\"order\":1.5,\"created\":1763300000000,\"changed\":1763386400000,\"by\":\"web\"}"
+    }
+  ]
+}

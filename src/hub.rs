@@ -77,6 +77,15 @@ pub struct HubStatus {
     /// La cuenta de este nido según el hub (`{"name","lang"}`), lo último que dijo: no se borra
     /// al desconectar, solo si se cambia de hub.
     pub account: Option<serde_json::Value>,
+    /// El `ref` de la cuenta (16 hex que no dicen nada, el mismo mientras sea la misma cuenta),
+    /// si el hub lo da (uno antiguo, no). Como `account`, pero no sale de aquí: solo sirve para
+    /// saber que la cuenta cambió.
+    #[serde(skip)]
+    pub account_ref: Option<String>,
+    /// Cuántas veces se ha conectado: sube con cada conexión, así quien mira el estado no se
+    /// pierde una reconexión aunque `connected` ya estuviera a `true` la última vez que miró.
+    #[serde(skip)]
+    pub connections: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -177,6 +186,121 @@ const SESSION_WAIT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const SESSION_WAIT: Duration = Duration::from_secs(1);
 
+/// Cuánto se espera la respuesta a una petición del tablero: el hub contesta en 10 s como mucho
+/// (con un 503 si MongoDB no responde), y uno antiguo no contesta nunca.
+#[cfg(not(test))]
+const BOARD_WAIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const BOARD_WAIT: Duration = Duration::from_secs(2);
+/// Peticiones del tablero sin contestar a la vez: el hub contesta 429 a la quinta.
+pub const BOARD_IN_FLIGHT: usize = 4;
+/// Cómo empieza el 413 del hub cuando la cuenta ya tiene todos los objetos que caben («la cuenta
+/// ya tiene 2000 objetos»; el otro 413 es el de un blob demasiado largo).
+const BOARD_FULL: &str = "la cuenta ya tiene";
+const BOARD_NO_HUB: &str = "sin conexión con el hub";
+const BOARD_SILENT: &str = "el hub no contestó";
+/// Una respuesta del tablero que no es como dice el protocolo.
+const BOARD_ODD: &str = "respuesta del tablero no válida";
+
+/// Un objeto del tablero tal y como lo guarda el hub: el blob cifrado y lo que hace falta para
+/// versionarlo. En una lápida (`gone`), `kid` va vacío y `blob` a `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardItem {
+    pub id: String,
+    pub v: i64,
+    #[serde(default, deserialize_with = "null_empty")]
+    pub kid: String,
+    #[serde(default)]
+    pub blob: Option<String>,
+    #[serde(default)]
+    pub gone: bool,
+    /// La marca de su última escritura (µs, del hub).
+    #[serde(default)]
+    pub at: i64,
+}
+
+impl BoardItem {
+    /// ¿Puede venir así del hub? Su `kid` son 16 hex en minúsculas (en una lápida puede ir
+    /// vacío), el blob no pasa de `MAX_BLOB` y `v` no es negativa (0 es «no existe», en un 409).
+    /// El id no se mira aquí: es `board::is_id`.
+    pub fn fits(&self) -> bool {
+        let kid_ok = (self.gone && self.kid.is_empty())
+            || (self.kid.len() == 16
+                && self
+                    .kid
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        kid_ok
+            && self
+                .blob
+                .as_ref()
+                .is_none_or(|b| b.len() <= crate::board::MAX_BLOB)
+            && self.v >= 0
+    }
+}
+
+/// Un texto que puede venir a `null`: vacío.
+fn null_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Una página de lo cambiado en el tablero desde una marca.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardPage {
+    /// En orden de `(at, id)`.
+    pub items: Vec<BoardItem>,
+    /// La marca que se guarda al acabar (con `more: false`) como el `since` de la próxima.
+    pub next: i64,
+    /// Si hay más: la siguiente se pide con el mismo `since` y `after`.
+    pub more: bool,
+    /// El cursor de la página siguiente (`"<at>:<id>"`), tal cual.
+    pub after: Option<String>,
+    /// La marca era más vieja que las lápidas: hay que vaciar la copia y empezar desde 0.
+    pub reset: bool,
+    /// La `ref` de la cuenta que se ha leído (la de `{"account"}`): un `since` solo vale en la
+    /// cuenta de la que vino. Un hub de antes no la manda.
+    pub account_ref: Option<String>,
+}
+
+/// Lo que da una escritura que sale bien: la versión nueva y su marca.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoardStamp {
+    pub v: i64,
+    pub at: i64,
+}
+
+/// Por qué no salió una petición del tablero.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoardError {
+    /// La versión no es la que hay (409): el objeto como está ahora.
+    Conflict(BoardItem),
+    /// La cuenta ya tiene todos los objetos que caben (413).
+    Full,
+    /// El blob es demasiado largo para el hub (413).
+    TooBig,
+    /// El freno de escrituras, o demasiadas peticiones a la vez (429).
+    Busy,
+    /// El hub no acepta la petición (400): un id, un `kid` o un blob que no valen.
+    Bad(String),
+    /// Sin conexión, sin respuesta, un 503 (sin cuenta, MongoDB) o algo que no se esperaba.
+    Hub(String),
+}
+
+impl std::fmt::Display for BoardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoardError::Conflict(c) => write!(f, "el objeto cambió (va por la versión {})", c.v),
+            BoardError::Full => write!(f, "el tablero de la cuenta está lleno"),
+            BoardError::TooBig => write!(f, "el objeto es demasiado grande para el hub"),
+            BoardError::Busy => write!(f, "demasiadas escrituras en el tablero: prueba en un rato"),
+            BoardError::Bad(e) => write!(f, "el hub no acepta la petición del tablero ({e})"),
+            BoardError::Hub(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BoardError {}
+
 /// Los pedidos que esperan respuesta del hub, por su número.
 type Waiters = Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>;
 
@@ -185,6 +309,7 @@ type Waiters = Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>;
 enum Asking {
     Voice,
     Session,
+    Board,
 }
 
 impl Asking {
@@ -193,6 +318,7 @@ impl Asking {
         match self {
             Self::Voice => "voice",
             Self::Session => "session",
+            Self::Board => "board",
         }
     }
 }
@@ -265,10 +391,20 @@ pub struct Hub {
     voice_pending: Waiters,
     /// Los pedidos de sesión de dispositivo que esperan respuesta (lo que vino en `sessioned`).
     session_pending: Waiters,
+    /// Las peticiones del tablero que esperan respuesta (lo que vino en `boarded`).
+    board_pending: Waiters,
+    /// Para no tener más de `BOARD_IN_FLIGHT` peticiones del tablero sin contestar.
+    board_slots: tokio::sync::Semaphore,
+    /// Los avisos del hub de que el tablero de la cuenta cambió (`{"board":{"at"}}`). El valor es
+    /// la marca del aviso, que solo es una pista: se sincroniza siempre desde la guardada.
+    board_notice: watch::Sender<i64>,
     /// Lo mandado en esta conexión (se vacía al conectar y al desconectar, así que al reconectar
     /// se manda siempre). Va con `control`: se cogen en ese orden.
     sent: Mutex<Sent>,
     next_req: AtomicU64,
+    /// Cuántas escrituras del tablero (`board_put`, `board_del`) se han pedido: para que quien
+    /// escribe mucho de una vez se pueda medir (`board_progress`).
+    board_writes: AtomicU64,
 }
 
 impl Hub {
@@ -285,9 +421,13 @@ impl Hub {
             pending: Default::default(),
             voice_pending: Default::default(),
             session_pending: Default::default(),
+            board_pending: Default::default(),
+            board_slots: tokio::sync::Semaphore::new(BOARD_IN_FLIGHT),
+            board_notice: watch::Sender::new(0),
             control: Default::default(),
             sent: Default::default(),
             next_req: AtomicU64::new(1),
+            board_writes: AtomicU64::new(0),
         })
     }
 
@@ -365,6 +505,7 @@ impl Hub {
         match of {
             Asking::Voice => &self.voice_pending,
             Asking::Session => &self.session_pending,
+            Asking::Board => &self.board_pending,
         }
     }
 
@@ -536,6 +677,143 @@ impl Hub {
             .is_some_and(|r| answered(&self.session_pending, r))
     }
 
+    /// Lo mismo con `{"boarded":{"req":N,…}}`, las respuestas del tablero.
+    fn boarded(&self, v: &mut serde_json::Value) -> bool {
+        v.get_mut("boarded")
+            .is_some_and(|r| answered(&self.board_pending, r))
+    }
+
+    /// Si es el aviso `{"board":{"at":…}}` (el tablero de la cuenta cambió): despierta a quien
+    /// escuche `board_notices`, aunque la marca sea la misma que la anterior. Devuelve si lo era.
+    /// El nido no manda `board` sin `req`, y el hub no contesta con `board`: un `board` que llega
+    /// es siempre un aviso.
+    fn board_noticed(&self, v: &serde_json::Value) -> bool {
+        let Some(b) = v.get("board").and_then(|b| b.as_object()) else {
+            return false;
+        };
+        let at = b.get("at").and_then(|a| a.as_i64());
+        self.board_notice.send_modify(|n| *n = at.unwrap_or(*n));
+        true
+    }
+
+    /// Los avisos de cambio del tablero de la cuenta. Llegan solo a una conexión que ya ha hecho
+    /// alguna petición del tablero: tras cada reconexión hay que pedir algo (`board_get`).
+    pub fn board_notices(&self) -> watch::Receiver<i64> {
+        self.board_notice.subscribe()
+    }
+
+    /// Manda una petición del tablero y espera su respuesta: con 200, lo que da el hub; con otro
+    /// estado, su error. Antes coge un hueco de los `BOARD_IN_FLIGHT` (el plazo empieza a contar
+    /// al encolarla, así que no se gasta esperando el hueco).
+    async fn board_ask(
+        &self,
+        body: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, BoardError> {
+        let _slot = self
+            .board_slots
+            .acquire()
+            .await
+            .map_err(|_| BoardError::Hub(BOARD_NO_HUB.into()))?;
+        let v = match self.ask(Asking::Board, body, BOARD_WAIT).await {
+            Ok(v) => v,
+            Err(Unanswered::NoHub) => return Err(BoardError::Hub(BOARD_NO_HUB.into())),
+            Err(Unanswered::Silent) => return Err(BoardError::Hub(BOARD_SILENT.into())),
+        };
+        let error = || v["error"].as_str().unwrap_or_default().to_owned();
+        match v["status"].as_u64() {
+            Some(200) => Ok(v),
+            Some(409) => match serde_json::from_value::<BoardItem>(v["current"].clone()) {
+                Ok(current) if current.fits() => Err(BoardError::Conflict(current)),
+                _ => Err(BoardError::Hub(BOARD_ODD.into())),
+            },
+            Some(413)
+                if v["error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with(BOARD_FULL)) =>
+            {
+                Err(BoardError::Full)
+            }
+            Some(413) => Err(BoardError::TooBig),
+            Some(429) => Err(BoardError::Busy),
+            Some(400) => Err(BoardError::Bad(error())),
+            Some(_) if !error().is_empty() => Err(BoardError::Hub(error())),
+            _ => Err(BoardError::Hub(BOARD_ODD.into())),
+        }
+    }
+
+    /// Una página de lo cambiado en el tablero de la cuenta desde `since` (µs; 0, todo). La
+    /// primera de una sincronización va sin `after`; las siguientes, con el mismo `since` y el
+    /// `after` de la anterior, tal cual.
+    pub async fn board_get(
+        &self,
+        since: i64,
+        after: Option<&str>,
+    ) -> Result<BoardPage, BoardError> {
+        let mut body = serde_json::Map::new();
+        body.insert("op".into(), "get".into());
+        body.insert("since".into(), since.into());
+        body.insert("after".into(), after.into());
+        let v = self.board_ask(body).await?;
+        let odd = || BoardError::Hub(BOARD_ODD.into());
+        let items: Vec<BoardItem> =
+            serde_json::from_value(v["items"].clone()).map_err(|_| odd())?;
+        let more = v["more"].as_bool().ok_or_else(odd)?;
+        let after = v["after"].as_str().map(str::to_owned);
+        if more && after.is_none() {
+            return Err(odd());
+        }
+        let account_ref = match &v["ref"] {
+            serde_json::Value::Null => None,
+            r => Some(
+                r.as_str()
+                    .filter(|r| account_ref(r))
+                    .ok_or_else(odd)?
+                    .to_owned(),
+            ),
+        };
+        Ok(BoardPage {
+            items,
+            next: v["next"].as_i64().ok_or_else(odd)?,
+            more,
+            after,
+            reset: v["reset"].as_bool().unwrap_or(false),
+            account_ref,
+        })
+    }
+
+    /// Escribe el objeto `id` si su versión es `v` (0: si es nuevo).
+    pub async fn board_put(
+        &self,
+        id: &str,
+        v: i64,
+        kid: &str,
+        blob: &str,
+    ) -> Result<BoardStamp, BoardError> {
+        let mut body = serde_json::Map::new();
+        body.insert("op".into(), "put".into());
+        body.insert("id".into(), id.into());
+        body.insert("v".into(), v.into());
+        body.insert("kid".into(), kid.into());
+        body.insert("blob".into(), blob.into());
+        self.board_writes.fetch_add(1, Ordering::SeqCst);
+        stamp(&self.board_ask(body).await?)
+    }
+
+    /// Borra el objeto `id` (deja una lápida) si su versión es `v`.
+    pub async fn board_del(&self, id: &str, v: i64) -> Result<BoardStamp, BoardError> {
+        let mut body = serde_json::Map::new();
+        body.insert("op".into(), "del".into());
+        body.insert("id".into(), id.into());
+        body.insert("v".into(), v.into());
+        self.board_writes.fetch_add(1, Ordering::SeqCst);
+        stamp(&self.board_ask(body).await?)
+    }
+
+    /// Cuántas escrituras del tablero ha pedido este nido desde que arrancó (salgan como salgan).
+    pub fn board_writes(&self) -> u64 {
+        self.board_writes.load(Ordering::SeqCst)
+    }
+
     /// Si es `{"account":{"name","lang"}}`, la cuenta de este nido: al estado (y, si cambió, avisa
     /// a quien lo escuche). Devuelve si lo era. Un nombre o un idioma que no valen se quedan en
     /// `null`: van a la información de los dispositivos, donde uno enorme no cabría y dejaría sin
@@ -554,11 +832,13 @@ impl Hub {
             "name": text("name", account_name),
             "lang": text("lang", account_lang),
         });
+        let account_ref = text("ref", account_ref);
         self.status.send_if_modified(|s| {
-            if s.account.as_ref() == Some(&account) {
+            if s.account.as_ref() == Some(&account) && s.account_ref == account_ref {
                 return false;
             }
             s.account = Some(account);
+            s.account_ref = account_ref;
             true
         });
         true
@@ -577,6 +857,7 @@ impl Hub {
         self.pending.lock().expect("avisos").clear();
         self.voice_pending.lock().expect("pedidos").clear();
         self.session_pending.lock().expect("pedidos").clear();
+        self.board_pending.lock().expect("pedidos").clear();
     }
 
     fn set_status(&self, f: impl FnOnce(&mut HubStatus)) {
@@ -594,6 +875,11 @@ fn account_name(name: &str) -> bool {
         && !name.starts_with('-')
         && !name.ends_with('-')
         && !name.contains("--")
+}
+
+/// El `ref` de una cuenta: 16 hex en minúsculas.
+fn account_ref(r: &str) -> bool {
+    r.len() == 16 && r.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Los idiomas de una cuenta.
@@ -630,6 +916,14 @@ fn strip_reply(v: &mut serde_json::Value) {
     }
 }
 
+/// La versión y la marca de una escritura del tablero que salió bien.
+fn stamp(v: &serde_json::Value) -> Result<BoardStamp, BoardError> {
+    match (v["v"].as_i64(), v["at"].as_i64()) {
+        (Some(v), Some(at)) => Ok(BoardStamp { v, at }),
+        _ => Err(BoardError::Hub(BOARD_ODD.into())),
+    }
+}
+
 /// Cifra un aviso para un teléfono: `nonce (12) || ChaCha20-Poly1305(clave, nonce, json)`.
 pub fn seal(push_key_b64: &str, body: &serde_json::Value) -> Option<String> {
     let key: [u8; 32] = B64.decode(push_key_b64).ok()?.try_into().ok()?;
@@ -656,10 +950,14 @@ pub fn spawn<H: e2e::Host>(hub: Arc<Hub>, host: Arc<H>) {
             };
             hub.set_status(|s| {
                 // La cuenta es lo último que se supo de este hub: con otro, ya no vale.
-                let account = s.account.take().filter(|_| s.url == url);
+                let same = s.url == url;
+                let account = s.account.take().filter(|_| same);
+                let account_ref = s.account_ref.take().filter(|_| same);
                 *s = HubStatus {
                     url: url.clone(),
                     account,
+                    account_ref,
+                    connections: s.connections,
                     ..Default::default()
                 }
             });
@@ -842,6 +1140,7 @@ async fn run<H: e2e::Host>(
     hub.set_status(|s| {
         s.id = Some(id.clone());
         s.connected = true;
+        s.connections += 1;
         s.error = None;
     });
 
@@ -909,7 +1208,11 @@ async fn run<H: e2e::Host>(
                         let _ = waiter.send(r);
                     } else if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&t) {
                         // Cada uno dice si era suyo; lo que no conoce nadie se ignora.
-                        let _ = hub.voiced(&mut v) || hub.sessioned(&mut v) || hub.account(&v);
+                        let _ = hub.voiced(&mut v)
+                            || hub.sessioned(&mut v)
+                            || hub.boarded(&mut v)
+                            || hub.board_noticed(&v)
+                            || hub.account(&v);
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
@@ -962,40 +1265,9 @@ mod tests {
 
     // ---------- El token de voz ----------
 
-    struct TestHost {
-        id: e2e::Identity,
-        pairing: e2e::Pairing,
-        phones: Mutex<e2e::Phones>,
-    }
-
-    impl e2e::Host for TestHost {
-        fn identity(&self) -> &e2e::Identity {
-            &self.id
-        }
-        fn pairing(&self) -> &e2e::Pairing {
-            &self.pairing
-        }
-        fn phones(&self) -> &Mutex<e2e::Phones> {
-            &self.phones
-        }
-        fn local_addr(&self) -> Option<std::net::SocketAddr> {
-            None
-        }
-        fn host_name(&self) -> String {
-            "equipo".into()
-        }
-    }
-
     /// Un nido conectado al hub de mentira de `addr`.
     async fn connected(dir: &Path, addr: std::net::SocketAddr) -> Arc<Hub> {
-        let hub = Hub::new(dir.join("hub.json"));
-        let host = Arc::new(TestHost {
-            id: e2e::Identity::load_or_create(&dir.join("nido.key")).unwrap(),
-            pairing: e2e::Pairing::default(),
-            phones: Mutex::new(e2e::Phones::load(dir.join("phones.json"))),
-        });
-        fake::connect(&hub, host, addr).await;
-        hub
+        fake::nido(dir, addr).await
     }
 
     #[tokio::test]
@@ -1214,6 +1486,60 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    /// El `ref` de la cuenta: 16 hex o nada, y cambiar solo el `ref` también avisa; no va en la
+    /// cuenta que sale hacia fuera. Y cada conexión suma una a `connections`; la cuenta y su
+    /// `ref` se quedan al reconectar.
+    #[tokio::test]
+    async fn the_account_ref_and_the_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        assert_eq!(hub.status.borrow().connections, 1);
+        let mut status = hub.status.subscribe();
+        let send_ref = |r: &str| {
+            rec.tell(fake::Tell::Send(serde_json::json!({
+                "account": { "name": "mirlo-sereno", "lang": "es", "ref": r }
+            })));
+        };
+        let wait_ref = |status: &mut watch::Receiver<HubStatus>, want: Option<&'static str>| {
+            let mut status = status.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    status.wait_for(|s| s.account_ref.as_deref() == want),
+                )
+                .await
+                .expect("no llegó el ref")
+                .unwrap();
+            }
+        };
+        send_ref("0123456789abcdef");
+        wait_ref(&mut status, Some("0123456789abcdef")).await;
+        send_ref("fedcba9876543210");
+        wait_ref(&mut status, Some("fedcba9876543210")).await;
+        send_ref("NO-ES-HEX-NO-ES-");
+        wait_ref(&mut status, None).await;
+        assert_eq!(
+            hub.status.borrow().account,
+            Some(serde_json::json!({ "name": "mirlo-sereno", "lang": "es" }))
+        );
+        send_ref("0123456789abcdef");
+        wait_ref(&mut status, Some("0123456789abcdef")).await;
+        rec.tell(fake::Tell::Hangup);
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| !s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        rec.next("pub").await;
+        rec.next("pub").await;
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+            .await
+            .unwrap()
+            .unwrap();
+        let s = hub.status.borrow().clone();
+        assert_eq!(s.connections, 2);
+        assert_eq!(s.account_ref.as_deref(), Some("0123456789abcdef"));
     }
 
     /// El nombre y el idioma de la cuenta, como los valida el hub: lo demás no es un nombre ni un
@@ -1484,6 +1810,421 @@ mod tests {
         let hub = Hub::new(tmp.path().join("hub.json"));
         assert_eq!(hub.voice_token().await, Err(VoiceError::NoHub));
     }
+
+    // ---------- El tablero ----------
+
+    const OBJ: &str = "0123456789abcdef0123456789abcdef";
+    const KID: &str = "1ffd9bb07aebb8f4";
+
+    fn shared(b: fake::Board) -> Arc<Mutex<fake::Board>> {
+        Arc::new(Mutex::new(b))
+    }
+
+    /// Leer, escribir y borrar, como contesta el hub: la versión sube, un 409 trae el objeto
+    /// como está y la lápida va sin `kid` ni blob.
+    #[tokio::test]
+    async fn the_board_reads_and_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = shared(fake::Board::default());
+        let mut rec = fake::board(board.clone()).await;
+        let hub = connected(tmp.path(), rec.addr).await;
+        let page = hub.board_get(0, None).await.unwrap();
+        assert_eq!(
+            page,
+            BoardPage {
+                items: vec![],
+                next: 0,
+                more: false,
+                after: None,
+                reset: false,
+                account_ref: None,
+            }
+        );
+        let asked = rec.next("board").await;
+        assert_eq!(asked["op"], "get");
+        assert_eq!(asked["since"], 0);
+        assert!(asked["after"].is_null(), "{asked}");
+        assert!(asked["req"].as_u64().is_some(), "{asked}");
+
+        let st = hub.board_put(OBJ, 0, KID, "QUJD").await.unwrap();
+        assert_eq!(st.v, 1);
+        let asked = rec.next("board").await;
+        assert_eq!(
+            (
+                &asked["op"],
+                &asked["id"],
+                &asked["v"],
+                &asked["kid"],
+                &asked["blob"]
+            ),
+            (
+                &"put".into(),
+                &OBJ.into(),
+                &0.into(),
+                &KID.into(),
+                &"QUJD".into()
+            )
+        );
+        let page = hub.board_get(0, None).await.unwrap();
+        assert_eq!(
+            page.items,
+            vec![BoardItem {
+                id: OBJ.into(),
+                v: 1,
+                kid: KID.into(),
+                blob: Some("QUJD".into()),
+                gone: false,
+                at: st.at
+            }]
+        );
+        assert_eq!(page.next, st.at);
+        // Con la versión que no es: el objeto como está.
+        let Err(BoardError::Conflict(cur)) = hub.board_put(OBJ, 0, KID, "REVG").await else {
+            panic!("tenía que chocar")
+        };
+        assert_eq!((cur.v, cur.blob.as_deref()), (1, Some("QUJD")));
+        let del = hub.board_del(OBJ, 1).await.unwrap();
+        assert_eq!(del.v, 2);
+        assert!(del.at > st.at);
+        // Un borrado repetido: 409 con la lápida.
+        let Err(BoardError::Conflict(cur)) = hub.board_del(OBJ, 1).await else {
+            panic!("tenía que chocar")
+        };
+        assert!(
+            cur.gone && cur.blob.is_none() && cur.kid.is_empty(),
+            "{cur:?}"
+        );
+        assert_eq!(cur.v, 2);
+        assert!(hub.board_pending.lock().unwrap().is_empty());
+    }
+
+    /// Cada página trae la `ref` de la cuenta leída; un hub de antes no la manda, y una que no
+    /// es una `ref` es una respuesta rara.
+    #[tokio::test]
+    async fn the_board_page_carries_the_account_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = shared(fake::Board::default());
+        let rec = fake::board(board.clone()).await;
+        let hub = connected(tmp.path(), rec.addr).await;
+        assert_eq!(hub.board_get(0, None).await.unwrap().account_ref, None);
+        board.lock().unwrap().account_ref = Some("0123456789abcdef".into());
+        assert_eq!(
+            hub.board_get(0, None).await.unwrap().account_ref.as_deref(),
+            Some("0123456789abcdef")
+        );
+        board.lock().unwrap().account_ref = Some("otra".into());
+        assert_eq!(
+            hub.board_get(0, None).await.unwrap_err(),
+            BoardError::Hub(BOARD_ODD.into())
+        );
+    }
+
+    /// Un objeto del tablero que no puede venir así del hub: un `kid` que no es de 16 hex en
+    /// minúsculas (en una lápida puede venir vacío), un blob de más de `MAX_BLOB` o una `v`
+    /// negativa.
+    #[test]
+    fn a_board_item_that_does_not_fit() {
+        let ok = BoardItem {
+            id: OBJ.into(),
+            v: 1,
+            kid: KID.into(),
+            blob: Some("QUJD".into()),
+            gone: false,
+            at: 1,
+        };
+        assert!(ok.fits());
+        let tomb = BoardItem {
+            v: 2,
+            kid: String::new(),
+            blob: None,
+            gone: true,
+            ..ok.clone()
+        };
+        assert!(tomb.fits(), "una lápida sin kid");
+        assert!(
+            BoardItem {
+                v: 0,
+                ..tomb.clone()
+            }
+            .fits(),
+            "lo que no existe"
+        );
+        assert!(
+            BoardItem {
+                kid: KID.into(),
+                ..tomb.clone()
+            }
+            .fits()
+        );
+        let long = "A".repeat(crate::board::MAX_BLOB);
+        assert!(
+            BoardItem {
+                blob: Some(long.clone()),
+                ..ok.clone()
+            }
+            .fits()
+        );
+        for bad in [
+            BoardItem {
+                kid: String::new(),
+                ..ok.clone()
+            },
+            BoardItem {
+                kid: KID.to_uppercase(),
+                ..ok.clone()
+            },
+            BoardItem {
+                kid: format!("{KID}0"),
+                ..ok.clone()
+            },
+            BoardItem {
+                kid: "z".repeat(16),
+                ..ok.clone()
+            },
+            BoardItem {
+                kid: "x".into(),
+                ..tomb.clone()
+            },
+            BoardItem {
+                blob: Some(format!("{long}A")),
+                ..ok.clone()
+            },
+            BoardItem {
+                v: -1,
+                ..ok.clone()
+            },
+            BoardItem {
+                v: -1,
+                ..tomb.clone()
+            },
+        ] {
+            assert!(!bad.fits(), "{bad:?}");
+        }
+    }
+
+    /// Un 409 con un objeto que no puede ser no es un conflicto que se pueda resolver.
+    #[tokio::test]
+    async fn a_conflict_that_does_not_fit_is_odd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = fake::Board::default();
+        b.write(OBJ, Some((KID, "QUJD")));
+        b.items.get_mut(OBJ).unwrap().v = -1;
+        let board = shared(b);
+        let rec = fake::board(board.clone()).await;
+        let hub = connected(tmp.path(), rec.addr).await;
+        assert_eq!(
+            hub.board_put(OBJ, 0, KID, "REVG").await,
+            Err(BoardError::Hub(BOARD_ODD.into()))
+        );
+    }
+
+    /// Las páginas siguen el cursor del hub, tal cual.
+    #[tokio::test]
+    async fn the_board_pages_carry_the_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = fake::Board {
+            page: 2,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            b.write(&format!("{i:032x}"), Some((KID, "QUJD")));
+        }
+        let board = shared(b);
+        let rec = fake::board(board.clone()).await;
+        let hub = connected(tmp.path(), rec.addr).await;
+        let first = hub.board_get(0, None).await.unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.more);
+        let after = first.after.clone().unwrap();
+        assert_eq!(
+            after,
+            format!("{}:{}", first.items[1].at, first.items[1].id)
+        );
+        let second = hub.board_get(0, Some(&after)).await.unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert!(!second.more && second.after.is_none());
+        assert_eq!(second.next, board.lock().unwrap().clock);
+        assert_eq!(
+            board.lock().unwrap().gets,
+            vec![(0, None), (0, Some(after))]
+        );
+    }
+
+    /// Cada estado del hub, su error: el 413 de la cuenta llena y el del blob largo se
+    /// distinguen por el texto, los dos 429 son `Busy` y lo demás es `Hub`.
+    #[tokio::test]
+    async fn the_board_errors_from_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Lo que contesta, según el `kid` de la escritura.
+        let (hub, _rec) = recorded(tmp.path(), |v| {
+            let b = v.get("board")?;
+            let req = b["req"].as_u64()?;
+            let (status, error) = match b["kid"].as_str().unwrap_or_default() {
+                "full" => (413, "la cuenta ya tiene 2000 objetos"),
+                "full5000" => (413, "la cuenta ya tiene 5000 objetos"),
+                "big" => (413, "el blob pasa de 11000 bytes"),
+                "rate" => (
+                    429,
+                    "demasiadas escrituras en el tablero: prueba en un rato",
+                ),
+                "many" => (429, "demasiadas peticiones del tablero a la vez"),
+                "none" => (503, "el nido no tiene cuenta"),
+                "bad" => (400, "petición del tablero no válida"),
+                "odd" => (409, "la versión no es la que hay"),
+                "silent" => return Some(Reply::Silent),
+                _ => (503, "error del hub"),
+            };
+            Some(Reply::Send(serde_json::json!({ "boarded": {
+                "req": req, "status": status, "error": error,
+            }})))
+        })
+        .await;
+        let put = |kid: &'static str| {
+            let hub = hub.clone();
+            async move { hub.board_put(OBJ, 0, kid, "QUJD").await }
+        };
+        assert_eq!(put("full").await, Err(BoardError::Full));
+        assert_eq!(put("big").await, Err(BoardError::TooBig));
+        assert_eq!(put("rate").await, Err(BoardError::Busy));
+        assert_eq!(put("many").await, Err(BoardError::Busy));
+        assert_eq!(
+            put("none").await,
+            Err(BoardError::Hub("el nido no tiene cuenta".into()))
+        );
+        assert_eq!(
+            put("mongo").await,
+            Err(BoardError::Hub("error del hub".into()))
+        );
+        assert_eq!(
+            put("bad").await,
+            Err(BoardError::Bad("petición del tablero no válida".into()))
+        );
+        // El de la cuenta llena, con otro número de objetos, también.
+        assert_eq!(put("full5000").await, Err(BoardError::Full));
+        // Un 409 sin el objeto como está no es un conflicto que se pueda resolver.
+        assert!(matches!(put("odd").await, Err(BoardError::Hub(_))));
+        // Uno que no contesta (un hub antiguo): al vencer el plazo, `Hub`.
+        let started = std::time::Instant::now();
+        assert!(matches!(put("silent").await, Err(BoardError::Hub(_))));
+        assert!(started.elapsed() >= BOARD_WAIT);
+        assert!(hub.board_pending.lock().unwrap().is_empty());
+        // Sin conexión, también.
+        let none = Hub::new(tmp.path().join("otro.json"));
+        assert!(matches!(
+            none.board_get(0, None).await,
+            Err(BoardError::Hub(_))
+        ));
+    }
+
+    /// Un corte con la petición en marcha: `Hub`, sin esperar al plazo.
+    #[tokio::test]
+    async fn a_board_request_when_the_hub_hangs_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, _rec) = recorded(tmp.path(), |v| v.get("board").map(|_| Reply::Close)).await;
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            hub.board_get(0, None).await,
+            Err(BoardError::Hub(_))
+        ));
+        assert!(started.elapsed() < BOARD_WAIT, "{:?}", started.elapsed());
+        assert!(hub.board_pending.lock().unwrap().is_empty());
+    }
+
+    /// Las respuestas pueden llegar en otro orden: cada una va a quien la pidió, por su `req`.
+    #[tokio::test]
+    async fn board_answers_out_of_order_find_their_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        let a = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.board_put(OBJ, 0, KID, "QUFB").await }
+        });
+        let first = rec.next("board").await;
+        let b = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.board_del(OBJ, 7).await }
+        });
+        let second = rec.next("board").await;
+        assert_eq!(
+            (&first["op"], &second["op"]),
+            (&"put".into(), &"del".into())
+        );
+        rec.tell(fake::Tell::Send(serde_json::json!({ "boarded": {
+            "req": second["req"], "status": 200, "v": 8, "at": 20,
+        }})));
+        rec.tell(fake::Tell::Send(serde_json::json!({ "boarded": {
+            "req": first["req"], "status": 200, "v": 1, "at": 10,
+        }})));
+        assert_eq!(b.await.unwrap(), Ok(BoardStamp { v: 8, at: 20 }));
+        assert_eq!(a.await.unwrap(), Ok(BoardStamp { v: 1, at: 10 }));
+    }
+
+    /// Como mucho `BOARD_IN_FLIGHT` sin contestar: la quinta sale cuando se contesta una.
+    #[tokio::test]
+    async fn at_most_four_board_requests_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, mut rec) = recorded(tmp.path(), |_| None).await;
+        let mut calls = vec![];
+        for i in 0..6 {
+            let hub = hub.clone();
+            calls.push(tokio::spawn(async move { hub.board_get(i, None).await }));
+        }
+        let mut asked = vec![];
+        for _ in 0..BOARD_IN_FLIGHT {
+            asked.push(rec.next("board").await);
+        }
+        rec.quiet("board", Duration::from_millis(300)).await;
+        rec.tell(fake::Tell::Send(serde_json::json!({ "boarded": {
+            "req": asked[0]["req"], "status": 200, "items": [], "next": 0, "more": false,
+            "after": null, "reset": false,
+        }})));
+        asked.push(rec.next("board").await);
+        rec.quiet("board", Duration::from_millis(300)).await;
+        // Cada `since` una sola vez: ninguna se ha repetido.
+        let mut since: Vec<i64> = asked.iter().map(|a| a["since"].as_i64().unwrap()).collect();
+        since.sort();
+        since.dedup();
+        assert_eq!(since.len(), BOARD_IN_FLIGHT + 1);
+        for c in calls {
+            c.abort();
+        }
+    }
+
+    /// El aviso del hub despierta a quien escucha, también con la misma marca otra vez, y no
+    /// corta la conexión. Uno raro (sin objeto) no es un aviso.
+    #[tokio::test]
+    async fn the_board_notice_wakes_the_listener() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, rec) = recorded(tmp.path(), |_| None).await;
+        let mut notices = hub.board_notices();
+        notices.borrow_and_update();
+        rec.tell(fake::Tell::Send(
+            serde_json::json!({ "board": { "at": 1794868073946142i64 } }),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), notices.changed())
+            .await
+            .expect("no llegó el aviso")
+            .unwrap();
+        assert_eq!(*notices.borrow_and_update(), 1794868073946142);
+        rec.tell(fake::Tell::Send(
+            serde_json::json!({ "board": { "at": 1794868073946142i64 } }),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), notices.changed())
+            .await
+            .expect("no llegó el aviso repetido")
+            .unwrap();
+        notices.borrow_and_update();
+        rec.tell(fake::Tell::Send(serde_json::json!({ "board": 5 })));
+        rec.tell(fake::Tell::Send(
+            serde_json::json!({ "board": { "at": 7 } }),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), notices.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*notices.borrow_and_update(), 7);
+        assert!(hub.status.borrow().connected);
+    }
 }
 
 /// Un hub de mentira en `127.0.0.1`, para las pruebas de aquí y de la API.
@@ -1495,6 +2236,8 @@ pub(crate) mod fake {
     pub enum Reply {
         /// Contesta esto.
         Send(serde_json::Value),
+        /// Contesta todo esto, en orden (solo el hub que graba).
+        SendAll(Vec<serde_json::Value>),
         /// Nada (como un hub antiguo).
         Silent,
         /// Cuelga.
@@ -1542,7 +2285,7 @@ pub(crate) mod fake {
                         .await
                         .unwrap(),
                     Some(Reply::Close) => return,
-                    Some(Reply::Silent) | None => {}
+                    Some(Reply::Silent | Reply::SendAll(_)) | None => {}
                 }
             }
         });
@@ -1641,6 +2384,11 @@ pub(crate) mod fake {
                                 Some(Reply::Send(r)) => {
                                     let _ = ws.send(Message::Text(r.to_string().into())).await;
                                 }
+                                Some(Reply::SendAll(all)) => {
+                                    for r in all {
+                                        let _ = ws.send(Message::Text(r.to_string().into())).await;
+                                    }
+                                }
                                 Some(Reply::Close) => break,
                                 Some(Reply::Silent) | None => {}
                             }
@@ -1658,6 +2406,274 @@ pub(crate) mod fake {
             }
         });
         Recorder { addr, got, tell }
+    }
+
+    /// Un equipo de prueba para el lado del nido.
+    pub struct Host {
+        id: e2e::Identity,
+        pairing: e2e::Pairing,
+        phones: Mutex<e2e::Phones>,
+    }
+
+    impl e2e::Host for Host {
+        fn identity(&self) -> &e2e::Identity {
+            &self.id
+        }
+        fn pairing(&self) -> &e2e::Pairing {
+            &self.pairing
+        }
+        fn phones(&self) -> &Mutex<e2e::Phones> {
+            &self.phones
+        }
+        fn local_addr(&self) -> Option<std::net::SocketAddr> {
+            None
+        }
+        fn host_name(&self) -> String {
+            "equipo".into()
+        }
+    }
+
+    /// Un nido (con su configuración en `dir`) conectado al hub de mentira de `addr`.
+    pub async fn nido(dir: &Path, addr: std::net::SocketAddr) -> Arc<Hub> {
+        let hub = Hub::new(dir.join("hub.json"));
+        let host = Arc::new(Host {
+            id: e2e::Identity::load_or_create(&dir.join("nido.key")).unwrap(),
+            pairing: e2e::Pairing::default(),
+            phones: Mutex::new(e2e::Phones::load(dir.join("phones.json"))),
+        });
+        connect(&hub, host, addr).await;
+        hub
+    }
+
+    // ---------- El tablero de mentira ----------
+
+    /// La primera marca del tablero de mentira (µs, una fecha de verdad), y lo que sube con cada
+    /// escritura.
+    pub const BOARD_T0: i64 = 1_794_868_073_000_000;
+    const BOARD_TICK: i64 = 1000;
+    /// El solape de la primera página, como en el hub.
+    const BOARD_OVERLAP: i64 = 2_000_000;
+
+    /// Un tablero en memoria que contesta como el del hub (versiones, lápidas, el solape de 2 s,
+    /// páginas por número de objetos, el cursor `after`, los avisos y los 413), con lo que hace
+    /// falta para las pruebas: un `reset`, escrituras de otro que se adelantan, el freno, un 400
+    /// y ganchos para cortar algo a medias.
+    pub struct Board {
+        pub items: std::collections::BTreeMap<String, BoardItem>,
+        /// La marca de la última escritura.
+        pub clock: i64,
+        /// Objetos por página.
+        pub page: usize,
+        /// Que la próxima primera página con `since > 0` diga `reset`.
+        pub reset: bool,
+        /// Por id, lo que escribe otro justo antes de cada una de las próximas escrituras de ese
+        /// objeto (su `kid` y su blob; `None`, una lápida): la nuestra choca (409). Ver `clash`.
+        pub clashes: std::collections::BTreeMap<
+            String,
+            std::collections::VecDeque<Option<(String, String)>>,
+        >,
+        /// Las próximas escrituras que dan 429.
+        pub busy: usize,
+        /// Las próximas escrituras que dan 503 (el hub sin MongoDB).
+        pub down: usize,
+        /// Lo que se ha pedido leer: `(since, after)`.
+        pub gets: Vec<(i64, Option<String>)>,
+        /// Las escrituras que han llegado: cuándo, `op`, id y `v`.
+        pub writes: Vec<(std::time::Instant, String, String, i64)>,
+        /// Cuántos objetos caben (lápidas incluidas): crear uno más da 413 «cuenta llena».
+        pub limit: usize,
+        /// Los ids cuyo blob es «demasiado largo» (413).
+        pub too_big: std::collections::BTreeSet<String>,
+        /// Los ids que el hub no acepta (400).
+        pub bad: std::collections::BTreeSet<String>,
+        /// Lo menos que da como `next`: un hub cuyo reloj avanzó sin nada nuevo que enseñar.
+        pub floor: i64,
+        /// La `ref` de la cuenta que lleva cada página; sin ella, como un hub de antes.
+        pub account_ref: Option<String>,
+        /// Lo que se hace al recibir cada lectura (con cuántas van, contándola) y cada escritura
+        /// (con cuántas van): para cortar algo a medias en las pruebas.
+        pub on_get: Option<Box<dyn FnMut(usize) + Send>>,
+        pub on_write: Option<Box<dyn FnMut(usize) + Send>>,
+    }
+
+    impl Default for Board {
+        fn default() -> Self {
+            Self {
+                items: Default::default(),
+                clock: BOARD_T0,
+                page: 100,
+                reset: false,
+                clashes: Default::default(),
+                busy: 0,
+                down: 0,
+                gets: vec![],
+                writes: vec![],
+                limit: 2000,
+                too_big: Default::default(),
+                bad: Default::default(),
+                floor: 0,
+                account_ref: None,
+                on_get: None,
+                on_write: None,
+            }
+        }
+    }
+
+    impl Board {
+        fn tick(&mut self) -> i64 {
+            self.clock += BOARD_TICK;
+            self.clock
+        }
+
+        /// Que otro escriba `other` en `id` justo antes de nuestra próxima escritura de `id`.
+        pub fn clash(&mut self, id: &str, other: Option<(String, String)>) {
+            self.clashes.entry(id.into()).or_default().push_back(other);
+        }
+
+        /// Otro escribe `id` (un blob, o una lápida con `None`): da el objeto como queda.
+        pub fn write(&mut self, id: &str, blob: Option<(&str, &str)>) -> BoardItem {
+            let v = self.items.get(id).map_or(0, |i| i.v) + 1;
+            let at = self.tick();
+            let item = BoardItem {
+                id: id.into(),
+                v,
+                kid: blob.map(|b| b.0.to_owned()).unwrap_or_default(),
+                blob: blob.map(|b| b.1.to_owned()),
+                gone: blob.is_none(),
+                at,
+            };
+            self.items.insert(id.into(), item.clone());
+            item
+        }
+
+        /// Contesta un `{"board": …}` del nido como el hub; lo demás, nada. Tras una escritura
+        /// que sale bien avisa del cambio, también a quien escribe (como el hub).
+        pub fn answer(&mut self, msg: &serde_json::Value) -> Option<Reply> {
+            let b = msg.get("board")?;
+            let req = b["req"].as_u64()?;
+            let mut reply = match b["op"].as_str() {
+                Some("get") => {
+                    let mut page = self.get(b["since"].as_i64().unwrap_or(0), b["after"].as_str());
+                    if let Some(r) = &self.account_ref {
+                        page["ref"] = r.clone().into();
+                    }
+                    page
+                }
+                Some(op @ ("put" | "del")) => self.change(op, b),
+                _ => serde_json::json!({
+                    "status": 400, "error": "petición del tablero no válida",
+                }),
+            };
+            reply["req"] = req.into();
+            let at = (reply["status"] == 200 && b["op"] != "get")
+                .then(|| reply["at"].as_i64())
+                .flatten();
+            let mut all = vec![serde_json::json!({ "boarded": reply })];
+            if let Some(at) = at {
+                all.push(serde_json::json!({ "board": { "at": at } }));
+            }
+            Some(Reply::SendAll(all))
+        }
+
+        fn get(&mut self, since: i64, after: Option<&str>) -> serde_json::Value {
+            self.gets.push((since, after.map(str::to_owned)));
+            if let Some(f) = self.on_get.as_mut() {
+                f(self.gets.len());
+            }
+            if after.is_none() && since > 0 && std::mem::take(&mut self.reset) {
+                return serde_json::json!({ "status": 200, "items": [], "next": 0,
+                    "more": false, "after": null, "reset": true });
+            }
+            let after = after.map(|a| {
+                let (at, id) = a.split_once(':').unwrap();
+                (at.parse::<i64>().unwrap(), id.to_owned())
+            });
+            let lo = if since > 0 {
+                since - BOARD_OVERLAP
+            } else {
+                i64::MIN
+            };
+            let mut rows: Vec<&BoardItem> = self
+                .items
+                .values()
+                .filter(|i| match &after {
+                    Some((at, id)) => (i.at, &i.id) > (*at, id),
+                    None => i.at > lo,
+                })
+                .collect();
+            rows.sort_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
+            let more = rows.len() > self.page;
+            rows.truncate(self.page);
+            let next = rows
+                .iter()
+                .map(|i| i.at)
+                .max()
+                .unwrap_or(0)
+                .max(since)
+                .max(self.floor);
+            let after = rows
+                .last()
+                .filter(|_| more)
+                .map(|i| format!("{}:{}", i.at, i.id));
+            serde_json::json!({ "status": 200, "items": rows, "next": next, "more": more,
+                "after": after, "reset": false })
+        }
+
+        fn change(&mut self, op: &str, b: &serde_json::Value) -> serde_json::Value {
+            let id = b["id"].as_str().unwrap_or_default().to_owned();
+            let v = b["v"].as_i64().unwrap_or(-1);
+            self.writes
+                .push((std::time::Instant::now(), op.into(), id.clone(), v));
+            if let Some(f) = self.on_write.as_mut() {
+                f(self.writes.len());
+            }
+            if self.bad.contains(&id) {
+                return serde_json::json!({ "status": 400, "error": "el blob no es base64" });
+            }
+            if op == "put" && self.too_big.contains(&id) {
+                return serde_json::json!({ "status": 413, "error": "el blob pasa de 11000 bytes" });
+            }
+            if self.busy > 0 {
+                self.busy -= 1;
+                return serde_json::json!({ "status": 429,
+                    "error": "demasiadas escrituras en el tablero: prueba en un rato" });
+            }
+            if self.down > 0 {
+                self.down -= 1;
+                return serde_json::json!({ "status": 503, "error": "error del hub" });
+            }
+            if let Some(other) = self.clashes.get_mut(&id).and_then(|q| q.pop_front()) {
+                self.write(&id, other.as_ref().map(|(k, b)| (k.as_str(), b.as_str())));
+            }
+            let current = self.items.get(&id).cloned().unwrap_or(BoardItem {
+                id: id.clone(),
+                v: 0,
+                kid: String::new(),
+                blob: None,
+                gone: true,
+                at: 0,
+            });
+            if current.v != v {
+                return serde_json::json!({ "status": 409,
+                    "error": "la versión no es la que hay", "current": current });
+            }
+            if op == "put" && v == 0 && self.items.len() >= self.limit {
+                return serde_json::json!({ "status": 413,
+                    "error": format!("la cuenta ya tiene {} objetos", self.limit) });
+            }
+            let item = if op == "put" {
+                let (kid, blob) = (b["kid"].as_str().unwrap(), b["blob"].as_str().unwrap());
+                self.write(&id, Some((kid, blob)))
+            } else {
+                self.write(&id, None)
+            };
+            serde_json::json!({ "status": 200, "v": item.v, "at": item.at })
+        }
+    }
+
+    /// Un hub de mentira (el que graba) con el tablero `board`.
+    pub async fn board(board: Arc<Mutex<Board>>) -> Recorder {
+        recording(move |v| board.lock().unwrap().answer(v)).await
     }
 
     /// Conecta `hub` al hub de mentira de `addr` y espera a que esté conectado.

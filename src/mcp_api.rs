@@ -12,7 +12,8 @@
 //!
 //! Las sesiones de otro equipo del grupo piden lo mismo por el canal «peer» (`e2e::MODE_PEER`):
 //! `peer_call` atiende esas peticiones con las mismas herramientas, salvo las que son solo de la
-//! propia sesión (`alert`, `secret`, `clipboard`, `send_file` y `plan_*`, menos `plan_get`). Quien llama es
+//! propia sesión (`alert`, `secret`, `clipboard`, `send_file`, `plan_*` menos `plan_get`, y las
+//! del tablero, en `board_tools`). Quien llama es
 //! un [`Caller`]: una sesión de aquí o una de otro equipo, siempre con su dirección canónica.
 //! Lo que pide una de aquí para una sesión de otro equipo se le pasa a ese equipo por el mismo
 //! canal (`AppState::peer_member`), y `sessions` junta las de todos. Lo que pide una de otro
@@ -1173,6 +1174,13 @@ pub async fn api_mcp(
         "plan_set" => tool_plan_set(&st, &session, args).await,
         "plan_task" => tool_plan_task(&st, &session, args).await,
         "plan_clear" => tool_plan_clear(&st, &session, args).await,
+        // El tablero de la cuenta: cada nido tiene su copia, así que solo desde una sesión de
+        // aquí.
+        "board" => crate::board_tools::tool_board(&st, &session, args).await,
+        "project" => crate::board_tools::tool_project(&st, &session, args).await,
+        "objective" => crate::board_tools::tool_objective(&st, &session, args).await,
+        "join" => crate::board_tools::tool_join(&st, &session, args).await,
+        "leave" => crate::board_tools::tool_leave(&st, &session, args).await,
         _ => {
             let caller = Caller::local(&me, &session.id, &session.name);
             run_tool(&st, &me, &caller, &tool, args).await
@@ -1185,9 +1193,10 @@ pub async fn api_mcp(
 }
 
 /// Lo que se puede pedir desde otro equipo: las herramientas, menos `alert`, `secret`,
-/// `clipboard`, `send_file`, `plan_set`, `plan_task` y `plan_clear` (van siempre al nido de quien
-/// las usa), y, para su nido, `status` (lo que miran sus esperas) y `alerts` (las de aquí sin
-/// leer, para `nido alerts`).
+/// `clipboard`, `send_file`, `plan_set`, `plan_task`, `plan_clear` y las del tablero: `board`,
+/// `project`, `objective`, `join` y `leave`. Esas van siempre al nido de quien las usa. Y, para
+/// su nido, `status` (lo que miran sus esperas) y `alerts` (las de aquí sin leer, para
+/// `nido alerts`).
 pub const PEER_TOOLS: [&str; 11] = [
     "sessions", "send", "read", "open", "answer", "close", "start", "stop", "status", "alerts",
     "plan_get",
@@ -2630,7 +2639,7 @@ async fn tool_plan_set(st: &Arc<AppState>, caller: &Session, args: Value) -> Rep
     let a: plan::SetArgs = args_of(args)?;
     let id = caller.id.clone();
     let p = with_plans(st, move |plans| plans.set(&id, a, now_ms())).await?;
-    server::plan_changed(st);
+    server::plan_changed(st, &caller.id);
     progress_reply(p)
 }
 
@@ -2639,7 +2648,7 @@ async fn tool_plan_task(st: &Arc<AppState>, caller: &Session, args: Value) -> Re
     let a: plan::TaskArgs = args_of(args)?;
     let id = caller.id.clone();
     let p = with_plans(st, move |plans| plans.update_task(&id, a, now_ms())).await?;
-    server::plan_changed(st);
+    server::plan_changed(st, &caller.id);
     progress_reply(p)
 }
 
@@ -2648,7 +2657,7 @@ async fn tool_plan_clear(st: &Arc<AppState>, caller: &Session, args: Value) -> R
     let NoArgs {} = args_of(args)?;
     let id = caller.id.clone();
     with_plans(st, move |plans| plans.clear(&id)).await?;
-    server::plan_changed(st);
+    server::plan_changed(st, &caller.id);
     Ok(json!({ "ok": true }))
 }
 
@@ -3323,7 +3332,7 @@ mod tests {
         let _limit = crate::watchdog::limit(Duration::from_secs(60));
         let tmp = tempfile::tempdir().unwrap();
         let (st, s) = with_plan_session(tmp.path()).await;
-        st.group.add_member("mac-id", "bWFj", "Mac");
+        st.group.add_member("lejano-id", "bWFj", "Lejano");
         type Asked = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
         let answer: Arc<std::sync::Mutex<e2e::PeerResult>> =
             Arc::new(std::sync::Mutex::new(Ok(json!({"plan": null}))));
@@ -3336,7 +3345,7 @@ mod tests {
         })));
         let me = Machine::of(&st);
         let caller = Caller::local(&me, &s.id, &s.name);
-        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Lejano/abcd1234"}))
             .await
             .unwrap();
         assert_eq!(r, json!({"plan": null}));
@@ -3349,7 +3358,7 @@ mod tests {
         );
         let plan = json!({"plan": {"phases": [], "updated": 1}, "progress": "0/0"});
         *answer.lock().unwrap() = Ok(plan.clone());
-        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Lejano/abcd1234"}))
             .await
             .unwrap();
         assert_eq!(r, plan);
@@ -3362,14 +3371,14 @@ mod tests {
             (404, "no hay ninguna herramienta \"plan_get\"".to_owned()),
         ] {
             *answer.lock().unwrap() = Err(old);
-            let e = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+            let e = tool_plan_get(&st, &me, &caller, json!({"session": "Lejano/abcd1234"}))
                 .await
                 .unwrap_err();
             assert_eq!(e.1, "ese equipo no tiene planes (su nido es anterior)");
         }
         // Otro error, tal cual.
         *answer.lock().unwrap() = Err((404, "no existe esa sesión".to_owned()));
-        let e = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+        let e = tool_plan_get(&st, &me, &caller, json!({"session": "Lejano/abcd1234"}))
             .await
             .unwrap_err();
         assert_eq!(

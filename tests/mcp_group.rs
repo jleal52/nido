@@ -415,7 +415,7 @@ async fn the_mcp_reaches_every_machine_of_the_group() {
                 "error": "the other machine does not answer"}),
         ]
     );
-    assert!(here.group.remove_member("lento-id"));
+    assert!(here.group.remove_member_rotating("lento-id").0);
 
     // `read` en el Mac: allí lleva su posición (la de quien llama aquí).
     let (code, r) = tool(addr, &padre, "read", json!({"session": at_mac})).await;

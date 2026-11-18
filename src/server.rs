@@ -56,6 +56,8 @@ pub struct AppState {
     alert_throttle: std::sync::Mutex<AlertThrottle>,
     /// La conexión con el hub: móviles sin VPN y avisos.
     pub hub: Arc<hub::Hub>,
+    /// La copia de este nido del tablero de la cuenta (`<data>/board.json`), al día con el hub.
+    pub board: Arc<crate::board::BoardCache>,
     /// Lo que `scan` ve pasar (terminó, te necesita), para avisar al móvil.
     alerts: tokio::sync::mpsc::UnboundedSender<Alert>,
     alerts_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Alert>>>,
@@ -70,6 +72,10 @@ pub struct AppState {
     /// El grupo de equipos y el aviso de que hay que sincronizarlo.
     pub group: crate::group::Group,
     group_dirty: Notify,
+    /// Las claves del tablero que había que cambiar (un dispositivo quitado tenía la actual) y
+    /// no se pudo, por no poder guardar: el siguiente `apply_group` rota si la actual sigue
+    /// siendo una de ellas (`retry_owed`).
+    board_rotation_owed: std::sync::Mutex<Vec<String>>,
     /// Las peticiones de otros equipos ya atendidas (`e2e::MODE_PEER`), para no repetirlas.
     peer_replays: e2e::PeerReplays,
     /// Dónde estaba la conversación de cada sesión al encolarle un mensaje (`send`), para saber
@@ -101,6 +107,9 @@ pub struct AppState {
     pub outbox: Arc<crate::outbox::Outbox>,
     /// El plan de fases y tareas de cada sesión (`plan_*` del MCP).
     pub plans: Arc<crate::plan::Plans>,
+    /// El resumen del plan de las sesiones en sus enlaces del tablero, y el cierre de los de las
+    /// que se borran (la tarea, `board_progress::spawn`, la lanza `spawn_scanner`).
+    pub progress: crate::board_progress::Progress,
     /// La memoria de la voz (`/api/v1/voice/memory`), en `<state>/voice-memory.json`.
     pub voice_memory: Arc<crate::voice_memory::VoiceMemory>,
     /// Los modelos que se pueden elegir, como los enseñó el menú de `/model` la última vez que
@@ -609,6 +618,12 @@ impl AppState {
             .map_err(|e| RegistryError::Io(std::io::Error::other(e)))?;
         let phones = e2e::Phones::load(paths.data.join("phones.json"));
         let group = crate::group::Group::load(paths.data.join("group.json"), identity.public);
+        let board = crate::board::BoardCache::load(paths.data.join("board.json"), hub.clone());
+        // El equipo que sale del grupo no se lleva el tablero (decisión 8 de los proyectos).
+        {
+            let board = board.clone();
+            group.on_leave(move || board.clear());
+        }
         // Los dispositivos emparejados antes de haber grupo, también en él.
         for p in phones.list() {
             if !group.snapshot().devices.iter().any(|d| d.key == p.key)
@@ -646,6 +661,7 @@ impl AppState {
             finished_pushed: Default::default(),
             alert_throttle: Default::default(),
             hub,
+            board,
             alerts,
             alerts_rx: std::sync::Mutex::new(Some(alerts_rx)),
             identity,
@@ -654,6 +670,7 @@ impl AppState {
             tunnel_addr: Default::default(),
             direct: Default::default(),
             group,
+            board_rotation_owed: Default::default(),
             group_dirty: Notify::new(),
             peer_replays: Default::default(),
             mcp_marks: Default::default(),
@@ -668,6 +685,7 @@ impl AppState {
             asks: Default::default(),
             outbox,
             plans,
+            progress: Default::default(),
             voice_memory,
             models: std::sync::Mutex::new(models),
             model_seen: Default::default(),
@@ -1991,18 +2009,47 @@ impl AppState {
     }
 }
 
+/// El llavero del tablero, para la tarea del llavero: lo que se retire o se quite aquí se cuenta
+/// al resto del grupo.
+impl crate::board::KeyHolder for AppState {
+    fn keychain(&self) -> &crate::group::Group {
+        &self.group
+    }
+    fn keys_changed(&self) {
+        self.group_dirty.notify_one();
+    }
+}
+
 impl AppState {
-    /// Lo que el grupo ha dado de baja, fuera también de aquí.
+    /// Lo que el grupo ha dado de baja, fuera también de aquí. Por la baja en sí no se cambia la
+    /// clave del tablero (ya la cambió el equipo que lo quitó); solo si el dispositivo se llevó
+    /// de aquí la actual (`rotate_if_given`).
     fn apply_group(&self) {
+        self.retry_owed();
         for key in self.group.removed_devices() {
-            let mut phones = self.phones.lock().expect("teléfonos");
-            let id = phones
+            let given = self
+                .phones
+                .lock()
+                .expect("teléfonos")
                 .list()
                 .iter()
                 .find(|p| p.key == key)
-                .map(|p| p.id.clone());
+                .map(|p| p.board_kids.clone())
+                .unwrap_or_default();
+            self.rotate_if_given(&given);
+            #[cfg(test)]
+            tests::run_apply_group_hook(self);
+            let mut phones = self.phones.lock().expect("teléfonos");
+            let (id, given) = phones
+                .list()
+                .iter()
+                .find(|p| p.key == key)
+                .map(|p| (Some(p.id.clone()), p.board_kids.clone()))
+                .unwrap_or_default();
             let removed = phones.remove_by_key(&key);
             drop(phones);
+            // Otra vez, con lo apuntado justo al quitarlo (ver `rotate_if_given`).
+            self.rotate_if_given(&given);
             if let Err(e) = &removed {
                 eprintln!("nido: no se pudo guardar la baja de un dispositivo: {e}");
             }
@@ -2015,35 +2062,88 @@ impl AppState {
         }
     }
 
+    /// Un dispositivo quitado en otro equipo pudo llevarse de aquí la clave actual después de su
+    /// baja, antes de que esta llegara (`api_board_keys`): la primera, creada aquí con el llavero
+    /// vacío, o una que llegó aquí antes que la baja. Esa clave es posterior a la baja, así que
+    /// `rotation_due` no la rotaría. Se rota si la actual está entre las activas que se le dieron
+    /// (`board_kids`, que junta todas las activas que se le dieron y solo poda las retiradas).
+    ///
+    /// Se mira por `kid`, no por horas: no depende de los relojes de los equipos ni de empates en
+    /// el mismo milisegundo, y una retirada nunca vuelve a ser activa. En una baja normal, que
+    /// llega con su rotación, la actual es la nueva, que no se le dio: no se rota dos veces. Tras
+    /// rotar aquí, la actual tampoco está entre ellas: no se repite.
+    ///
+    /// Se llama dos veces por dispositivo quitado. Antes de quitarlo de `phones`, para que si el
+    /// proceso cae entre medias lo apuntado siga en el disco. Y después, con lo que tenía apuntado
+    /// en el mismo cerrojo con que se quita: una petición que apuntó entre la primera mirada y la
+    /// baja en `phones` (con una instantánea de antes de la baja) también se ve, y una posterior
+    /// ya no encuentra su `Phone` y recibe 403. También lo usa `remove_phone`, por si el grupo ya
+    /// traía la baja y no rota.
+    ///
+    /// Si no se puede guardar, no rota (`rotate_board_key` no da una clave que no está en el
+    /// disco) y la actual queda adeudada en memoria (`board_rotation_owed`), para `retry_owed`.
+    /// Tras un reinicio con la rotación aún adeudada, se pierde: es el único hueco que queda, y
+    /// solo con el disco fallando. No mira lo adeudado: así, con el disco fallando, cada baja
+    /// intenta solo lo suyo.
+    fn rotate_if_given(&self, given: &[String]) {
+        let Some(current) = self.group.board_keys().current().map(|k| k.kid.clone()) else {
+            return;
+        };
+        if !given.contains(&current) {
+            return;
+        }
+        match self.group.rotate_after_removal() {
+            Ok(rotated) => {
+                if rotated.is_some() {
+                    eprintln!(
+                        "nido: cambiada la clave del tablero que pudo llevarse un dispositivo quitado"
+                    );
+                }
+            }
+            Err(e) => {
+                let mut owed = self.board_rotation_owed.lock().expect("deuda");
+                if !owed.contains(&current) {
+                    owed.push(current);
+                }
+                eprintln!(
+                    "nido: no se pudo guardar el cambio de la clave del tablero tras una baja ({e}); se reintentará"
+                );
+            }
+        }
+    }
+
+    /// Reintenta la rotación adeudada (`rotate_if_given`), una vez por `apply_group`: solo si la
+    /// actual sigue siendo una de las adeudadas. Si ya no (otro equipo rotó, o se rotó aquí por
+    /// otra baja), la deuda está pagada y no se rota de más.
+    fn retry_owed(&self) {
+        let mut owed = self.board_rotation_owed.lock().expect("deuda");
+        if owed.is_empty() {
+            return;
+        }
+        let current = self.group.board_keys().current().map(|k| k.kid.clone());
+        if !current.is_some_and(|c| owed.contains(&c)) {
+            owed.clear();
+            return;
+        }
+        match self.group.rotate_after_removal() {
+            Ok(_) => {
+                owed.clear();
+                eprintln!("nido: cambiada la clave del tablero que quedó pendiente tras una baja");
+            }
+            Err(e) => eprintln!(
+                "nido: sigue sin poder guardarse el cambio de la clave del tablero ({e}); se reintentará"
+            ),
+        }
+    }
+
     /// Cuenta el estado del grupo a cada equipo y junta lo que contesten. Si alguno sabía algo
     /// nuevo, se repite una vez para que lo sepan todos.
     async fn sync_group(&self) {
         for _ in 0..2 {
-            let mut learned = false;
-            for m in self.group.others() {
-                let Ok(key) =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &m.key)
-                else {
-                    continue;
-                };
-                let Ok(key) = <[u8; 32]>::try_from(key) else {
-                    continue;
-                };
-                let ours = serde_json::to_vec(&self.group.snapshot()).unwrap_or_default();
-                let Ok((dial, first)) = e2e::Dial::start(&self.identity, &key, None, &ours) else {
-                    continue;
-                };
-                let reply = match self.hub.exchange(&m.id, first).await {
-                    Ok(r) => r,
-                    Err(_) => continue, // apagado o sin conexión: ya se pondrá al día
-                };
-                if let Ok(payload) = dial.finish(&reply)
-                    && let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload)
-                    && self.group.merge(&theirs)
-                {
-                    learned = true;
-                }
-            }
+            let learned = e2e::sync_members(&self.group, &self.identity, |id, first| async move {
+                self.hub.exchange(&id, first).await
+            })
+            .await;
             self.apply_group();
             if !learned {
                 break;
@@ -2368,6 +2468,16 @@ pub fn spawn_scanner(state: Arc<AppState>) {
     }
     // La conexión con el hub (si hay uno configurado).
     hub::spawn(state.hub.clone(), state.clone());
+    // La copia del tablero, al día con el hub mientras haya conexión.
+    {
+        let st = state.clone();
+        crate::board::spawn(state.board.clone(), move || st.group.board_keys());
+    }
+    // El llavero: recifrar lo cifrado con claves retiradas y quitar las que no usa nadie.
+    crate::board::spawn_upkeep(state.board.clone(), state.clone());
+    // El resumen del plan de las sesiones en sus enlaces del tablero, y el cierre y la limpieza
+    // de los de las sesiones que ya no están.
+    crate::board_progress::spawn(state.clone());
     // Las cuentas de Claude: lo que gasta cada una, mirado de vez en cuando.
     state.accounts.spawn(state.paths.home.clone());
     // Tras un cambio automático de cuenta, las sesiones paradas por el límite siguen con la nueva.
@@ -2431,6 +2541,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/push/test", post(api_push_test))
         .route("/api/v1/voice/token", post(api_voice_token))
         .route("/api/v1/hub/session", post(api_hub_session))
+        .route("/api/v1/board/keys", get(api_board_keys))
         // La memoria de la voz: cada ruta tiene que mirar `paired_device` antes que nada y estar
         // en `memory_routes()` de las pruebas, que comprueban que el token de este equipo no vale.
         .route("/api/v1/voice/memory", get(api_voice_memory))
@@ -2748,6 +2859,168 @@ async fn api_hub_session(
             error(status, e.message())
         }
     }
+}
+
+const BOARD_KEYS_DENIED: &str =
+    "solo un teléfono o una web emparejados pueden pedir las claves del tablero";
+const BOARD_KEY_UNSAVED: &str = "no se pudo guardar la clave del tablero; prueba otra vez";
+const BOARD_KEY_NONE: &str =
+    "el llavero del tablero no tiene ninguna clave activa; prueba otra vez";
+const BOARD_KIDS_UNSAVED: &str =
+    "no se pudo apuntar qué claves del tablero tiene este dispositivo; prueba otra vez";
+
+/// Que el llavero del tablero tenga clave actual: si no hay ninguna activa, crea la primera.
+/// Crearla guarda en el disco (con fsync): fuera del runtime, y solo si hace falta. Si no se
+/// pudo guardar, el mensaje del error (503). Lo usan `GET /api/v1/board/keys` y las
+/// herramientas del MCP que escriben en el tablero (`board_tools`).
+pub(crate) async fn ensure_board_key(st: &Arc<AppState>) -> Result<(), &'static str> {
+    if st.group.board_keys().current().is_some() {
+        return Ok(());
+    }
+    let st = st.clone();
+    match tokio::task::spawn_blocking(move || st.group.ensure_board_key()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            eprintln!("nido: no se pudo guardar la clave del tablero: {e}");
+            Err(BOARD_KEY_UNSAVED)
+        }
+        Err(e) => {
+            eprintln!("nido: falló la tarea que crea la clave del tablero: {e}");
+            Err(BOARD_KEY_UNSAVED)
+        }
+    }
+}
+
+/// Una clave del llavero tal como la recibe un dispositivo. Sin `Debug`: lleva el secreto.
+#[derive(Serialize)]
+struct DeviceBoardKey {
+    kid: String,
+    /// Los 32 bytes, en base64 estándar con relleno (como van en el llavero).
+    key: String,
+    retired: bool,
+}
+
+/// Lo que recibe un dispositivo de `GET /api/v1/board/keys`. Sin `Debug`: lleva los secretos.
+#[derive(Serialize)]
+struct DeviceKeyring {
+    current: String,
+    keys: Vec<DeviceBoardKey>,
+}
+
+impl DeviceKeyring {
+    /// Los `kid` de las activas que lleva: lo que se apunta en su `Phone` (`board_kids`).
+    fn active_kids(&self) -> Vec<String> {
+        self.keys
+            .iter()
+            .filter(|k| !k.retired)
+            .map(|k| k.kid.clone())
+            .collect()
+    }
+}
+
+/// Por qué no se le da el llavero a un dispositivo.
+#[derive(Debug, PartialEq)]
+enum KeysRefused {
+    /// El grupo ya no lo conoce (o nunca lo conoció).
+    NotInGroup,
+    /// No hay clave activa.
+    NoKey,
+}
+
+/// El llavero para el dispositivo de clave `device_key`, de una instantánea del grupo: se decide
+/// y se contesta con la misma. Van las claves que siguen en el llavero (`Keyring::of`: activas y
+/// retiradas, que tienen secreto; las lápidas no), por `kid`, y la actual.
+///
+/// El invariante: en una instantánea en la que el dispositivo sigue vivo, ninguna clave es
+/// posterior a una baja suya que este nido conozca, porque la baja y su rotación van en un solo
+/// cambio (`remove_device_rotating`). Lo que no cubre es una baja que este nido aún no conoce
+/// (hecha en otro equipo): eso lo arregla `apply_group` al enterarse, con `board_kids`.
+fn board_keys_for(
+    snapshot: &crate::group::State,
+    device_key: &str,
+) -> Result<DeviceKeyring, KeysRefused> {
+    if snapshot.device(device_key).is_none() {
+        return Err(KeysRefused::NotInGroup);
+    }
+    let ring = crate::group::Keyring::of(snapshot);
+    let current = ring.current().ok_or(KeysRefused::NoKey)?.kid.clone();
+    let keys = ring
+        .keys
+        .into_iter()
+        .map(|k| DeviceBoardKey {
+            retired: k.retired.is_some(),
+            kid: k.kid,
+            key: k.key,
+        })
+        .collect();
+    Ok(DeviceKeyring { current, keys })
+}
+
+/// `GET /api/v1/board/keys`: el llavero del tablero para la web y la app, que cifran y descifran
+/// el tablero ellas mismas: `{"current": "<kid>", "keys": [{"kid", "key", "retired"}]}`
+/// (`board_keys_for`). Si no hay ninguna activa, la crea, y solo la da si quedó guardada (503 si
+/// no).
+///
+/// Solo para un dispositivo emparejado que el grupo sigue conociendo: uno quitado desde otro
+/// equipo conserva su token en `phones` hasta que aquí corre `apply_group`, y en ese rato no
+/// tiene que llevarse ninguna clave. Se mira antes de crear la clave (un 403 no crea nada) y otra
+/// vez con la instantánea con la que se contesta.
+///
+/// Lo que esto no ve es una baja hecha en otro equipo que aquí aún no ha llegado: el dispositivo
+/// se lleva la clave actual (o la primera, que se crea aquí), posterior a su baja, y
+/// `rotation_due` ya no rotaría al llegar la baja. Por eso se apuntan en su `Phone` los `kid` de
+/// las activas que se le dan (`board_kids`), antes de contestar y en el disco (503 si no se
+/// puede), y `apply_group`, al quitarlo, rota si la actual está entre ellas. Si lo acaban de
+/// quitar de `phones` entre medias, 403.
+///
+/// La respuesta lleva `Cache-Control: no-store`, y no se registra.
+async fn api_board_keys(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let device = crate::auth::bearer(&headers).and_then(|t| {
+        st.phones
+            .lock()
+            .expect("teléfonos")
+            .by_token(t)
+            .map(|p| (p.id.clone(), p.key.clone()))
+    });
+    let Some((device_id, device_key)) =
+        device.filter(|(_, k)| st.group.snapshot().device(k).is_some())
+    else {
+        return error(StatusCode::FORBIDDEN, BOARD_KEYS_DENIED);
+    };
+    if let Err(msg) = ensure_board_key(&st).await {
+        return error(StatusCode::SERVICE_UNAVAILABLE, msg);
+    }
+    let ring = match board_keys_for(&st.group.snapshot(), &device_key) {
+        Ok(r) => r,
+        Err(KeysRefused::NotInGroup) => return error(StatusCode::FORBIDDEN, BOARD_KEYS_DENIED),
+        Err(KeysRefused::NoKey) => return error(StatusCode::SERVICE_UNAVAILABLE, BOARD_KEY_NONE),
+    };
+    // Lo que ya está retirado o borrado no puede volver a ser la actual: se poda de lo apuntado.
+    let dead: Vec<String> = st
+        .group
+        .snapshot()
+        .keys
+        .iter()
+        .filter(|k| k.removed || k.retired.is_some())
+        .map(|k| k.kid.clone())
+        .collect();
+    let noted =
+        st.phones
+            .lock()
+            .expect("teléfonos")
+            .note_board_kids(&device_id, ring.active_kids(), &dead);
+    match noted {
+        Ok(true) => {}
+        Ok(false) => return error(StatusCode::FORBIDDEN, BOARD_KEYS_DENIED),
+        Err(e) => {
+            eprintln!("nido: no se pudo apuntar qué claves del tablero tiene un dispositivo: {e}");
+            return error(StatusCode::SERVICE_UNAVAILABLE, BOARD_KIDS_UNSAVED);
+        }
+    }
+    ([(header::CACHE_CONTROL, "no-store")], Json(ring)).into_response()
 }
 
 /// Si pide un dispositivo emparejado (con su token), no el token de este equipo.
@@ -3665,7 +3938,20 @@ async fn api_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> 
 /// La para, la quita del registro y borra su estado (historial, registro del guardián).
 pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), RegistryError> {
     stop_and_wait(st, id).await;
+    // El último resumen de su plan, para sus enlaces del tablero, que se cierran (parada, ya no
+    // cambia). Puede leer del disco: fuera del hilo.
+    let last = {
+        let (plans, id) = (st.plans.clone(), id.to_owned());
+        tokio::task::spawn_blocking(move || plans.try_summary(&id))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
     let res = st.registry.lock().await.remove(id);
+    if res.is_ok() {
+        let last = last.map(|s| s.as_ref().map(crate::board_progress::link_plan));
+        st.progress.session_deleted(id, now_ms(), last);
+    }
     st.mcp_cursors.forget(id);
     st.inbox.forget(id);
     st.asks.cancel_session(id);
@@ -3706,9 +3992,11 @@ async fn api_plan(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Re
     }
 }
 
-/// Ha cambiado el plan de una sesión: la lista, otra vez (con el `rev` nuevo de su resumen).
-pub fn plan_changed(st: &AppState) {
+/// Ha cambiado el plan de la sesión `id`: la lista, otra vez (con el `rev` nuevo de su
+/// resumen), y su resumen a sus enlaces del tablero (`board_progress`, a su ritmo).
+pub fn plan_changed(st: &AppState, id: &str) {
     st.refresh.notify_one();
+    st.progress.plan_changed(id);
 }
 
 #[derive(Deserialize)]
@@ -4128,7 +4416,9 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
             "para sacar este equipo, hazlo desde otro del grupo",
         );
     }
-    if st.group.remove_member(&id) {
+    let (found, rotated) = st.group.remove_member_rotating(&id);
+    if found {
+        said_rotated(rotated);
         st.group_dirty.notify_one();
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -4136,21 +4426,42 @@ async fn api_group_remove(State(st): State<Arc<AppState>>, Path(id): Path<String
     }
 }
 
-/// Quita un dispositivo de este equipo y de todo el grupo (por su clave).
+/// Tras quitar un equipo o un dispositivo del grupo, la clave del tablero cambia, en el mismo
+/// cambio que la baja (`Group::remove_member_rotating`, `remove_device_rotating`): lo que se
+/// cifre desde ahora no lo lee quien se fue, y la tarea del llavero (`board::spawn_upkeep`)
+/// recifra lo de antes. Solo donde se quita: al enterarse de que lo quitó otro equipo
+/// (`apply_group`) no, que ese ya rotó. Con el llavero vacío no hay nada que cambiar: quien se
+/// fue no tenía ninguna clave. Si no se puede guardar, la baja queda en el estado y la tarea del
+/// llavero (aquí o en otro equipo) rota en cuanto pueda (`Group::rotate_if_due`).
+fn said_rotated(rotated: Option<crate::group::BoardKey>) {
+    if let Some(k) = rotated {
+        eprintln!("nido: la clave del tablero ha cambiado ({})", k.kid);
+    }
+}
+
+/// Quita un dispositivo de este equipo y de todo el grupo (por su clave). Si estaba en el grupo,
+/// cambia la clave del tablero (`said_rotated`); por aquí pasa también el que se sale solo
+/// (`api_remove_me`).
 fn remove_phone(st: &AppState, id: &str) -> Response {
-    let key = st
-        .phones
-        .lock()
-        .expect("teléfonos")
-        .list()
-        .iter()
-        .find(|p| p.id == id)
-        .map(|p| p.key.clone());
+    // Fuera de aquí antes de rotar: que no pueda pedir la clave nueva entre medias.
+    let (key, given, removed) = {
+        let mut phones = st.phones.lock().expect("teléfonos");
+        let (key, given) = phones
+            .list()
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (Some(p.key.clone()), p.board_kids.clone()))
+            .unwrap_or_default();
+        (key, given, phones.remove(id))
+    };
     if let Some(k) = &key {
-        st.group.remove_device(k);
+        let (_, rotated) = st.group.remove_device_rotating(k);
+        said_rotated(rotated);
+        // Si el grupo ya traía su baja (de otro equipo, sin aplicar aún), no ha rotado: rota si
+        // se llevó la actual.
+        st.rotate_if_given(&given);
         st.group_dirty.notify_one();
     }
-    let removed = st.phones.lock().expect("teléfonos").remove(id);
     // Sus sesiones del hub, fuera también; aunque no se haya podido guardar la baja, de la
     // memoria ya ha salido.
     if key.is_some() {
@@ -4622,6 +4933,28 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+
+    /// Lo que corre en `apply_group` entre la primera mirada a `board_kids` y la baja en
+    /// `phones`.
+    type ApplyGroupHook = Box<dyn Fn(&AppState)>;
+
+    thread_local! {
+        /// El gancho de `apply_group` (las pruebas son de un solo hilo: el mismo que la llama).
+        static APPLY_GROUP_HOOK: std::cell::RefCell<Option<ApplyGroupHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_apply_group_hook(st: &AppState) {
+        APPLY_GROUP_HOOK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(st);
+            }
+        });
+    }
+
+    fn set_apply_group_hook(f: ApplyGroupHook) {
+        APPLY_GROUP_HOOK.with(|h| *h.borrow_mut() = Some(f));
+    }
 
     #[test]
     fn a_stop_time_from_before_the_last_run_is_forgotten() {
@@ -5253,7 +5586,7 @@ mod tests {
             .add(&[2u8; 32], "web", None)
             .unwrap();
         // El fichero temporal de `phones.json` es una carpeta: no se puede guardar.
-        std::fs::create_dir_all(tmp.path().join("data").join("phones.tmp")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("data").join("phones.json.tmp")).unwrap();
         assert_eq!(
             remove_phone(&st, &phone.id).status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -5310,6 +5643,655 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert_eq!(rec.next("unsession").await, json!({ "device": third.id }));
+    }
+
+    // ---------- La clave del tablero al quitar ----------
+
+    /// El llavero: la actual y cuántas retiradas.
+    fn ring_of(st: &AppState) -> (String, usize) {
+        let ring = st.group.board_keys();
+        let current = ring.current().unwrap().kid.clone();
+        let retired = ring.keys.iter().filter(|k| k.retired.is_some()).count();
+        (current, retired)
+    }
+
+    /// Quitar un dispositivo (aquí, o él mismo con «Cerrar sesión») o un equipo cambia la clave
+    /// del tablero: la nueva es la actual y la de antes queda retirada. Una vez por baja.
+    #[tokio::test]
+    async fn removing_a_device_or_a_machine_rotates_the_board_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let first = st.group.ensure_board_key().unwrap();
+        let add = |n: u8| {
+            st.group.add_device(&[n; 32], "tel");
+            st.phones
+                .lock()
+                .unwrap()
+                .add(&[n; 32], "tel", None)
+                .unwrap()
+        };
+        let (phone, web) = (add(1), add(2));
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        let (cur, retired) = ring_of(&st);
+        assert_ne!(cur, first.kid);
+        assert_eq!(retired, 1);
+        // Otra vez el mismo: ya no está, no rota.
+        assert_eq!(remove_phone(&st, &phone.id).status(), StatusCode::NOT_FOUND);
+        assert_eq!(ring_of(&st), (cur.clone(), 1));
+        // El que se sale solo (`DELETE /api/v1/phones/me`).
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", web.token).parse().unwrap(),
+        );
+        let r = api_remove_me(State(st.clone()), headers).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        let (cur2, retired) = ring_of(&st);
+        assert_ne!(cur2, cur);
+        assert_eq!(retired, 2);
+        // Un equipo del grupo.
+        st.group.add_member("otro", "k-otro", "mac");
+        let r = api_group_remove(State(st.clone()), Path("otro".into())).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        let (cur3, retired) = ring_of(&st);
+        assert_ne!(cur3, cur2);
+        assert_eq!(retired, 3);
+        let r = api_group_remove(State(st.clone()), Path("otro".into())).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(ring_of(&st), (cur3, 3));
+    }
+
+    /// De punta a punta: quitar un dispositivo rota la clave, la tarea del llavero lo recifra
+    /// todo en el hub con la nueva (los bytes tal cual), y la vieja queda retirada (se quitará a
+    /// los 30 días, sin objetos).
+    #[tokio::test]
+    async fn removing_a_device_ends_with_everything_recrypted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let board = Arc::new(std::sync::Mutex::new(hub::fake::Board::default()));
+        let rec = hub::fake::board(board.clone()).await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        let old = st.group.ensure_board_key().unwrap();
+        let raw = |k: &crate::group::BoardKey| -> [u8; 32] {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &k.key)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let texts: Vec<(String, Vec<u8>)> = (1..=2u8)
+            .map(|n| {
+                let id = format!("{n:032x}");
+                let text = format!(r#"{{"t":"project","name":"p{n}","futuro":true}}"#);
+                (id, text.into_bytes())
+            })
+            .collect();
+        for (id, text) in &texts {
+            let blob = crate::board::seal(&raw(&old), id, text).unwrap();
+            board.lock().unwrap().write(id, Some((&old.kid, &blob)));
+        }
+        // La copia, con un hueco corto entre escrituras (no los 6 s de verdad).
+        let cache = crate::board::BoardCache::load_with(
+            tmp.path().join("data/board-prueba.json"),
+            st.hub.clone(),
+            Duration::from_millis(50),
+        );
+        cache.sync().await.unwrap();
+        st.group.add_device(&[1u8; 32], "tel");
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        let new = st.group.board_keys().current().cloned().unwrap();
+        assert_ne!(new.kid, old.kid);
+        crate::board::spawn_upkeep_with(cache.clone(), st.clone(), Duration::from_secs(3600));
+        let wait = async {
+            while !board
+                .lock()
+                .unwrap()
+                .items
+                .values()
+                .all(|i| i.kid == new.kid)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("todo recifrado");
+        for (id, text) in &texts {
+            let b = board.lock().unwrap();
+            let blob = b.items[id].blob.clone().unwrap();
+            assert_eq!(&crate::board::open(&raw(&new), id, &blob).unwrap(), text);
+        }
+        let ring = st.group.board_keys();
+        let was = ring.keys.iter().find(|k| k.kid == old.kid).unwrap();
+        assert!(was.retired.is_some(), "la vieja, retirada");
+        assert_eq!(ring.current(), Some(&new));
+    }
+
+    /// Sin llavero (el tablero no se ha usado), quitar no crea ninguna clave: quien se va no
+    /// tenía ninguna.
+    #[tokio::test]
+    async fn removing_without_board_keys_makes_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        st.group.add_device(&[1u8; 32], "tel");
+        let phone = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        assert_eq!(
+            remove_phone(&st, &phone.id).status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(st.group.snapshot().keys.is_empty());
+    }
+
+    /// Lo que quitó otro equipo, al llegar por el grupo (`apply_group`), no vuelve a rotar: ese
+    /// ya rotó. Los dos acaban con el mismo llavero, con una sola clave nueva.
+    #[tokio::test]
+    async fn a_removal_from_another_machine_does_not_rotate_twice() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        a.group.ensure_board_key().unwrap();
+        a.group.add_device(&[1u8; 32], "tel");
+        b.group.merge(&a.group.snapshot());
+        let phone = a
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        b.phones
+            .lock()
+            .unwrap()
+            .add(&[1u8; 32], "tel", None)
+            .unwrap();
+        assert_eq!(remove_phone(&a, &phone.id).status(), StatusCode::NO_CONTENT);
+        assert!(b.group.merge(&a.group.snapshot()));
+        b.apply_group();
+        assert!(b.phones.lock().unwrap().list().is_empty(), "quitado aquí");
+        assert_eq!(b.group.board_keys(), a.group.board_keys());
+        assert_eq!(b.group.board_keys().keys.len(), 2);
+    }
+
+    // ---------- El llavero para los dispositivos (`GET /api/v1/board/keys`) ----------
+
+    /// Un dispositivo emparejado aquí y apuntado en el grupo, como queda al emparejarse.
+    fn board_device(st: &AppState, n: u8) -> crate::e2e::Phone {
+        st.group.add_device(&[n; 32], "tel");
+        st.phones
+            .lock()
+            .unwrap()
+            .add(&[n; 32], "tel", None)
+            .unwrap()
+    }
+
+    /// `GET /api/v1/board/keys` con ese token: el código, `Cache-Control` y el cuerpo.
+    async fn board_keys_with(
+        st: &Arc<AppState>,
+        token: &str,
+    ) -> (StatusCode, Option<String>, serde_json::Value) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let r = api_board_keys(State(st.clone()), headers).await;
+        let status = r.status();
+        let cache = r
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap().to_owned());
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (status, cache, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Un 403 que no lleva nada del llavero.
+    fn denied_without_keys(code: StatusCode, body: &serde_json::Value) {
+        assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body,
+            &json!({"error": "only a paired phone or browser can get the board keys"})
+        );
+    }
+
+    /// Un dispositivo emparejado recibe el llavero como dice el contrato: la actual por su `kid`
+    /// y cada clave con `kid`, `key` (base64 estándar, 32 bytes) y `retired`. Sin caché.
+    #[tokio::test]
+    async fn a_paired_device_gets_the_board_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        let key = st.group.ensure_board_key().unwrap();
+        let (code, cache, body) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(
+            body,
+            json!({
+                "current": key.kid,
+                "keys": [{"kid": key.kid, "key": key.key, "retired": false}],
+            })
+        );
+        let raw = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            body["keys"][0]["key"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw.len(), 32);
+        assert_eq!(crate::group::board_kid(&raw), key.kid);
+    }
+
+    /// Las retiradas que aún tienen secreto salen, con `retired: true` (el dispositivo las
+    /// necesita para leer lo cifrado con ellas); las lápidas no. En orden de `kid`.
+    #[tokio::test]
+    async fn retired_keys_go_and_tombstones_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        let gone = st.group.ensure_board_key().unwrap();
+        let old = st.group.rotate_board_key().unwrap();
+        let new = st.group.rotate_board_key().unwrap();
+        assert!(st.group.drop_board_key(&gone.kid));
+        let (code, _, body) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let mut want = vec![
+            json!({"kid": old.kid, "key": old.key, "retired": true}),
+            json!({"kid": new.kid, "key": new.key, "retired": false}),
+        ];
+        want.sort_by(|a, b| a["kid"].as_str().cmp(&b["kid"].as_str()));
+        assert_eq!(body, json!({"current": new.kid, "keys": want}));
+        assert!(!body.to_string().contains(&gone.kid), "ni la lápida");
+    }
+
+    /// Ni el token de este equipo ni uno que no es de nadie: 403, sin claves, y no se crea
+    /// ninguna.
+    #[tokio::test]
+    async fn only_a_paired_device_gets_the_board_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        board_device(&st, 1);
+        for token in ["local", "no-es-de-nadie", ""] {
+            let (code, _, body) = board_keys_with(&st, token).await;
+            denied_without_keys(code, &body);
+        }
+        assert!(st.group.snapshot().keys.is_empty(), "no se crea ninguna");
+        // Con una clave ya hecha, tampoco.
+        st.group.ensure_board_key().unwrap();
+        let (code, _, body) = board_keys_with(&st, "local").await;
+        denied_without_keys(code, &body);
+    }
+
+    /// Por la API de verdad: la ruta está, y el token de este equipo no vale. Uno que no es de
+    /// nadie ni llega: el guardián contesta 401 antes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_board_keys_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, addr, token) = memory_server(tmp.path()).await;
+        st.group.add_device(&[1u8; 32], "tel");
+        let (code, r) = memory_call(addr, &token, "GET", "/api/v1/board/keys", None).await;
+        assert_eq!(code, 200, "{r}");
+        let current = st.group.board_keys().current().unwrap().kid.clone();
+        assert_eq!(r["current"], json!(current));
+        let (code, r) = memory_call(addr, "local", "GET", "/api/v1/board/keys", None).await;
+        assert_eq!(code, 403, "{r}");
+        assert!(r.get("keys").is_none());
+        let (code, _) = memory_call(addr, "nadie", "GET", "/api/v1/board/keys", None).await;
+        assert_eq!(code, 401);
+    }
+
+    /// Quitado del grupo (desde otro equipo, p. ej.) pero con su token aún en `phones`, porque
+    /// `apply_group` no ha corrido: 403, ni la clave de antes. Tampoco uno que nunca estuvo en
+    /// el grupo.
+    #[tokio::test]
+    async fn a_device_removed_from_the_group_gets_no_board_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        st.group.ensure_board_key().unwrap();
+        assert_eq!(board_keys_with(&st, &phone.token).await.0, StatusCode::OK);
+        assert!(st.group.remove_device(&phone.key));
+        assert!(
+            st.phones
+                .lock()
+                .unwrap()
+                .id_by_token(&phone.token)
+                .is_some()
+        );
+        let (code, _, body) = board_keys_with(&st, &phone.token).await;
+        denied_without_keys(code, &body);
+        // Solo en `phones`.
+        let stray = st
+            .phones
+            .lock()
+            .unwrap()
+            .add(&[2u8; 32], "otro", None)
+            .unwrap();
+        let (code, _, body) = board_keys_with(&st, &stray.token).await;
+        denied_without_keys(code, &body);
+    }
+
+    /// Con el llavero vacío, la primera petición crea la clave y la guarda (en el grupo y en el
+    /// disco) antes de darla; la segunda da la misma.
+    #[tokio::test]
+    async fn the_first_request_makes_and_saves_the_board_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        assert!(st.group.snapshot().keys.is_empty());
+        let (code, _, first) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::OK, "{first}");
+        let ring = st.group.board_keys();
+        assert_eq!(ring.keys.len(), 1);
+        let key = &ring.keys[0];
+        assert_eq!(
+            first,
+            json!({
+                "current": key.kid,
+                "keys": [{"kid": key.kid, "key": key.key, "retired": false}],
+            })
+        );
+        let saved = crate::group::Group::load(tmp.path().join("data/group.json"), [9u8; 32]);
+        assert_eq!(saved.board_keys().current(), Some(key));
+        let (code, _, second) = board_keys_with(&st, &phone.token).await;
+        assert_eq!((code, second), (StatusCode::OK, first));
+    }
+
+    /// Si la clave nueva no se puede guardar, no se da: 503 sin ninguna clave, y el llavero
+    /// sigue vacío.
+    #[tokio::test]
+    async fn a_board_key_that_cannot_be_saved_is_not_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        // El temporal de `group.json` es una carpeta: no se puede guardar
+        // (`sys::write_private_atomic` lo abre con `create_new` y no puede borrar una carpeta).
+        std::fs::create_dir_all(tmp.path().join("data/group.json.tmp")).unwrap();
+        let (code, _, body) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(
+            body,
+            json!({"error": "the board key could not be saved; try again"})
+        );
+        assert!(st.group.snapshot().keys.is_empty());
+    }
+
+    /// Si no se puede apuntar en su `Phone` qué claves se le dan, no se le da ninguna: tras un
+    /// reinicio, `apply_group` no sabría que tiene la actual.
+    #[tokio::test]
+    async fn board_keys_whose_note_cannot_be_saved_are_not_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        let key = st.group.ensure_board_key().unwrap();
+        // Como en `a_removal_that_cannot_be_saved_still_tells_the_hub`: `phones.json` no se
+        // puede guardar.
+        let blocker = tmp.path().join("data").join("phones.json.tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let (code, _, body) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.get("keys").is_none(), "{body}");
+        std::fs::remove_dir(&blocker).unwrap();
+        let (code, _, _) = board_keys_with(&st, &phone.token).await;
+        assert_eq!(code, StatusCode::OK);
+        let noted = crate::e2e::Phones::load(tmp.path().join("data/phones.json"));
+        assert_eq!(noted.list()[0].board_kids, vec![key.kid]);
+    }
+
+    /// Tras rotar, lo apuntado es la nueva: la retirada se poda, porque ya no puede ser la
+    /// actual.
+    #[tokio::test]
+    async fn the_noted_board_kids_follow_rotations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        st.group.ensure_board_key().unwrap();
+        board_keys_with(&st, &phone.token).await;
+        let new = st.group.rotate_board_key().unwrap();
+        board_keys_with(&st, &phone.token).await;
+        let noted = st.phones.lock().unwrap().list()[0].board_kids.clone();
+        assert_eq!(noted, vec![new.kid]);
+    }
+
+    /// Quitado con el llavero vacío: 403, y no se crea ninguna clave.
+    #[tokio::test]
+    async fn a_removed_device_does_not_make_the_first_board_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = hub_state(tmp.path());
+        let phone = board_device(&st, 1);
+        assert!(st.group.remove_device(&phone.key));
+        let (code, _, body) = board_keys_with(&st, &phone.token).await;
+        denied_without_keys(code, &body);
+        assert!(st.group.snapshot().keys.is_empty());
+    }
+
+    /// La segunda comprobación, la de la instantánea con que se contesta: con el dispositivo ya
+    /// quitado en ella, nada, aunque haya claves; vivo, el llavero, y solo las activas cuentan
+    /// como lo que tiene.
+    #[test]
+    fn board_keys_for_follow_the_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = crate::group::Group::load(tmp.path().join("group.json"), [9u8; 32]);
+        g.add_device(&[1u8; 32], "tel");
+        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1u8; 32]);
+        assert_eq!(
+            board_keys_for(&g.snapshot(), &key).err(),
+            Some(KeysRefused::NoKey)
+        );
+        let old = g.ensure_board_key().unwrap();
+        let new = g.rotate_board_key().unwrap();
+        let ring = board_keys_for(&g.snapshot(), &key).unwrap();
+        assert_eq!(ring.current, new.kid);
+        assert_eq!(ring.keys.len(), 2);
+        assert_eq!(ring.active_kids(), vec![new.kid.clone()]);
+        assert!(ring.keys.iter().any(|k| k.kid == old.kid && k.retired));
+        let alive = g.snapshot();
+        g.remove_device(&key);
+        assert_eq!(
+            board_keys_for(&g.snapshot(), &key).err(),
+            Some(KeysRefused::NotInGroup)
+        );
+        assert!(board_keys_for(&alive, &key).is_ok(), "la de antes, sí");
+        assert_eq!(
+            board_keys_for(&g.snapshot(), "otro").err(),
+            Some(KeysRefused::NotInGroup)
+        );
+    }
+
+    /// El hueco: con el llavero vacío, B quita a D (no hay qué rotar) y, antes de que A se
+    /// entere, D le pide el llavero a A, que crea K1 y se la da. K1 es posterior a la baja, así
+    /// que `rotation_due` no rotaría; al aplicar la baja, A ve que D tiene la actual y rota.
+    #[tokio::test]
+    async fn a_key_given_after_a_removal_elsewhere_is_rotated() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        b.group.merge(&a.group.snapshot());
+        let (removed, rotated) = b.group.remove_device_rotating(&phone.key);
+        assert!(removed && rotated.is_none(), "sin llavero, sin rotar");
+        let (code, _, body) = board_keys_with(&a, &phone.token).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let k1 = body["current"].as_str().unwrap().to_owned();
+        assert!(a.group.merge(&b.group.snapshot()));
+        a.apply_group();
+        assert!(a.phones.lock().unwrap().list().is_empty(), "quitado aquí");
+        let ring = a.group.board_keys();
+        let current = ring.current().unwrap();
+        assert_ne!(current.kid, k1, "la que tiene D ya no es la actual");
+        let was = ring.keys.iter().find(|k| k.kid == k1).unwrap();
+        assert!(was.retired.is_some());
+        // Y no vuelve a rotar.
+        a.apply_group();
+        assert_eq!(a.group.board_keys(), ring);
+    }
+
+    /// Lo mismo con una clave que ya había: D se la lleva de A después de que B lo quitara. Si B
+    /// no pudo rotar, `rotation_due` lo cubre; aquí rotó pero A aún no tenía la nueva, y lo que
+    /// D se lleva es la actual de A.
+    #[tokio::test]
+    async fn the_current_key_given_after_a_removal_elsewhere_is_rotated() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        let k0 = a.group.ensure_board_key().unwrap();
+        b.group.merge(&a.group.snapshot());
+        // B lo quita y rota; B le da la nueva a A, pero A le dio antes su llavero a D... con la
+        // nueva ya dentro: D pidió después de que la rotación llegara y antes que la baja.
+        let (_, rotated) = b.group.remove_device_rotating(&phone.key);
+        let k2 = rotated.unwrap();
+        let mut only_key = b.group.snapshot();
+        only_key.devices = a.group.snapshot().devices;
+        a.group.merge(&only_key);
+        assert_eq!(a.group.board_keys().current(), Some(&k2));
+        let (code, _, _) = board_keys_with(&a, &phone.token).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(a.group.merge(&b.group.snapshot()));
+        a.apply_group();
+        let ring = a.group.board_keys();
+        assert_ne!(ring.current().unwrap().kid, k2.kid);
+        assert_ne!(ring.current().unwrap().kid, k0.kid);
+        assert_eq!(ring.keys.len(), 3);
+    }
+
+    /// Si la rotación por el hueco no se puede guardar, el dispositivo sale igual de `phones` y
+    /// la rotación queda debida: el siguiente `apply_group` la hace.
+    #[tokio::test]
+    async fn a_rotation_for_a_removal_elsewhere_that_cannot_be_saved_is_retried() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        b.group.merge(&a.group.snapshot());
+        b.group.remove_device_rotating(&phone.key);
+        let (_, _, body) = board_keys_with(&a, &phone.token).await;
+        let k1 = body["current"].as_str().unwrap().to_owned();
+        assert!(a.group.merge(&b.group.snapshot()));
+        // Como en `a_board_key_that_cannot_be_saved_is_not_given`.
+        let blocker = t1.path().join("data/group.json.tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        a.apply_group();
+        assert!(a.phones.lock().unwrap().list().is_empty(), "quitado igual");
+        assert_eq!(a.group.board_keys().current().unwrap().kid, k1);
+        std::fs::remove_dir(&blocker).unwrap();
+        a.apply_group();
+        let ring = a.group.board_keys();
+        assert_ne!(ring.current().unwrap().kid, k1, "rotada al reintentar");
+        assert_eq!(ring.keys.len(), 2);
+        a.apply_group();
+        assert_eq!(a.group.board_keys(), ring, "una sola vez");
+    }
+
+    /// Quitarlo a mano aquí cuando el grupo ya traía su baja (sin aplicar aún): la baja no
+    /// rota, porque ya estaba, pero se llevó la actual: se rota igual.
+    #[tokio::test]
+    async fn removing_here_a_device_already_removed_elsewhere_rotates_what_it_took() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        b.group.merge(&a.group.snapshot());
+        b.group.remove_device_rotating(&phone.key);
+        let (_, _, body) = board_keys_with(&a, &phone.token).await;
+        let k1 = body["current"].as_str().unwrap().to_owned();
+        assert!(a.group.merge(&b.group.snapshot()));
+        assert_eq!(remove_phone(&a, &phone.id).status(), StatusCode::NO_CONTENT);
+        let ring = a.group.board_keys();
+        assert_ne!(ring.current().unwrap().kid, k1);
+        assert_eq!(ring.keys.len(), 2);
+        a.apply_group();
+        assert_eq!(a.group.board_keys(), ring, "no rota otra vez");
+    }
+
+    /// La segunda mirada de `apply_group`: una petición con una instantánea de antes de la baja
+    /// apunta la clave justo entre la primera mirada y la baja en `phones` (el gancho). Se ve
+    /// con lo que se copia al quitarlo, y se rota.
+    #[tokio::test]
+    async fn a_note_between_the_two_looks_of_apply_group_is_seen() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        b.group.merge(&a.group.snapshot());
+        b.group.remove_device_rotating(&phone.key);
+        assert!(a.group.merge(&b.group.snapshot()));
+        let id = phone.id.clone();
+        let k1 = Arc::new(std::sync::Mutex::new(None));
+        let seen = k1.clone();
+        set_apply_group_hook(Box::new(move |st: &AppState| {
+            let k = st.group.ensure_board_key().unwrap();
+            st.phones
+                .lock()
+                .unwrap()
+                .note_board_kids(&id, vec![k.kid.clone()], &[])
+                .unwrap();
+            *seen.lock().unwrap() = Some(k.kid);
+        }));
+        a.apply_group();
+        APPLY_GROUP_HOOK.with(|h| *h.borrow_mut() = None);
+        let k1 = k1.lock().unwrap().clone().expect("el gancho corrió");
+        assert!(a.phones.lock().unwrap().list().is_empty());
+        let ring = a.group.board_keys();
+        assert_ne!(
+            ring.current().unwrap().kid,
+            k1,
+            "rotada en la segunda mirada"
+        );
+        assert_eq!(ring.keys.len(), 2);
+    }
+
+    /// Lo que se debe de una rotación que no se pudo guardar se reintenta una vez por
+    /// `apply_group`, aunque haya muchos dispositivos quitados, y no se rota si la actual ya no
+    /// es la adeudada (otro equipo rotó entre medias).
+    #[tokio::test]
+    async fn an_owed_rotation_is_dropped_if_someone_else_rotated() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        b.group.merge(&a.group.snapshot());
+        b.group.remove_device_rotating(&phone.key);
+        let (_, _, body) = board_keys_with(&a, &phone.token).await;
+        let k1 = body["current"].as_str().unwrap().to_owned();
+        assert!(a.group.merge(&b.group.snapshot()));
+        let blocker = t1.path().join("data/group.json.tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        a.apply_group();
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(a.group.board_keys().current().unwrap().kid, k1, "debida");
+        // Otro equipo rota antes del reintento.
+        let other = a.group.rotate_board_key().unwrap();
+        a.apply_group();
+        let ring = a.group.board_keys();
+        assert_eq!(ring.current(), Some(&other), "no rota de más");
+        assert_eq!(ring.keys.len(), 2);
+    }
+
+    /// Una baja normal, que llega con su rotación: D tenía la de antes, no la nueva. No se rota
+    /// otra vez: los dos acaban con el mismo llavero, con dos claves.
+    #[tokio::test]
+    async fn a_removal_with_its_rotation_does_not_rotate_twice() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (hub_state(t1.path()), hub_state(t2.path()));
+        let phone = board_device(&a, 1);
+        a.group.ensure_board_key().unwrap();
+        let (code, _, _) = board_keys_with(&a, &phone.token).await;
+        assert_eq!(code, StatusCode::OK);
+        b.group.merge(&a.group.snapshot());
+        let (removed, rotated) = b.group.remove_device_rotating(&phone.key);
+        assert!(removed && rotated.is_some());
+        assert!(a.group.merge(&b.group.snapshot()));
+        a.apply_group();
+        assert!(a.phones.lock().unwrap().list().is_empty());
+        assert_eq!(a.group.board_keys(), b.group.board_keys());
+        assert_eq!(a.group.board_keys().keys.len(), 2);
     }
 
     // ---------- La memoria de la voz ----------
@@ -7379,7 +8361,7 @@ mod tests {
         }))
         .unwrap();
         st.plans.set(&id, args, 1000).unwrap();
-        plan_changed(&st);
+        plan_changed(&st, &id);
         let (_, list) = get_json(addr, "/api/v1/sessions").await;
         let plan = &list[0]["plan"];
         assert_eq!(plan["title"], "Migrar", "{list}");
@@ -7396,7 +8378,7 @@ mod tests {
         let t: crate::plan::TaskArgs =
             serde_json::from_value(json!({"id": "t2", "status": "done"})).unwrap();
         st.plans.update_task(&id, t, 2000).unwrap();
-        plan_changed(&st);
+        plan_changed(&st, &id);
         let (_, list) = get_json(addr, "/api/v1/sessions").await;
         let plan = &list[0]["plan"];
         assert!(plan["rev"].as_u64().unwrap() > rev, "{list}");

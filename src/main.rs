@@ -446,6 +446,8 @@ async fn serve(
     for s in servers {
         let _ = s.await;
     }
+    // Lo que quedara por guardar de la copia del tablero (como `next`, que no se guarda solo).
+    state.board.flush().await;
     ExitCode::SUCCESS
 }
 

@@ -185,8 +185,11 @@ impl Identity {
                     x25519: k.x25519.clone(),
                     ed25519: Some(B64.encode(seed)),
                 };
-                write_private(path, &serde_json::to_vec_pretty(&file).expect("json"))
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                crate::sys::write_private_atomic(
+                    path,
+                    &serde_json::to_vec_pretty(&file).expect("json"),
+                )
+                .map_err(|e| format!("{}: {e}", path.display()))?;
                 seed
             }
         };
@@ -208,23 +211,6 @@ fn x25519_public(private: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private)).to_bytes()
 }
 
-/// Escribe un fichero que solo puede leer el usuario (0600), de una vez.
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let mut f = crate::sys::private(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true),
-    )
-    .open(&tmp)?;
-    std::io::Write::write_all(&mut f, data)?;
-    std::fs::rename(&tmp, path)
-}
-
 // ---------- Teléfonos emparejados ----------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -242,6 +228,11 @@ pub struct Phone {
     #[serde(default)]
     pub handle: Option<String>,
     pub added: u64,
+    /// Los `kid` de las claves activas del tablero que se le dieron aquí la última vez
+    /// (`GET /api/v1/board/keys`). Si lo quitan en otro equipo, `apply_group` rota la clave
+    /// actual si está entre estas: pudo llevársela después de su baja (ver `api_board_keys`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub board_kids: Vec<String>,
 }
 
 /// Lo que se puede enseñar de un teléfono (sin claves ni token).
@@ -268,7 +259,9 @@ impl Phones {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        write_private(&self.path, &serde_json::to_vec_pretty(&self.list)?)
+        // Lleva los tokens: 0600, entero o nada, y en el disco (`board_kids` tiene que
+        // sobrevivir a un reinicio).
+        crate::sys::write_private_atomic(&self.path, &serde_json::to_vec_pretty(&self.list)?)
     }
 
     pub fn views(&self) -> Vec<PhoneView> {
@@ -299,12 +292,16 @@ impl Phones {
             .any(|p| crate::auth::ct_eq(given, &p.token))
     }
 
-    /// El dispositivo de ese token (para que se dé de baja él mismo).
-    pub fn id_by_token(&self, given: &str) -> Option<String> {
+    /// El dispositivo de ese token (comparación en tiempo constante).
+    pub fn by_token(&self, given: &str) -> Option<&Phone> {
         self.list
             .iter()
             .find(|p| crate::auth::ct_eq(given, &p.token))
-            .map(|p| p.id.clone())
+    }
+
+    /// El id del dispositivo de ese token (para que se dé de baja él mismo).
+    pub fn id_by_token(&self, given: &str) -> Option<String> {
+        self.by_token(given).map(|p| p.id.clone())
     }
 
     /// Apunta un teléfono (o lo renueva, si ya estaba con esa clave). Devuelve su token y su
@@ -316,6 +313,13 @@ impl Phones {
         handle: Option<String>,
     ) -> std::io::Result<Phone> {
         let k = B64.encode(key);
+        // Al renovarlo, lo que se le dio del llavero sigue en sus manos.
+        let board_kids = self
+            .list
+            .iter()
+            .find(|p| p.key == k)
+            .map(|p| p.board_kids.clone())
+            .unwrap_or_default();
         self.list.retain(|p| p.key != k);
         let phone = Phone {
             id: hex(&random::<6>()),
@@ -325,10 +329,47 @@ impl Phones {
             push_key: B64.encode(random::<32>()),
             handle,
             added: unix_now(),
+            board_kids,
         };
         self.list.push(phone.clone());
         self.save()?;
         Ok(phone)
+    }
+
+    /// Apunta qué claves activas del tablero se le dan (`board_kids`), y lo guarda si cambió.
+    /// Se junta con lo que ya tenía: dos peticiones a la vez con una rotación entre medias
+    /// podrían apuntar la vieja después de la nueva. Solo se quita lo que está en `dead` (las
+    /// retiradas o borradas, según una lectura del llavero hecha antes): una retirada no vuelve
+    /// a ser la actual. Lo dado ahora se queda siempre. `Ok(false)` si ya no está (lo acaban de
+    /// quitar). Si no se puede guardar, queda como estaba, para volver a intentarlo en la
+    /// siguiente petición.
+    pub fn note_board_kids(
+        &mut self,
+        id: &str,
+        given: Vec<String>,
+        dead: &[String],
+    ) -> std::io::Result<bool> {
+        let Some(i) = self.list.iter().position(|p| p.id == id) else {
+            return Ok(false);
+        };
+        let mut kids: Vec<String> = self.list[i]
+            .board_kids
+            .iter()
+            .filter(|k| !dead.contains(k))
+            .cloned()
+            .chain(given)
+            .collect();
+        kids.sort();
+        kids.dedup();
+        if self.list[i].board_kids == kids {
+            return Ok(true);
+        }
+        let before = std::mem::replace(&mut self.list[i].board_kids, kids);
+        if let Err(e) = self.save() {
+            self.list[i].board_kids = before;
+            return Err(e);
+        }
+        Ok(true)
     }
 
     /// El teléfono avisa de su handle en el hub al conectar (por si cambió).
@@ -844,14 +885,20 @@ async fn group_sync<H: Host>(host: &H, msg1: &[u8], tx: &mpsc::Sender<Vec<u8>>) 
     let Some(key) = hs.get_remote_static().map(|k| B64.encode(k)) else {
         return;
     };
-    if !g.snapshot().members.iter().any(|m| m.key == key) {
+    if g.peer_state(&key).is_none() {
         return;
     }
     let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload[..n]) else {
         return;
     };
-    let changed = g.merge(&theirs);
-    let reply = serde_json::to_vec(&g.snapshot()).unwrap_or_default();
+    // De uno ya quitado no entra nada, y se le contesta sin el llavero (ver `merge_from` y
+    // `peer_state`): solo se entera de que está fuera.
+    let changed = g.merge_from(&key, &theirs);
+    // Si entre medias ha dejado de ser del grupo, ni se le contesta.
+    let Some(ours) = g.peer_state(&key) else {
+        return;
+    };
+    let reply = serde_json::to_vec(&ours.into_state()).unwrap_or_default();
     let mut msg2 = vec![0u8; MAX_MSG];
     if let Ok(n) = hs.write_message(&reply, &mut msg2) {
         msg2.truncate(n);
@@ -988,6 +1035,46 @@ where
 /// transporte lo pone quien llama (el hub).
 pub struct Dial {
     hs: snow::HandshakeState,
+}
+
+/// Una vuelta de sincronización del grupo: cuenta el estado a cada equipo vivo (por `exchange`,
+/// con su id en el hub) y junta lo que conteste. Devuelve si alguno sabía algo nuevo.
+///
+/// La lista se saca al empezar, pero lo que conteste uno puede sacar del grupo a otro que viene
+/// detrás: antes de llamarle y antes de juntar lo suyo se mira otra vez que siga vivo. Si no, se
+/// le mandaría el llavero y, al enterarse de la baja por ese mensaje, contestaría dándose de alta
+/// de nuevo, por encima de nuestra baja.
+pub async fn sync_members<F, Fut>(g: &crate::group::Group, identity: &Identity, exchange: F) -> bool
+where
+    F: Fn(String, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    let mut learned = false;
+    for m in g.others() {
+        let Ok(key) = B64.decode(&m.key) else {
+            continue;
+        };
+        let Ok(key) = <[u8; 32]>::try_from(key) else {
+            continue;
+        };
+        let Some(crate::group::PeerState::Live(ours)) = g.peer_state(&m.key) else {
+            continue;
+        };
+        let ours = serde_json::to_vec(&ours).unwrap_or_default();
+        let Ok((dial, first)) = Dial::start(identity, &key, None, &ours) else {
+            continue;
+        };
+        let Ok(reply) = exchange(m.id.clone(), first).await else {
+            continue; // apagado o sin conexión: ya se pondrá al día
+        };
+        if let Ok(payload) = dial.finish(&reply)
+            && let Ok(theirs) = serde_json::from_slice::<crate::group::State>(&payload)
+            && g.merge_from(&m.key, &theirs)
+        {
+            learned = true;
+        }
+    }
+    learned
 }
 
 impl Dial {
@@ -1232,6 +1319,80 @@ async fn run_flow(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Lo apuntado se junta con lo de antes (dos peticiones a la vez con una rotación entre
+    /// medias no dejan solo la vieja): solo se quita lo que se sabe retirado o borrado.
+    #[test]
+    fn the_board_kids_add_up_and_only_dead_ones_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut phones = Phones::load(dir.path().join("phones.json"));
+        let p = phones.add(&[1u8; 32], "tel", None).unwrap();
+        let kids = |v: &[&str]| v.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        let noted = |phones: &Phones| phones.list()[0].board_kids.clone();
+        phones.note_board_kids(&p.id, kids(&["b"]), &[]).unwrap();
+        // La petición vieja apunta después, con la de antes de rotar: quedan las dos.
+        phones.note_board_kids(&p.id, kids(&["a"]), &[]).unwrap();
+        assert_eq!(noted(&phones), kids(&["a", "b"]));
+        phones
+            .note_board_kids(&p.id, kids(&["c"]), &kids(&["a", "x"]))
+            .unwrap();
+        assert_eq!(noted(&phones), kids(&["b", "c"]));
+        // Lo dado ahora no se quita aunque salga como retirado (no puede: se da por activo).
+        phones
+            .note_board_kids(&p.id, kids(&["c"]), &kids(&["b"]))
+            .unwrap();
+        assert_eq!(noted(&phones), kids(&["c"]));
+    }
+
+    /// `phones.json` lleva los tokens: 0600, también si quedó un temporal de antes con otros
+    /// permisos (el `write_private` de antes lo abría sin crearlo y conservaba su modo).
+    #[cfg(unix)]
+    #[test]
+    fn the_phones_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phones.json");
+        let tmp = dir.path().join("phones.json.tmp");
+        std::fs::write(&tmp, b"de antes").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut phones = Phones::load(path.clone());
+        phones.add(&[1u8; 32], "tel", None).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!tmp.exists());
+    }
+
+    /// Lo que se le dio del llavero se guarda con el teléfono, sobrevive a reemparejarlo, y un
+    /// `phones.json` de antes (sin el campo) se lee igual.
+    #[test]
+    fn the_board_kids_given_to_a_phone_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phones.json");
+        let mut phones = Phones::load(path.clone());
+        let p = phones.add(&[1u8; 32], "tel", None).unwrap();
+        assert!(p.board_kids.is_empty());
+        let kids = vec!["00112233aabbccdd".to_owned()];
+        assert!(phones.note_board_kids(&p.id, kids.clone(), &[]).unwrap());
+        assert!(
+            !phones
+                .note_board_kids("no-esta", kids.clone(), &[])
+                .unwrap()
+        );
+        assert_eq!(Phones::load(path.clone()).list()[0].board_kids, kids);
+        let again = phones.add(&[1u8; 32], "tel", None).unwrap();
+        assert_eq!(again.board_kids, kids, "reemparejado, sigue teniéndolas");
+        // Un fichero de antes.
+        let path = dir.path().join("antes.json");
+        let old = serde_json::json!([{"id": "a1", "name": "tel", "key": "k", "token": "t",
+            "added": 1}]);
+        std::fs::write(&path, old.to_string()).unwrap();
+        let phones = Phones::load(path.clone());
+        assert_eq!(phones.list().len(), 1);
+        assert!(phones.list()[0].board_kids.is_empty());
+        // Sin claves dadas, el campo no se escribe.
+        let text = serde_json::to_string(&phones.list()[0]).unwrap();
+        assert!(!text.contains("board_kids"), "{text}");
+    }
 
     struct TestHost {
         id: Identity,
@@ -2056,6 +2217,272 @@ mod tests {
         // Un error enorme también se sustituye.
         let big_err = peer_reply(Err((500, "e".repeat(70_000))));
         assert!(big_err.len() <= PEER_ROOM);
+    }
+
+    /// Sincroniza `from` con `host` mandando `state`: lo que le devuelve (`None`: nada).
+    async fn sync_with<H: Host>(
+        host: &Arc<H>,
+        from: &Identity,
+        state: &crate::group::State,
+    ) -> Option<crate::group::State> {
+        let body = serde_json::to_vec(state).unwrap();
+        let (dial, first) = Dial::start(from, &host.identity().public, None, &body).unwrap();
+        let reply = exchange_with(host, first).await.ok()?;
+        Some(serde_json::from_slice(&dial.finish(&reply).expect("descifra")).unwrap())
+    }
+
+    /// Un equipo ya sacado del grupo aún sincroniza (para enterarse), pero sin el llavero del
+    /// tablero en ningún sentido: ni se lleva nuestras claves ni nos cuela las suyas.
+    #[tokio::test]
+    async fn a_removed_member_syncs_without_keys() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let g = host.group.as_ref().unwrap();
+        let ours = g.ensure_board_key().unwrap();
+        let theirs = || crate::group::State {
+            keys: vec![crate::group::BoardKey::generate(now() + 60_000).unwrap()],
+            ..Default::default()
+        };
+
+        // El quitado se entera de que está fuera, pero sin claves.
+        let sent = theirs();
+        let reply = sync_with(&host, &viejo, &sent).await.expect("contesta");
+        assert!(reply.keys.is_empty(), "al quitado no van las claves");
+        assert!(
+            reply
+                .members
+                .iter()
+                .any(|m| m.id == "viejo-id" && m.removed),
+            "sí se entera de que está fuera"
+        );
+        let ring = g.board_keys();
+        assert_eq!(ring.current(), Some(&ours), "su clave no entra");
+        assert!(ring.keys.iter().all(|k| k.kid != sent.keys[0].kid));
+
+        // Un miembro vivo, en cambio, las recibe y las da.
+        let sent = theirs();
+        let reply = sync_with(&host, &mac, &sent).await.expect("contesta");
+        assert!(reply.keys.iter().any(|k| k.kid == ours.kid));
+        assert!(
+            g.board_keys()
+                .keys
+                .iter()
+                .any(|k| k.kid == sent.keys[0].kid)
+        );
+
+        // Y uno de fuera ni recibe respuesta.
+        let otro = new_identity(dir.path(), "otro");
+        assert_eq!(sync_with(&host, &otro, &theirs()).await, None);
+    }
+
+    /// Lo que manda un quitado no entra: ni se da de alta a sí mismo con una hora más nueva, ni
+    /// cuela otros miembros, dispositivos o claves. Y sigue sin recibir el llavero.
+    #[tokio::test]
+    async fn a_removed_member_cannot_bring_itself_back() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let g = host.group.as_ref().unwrap();
+        g.ensure_board_key().unwrap();
+        let before = g.snapshot();
+        let later = now() + 60_000;
+        let member = |id: &str, key: &[u8; 32]| crate::group::Member {
+            id: id.into(),
+            key: B64.encode(key),
+            name: id.into(),
+            at: later,
+            removed: false,
+        };
+        let intruso = new_identity(dir.path(), "intruso");
+        let sent = crate::group::State {
+            members: vec![
+                member("viejo-id", &viejo.public),
+                member("intruso-id", &intruso.public),
+            ],
+            devices: vec![crate::group::Device {
+                key: B64.encode([9u8; 32]),
+                name: "Colado".into(),
+                at: later,
+                removed: false,
+            }],
+            keys: vec![crate::group::BoardKey::generate(later).unwrap()],
+        };
+        let reply = sync_with(&host, &viejo, &sent).await.expect("contesta");
+        assert!(reply.keys.is_empty());
+        assert_eq!(g.snapshot(), before, "no entra nada de lo suyo");
+        assert!(
+            g.snapshot()
+                .member_by_key(&B64.encode(viejo.public))
+                .is_none()
+        );
+        assert!(!g.has_device(&[9u8; 32]));
+        // En la siguiente, igual: sigue fuera y sin claves.
+        let reply = sync_with(&host, &viejo, &sent).await.expect("contesta");
+        assert!(reply.keys.is_empty(), "sigue sin claves");
+        assert!(
+            reply
+                .members
+                .iter()
+                .any(|m| m.id == "viejo-id" && m.removed)
+        );
+        assert_eq!(g.snapshot(), before);
+    }
+
+    /// Volver al grupo es con una invitación nueva: entonces sincroniza como uno más y recibe
+    /// el llavero.
+    #[tokio::test]
+    async fn a_removed_member_comes_back_with_an_invite() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (mac, viejo) = (
+            new_identity(dir.path(), "mac"),
+            new_identity(dir.path(), "viejo"),
+        );
+        let host = group_host(dir.path(), &mac, &viejo);
+        let g = host.group.as_ref().unwrap();
+        let ours = g.ensure_board_key().unwrap();
+        let empty = crate::group::State::default();
+        assert!(
+            sync_with(&host, &viejo, &empty)
+                .await
+                .unwrap()
+                .keys
+                .is_empty()
+        );
+
+        g.invite("https://hub.ejemplo", "yo-id");
+        let secret = g.current_invite().unwrap();
+        let hello = serde_json::json!({"id": "viejo-id", "name": "Viejo", "state": empty});
+        let (dial, first) = Dial::start(
+            &viejo,
+            &host.identity().public,
+            Some(&secret),
+            hello.to_string().as_bytes(),
+        )
+        .unwrap();
+        let reply = exchange_with(&host, first).await.expect("contesta");
+        let joined: crate::group::State =
+            serde_json::from_slice(&dial.finish(&reply).unwrap()).unwrap();
+        assert!(joined.keys.iter().any(|k| k.kid == ours.kid), "al unirse");
+        assert!(
+            g.snapshot()
+                .member_by_key(&B64.encode(viejo.public))
+                .is_some()
+        );
+
+        // Ya dentro, sincroniza normal: da y recibe claves.
+        let mine = crate::group::State {
+            keys: vec![crate::group::BoardKey::generate(now()).unwrap()],
+            ..Default::default()
+        };
+        let reply = sync_with(&host, &viejo, &mine).await.expect("contesta");
+        assert!(reply.keys.iter().any(|k| k.kid == ours.kid));
+        assert!(
+            g.board_keys()
+                .keys
+                .iter()
+                .any(|k| k.kid == mine.keys[0].kid)
+        );
+    }
+
+    /// Un nido de pruebas con este grupo.
+    fn host_with(dir: &Path, id: Identity, g: crate::group::Group) -> Arc<TestHost> {
+        Arc::new(TestHost {
+            id,
+            pairing: Pairing::default(),
+            phones: Mutex::new(Phones::load(dir.join("phones.json"))),
+            addr: None,
+            group: Some(g),
+            replays: PeerReplays::default(),
+            replaced: Default::default(),
+            account: Default::default(),
+        })
+    }
+
+    /// En una misma vuelta de `sync_members`, la respuesta de A dice que B ya está fuera: a B no
+    /// se le manda nada (ni el llavero), y no se le deja resucitar con su respuesta.
+    #[tokio::test]
+    async fn a_member_removed_mid_round_is_skipped() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (da, db, dy) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("yo"),
+        );
+        let ida = Identity::load_or_create(&da.join("hub.key")).unwrap();
+        let idb = Identity::load_or_create(&db.join("hub.key")).unwrap();
+        let yo = Identity::load_or_create(&dy.join("hub.key")).unwrap();
+        let (ka, kb, ky) = (
+            B64.encode(ida.public),
+            B64.encode(idb.public),
+            B64.encode(yo.public),
+        );
+        // Nosotros: A y B vivos, y el llavero.
+        let g = crate::group::Group::load(dy.join("group.json"), yo.public);
+        g.set_self("yo-id", "Yo");
+        g.add_member("a-mac", &ka, "A");
+        g.add_member("b-viejo", &kb, "B");
+        let ours = g.ensure_board_key().unwrap();
+        // A ya sabe que B está fuera.
+        let ga = crate::group::Group::load(da.join("group.json"), ida.public);
+        ga.set_self("a-mac", "A");
+        ga.add_member("yo-id", &ky, "Yo");
+        ga.add_member("b-viejo", &kb, "B");
+        assert!(ga.remove_member("b-viejo"));
+        // B aún no: cree que sigue dentro.
+        let gb = crate::group::Group::load(db.join("group.json"), idb.public);
+        gb.set_self("b-viejo", "B");
+        gb.add_member("yo-id", &ky, "Yo");
+        gb.add_member("a-mac", &ka, "A");
+        let a = host_with(&da, ida, ga);
+        let b = host_with(&db, idb, gb);
+
+        // A va antes que B: así la respuesta de A llega antes de llamar a B.
+        let order: Vec<String> = g.others().into_iter().map(|m| m.id).collect();
+        assert_eq!(order, ["a-mac", "b-viejo"]);
+        let to_b = std::sync::atomic::AtomicUsize::new(0);
+        let learned = sync_members(&g, &yo, |id, first| {
+            let (a, b, to_b) = (a.clone(), b.clone(), &to_b);
+            async move {
+                match id.as_str() {
+                    "a-mac" => exchange_with(&a, first).await,
+                    "b-viejo" => {
+                        to_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        exchange_with(&b, first).await
+                    }
+                    _ => Err("no está".into()),
+                }
+            }
+        })
+        .await;
+        assert!(learned, "de A se aprende la baja");
+        assert_eq!(
+            to_b.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a B no se le llama"
+        );
+        assert!(
+            matches!(g.peer_state(&kb), Some(crate::group::PeerState::Removed(_))),
+            "B sigue fuera"
+        );
+        let gb = b.group.as_ref().unwrap();
+        assert!(
+            gb.board_keys().keys.iter().all(|k| k.kid != ours.kid),
+            "B no tiene nuestras claves"
+        );
+        // A, que sigue dentro, sí las tiene.
+        let ga = a.group.as_ref().unwrap();
+        assert!(ga.board_keys().keys.iter().any(|k| k.kid == ours.kid));
     }
 
     #[tokio::test]

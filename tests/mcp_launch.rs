@@ -146,9 +146,9 @@ fn guard(paths: &Paths) -> Vec<String> {
     g
 }
 
-/// Las de nido: el channel y solo las herramientas que miran y hablan, o mandan cosas al
-/// usuario, sin pedir permiso.
-const FLAGS: [&str; 14] = [
+/// Las de nido: el channel y solo las herramientas que miran y hablan, mandan cosas al usuario o
+/// llevan el plan de la sesión y el tablero de la cuenta, sin pedir permiso.
+const FLAGS: [&str; 19] = [
     "--dangerously-load-development-channels",
     "server:nido",
     "--allowedTools",
@@ -163,6 +163,11 @@ const FLAGS: [&str; 14] = [
     "mcp__nido__plan_task",
     "mcp__nido__plan_get",
     "mcp__nido__plan_clear",
+    "mcp__nido__board",
+    "mcp__nido__project",
+    "mcp__nido__objective",
+    "mcp__nido__join",
+    "mcp__nido__leave",
 ];
 
 fn nido_mcp(home: &Path, on: bool) -> String {
