@@ -15,12 +15,16 @@
 //! - De una sesión que no está en el registro, abierto: se cierra (`closed`), con la hora en que
 //!   se borró si fue aquí (`session_deleted`, con el último resumen de su plan) o la de ahora.
 //! - Cerrado hace `KEEP_CLOSED` o más: se borra.
+//! - Huérfano de un objetivo borrado (su objetivo es una lápida en la copia), abierto o cerrado
+//!   y sea de quien sea la sesión: se borra. Quien borra un objetivo (`board_delete`, la web, la
+//!   app) borra sus enlaces, pero uno borrado desde otro sitio, o una cascada a medias, los
+//!   dejaría para siempre: no salen en el tablero y cuentan para el tope de objetos de la cuenta.
 //!
 //! Lo que no se toca nunca: los enlaces de otros equipos, los que no se pueden leer y los
-//! huérfanos (su objetivo no está o no se puede leer). Un objetivo que falta puede volver (un
-//! hub que se quedó sin tablero y se está resubiendo, una copia de otra cuenta, una clave que
-//! llega con el grupo): borrar o cerrar sus enlaces entonces los perdería para siempre. Los
-//! borra quien borra el objetivo (`objective`, `project`).
+//! huérfanos de un objetivo que no está sin más (sin lápida) o no se puede leer. Un objetivo que
+//! falta puede volver (un hub que se quedó sin tablero y se está resubiendo, una copia de otra
+//! cuenta, una clave que llega con el grupo): borrar o cerrar sus enlaces entonces los perdería
+//! para siempre. Una lápida, en cambio, es un borrado de verdad.
 //!
 //! Sin conexión no se hace nada y no se pierde nada: lo pendiente es «lo que hay ahora frente a
 //! lo que tiene el enlace», que se mira al volver. Con un 429 se espera `BUSY_WAIT`; con otro
@@ -101,12 +105,23 @@ struct Inner {
     said: Option<String>,
 }
 
-/// Una sesión borrada: cuándo y el último resumen de su plan (`None` si no se pudo leer: el
-/// resumen del enlace se deja como está).
+/// Una sesión borrada: cuándo y lo último que se sabe de su plan.
 #[derive(Debug, Clone, PartialEq)]
 struct Closing {
     at: u64,
-    plan: Option<Option<PlanSummary>>,
+    plan: LastPlan,
+}
+
+/// Lo último que se sabe del plan de una sesión borrada, para el cierre de sus enlaces.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LastPlan {
+    /// No se sabe: no se pudo leer, o la sesión no se borró aquí (no está en el registro, y ya).
+    /// El resumen del enlace se deja como está.
+    Unknown,
+    /// No tenía plan: el resumen del enlace se quita.
+    NoPlan,
+    /// El resumen de su plan: va al enlace, si no es el que tiene.
+    Summary(PlanSummary),
 }
 
 /// Lo que hay que hacer con un enlace.
@@ -122,6 +137,11 @@ enum Job {
     Close { session: String, closing: Closing },
     /// Borrarlo.
     Remove,
+    /// Borrarlo, porque su objetivo (`objective`) está borrado. Uno que falta por resubir se
+    /// sube y se borra (`BoardCache::remove`), para que en el hub quede su lápida: quitarlo solo
+    /// de la copia no basta, porque otro equipo que aún lo tenga lo volvería a subir. Con la
+    /// cuenta llena esa subida no cabe: se queda atascado (`stuck`) hasta que cambie.
+    Orphan { objective: String },
 }
 
 impl Job {
@@ -141,7 +161,7 @@ struct Task {
     job: Job,
 }
 
-/// Un enlace de este equipo, legible y con su objetivo.
+/// Un enlace de este equipo, legible y con su objetivo (o con su objetivo borrado: `orphan`).
 #[derive(Debug)]
 struct Mine {
     id: String,
@@ -150,6 +170,15 @@ struct Mine {
     name: String,
     plan: Option<PlanSummary>,
     closed: Option<u64>,
+    /// El objetivo borrado (una lápida en la copia) del que cuelga, si es eso.
+    orphan: Option<String>,
+}
+
+impl Mine {
+    /// Abierto y de un objetivo que está: el que lleva el resumen del plan de su sesión.
+    fn live(&self) -> bool {
+        self.closed.is_none() && self.orphan.is_none()
+    }
 }
 
 /// El resumen de un plan como va en el enlace.
@@ -212,9 +241,9 @@ impl Progress {
         self.wake.notify_one();
     }
 
-    /// Se ha borrado la sesión `id` a las `at` (ms): sus enlaces se cierran, con `plan` (el
-    /// último resumen de su plan; `None` si no se pudo leer) si cambió.
-    pub fn session_deleted(&self, id: &str, at: u64, plan: Option<Option<PlanSummary>>) {
+    /// Se ha borrado la sesión `id` a las `at` (ms): sus enlaces se cierran, con `plan` (lo
+    /// último que se sabe de su plan) si cambió.
+    pub fn session_deleted(&self, id: &str, at: u64, plan: LastPlan) {
         let mut i = self.lock();
         i.dirty.remove(id);
         i.last.remove(id);
@@ -262,7 +291,11 @@ impl Progress {
         let mut tasks = vec![];
         let (mut later, mut unread) = (HashSet::new(), HashSet::new());
         for m in mine {
-            let job = if let Some(t) = m.closed {
+            let job = if let Some(objective) = &m.orphan {
+                Job::Orphan {
+                    objective: objective.clone(),
+                }
+            } else if let Some(t) = m.closed {
                 if now.saturating_sub(t) < KEEP_CLOSED {
                     continue;
                 }
@@ -294,7 +327,7 @@ impl Progress {
             } else {
                 let closing = i.closing.get(&m.session).cloned().unwrap_or(Closing {
                     at: now,
-                    plan: None,
+                    plan: LastPlan::Unknown,
                 });
                 Job::Close {
                     session: m.session.clone(),
@@ -343,9 +376,10 @@ impl Progress {
 /// El resumen de ahora del plan de una sesión (`None`: no tiene), o `Err` si no se pudo leer.
 type Plan = Result<Option<PlanSummary>, ()>;
 
-/// Los enlaces de este equipo (`machine`) que se pueden leer y tienen su objetivo, y los
-/// resúmenes de ahora de las sesiones de `sessions` que tienen alguno abierto. Descifra la copia
-/// entera y puede leer planes del disco: fuera del hilo de tokio.
+/// Los enlaces de este equipo (`machine`) que se pueden leer y tienen su objetivo o lo tienen
+/// borrado (una lápida en la copia: `orphan`), y los resúmenes de ahora de las sesiones de
+/// `sessions` que tienen alguno abierto (de un objetivo que está). Descifra la copia entera y
+/// puede leer planes del disco: fuera del hilo de tokio.
 fn read_mine(
     st: &AppState,
     keys: &Keyring,
@@ -359,13 +393,19 @@ fn read_mine(
         .filter(|e| matches!(e.object, Object::Objective(_)))
         .map(|e| e.id.as_str())
         .collect();
+    let buried = |id: &str| st.board.item(id).is_some_and(|s| s.gone);
     let mine: Vec<Mine> = d
         .objects
         .iter()
         .filter_map(|e| match &e.object {
-            Object::Link(l)
-                if l.session.machine == machine && objectives.contains(l.objective.as_str()) =>
-            {
+            Object::Link(l) if l.session.machine == machine => {
+                let orphan = if objectives.contains(l.objective.as_str()) {
+                    None
+                } else if buried(&l.objective) {
+                    Some(l.objective.clone())
+                } else {
+                    return None;
+                };
                 Some(Mine {
                     id: e.id.clone(),
                     v: e.v,
@@ -373,13 +413,14 @@ fn read_mine(
                     name: l.session.name.clone(),
                     plan: l.plan.clone(),
                     closed: l.closed,
+                    orphan,
                 })
             }
             _ => None,
         })
         .collect();
     let mut plans = HashMap::new();
-    for m in mine.iter().filter(|m| m.closed.is_none()) {
+    for m in mine.iter().filter(|m| m.live()) {
         if plans.contains_key(&m.session) || !sessions.contains(&m.session) {
             continue;
         }
@@ -439,10 +480,14 @@ fn close(o: &mut Object, machine: &str, session: &str, c: &Closing, now: u64) {
         && l.closed.is_none()
     {
         l.closed = Some(c.at);
-        if let Some(plan) = &c.plan
-            && !same_plan(l.plan.as_ref(), plan.as_ref())
-        {
-            put_plan(&mut l.plan, plan.as_ref());
+        let want = match &c.plan {
+            LastPlan::Unknown => l.plan.as_ref(),
+            LastPlan::NoPlan => None,
+            LastPlan::Summary(p) => Some(p),
+        };
+        if !same_plan(l.plan.as_ref(), want) {
+            let want = want.cloned();
+            put_plan(&mut l.plan, want.as_ref());
             l.copied = c.at;
         }
         l.changed = now;
@@ -501,7 +546,7 @@ pub async fn pass(st: &Arc<AppState>, now: u64) {
         // se borra mientras tanto aún los tiene: se queda.
         let open: HashSet<String> = mine
             .iter()
-            .filter(|m| m.closed.is_none())
+            .filter(|m| m.live())
             .map(|m| m.session.clone())
             .collect();
         i.closing.retain(|s, _| open.contains(s));
@@ -510,11 +555,39 @@ pub async fn pass(st: &Arc<AppState>, now: u64) {
     run(st, &keys, &machine, tasks, now).await;
 }
 
+/// Lo que dio un trabajo que no falló.
+enum Did {
+    /// Hecho: se escribió (o, una subida, ya estaba).
+    Done,
+    /// No hizo falta: otro se adelantó.
+    Nothing,
+    /// No se hizo: el enlace o su objetivo cambiaron mientras tanto. Que la próxima pasada
+    /// vuelva a leer y decida.
+    Later,
+}
+
+/// Borra el enlace de `t` si sigue siendo el que se leyó (su `v`) y si `when` vale para él, como
+/// está en la copia y tras cada choque (409).
+async fn remove_link(
+    st: &AppState,
+    keys: &Keyring,
+    t: &Task,
+    when: impl Fn(&Object) -> bool + Sync,
+) -> Result<Did, EditError> {
+    if st.board.item(&t.link).map(|s| s.v) != Some(t.v) {
+        return Ok(Did::Later);
+    }
+    match st.board.remove_when(keys, &t.link, when).await? {
+        true => Ok(Did::Done),
+        false => Ok(Did::Later),
+    }
+}
+
 /// Hace lo decidido, en orden. Un error que se puede arreglar esperando deja lo que falte para
 /// la próxima pasada; con el hub caído o un 429, se para.
 async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>, now: u64) {
     let p = &st.progress;
-    let (mut again, mut closed, mut removed) = (false, 0, 0);
+    let (mut again, mut closed, mut removed, mut orphans) = (false, 0, 0, 0);
     let start = st.hub.board_writes();
     for t in tasks {
         if st.hub.board_writes().saturating_sub(start) >= MAX_WRITES as u64 {
@@ -533,44 +606,55 @@ async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>
                     copy(o, machine, session, plan.as_ref(), name, now)
                 })
                 .await
-                .map(drop),
+                .map(|_| Did::Done),
             Job::Close { session, closing } => st
                 .board
                 .update(keys, &t.link, |o| close(o, machine, session, closing, now))
                 .await
-                .map(drop),
+                .map(|o| {
+                    // Cerrado por esta pasada, o no hizo falta (otro lo cerró o lo pasó a otra
+                    // sesión entretanto): solo lo primero cuenta en el registro.
+                    let ours = matches!(&o, Object::Link(l) if l.session.machine == machine
+                        && l.session.id == *session && l.closed == Some(closing.at));
+                    if ours { Did::Done } else { Did::Nothing }
+                }),
             Job::Remove => {
-                // Solo si sigue siendo el que se leyó y, tras cada choque, si sigue cerrado hace
-                // 30 días: uno que se vuelve a abrir (`join`) entretanto no se borra.
-                let same = st.board.item(&t.link).map(|s| s.v) == Some(t.v);
+                // Tras cada choque, si sigue cerrado hace 30 días: uno que se vuelve a abrir
+                // (`join`) entretanto no se borra.
                 let gone = |o: &Object| {
                     matches!(o, Object::Link(l) if l.session.machine == machine
                         && l.closed.is_some_and(|c| now.saturating_sub(c) >= KEEP_CLOSED))
                 };
-                let r = if same {
-                    st.board.remove_when(keys, &t.link, gone).await
-                } else {
-                    Ok(false)
+                remove_link(st, keys, &t, gone).await
+            }
+            Job::Orphan { objective } => {
+                // Si su objetivo sigue borrado y, tras cada choque, si sigue siendo de este
+                // equipo y de ese objetivo: uno que otro pasa a otro objetivo entretanto no se
+                // borra.
+                let still = |o: &Object| {
+                    matches!(o, Object::Link(l) if l.session.machine == machine
+                        && l.objective == *objective)
                 };
-                match r {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        again = true;
-                        continue;
-                    }
-                    Err(e) => Err(e),
+                if st.board.item(objective).is_some_and(|s| s.gone) {
+                    remove_link(st, keys, &t, still).await
+                } else {
+                    Ok(Did::Later)
                 }
             }
         };
         // Si hay que parar y si falta algo (que la próxima pasada vuelva a mirar).
         let (stop, pending) = match r {
-            Ok(()) | Err(EditError::Missing) => {
+            Ok(Did::Later) => (false, true),
+            r @ (Ok(_) | Err(EditError::Missing)) => {
+                let done = matches!(r, Ok(Did::Done));
                 match &t.job {
                     Job::Copy { session, .. } => {
                         p.lock().last.insert(session.clone(), now);
                     }
-                    Job::Close { .. } => closed += 1,
-                    Job::Remove => removed += 1,
+                    Job::Close { .. } if done => closed += 1,
+                    Job::Remove if done => removed += 1,
+                    Job::Orphan { .. } if done => orphans += 1,
+                    _ => {}
                 }
                 (false, false)
             }
@@ -617,6 +701,9 @@ async fn run(st: &Arc<AppState>, keys: &Keyring, machine: &str, tasks: Vec<Task>
     }
     if removed > 0 {
         eprintln!("nido: tablero: {removed} enlaces de sesiones cerradas hace 30 días, fuera");
+    }
+    if orphans > 0 {
+        eprintln!("nido: tablero: {orphans} enlaces de objetivos borrados, fuera");
     }
 }
 
@@ -949,6 +1036,68 @@ mod tests {
         assert_eq!(items(&w), before);
     }
 
+    /// Los enlaces de este equipo cuyo objetivo se borró de verdad (es una lápida en la copia) se
+    /// borran, abiertos o cerrados y sea de quien sea la sesión. Los de otro equipo, no; ni los de
+    /// un objetivo que no está sin más (puede volver).
+    #[tokio::test]
+    async fn links_of_a_deleted_objective_are_removed() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let mine = join(&w, &w.s).await;
+        let (closed, gone, theirs) = ("1".repeat(32), "2".repeat(32), "3".repeat(32));
+        put_link(&w, &closed, &o, "este", &w.s.id, json!({"closed": T0}));
+        put_link(&w, &gone, &o, "este", "dead0000", json!({}));
+        put_link(&w, &theirs, &o, "mac", "dead0000", json!({}));
+        // Uno de un objetivo que no está (sin lápida): se queda.
+        let nowhere = "4".repeat(32);
+        put_link(&w, &nowhere, &"9".repeat(32), "este", &w.s.id, json!({}));
+        set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        // Otro (la web, la app, una cascada a medias) borra el objetivo y no sus enlaces.
+        w.board.lock().unwrap().write(&o, None);
+        w.st.board.sync().await.unwrap();
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        for l in [&mine, &closed, &gone] {
+            assert!(items(&w)[l].gone, "{l}");
+        }
+        // Solo los borrados: ni el resumen ni el cierre se escriben antes.
+        assert_eq!(w.writes(), n + 3);
+        assert!(w.stored(&theirs).is_some());
+        assert!(w.stored(&nowhere).is_some());
+        let (before, n) = (items(&w), w.writes());
+        pass(&w.st, T0 + GAP).await;
+        pass(&w.st, T0 + KEEP_CLOSED).await;
+        assert_eq!(w.writes(), n);
+        assert_eq!(items(&w), before);
+    }
+
+    /// Si el enlace ya no estaba (otro lo borró antes, o el hub no lo tiene), el borrado choca
+    /// (409) una vez y cuenta como hecho: no se vuelve a pedir en cada pasada.
+    #[tokio::test]
+    async fn an_orphan_already_gone_is_not_retried() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let (deleted, lost) = ("1".repeat(32), "2".repeat(32));
+        put_link(&w, &deleted, &o, "este", &w.s.id, json!({}));
+        put_link(&w, &lost, &o, "este", "dead0000", json!({}));
+        w.board.lock().unwrap().write(&o, None);
+        w.st.board.sync().await.unwrap();
+        // El hub ya no los tiene como los tiene la copia: uno lo borró otro, y el otro no está.
+        w.board.lock().unwrap().write(&deleted, None);
+        w.board.lock().unwrap().items.remove(&lost);
+        let n = w.writes();
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n + 2, "un intento cada uno");
+        assert!(w.st.board.item(&deleted).unwrap().gone);
+        assert!(w.st.board.item(&lost).is_none());
+        pass(&w.st, T0 + GAP).await;
+        pass(&w.st, T0 + 2 * GAP).await;
+        pass(&w.st, T0 + KEEP_CLOSED).await;
+        assert_eq!(w.writes(), n + 2);
+    }
+
     /// Los huérfanos (su objetivo no está o no se puede leer) y los que no se pueden leer no se
     /// tocan.
     #[tokio::test]
@@ -1206,6 +1355,42 @@ mod tests {
         )
     }
 
+    /// Un huérfano que otro pasa a un objetivo que está justo antes de borrarlo (un 409) no se
+    /// borra: la pasada siguiente vuelve a leer, ya no es huérfano y no se vuelve a pedir nada.
+    #[tokio::test]
+    async fn an_orphan_moved_meanwhile_is_not_removed() {
+        let _limit = limit();
+        let w = world().await;
+        let o = goal(&w).await;
+        let o2 = w
+            .call("objective", json!({"project": "P", "name": "O2"}))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let l = "1".repeat(32);
+        put_link(&w, &l, &o, "este", "dead0000", json!({"closed": T0}));
+        w.board.lock().unwrap().write(&o, None);
+        w.st.board.sync().await.unwrap();
+        let moved = json!({"t": "link", "objective": o2,
+            "session": {"machine": "este", "id": "dead0000", "name": "Otro/vieja"},
+            "plan": null, "copied": 0, "closed": T0, "created": 1, "changed": 3, "by": "web"});
+        w.board
+            .lock()
+            .unwrap()
+            .clash(&l, Some(sealed(&w, &l, moved)));
+        let (n, reads) = (w.writes(), w.st.progress.reads());
+        pass(&w.st, T0).await;
+        assert_eq!(w.writes(), n + 1, "el borrado que choca");
+        assert_eq!(w.stored(&l).unwrap()["objective"], json!(o2));
+        pass(&w.st, T0 + 1).await;
+        assert_eq!(w.st.progress.reads(), reads + 2, "vuelve a leer enseguida");
+        pass(&w.st, T0 + 2).await;
+        assert_eq!(w.writes(), n + 1);
+        assert_eq!(w.stored(&l).unwrap()["objective"], json!(o2));
+    }
+
     /// Un enlace que otro vuelve a abrir justo antes de borrarlo (un 409) no se borra.
     #[tokio::test]
     async fn a_link_reopened_meanwhile_is_not_removed() {
@@ -1253,7 +1438,11 @@ mod tests {
             b.clash(&l3, Some(c3));
         }
         set_plan(&w, &w.s.id, "Migrar", &["done"]);
+        let n = w.writes();
         pass(&w.st, T0).await;
+        // Una escritura cada uno, la que choca: tras el 409 no queda nada que cambiar, y no se
+        // escribe otra vez lo mismo.
+        assert_eq!(w.writes(), n + 3);
         let v1 = w.stored(&l1).unwrap();
         assert_eq!((&v1["closed"], &v1["plan"]), (&json!(5), &Value::Null));
         let v2 = w.stored(&l2).unwrap();
@@ -1359,14 +1548,21 @@ mod tests {
     }
 
     /// Lo que no se arregla reintentando (un 413) se prueba una vez, y otra cuando cambia lo
-    /// que se quiere escribir.
+    /// que se quiere escribir: con el `code` del hub y sin él (un hub de antes).
     #[tokio::test]
     async fn what_cannot_be_written_is_not_retried_until_it_changes() {
+        for uncoded in [false, true] {
+            what_cannot_be_written(uncoded).await;
+        }
+    }
+
+    async fn what_cannot_be_written(uncoded: bool) {
         let _limit = limit();
         let w = world().await;
         goal(&w).await;
         let l = join(&w, &w.s).await;
         w.board.lock().unwrap().too_big.insert(l.clone());
+        w.board.lock().unwrap().uncoded = uncoded;
         set_plan(&w, &w.s.id, "Migrar", &["pending"]);
         let n = w.writes();
         pass(&w.st, T0).await;
@@ -1418,7 +1614,8 @@ mod tests {
         let _limit = limit();
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
-        st.progress.session_deleted("dead0000", T0, None);
+        st.progress
+            .session_deleted("dead0000", T0, LastPlan::Unknown);
         pass(&st, T0 + KEEP_CLOSED - 1).await;
         assert_eq!(st.progress.closing_len(), 1);
         pass(&st, T0 + KEEP_CLOSED).await;

@@ -1554,7 +1554,9 @@ impl BoardCache {
     /// así se conserva lo que no conocemos, en `extra`. Se escribe con la clave actual. Si choca
     /// (409), se vuelve a aplicar `f` sobre el objeto como está, hasta `MAX_TRIES` escrituras en
     /// total. Lo que no se puede leer no se reescribe. Uno borrado en el hub queda borrado aquí
-    /// (`Missing`); uno que el hub no tiene se marca así (`Missing`, y se pide un sondeo).
+    /// (`Missing`); uno que el hub no tiene se marca así (`Missing`, y se pide un sondeo). Si `f`
+    /// no cambia nada (de entrada, o tras un 409 que ya trae lo que se quería), no se escribe: se
+    /// devuelve tal cual (aunque esté cifrado con una clave retirada: eso lo hace el recifrado).
     /// Devuelve el objeto como quedó.
     pub async fn update(
         self: &Arc<Self>,
@@ -1578,8 +1580,12 @@ impl BoardCache {
         let mut tries = 0;
         loop {
             tries += 1;
-            let mut obj = read(keys, id, &stored).map_err(EditError::Unreadable)?;
+            let before = read(keys, id, &stored).map_err(EditError::Unreadable)?;
+            let mut obj = before.clone();
             f(&mut obj);
+            if obj == before {
+                return Ok(obj);
+            }
             let blob = seal_object(&key, id, &obj).map_err(EditError::Blob)?;
             match self.hub.board_put(id, v, &kid, &blob).await {
                 Ok(st) => {
@@ -3339,6 +3345,55 @@ mod tests {
         assert_eq!(r.cache.item(&id).unwrap().v, cur.v);
     }
 
+    /// Un cambio que no cambia nada no se escribe: ni de entrada, ni tras un 409 que ya trae lo
+    /// que se quería (otro hizo lo mismo).
+    #[tokio::test]
+    async fn an_update_that_changes_nothing_is_not_written() {
+        let r = rig(fake::Board::default()).await;
+        let id = bid(1);
+        r.write(&K_CUR, &id, &project("uno"));
+        r.cache.sync().await.unwrap();
+        let rename = |o: &mut Object| {
+            if let Object::Project(p) = o {
+                p.name = "dos".into();
+            }
+        };
+        let got = r.cache.update(&keyring(), &id, |_| {}).await.unwrap();
+        assert_eq!(got, project("uno"));
+        assert!(r.writes().is_empty(), "{:?}", r.writes());
+        // Otro lo deja como se quería justo antes: el 409 lo trae, y no hay segunda escritura.
+        r.board
+            .lock()
+            .unwrap()
+            .clash(&id, Some(sealed(&K_CUR, &id, &project("dos"))));
+        let got = r.cache.update(&keyring(), &id, rename).await.unwrap();
+        assert_eq!(got, project("dos"));
+        assert_eq!(r.writes(), vec![("put".into(), id.clone(), 1)]);
+        assert_eq!(r.cache.item(&id).unwrap().v, 2);
+        // Y lo mismo otra vez: ya está así, no se escribe.
+        r.cache.update(&keyring(), &id, rename).await.unwrap();
+        assert_eq!(r.writes().len(), 1);
+    }
+
+    /// Un cambio que no cambia nada tampoco se escribe en uno que falta por resubir (sigue
+    /// faltando) ni en uno cifrado con una clave retirada (eso lo hace el recifrado).
+    #[tokio::test]
+    async fn no_change_writes_nothing_while_reuploading_or_with_a_retired_key() {
+        let r = rig(fake::Board::default()).await;
+        let (pending, old) = (bid(1), bid(2));
+        r.write(&K_CUR, &pending, &project("uno"));
+        r.write(&K_OLD, &old, &project("vieja"));
+        r.cache.sync().await.unwrap();
+        r.cache.lock().reupload.insert(pending.clone());
+        let got = r.cache.update(&keyring(), &pending, |_| {}).await.unwrap();
+        assert_eq!(got, project("uno"));
+        assert!(r.cache.lock().reupload.contains(&pending));
+        let got = r.cache.update(&keyring(), &old, |_| {}).await.unwrap();
+        assert_eq!(got, project("vieja"));
+        assert_eq!(r.cache.item(&old).unwrap().kid, kid(&K_OLD));
+        assert!(r.writes().is_empty(), "{:?}", r.writes());
+    }
+
     /// Cambiar algo que otro borró: queda borrado aquí. Cambiar algo que el hub no tiene: no se
     /// entierra, se marca como que no está en el hub y se pide un sondeo.
     #[tokio::test]
@@ -3350,15 +3405,21 @@ mod tests {
         r.cache.sync().await.unwrap();
         r.board.lock().unwrap().write(&deleted, None);
         r.board.lock().unwrap().items.remove(&lost);
+        // Un cambio de verdad: uno que no cambia nada no se escribe.
+        let touch = |o: &mut Object| {
+            if let Object::Project(p) = o {
+                p.changed += 1;
+            }
+        };
         let e = r
             .cache
-            .update(&keyring(), &deleted, |_| {})
+            .update(&keyring(), &deleted, touch)
             .await
             .unwrap_err();
         assert!(matches!(e, EditError::Missing), "{e:?}");
         let s = r.cache.item(&deleted).unwrap();
         assert!(s.gone && s.v == 2, "{s:?}");
-        let e = r.cache.update(&keyring(), &lost, |_| {}).await.unwrap_err();
+        let e = r.cache.update(&keyring(), &lost, touch).await.unwrap_err();
         assert!(matches!(e, EditError::Missing), "{e:?}");
         assert!(!r.cache.item(&lost).unwrap().gone);
         assert_eq!(
@@ -3369,7 +3430,7 @@ mod tests {
             .await
             .expect("no se pidió el sondeo");
         // Y no se vuelve a intentar escribir.
-        let e = r.cache.update(&keyring(), &lost, |_| {}).await.unwrap_err();
+        let e = r.cache.update(&keyring(), &lost, touch).await.unwrap_err();
         assert!(
             matches!(e, EditError::Unreadable(Unreadable::NotInHub)),
             "{e:?}"
@@ -4415,6 +4476,117 @@ mod tests {
         assert!(cache.ids().is_empty());
         assert_eq!(cache.next(), 0);
         assert_eq!(cache.lock().account_ref, None);
+    }
+
+    /// «Borrar la cuenta» en el hub: borra todo lo de la cuenta y deja, en una cuenta nueva
+    /// para los mismos equipos (otra `ref`), una lápida por cada objeto (mismo id, `kid` vacío,
+    /// sin blob, su `v` + 1, `at` de ahora). Un nido con el tablero en su copia lo entierra
+    /// todo en vez de resubirlo: con la sincronización del cambio de `ref` y su sondeo, y
+    /// también si antes de sincronizar intenta cambiar algo (`edit_first`: el 409 trae la
+    /// lápida).
+    async fn a_deleted_account(edit_first: bool) {
+        let r = rig(with_ref(REF_A)).await;
+        let (p, g, t) = (bid(1), bid(2), bid(3));
+        // Tres escrituras del mismo P en el hub: queda en la v3.
+        for _ in 0..3 {
+            r.write(&K_CUR, &p, &project("P"));
+        }
+        r.write(&K_CUR, &g, &goal("nota"));
+        r.write(&K_CUR, &t, &project("T"));
+        r.board.lock().unwrap().write(&t, None);
+        r.cache.sync().await.unwrap();
+        {
+            let c = r.cache.lock();
+            assert_eq!(c.account_ref.as_deref(), Some(REF_A));
+            assert!(c.next > 0);
+            let v = |id: &str| (c.items[id].v, c.items[id].gone, c.items[id].blob.is_some());
+            assert_eq!(
+                (v(&p), v(&g), v(&t)),
+                ((3, false, true), (1, false, true), (2, true, false))
+            );
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let hub_after = {
+            let mut b = r.board.lock().unwrap();
+            b.account_ref = Some(REF_B.into());
+            b.items.clear();
+            for (id, v) in [(&p, 4), (&g, 2), (&t, 3)] {
+                let item = BoardItem {
+                    id: id.clone(),
+                    v,
+                    kid: String::new(),
+                    blob: None,
+                    gone: true,
+                    at: now,
+                };
+                b.items.insert(id.clone(), item);
+            }
+            b.items.clone()
+        };
+        let touch = |o: &mut Object| {
+            if let Object::Project(x) = o {
+                x.desc = "cambiada".into();
+            }
+        };
+        let mut tried = 0;
+        if edit_first {
+            let e = r.cache.update(&keyring(), &p, touch).await.unwrap_err();
+            assert!(matches!(e, EditError::Missing), "{e:?}");
+            let s = r.cache.item(&p).unwrap();
+            assert!(s.gone && s.v == 4 && s.blob.is_none(), "{s:?}");
+            // El intento (con la v3) choca, y no se crea nada.
+            assert_eq!(r.writes(), vec![("put".into(), p.clone(), 3)]);
+            assert_eq!(r.board.lock().unwrap().items, hub_after);
+            tried = 1;
+            // Un sondeo con G aún vivo en la copia: el hub no está vacío (tiene las lápidas), así
+            // que no hay nada que resubir; lo que trae se junta y entierra G.
+            r.cache.probe(&keys()).await.unwrap();
+            assert!(r.cache.item(&g).unwrap().gone);
+            assert_eq!(r.writes().len(), tried);
+        }
+        r.cache.refresh(&keys(), true).await;
+        let all_buried = |r: &Rig| {
+            let c = r.cache.lock();
+            assert_eq!(c.items.len(), 3, "{:?}", c.items);
+            for (id, s) in &c.items {
+                assert!(
+                    s.gone && s.blob.is_none() && s.kid.is_empty(),
+                    "{id}: {s:?}"
+                );
+            }
+            assert!(c.reupload.is_empty() && c.missing.is_empty(), "{c:?}");
+            assert_eq!(c.account_ref.as_deref(), Some(REF_B));
+        };
+        all_buried(&r);
+        assert_eq!(r.cache.decrypted(&keyring()), Decrypted::default());
+        assert_eq!(r.cache.pending_reupload(), 0);
+        assert_eq!(r.writes().len(), tried);
+        assert_eq!(r.on_disk().await.lock().account_ref.as_deref(), Some(REF_B));
+        // Lo de después tampoco escribe: cambiar P da `Missing`, y otro sondeo no resube nada.
+        // Sale enseguida, porque en la copia ya no queda nada vivo (`has_objects` da falso); las
+        // esperas (más que `EMPTY_CONFIRM`) dan tiempo a una resubida en segundo plano, si se
+        // hubiera puesto en marcha, para que se vea aquí.
+        let e = r.cache.update(&keyring(), &p, touch).await.unwrap_err();
+        assert!(matches!(e, EditError::Missing), "{e:?}");
+        tokio::time::sleep(EMPTY_CONFIRM * 4).await;
+        r.cache.refresh(&keys(), true).await;
+        tokio::time::sleep(EMPTY_CONFIRM * 4).await;
+        all_buried(&r);
+        assert_eq!(r.writes().len(), tried);
+        assert_eq!(r.board.lock().unwrap().items, hub_after);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_account_buries_the_copy() {
+        a_deleted_account(false).await;
+    }
+
+    #[tokio::test]
+    async fn an_edit_before_learning_of_a_deleted_account_is_buried() {
+        a_deleted_account(true).await;
     }
 
     /// Una `ref` por `{"account"}` que no es la guardada trae una sincronización con sondeo,

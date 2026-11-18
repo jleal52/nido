@@ -625,7 +625,7 @@ async fn peer_calls_end_to_end() {
 }
 
 /// Las herramientas del tablero llegan por la API local (`api_mcp`): en un nido sin hub, las
-/// cinco dicen que no hay hub.
+/// seis dicen que no hay hub.
 #[tokio::test]
 async fn the_board_tools_go_through_the_local_api() {
     let _limit = nido::watchdog::limit(std::time::Duration::from_secs(60));
@@ -663,6 +663,7 @@ async fn the_board_tools_go_through_the_local_api() {
         ("objective", json!({"project": "P", "name": "O"})),
         ("join", json!({"objective": "O"})),
         ("leave", json!({"objective": "O"})),
+        ("board_delete", json!({"kind": "objective", "id": "O"})),
     ] {
         let (status, body) = tool(addr, &caller, name, args).await;
         assert_eq!(status, 503, "{name}: {body}");

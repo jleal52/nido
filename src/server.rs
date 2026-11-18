@@ -3949,7 +3949,12 @@ pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), Regist
     };
     let res = st.registry.lock().await.remove(id);
     if res.is_ok() {
-        let last = last.map(|s| s.as_ref().map(crate::board_progress::link_plan));
+        use crate::board_progress::{LastPlan, link_plan};
+        let last = match last {
+            None => LastPlan::Unknown,
+            Some(None) => LastPlan::NoPlan,
+            Some(Some(s)) => LastPlan::Summary(link_plan(&s)),
+        };
         st.progress.session_deleted(id, now_ms(), last);
     }
     st.mcp_cursors.forget(id);

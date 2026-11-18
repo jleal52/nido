@@ -1,6 +1,8 @@
-//! Las herramientas MCP del tablero de la cuenta: `board`, `project`, `objective`, `join` y
-//! `leave`. Lo que ve y cambia una sesión de Claude de los proyectos, los objetivos y los enlaces
-//! (sesión ↔ objetivo).
+//! Las herramientas MCP del tablero de la cuenta: `board`, `project`, `objective`, `join`,
+//! `leave` y `board_delete`. Lo que ve y cambia una sesión de Claude de los proyectos, los
+//! objetivos y los enlaces (sesión ↔ objetivo). Borrar un proyecto o un objetivo va aparte, en
+//! `board_delete`, que pide permiso (no está en `claude::NIDO_TOOLS`): es en cascada y sin vuelta
+//! atrás.
 //!
 //! Solo desde una sesión de este equipo: no van por el canal «peer», porque cada nido tiene su
 //! copia del mismo tablero. Todo pasa por `BoardCache`: antes de nada se sincroniza con el hub,
@@ -349,9 +351,14 @@ fn board_fail(e: BoardError) -> Fail {
             StatusCode::CONFLICT,
             "el objeto cambió a la vez en otro sitio varias veces seguidas: prueba otra vez",
         ),
+        // Lo que cuenta el hub: todos los objetos de la cuenta (proyectos, objetivos y enlaces),
+        // también los archivados, y las lápidas de lo borrado hasta que caducan (hoy, 30 días:
+        // docs/protocolo.md del hub, §7). El número no se dice: es del hub y puede cambiar.
         BoardError::Full => fail(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "el tablero de la cuenta está lleno: borra objetivos o proyectos que ya no hagan falta",
+            "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra proyectos u \
+             objetivos que ya no hagan falta (lo borrado tarda en dejar sitio, y lo archivado \
+             cuenta igual)",
         ),
         BoardError::TooBig => fail(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -904,33 +911,35 @@ enum Mode<'a> {
     Create,
     /// Cambiar los campos dados del que dice `id`.
     Change(&'a str),
-    /// Borrar el que dice `id`.
-    Delete(&'a str),
 }
 
-/// Lo que se pide, según `id`, `delete` y si se da algún campo; lo que no tiene sentido, 400.
-fn mode<'a>(
-    id: &'a Option<String>,
-    delete: bool,
-    changes: bool,
-    kind: Kind,
-) -> Result<Mode<'a>, Fail> {
-    match (given(id), delete) {
-        (None, true) => Err(fail(StatusCode::BAD_REQUEST, "para borrar hace falta id")),
-        (None, false) => Ok(Mode::Create),
-        (Some(_), true) if changes => Err(fail(
+/// Borrar ya no va por `project` ni por `objective` (con `delete`, como antes): va por
+/// `board_delete`, que pide permiso. Con `delete`, 400 y lo dice, antes de mirar nada más. Lo
+/// manda sobre todo una sesión abierta antes de actualizar: su `nido mcp` es el de antes, que
+/// tiene `delete` y no tiene `board_delete` (el `nido mcp` nuevo ya no deja pasar `delete`).
+fn no_delete(delete: Option<bool>) -> Result<(), Fail> {
+    match delete {
+        Some(_) => Err(fail(
             StatusCode::BAD_REQUEST,
-            "delete va solo, sin otros cambios",
+            "para borrar, usa board_delete (si no la tienes, reinicia la sesión: llega con nido \
+             0.10.1)",
         )),
-        (Some(q), true) => Ok(Mode::Delete(q)),
-        (Some(_), false) if !changes => Err(fail(
+        None => Ok(()),
+    }
+}
+
+/// Lo que se pide, según `id` y si se da algún campo; lo que no tiene sentido, 400.
+fn mode(id: &Option<String>, changes: bool, kind: Kind) -> Result<Mode<'_>, Fail> {
+    match given(id) {
+        None => Ok(Mode::Create),
+        Some(_) if !changes => Err(fail(
             StatusCode::BAD_REQUEST,
             match kind {
-                Kind::Project => "nada que cambiar: da name, desc, state o delete",
-                Kind::Objective => "nada que cambiar: da name, desc, state, note, order o delete",
+                Kind::Project => "nada que cambiar: da name, desc o state",
+                Kind::Objective => "nada que cambiar: da name, desc, state, note u order",
             },
         )),
-        (Some(q), false) => Ok(Mode::Change(q)),
+        Some(q) => Ok(Mode::Change(q)),
     }
 }
 
@@ -954,22 +963,23 @@ struct ProjectArgs {
     desc: Option<String>,
     #[serde(default)]
     state: Option<String>,
+    /// Ya no vale (se borra con `board_delete`): solo para decirlo.
     #[serde(default)]
-    delete: bool,
+    delete: Option<bool>,
 }
 
 fn project_reply(id: &str, p: &Project) -> Value {
     json!({"ok": true, "id": id, "name": p.name, "state": token(&p.state)})
 }
 
-/// `project`: sin `id` crea uno; con `id` (o su nombre) lo cambia o, con `delete`, lo borra con
-/// sus objetivos y sus enlaces.
+/// `project`: sin `id` crea uno; con `id` (o su nombre) lo cambia. Borrar, con `board_delete`.
 pub async fn tool_project(st: &Arc<AppState>, s: &Session, args: Value) -> Reply {
     let a: ProjectArgs = args_of(args)?;
+    no_delete(a.delete)?;
     let name = a.name.as_deref().map(clean_name).transpose()?;
     let state = given(&a.state).map(project_state).transpose()?;
     let changes = name.is_some() || a.desc.is_some() || state.is_some();
-    let q = match mode(&a.id, a.delete, changes, Kind::Project)? {
+    let q = match mode(&a.id, changes, Kind::Project)? {
         Mode::Create => {
             let Some(name) = name else {
                 return Err(fail(
@@ -998,19 +1008,6 @@ pub async fn tool_project(st: &Arc<AppState>, s: &Session, args: Value) -> Reply
                 .await
                 .map_err(|e| edit_fail("", e))?;
             return Ok(project_reply(&id, &p));
-        }
-        Mode::Delete(q) => {
-            let (keys, d) = for_writing(st).await?;
-            let id = find(&d, q, Kind::Project, None)?.id.as_str();
-            let objs: Vec<&str> = objectives(&d)
-                .filter(|(_, o)| o.project == id)
-                .map(|(e, _)| e.id.as_str())
-                .collect();
-            let ls = links_of(&d, &objs);
-            let all: Vec<&str> = ls.iter().chain(&objs).copied().chain([id]).collect();
-            remove_all(st, &keys, &all).await?;
-            return Ok(json!({"ok": true, "deleted": id, "objectives": objs.len(),
-                "links": ls.len()}));
         }
         Mode::Change(q) => q,
     };
@@ -1068,8 +1065,9 @@ struct ObjectiveArgs {
     note: Option<String>,
     #[serde(default)]
     order: Option<f64>,
+    /// Ya no vale (se borra con `board_delete`): solo para decirlo.
     #[serde(default)]
-    delete: bool,
+    delete: Option<bool>,
 }
 
 fn objective_reply(id: &str, o: &Objective) -> Value {
@@ -1078,9 +1076,10 @@ fn objective_reply(id: &str, o: &Objective) -> Value {
 }
 
 /// `objective`: sin `id` crea uno en `project` (al final, si no se da `order`); con `id` (o su
-/// nombre, en `project` si se da) lo cambia o, con `delete`, lo borra con sus enlaces.
+/// nombre, en `project` si se da) lo cambia. Borrar, con `board_delete`.
 pub async fn tool_objective(st: &Arc<AppState>, s: &Session, args: Value) -> Reply {
     let a: ObjectiveArgs = args_of(args)?;
+    no_delete(a.delete)?;
     let name = a.name.as_deref().map(clean_name).transpose()?;
     let state = given(&a.state).map(objective_state).transpose()?;
     if a.order.is_some_and(|o| !o.is_finite()) {
@@ -1094,7 +1093,7 @@ pub async fn tool_objective(st: &Arc<AppState>, s: &Session, args: Value) -> Rep
         || state.is_some()
         || a.note.is_some()
         || a.order.is_some();
-    let q = match mode(&a.id, a.delete, changes, Kind::Objective)? {
+    let q = match mode(&a.id, changes, Kind::Objective)? {
         Mode::Create => {
             let Some(pq) = given(&a.project) else {
                 return Err(fail(
@@ -1143,7 +1142,7 @@ pub async fn tool_objective(st: &Arc<AppState>, s: &Session, args: Value) -> Rep
                 .map_err(|e| edit_fail("", e))?;
             return Ok(objective_reply(&id, &o));
         }
-        Mode::Delete(q) | Mode::Change(q) => q,
+        Mode::Change(q) => q,
     };
     let who = Who::of(st, s);
     let (keys, d) = for_writing(st).await?;
@@ -1153,12 +1152,6 @@ pub async fn tool_objective(st: &Arc<AppState>, s: &Session, args: Value) -> Rep
     };
     let e = find(&d, q, Kind::Objective, within.as_deref())?;
     let id = e.id.clone();
-    if a.delete {
-        let ls = links_of(&d, &[id.as_str()]);
-        let all: Vec<&str> = ls.iter().copied().chain([id.as_str()]).collect();
-        remove_all(st, &keys, &all).await?;
-        return Ok(json!({"ok": true, "deleted": id, "links": ls.len()}));
-    }
     if let (Some(n), Object::Objective(o)) = (&name, &e.object)
         && let Some(other) = taken(&d, n, Kind::Objective, Some(&o.project), Some(&id))
     {
@@ -1193,6 +1186,72 @@ pub async fn tool_objective(st: &Arc<AppState>, s: &Session, args: Value) -> Rep
     match obj {
         Object::Objective(o) => Ok(objective_reply(&id, &o)),
         _ => Err(changed_type(&id)),
+    }
+}
+
+// ---------- `board_delete` ----------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteArgs {
+    kind: String,
+    id: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// `board_delete`: borra un proyecto con sus objetivos y sus enlaces, o un objetivo con sus
+/// enlaces (`kind`). Se busca como en `project` y `objective`: por `id` (o su principio) o por su
+/// nombre, y un objetivo dentro de `project` si se da. Es la única herramienta del tablero que
+/// pide permiso (no está en `claude::NIDO_TOOLS`): no tiene vuelta atrás.
+pub async fn tool_board_delete(st: &Arc<AppState>, _s: &Session, args: Value) -> Reply {
+    let a: DeleteArgs = args_of(args)?;
+    let kind = match a.kind.trim() {
+        "project" => Kind::Project,
+        "objective" => Kind::Objective,
+        _ => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "kind tiene que ser project u objective",
+            ));
+        }
+    };
+    let q = a.id.trim();
+    if q.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "para borrar hace falta id"));
+    }
+    let scope = given(&a.project).map(str::to_owned);
+    if kind == Kind::Project && scope.is_some() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "project solo va con kind objective",
+        ));
+    }
+    let (keys, d) = for_writing(st).await?;
+    match kind {
+        Kind::Project => {
+            let id = find(&d, q, Kind::Project, None)?.id.as_str();
+            let objs: Vec<&str> = objectives(&d)
+                .filter(|(_, o)| o.project == id)
+                .map(|(e, _)| e.id.as_str())
+                .collect();
+            let ls = links_of(&d, &objs);
+            let all: Vec<&str> = ls.iter().chain(&objs).copied().chain([id]).collect();
+            remove_all(st, &keys, &all).await?;
+            Ok(json!({"ok": true, "deleted": id, "objectives": objs.len(),
+                "links": ls.len()}))
+        }
+        Kind::Objective => {
+            let within = match &scope {
+                Some(pq) => Some(find(&d, pq, Kind::Project, None)?.id.as_str()),
+                None => None,
+            };
+            let id = find(&d, q, Kind::Objective, within)?.id.as_str();
+            let ls = links_of(&d, &[id]);
+            let all: Vec<&str> = ls.iter().copied().chain([id]).collect();
+            remove_all(st, &keys, &all).await?;
+            Ok(json!({"ok": true, "deleted": id, "links": ls.len()}))
+        }
     }
 }
 
@@ -1400,6 +1459,7 @@ pub(crate) mod tests {
                 "objective" => tool_objective(&self.st, s, args).await,
                 "join" => tool_join(&self.st, s, args).await,
                 "leave" => tool_leave(&self.st, s, args).await,
+                "board_delete" => tool_board_delete(&self.st, s, args).await,
                 _ => panic!("{tool}"),
             }
         }
@@ -1464,6 +1524,15 @@ pub(crate) mod tests {
     fn has(e: &Fail, want: &str) -> bool {
         e.1.contains(want)
     }
+
+    /// El error de `delete` en `project` y en `objective`, entero.
+    const NO_DELETE: &str = "para borrar, usa board_delete (si no la tienes, reinicia la sesión: \
+                             llega con nido 0.10.1)";
+
+    /// El error de la cuenta llena, entero.
+    const FULL: &str = "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra \
+                        proyectos u objetivos que ya no hagan falta (lo borrado tarda en dejar \
+                        sitio, y lo archivado cuenta igual)";
 
     fn keys(v: &Value) -> std::collections::BTreeSet<String> {
         v.as_object().unwrap().keys().cloned().collect()
@@ -1591,13 +1660,16 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let r = w
-            .call("objective", json!({"id": o2, "delete": true}))
+            .call("board_delete", json!({"kind": "objective", "id": o2}))
             .await
             .unwrap();
         assert_eq!((&r["deleted"], &r["links"]), (&json!(o2), &json!(0)));
         assert!(w.stored(&o2).is_none());
         let r = w
-            .call("project", json!({"id": "nido 0.10.0", "delete": true}))
+            .call(
+                "board_delete",
+                json!({"kind": "project", "id": "nido 0.10.0"}),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1627,7 +1699,7 @@ pub(crate) mod tests {
         let link = w.live("link")[0].0.clone();
         w.board.lock().unwrap().bad.insert(o.clone());
         let e = w
-            .call("project", json!({"id": p, "delete": true}))
+            .call("board_delete", json!({"kind": "project", "id": p}))
             .await
             .unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_GATEWAY, "{}", e.1);
@@ -1636,7 +1708,7 @@ pub(crate) mod tests {
         assert!(w.stored(&o).is_some() && w.stored(&p).is_some());
         w.board.lock().unwrap().bad.clear();
         let r = w
-            .call("project", json!({"id": p, "delete": true}))
+            .call("board_delete", json!({"kind": "project", "id": p}))
             .await
             .unwrap();
         assert_eq!((&r["objectives"], &r["links"]), (&json!(1), &json!(0)));
@@ -1648,7 +1720,7 @@ pub(crate) mod tests {
         let p = id_of(&w.call("project", json!({"name": "Q"})).await.unwrap());
         w.board.lock().unwrap().bad.insert(p.clone());
         let e = w
-            .call("project", json!({"id": p, "delete": true}))
+            .call("board_delete", json!({"kind": "project", "id": p}))
             .await
             .unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_GATEWAY, "{}", e.1);
@@ -1673,7 +1745,10 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(w.live("link").len(), 2);
         let r = w
-            .call("objective", json!({"id": "O2", "delete": true}))
+            .call(
+                "board_delete",
+                json!({"kind": "objective", "id": "O2", "project": "Q"}),
+            )
             .await
             .unwrap();
         assert_eq!((&r["deleted"], &r["links"]), (&json!(o), &json!(2)));
@@ -1926,6 +2001,25 @@ pub(crate) mod tests {
         assert_eq!(e.0, StatusCode::BAD_REQUEST, "{}", e.1);
         assert!(has(&e, "no es de ese proyecto"), "{}", e.1);
 
+        // Borrar con un nombre que vale para varios, o por id fuera del proyecto dado: error, y
+        // nada escrito.
+        let items = w.board.lock().unwrap().items.clone();
+        let writes = w.writes();
+        for (args, want) in [
+            (json!({"kind": "project", "id": "web"}), "«web»"),
+            (json!({"kind": "objective", "id": "DOCS"}), "«Docs»"),
+            (
+                json!({"kind": "objective", "id": &d[..8], "project": a}),
+                "no es de ese proyecto",
+            ),
+        ] {
+            let e = w.call("board_delete", args.clone()).await.unwrap_err();
+            assert_eq!(e.0, StatusCode::BAD_REQUEST, "{args}: {}", e.1);
+            assert!(has(&e, want), "{args}: {}", e.1);
+        }
+        assert_eq!(w.writes(), writes);
+        assert_eq!(w.board.lock().unwrap().items, items);
+
         // No se crea otro con el mismo nombre (ni se renombra a uno que ya está).
         let e = w.call("project", json!({"name": "WEB"})).await.unwrap_err();
         assert_eq!(e.0, StatusCode::CONFLICT, "{}", e.1);
@@ -2055,10 +2149,10 @@ pub(crate) mod tests {
         let writes = w.writes();
         let tries: Vec<(&str, Value)> = vec![
             ("project", json!({"id": hidden, "state": "archived"})),
-            ("project", json!({"id": hidden, "delete": true})),
+            ("board_delete", json!({"kind": "project", "id": hidden})),
             ("project", json!({"id": bad, "name": "x"})),
-            ("project", json!({"id": &bad[..8], "delete": true})),
-            ("objective", json!({"id": hidden, "delete": true})),
+            ("board_delete", json!({"kind": "project", "id": &bad[..8]})),
+            ("board_delete", json!({"kind": "objective", "id": hidden})),
             ("objective", json!({"project": hidden, "name": "x"})),
             ("join", json!({"objective": bad})),
         ];
@@ -2083,11 +2177,25 @@ pub(crate) mod tests {
         let e = w.call("project", json!({"name": "P"})).await.unwrap_err();
         assert_eq!(e.0, StatusCode::TOO_MANY_REQUESTS, "{}", e.1);
         assert!(has(&e, "prueba en un rato"), "{}", e.1);
-        w.board.lock().unwrap().limit = 0;
-        let e = w.call("project", json!({"name": "P"})).await.unwrap_err();
-        assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
-        assert!(has(&e, "lleno"), "{}", e.1);
+        // La cuenta llena: con el `code` del hub y sin él (un hub de antes), lo mismo.
+        for uncoded in [false, true] {
+            {
+                let mut b = w.board.lock().unwrap();
+                b.limit = 0;
+                b.uncoded = uncoded;
+            }
+            let e = w.call("project", json!({"name": "P"})).await.unwrap_err();
+            assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
+            assert_eq!(e.1, FULL, "{uncoded}");
+        }
+        assert_eq!(
+            i18n::english(FULL),
+            "the account has reached the maximum number of objects the board can hold: delete \
+             projects or objectives that are no longer needed (deleted ones take a while to free \
+             up space, and archived ones count too)"
+        );
         w.board.lock().unwrap().limit = 2000;
+        w.board.lock().unwrap().uncoded = false;
         let e = w
             .call("project", json!({"name": "P", "desc": "x".repeat(9000)}))
             .await
@@ -2097,14 +2205,22 @@ pub(crate) mod tests {
 
         // Un 409 tras otro: se rinde y lo dice.
         let p = id_of(&w.call("project", json!({"name": "P"})).await.unwrap());
-        // El hub dice que es demasiado grande (413).
+        // El hub dice que es demasiado grande (413), con `code` y sin él.
         w.board.lock().unwrap().too_big.insert(p.clone());
-        let e = w
-            .call("project", json!({"id": "P", "desc": "d"}))
-            .await
-            .unwrap_err();
-        assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
-        assert!(has(&e, "demasiado grande para el hub"), "{}", e.1);
+        for uncoded in [false, true] {
+            w.board.lock().unwrap().uncoded = uncoded;
+            let e = w
+                .call("project", json!({"id": "P", "desc": "d"}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", e.1);
+            assert!(
+                has(&e, "demasiado grande para el hub"),
+                "{uncoded}: {}",
+                e.1
+            );
+        }
+        w.board.lock().unwrap().uncoded = false;
         w.board.lock().unwrap().too_big.clear();
         {
             let mut b = w.board.lock().unwrap();
@@ -2131,12 +2247,28 @@ pub(crate) mod tests {
             ("project", json!({"name": "x".repeat(121)}), "largo"),
             ("project", json!({"name": "Q", "state": "hecho"}), "active"),
             ("project", json!({"id": "P"}), "nada que cambiar"),
+            ("objective", json!({"id": "O"}), "nada que cambiar"),
+            // Borrar ya no va por `project` ni por `objective`: va por `board_delete`, que pide
+            // permiso.
             (
                 "project",
-                json!({"id": "P", "delete": true, "desc": "x"}),
-                "delete",
+                json!({"id": "P", "delete": true}),
+                "board_delete",
             ),
-            ("project", json!({"delete": true}), "id"),
+            ("project", json!({"delete": true}), "board_delete"),
+            (
+                "objective",
+                json!({"id": "P", "delete": true, "desc": "x"}),
+                "board_delete",
+            ),
+            ("board_delete", json!({"kind": "otro", "id": "P"}), "kind"),
+            ("board_delete", json!({"kind": "project", "id": " "}), "id"),
+            (
+                "board_delete",
+                json!({"kind": "project", "id": "P", "project": "P"}),
+                "project",
+            ),
+            ("board_delete", json!({"id": "P"}), "argumentos no válidos"),
             ("objective", json!({"name": "O"}), "project"),
             ("objective", json!({"project": "P"}), "name"),
             (
@@ -2156,6 +2288,18 @@ pub(crate) mod tests {
             assert_eq!(e.0, StatusCode::BAD_REQUEST, "{tool} {args}: {}", e.1);
             assert!(has(&e, want), "{tool} {args}: {}", e.1);
         }
+        // Lo que ve una sesión abierta antes de actualizar: su `nido mcp` es el de antes, con
+        // `delete` y sin `board_delete`.
+        let e = w
+            .call("objective", json!({"id": "O", "delete": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.1, NO_DELETE);
+        assert_eq!(
+            i18n::english(NO_DELETE),
+            "to delete, use board_delete (if you don't have it, restart the session: it comes \
+             with nido 0.10.1)"
+        );
         assert_eq!(w.writes(), writes);
     }
 
@@ -2225,6 +2369,81 @@ pub(crate) mod tests {
                 "the board is not available: this nido has no account"
             );
         }
+    }
+
+    /// Un hub sin tablero (uno de antes) no contesta: la primera herramienta espera el plazo del
+    /// hub, y las siguientes (las seis) fallan al momento con el mismo error, hasta que se
+    /// reconecta. Con la copia vacía, `board` no tiene nada que enseñar en su lugar (con copia, la
+    /// enseña: `without_the_hub_board_shows_the_copy`).
+    #[tokio::test]
+    async fn a_hub_without_a_board_makes_us_wait_once_per_connection() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let s = st
+            .registry
+            .lock()
+            .await
+            .add(session(tmp.path(), "api"))
+            .unwrap();
+        let mut rec = hub::fake::recording(|v| {
+            v.get("board")?;
+            Some(hub::fake::Reply::Silent)
+        })
+        .await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        let missing = "el tablero no está disponible: el hub no conoce el tablero (es de antes): \
+                       hace falta actualizarlo";
+        let call = |tool: &'static str, args: Value| {
+            let (st, s) = (st.clone(), s.clone());
+            async move {
+                let started = std::time::Instant::now();
+                let e = match tool {
+                    "project" => tool_project(&st, &s, args).await,
+                    "objective" => tool_objective(&st, &s, args).await,
+                    "join" => tool_join(&st, &s, args).await,
+                    "leave" => tool_leave(&st, &s, args).await,
+                    "board" => tool_board(&st, &s, args).await,
+                    "board_delete" => tool_board_delete(&st, &s, args).await,
+                    _ => unreachable!("{tool}"),
+                }
+                .unwrap_err();
+                assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{tool}: {}", e.1);
+                assert_eq!(e.1, missing, "{tool}");
+                started.elapsed()
+            }
+        };
+        assert!(call("project", json!({"name": "P"})).await >= hub::BOARD_WAIT);
+        rec.next("board").await;
+        for (tool, args) in [
+            ("project", json!({"name": "P"})),
+            ("objective", json!({"project": "P", "name": "O"})),
+            ("join", json!({"objective": "O"})),
+            ("leave", json!({"objective": "O"})),
+            ("board_delete", json!({"kind": "objective", "id": "O"})),
+            // Sin copia de este equipo que enseñar (nunca se habló con el hub), también el error.
+            ("board", json!({})),
+        ] {
+            assert!(call(tool, args).await < hub::BOARD_WAIT / 2, "{tool}");
+        }
+        rec.quiet("board", Duration::from_millis(300)).await;
+        assert_eq!(
+            i18n::english(missing),
+            "the board is not available: the hub does not know the board (it is an older one): \
+             it needs to be updated"
+        );
+
+        // Tras reconectar, vuelve a esperar.
+        let mut status = st.hub.status.subscribe();
+        rec.tell(hub::fake::Tell::Hangup);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.connected && s.connections == 2),
+        )
+        .await
+        .expect("no se volvió a conectar")
+        .unwrap();
+        assert!(call("project", json!({"name": "P"})).await >= hub::BOARD_WAIT);
     }
 
     // ---------- `render`, sin hub ----------

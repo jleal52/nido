@@ -1210,8 +1210,12 @@ const TABLE: &[(&str, &str)] = &[
         "the object was changed elsewhere at the same time, several times in a row: try again",
     ),
     (
-        "el tablero de la cuenta está lleno: borra objetivos o proyectos que ya no hagan falta",
-        "the account's board is full: delete objectives or projects that are no longer needed",
+        "la cuenta ya tiene el máximo de objetos que caben en el tablero: borra proyectos u \
+         objetivos que ya no hagan falta (lo borrado tarda en dejar sitio, y lo archivado cuenta \
+         igual)",
+        "the account has reached the maximum number of objects the board can hold: delete \
+         projects or objectives that are no longer needed (deleted ones take a while to free up \
+         space, and archived ones count too)",
     ),
     (
         "el objeto es demasiado grande para el hub: acorta la descripción o la nota",
@@ -1226,6 +1230,10 @@ const TABLE: &[(&str, &str)] = &[
         "the hub does not accept the board request ({0})",
     ),
     ("el hub no contestó", "the hub did not answer"),
+    (
+        "el hub no conoce el tablero (es de antes): hace falta actualizarlo",
+        "the hub does not know the board (it is an older one): it needs to be updated",
+    ),
     (
         "respuesta del tablero no válida",
         "invalid answer from the board",
@@ -1281,16 +1289,26 @@ const TABLE: &[(&str, &str)] = &[
         "to create an objective, give name (or id, to change one)",
     ),
     (
-        "delete va solo, sin otros cambios",
-        "delete goes alone, without other changes",
+        "para borrar, usa board_delete (si no la tienes, reinicia la sesión: llega con nido \
+         0.10.1)",
+        "to delete, use board_delete (if you don't have it, restart the session: it comes with \
+         nido 0.10.1)",
     ),
     (
-        "nada que cambiar: da name, desc, state o delete",
-        "nothing to change: give name, desc, state or delete",
+        "kind tiene que ser project u objective",
+        "kind must be project or objective",
     ),
     (
-        "nada que cambiar: da name, desc, state, note, order o delete",
-        "nothing to change: give name, desc, state, note, order or delete",
+        "project solo va con kind objective",
+        "project only goes with kind objective",
+    ),
+    (
+        "nada que cambiar: da name, desc o state",
+        "nothing to change: give name, desc or state",
+    ),
+    (
+        "nada que cambiar: da name, desc, state, note u order",
+        "nothing to change: give name, desc, state, note or order",
     ),
     ("order tiene que ser un número", "order must be a number"),
     // Por qué no se puede leer un objeto (`Unreadable`), en los errores

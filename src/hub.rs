@@ -187,17 +187,29 @@ const SESSION_WAIT: Duration = Duration::from_secs(30);
 const SESSION_WAIT: Duration = Duration::from_secs(1);
 
 /// Cuánto se espera la respuesta a una petición del tablero: el hub contesta en 10 s como mucho
-/// (con un 503 si MongoDB no responde), y uno antiguo no contesta nunca.
+/// (con un 503 si MongoDB no responde), y uno antiguo no contesta nunca. Se espera una vez por
+/// conexión: si vence sin que el hub haya contestado nunca al tablero en ella, las demás fallan
+/// al momento (`BoardState::Missing`).
 #[cfg(not(test))]
 const BOARD_WAIT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const BOARD_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const BOARD_WAIT: Duration = Duration::from_secs(2);
 /// Peticiones del tablero sin contestar a la vez: el hub contesta 429 a la quinta.
 pub const BOARD_IN_FLIGHT: usize = 4;
-/// Cómo empieza el 413 del hub cuando la cuenta ya tiene todos los objetos que caben («la cuenta
-/// ya tiene 2000 objetos»; el otro 413 es el de un blob demasiado largo).
+/// El `code` del 413 del hub cuando la cuenta ya tiene todos los objetos que caben, y el del
+/// blob demasiado largo.
+const BOARD_CODE_FULL: &str = "full";
+const BOARD_CODE_TOO_BIG: &str = "too_big";
+/// Sin `code` (un hub de antes), cómo empieza el texto del 413 de la cuenta llena («la cuenta ya
+/// tiene 2000 objetos»; el otro 413 es el de un blob demasiado largo).
 const BOARD_FULL: &str = "la cuenta ya tiene";
 const BOARD_NO_HUB: &str = "sin conexión con el hub";
+/// Lo que se dice cuando el hub no contestó a tiempo a una petición del tablero sin haber
+/// contestado nunca al tablero en esa conexión, y luego a las demás de ella: uno de antes del
+/// tablero no contesta a `board` (uno que lo tiene contesta en 10 s como mucho, aunque sea con un
+/// 503).
+const BOARD_MISSING: &str = "el hub no conoce el tablero (es de antes): hace falta actualizarlo";
+/// Un plazo vencido en una conexión en la que el hub ya contestó al tablero: no es uno de antes.
 const BOARD_SILENT: &str = "el hub no contestó";
 /// Una respuesta del tablero que no es como dice el protocolo.
 const BOARD_ODD: &str = "respuesta del tablero no válida";
@@ -369,8 +381,9 @@ impl Drop for Forget<'_> {
 enum Unanswered {
     /// No había conexión, o se cerró con el pedido en marcha.
     NoHub,
-    /// Venció el plazo (un hub antiguo no contesta a lo que no conoce).
-    Silent,
+    /// Venció el plazo (un hub antiguo no contesta a lo que no conoce): con la cola de control
+    /// de la conexión por la que salió.
+    Silent(mpsc::UnboundedSender<Control>),
 }
 
 /// El cliente: se reconecta solo y atiende los móviles que llegan por el hub.
@@ -398,8 +411,9 @@ pub struct Hub {
     /// Los avisos del hub de que el tablero de la cuenta cambió (`{"board":{"at"}}`). El valor es
     /// la marca del aviso, que solo es una pista: se sincroniza siempre desde la guardada.
     board_notice: watch::Sender<i64>,
-    /// Lo mandado en esta conexión (se vacía al conectar y al desconectar, así que al reconectar
-    /// se manda siempre). Va con `control`: se cogen en ese orden.
+    /// Lo mandado en esta conexión, y lo que se sabe del hub en ella (se vacía al conectar y al
+    /// desconectar, así que al reconectar se manda y se mira todo otra vez). Va con `control`:
+    /// cuando hacen falta los dos, se cogen en ese orden.
     sent: Mutex<Sent>,
     next_req: AtomicU64,
     /// Cuántas escrituras del tablero (`board_put`, `board_del`) se han pedido: para que quien
@@ -544,7 +558,7 @@ impl Hub {
             Ok(Ok(v)) => Ok(v),
             // Se cerró la conexión con el pedido en marcha (ver `disconnected`).
             Ok(Err(_)) => Err(Unanswered::NoHub),
-            Err(_) => Err(Unanswered::Silent),
+            Err(_) => Err(Unanswered::Silent(control)),
         }
     }
 
@@ -571,7 +585,7 @@ impl Hub {
         {
             Ok(v) => v,
             Err(Unanswered::NoHub) => return Err(VoiceError::NoHub),
-            Err(Unanswered::Silent) => return Err(VoiceError::NotOffered),
+            Err(Unanswered::Silent(_)) => return Err(VoiceError::NotOffered),
         };
         if v["ok"] != true {
             return Err(VoiceError::from_hub(
@@ -596,7 +610,7 @@ impl Hub {
         let mut v = match self.ask(Asking::Session, body, SESSION_WAIT).await {
             Ok(v) => v,
             Err(Unanswered::NoHub) => return Err(SessionError::NoHub),
-            Err(Unanswered::Silent) => return Err(SessionError::NotOffered),
+            Err(Unanswered::Silent(_)) => return Err(SessionError::NotOffered),
         };
         if v["ok"] != true {
             return Err(SessionError::from_hub(
@@ -677,10 +691,36 @@ impl Hub {
             .is_some_and(|r| answered(&self.session_pending, r))
     }
 
-    /// Lo mismo con `{"boarded":{"req":N,…}}`, las respuestas del tablero.
+    /// Lo mismo con `{"boarded":{"req":N,…}}`, las respuestas del tablero. Una cualquiera (también
+    /// la tardía de una que venció) dice que el hub sí tiene tablero (`BoardState::Answered`).
     fn boarded(&self, v: &mut serde_json::Value) -> bool {
-        v.get_mut("boarded")
-            .is_some_and(|r| answered(&self.board_pending, r))
+        let Some(r) = v.get_mut("boarded") else {
+            return false;
+        };
+        self.sent.lock().expect("hub").board = BoardState::Answered;
+        answered(&self.board_pending, r)
+    }
+
+    /// Si el hub de esta conexión es uno sin tablero (ver `board_ask`).
+    fn boardless(&self) -> bool {
+        self.sent.lock().expect("hub").board == BoardState::Missing
+    }
+
+    /// Venció una petición del tablero que salió por `asked` (su cola de control). Si es la
+    /// conexión de ahora y el hub no ha contestado nunca al tablero en ella, se apunta que no lo
+    /// tiene. Devuelve si la conexión de ahora queda (o ya estaba) como sin tablero. Una de una
+    /// conexión que ya acabó no dice nada de la nueva; y en una en la que ya contestó, el plazo
+    /// es otra cosa (una petición que no llegó a salir, una conexión medio abierta…).
+    fn note_boardless(&self, asked: &mpsc::UnboundedSender<Control>) -> bool {
+        let control = self.control.lock().expect("hub");
+        if !control.as_ref().is_some_and(|now| now.same_channel(asked)) {
+            return false;
+        }
+        let mut sent = self.sent.lock().expect("hub");
+        if sent.board == BoardState::Unknown {
+            sent.board = BoardState::Missing;
+        }
+        sent.board == BoardState::Missing
     }
 
     /// Si es el aviso `{"board":{"at":…}}` (el tablero de la cuenta cambió): despierta a quien
@@ -691,6 +731,8 @@ impl Hub {
         let Some(b) = v.get("board").and_then(|b| b.as_object()) else {
             return false;
         };
+        // Un aviso del tablero: este hub lo tiene.
+        self.sent.lock().expect("hub").board = BoardState::Answered;
         let at = b.get("at").and_then(|a| a.as_i64());
         self.board_notice.send_modify(|n| *n = at.unwrap_or(*n));
         true
@@ -705,19 +747,36 @@ impl Hub {
     /// Manda una petición del tablero y espera su respuesta: con 200, lo que da el hub; con otro
     /// estado, su error. Antes coge un hueco de los `BOARD_IN_FLIGHT` (el plazo empieza a contar
     /// al encolarla, así que no se gasta esperando el hueco).
+    ///
+    /// Si el hub no contesta a tiempo y no ha contestado nunca al tablero en esta conexión, queda
+    /// apuntada como sin tablero (`BoardState::Missing`): las peticiones siguientes fallan al
+    /// momento con el mismo error, sin mandarse ni esperar otro plazo entero. Se olvida al
+    /// reconectar y con cualquier respuesta `boarded` o aviso del tablero. Si ya había contestado,
+    /// el plazo vencido es «el hub no contestó», y no se apunta nada.
     async fn board_ask(
         &self,
         body: serde_json::Map<String, serde_json::Value>,
     ) -> Result<serde_json::Value, BoardError> {
+        let missing = || BoardError::Hub(BOARD_MISSING.into());
+        if self.boardless() {
+            return Err(missing());
+        }
         let _slot = self
             .board_slots
             .acquire()
             .await
             .map_err(|_| BoardError::Hub(BOARD_NO_HUB.into()))?;
+        // Otra pudo apuntarlo mientras se esperaba el hueco.
+        if self.boardless() {
+            return Err(missing());
+        }
         let v = match self.ask(Asking::Board, body, BOARD_WAIT).await {
             Ok(v) => v,
             Err(Unanswered::NoHub) => return Err(BoardError::Hub(BOARD_NO_HUB.into())),
-            Err(Unanswered::Silent) => return Err(BoardError::Hub(BOARD_SILENT.into())),
+            Err(Unanswered::Silent(asked)) if self.note_boardless(&asked) => {
+                return Err(missing());
+            }
+            Err(Unanswered::Silent(_)) => return Err(BoardError::Hub(BOARD_SILENT.into())),
         };
         let error = || v["error"].as_str().unwrap_or_default().to_owned();
         match v["status"].as_u64() {
@@ -726,14 +785,13 @@ impl Hub {
                 Ok(current) if current.fits() => Err(BoardError::Conflict(current)),
                 _ => Err(BoardError::Hub(BOARD_ODD.into())),
             },
-            Some(413)
-                if v["error"]
-                    .as_str()
-                    .is_some_and(|e| e.starts_with(BOARD_FULL)) =>
-            {
-                Err(BoardError::Full)
-            }
-            Some(413) => Err(BoardError::TooBig),
+            // Por su `code`; sin él (un hub de antes) o con uno que no se conoce, por el texto.
+            Some(413) => match v["code"].as_str() {
+                Some(BOARD_CODE_FULL) => Err(BoardError::Full),
+                Some(BOARD_CODE_TOO_BIG) => Err(BoardError::TooBig),
+                _ if error().starts_with(BOARD_FULL) => Err(BoardError::Full),
+                _ => Err(BoardError::TooBig),
+            },
             Some(429) => Err(BoardError::Busy),
             Some(400) => Err(BoardError::Bad(error())),
             Some(_) if !error().is_empty() => Err(BoardError::Hub(error())),
@@ -887,13 +945,27 @@ fn account_lang(lang: &str) -> bool {
     matches!(lang, "es" | "en")
 }
 
-/// Lo mandado al hub en una conexión.
+/// Lo mandado al hub en una conexión, y lo que se sabe de él en ella.
 #[derive(Default)]
 struct Sent {
     /// Los ids del grupo de la última vez.
     group: Option<Vec<String>>,
     /// Si ya se mandó la lista de dispositivos.
     devices: bool,
+    /// Lo que se sabe del tablero del hub en esta conexión.
+    board: BoardState,
+}
+
+/// Lo que se sabe del tablero del hub en una conexión.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum BoardState {
+    /// Todavía nada: no ha contestado al tablero ni ha vencido ninguna petición.
+    #[default]
+    Unknown,
+    /// Contestó a una petición del tablero, o avisó de un cambio: lo tiene.
+    Answered,
+    /// Venció una petición sin que hubiera contestado nunca: es de antes del tablero.
+    Missing,
 }
 
 /// Le entrega `reply` (lo de dentro de `{"voiced":…}`, `{"sessioned":…}`) a quien espera su
@@ -1132,7 +1204,8 @@ async fn run<H: e2e::Host>(
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Control>();
     *hub.out.lock().expect("hub") = Some(out_tx.clone());
     {
-        // Una conexión nueva: el grupo y los dispositivos se vuelven a mandar.
+        // Una conexión nueva: el grupo y los dispositivos se vuelven a mandar, y lo que se sabía
+        // del tablero del hub se olvida (`BoardState`).
         let mut control = hub.control.lock().expect("hub");
         *hub.sent.lock().expect("hub") = Sent::default();
         *control = Some(control_tx.clone());
@@ -1753,7 +1826,7 @@ mod tests {
         let r = hub
             .ask(Asking::Session, Default::default(), Duration::ZERO)
             .await;
-        assert!(matches!(r, Err(Unanswered::Silent)));
+        assert!(matches!(r, Err(Unanswered::Silent(_))));
         let sent = sent_before_the_mark(&hub, &mut rec).await;
         assert!(sent.iter().all(|v| v.get("session").is_none()), "{sent:?}");
     }
@@ -2051,7 +2124,8 @@ mod tests {
     }
 
     /// Cada estado del hub, su error: el 413 de la cuenta llena y el del blob largo se
-    /// distinguen por el texto, los dos 429 son `Busy` y lo demás es `Hub`.
+    /// distinguen por su `code` y, sin él (un hub de antes), por el texto; los dos 429 son `Busy`
+    /// y lo demás es `Hub`.
     #[tokio::test]
     async fn the_board_errors_from_the_hub() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2059,6 +2133,19 @@ mod tests {
         let (hub, _rec) = recorded(tmp.path(), |v| {
             let b = v.get("board")?;
             let req = b["req"].as_u64()?;
+            // Los 413 con `code`: manda el `code`, diga lo que diga el texto.
+            let coded = match b["kid"].as_str().unwrap_or_default() {
+                "code-full" => Some(("full", "account full")),
+                "code-big" => Some(("too_big", "la cuenta ya tiene 2000 objetos")),
+                "code-new-full" => Some(("otro", "la cuenta ya tiene 2000 objetos")),
+                "code-new-big" => Some(("otro", "el blob pasa de 11000 bytes")),
+                _ => None,
+            };
+            if let Some((code, error)) = coded {
+                return Some(Reply::Send(serde_json::json!({ "boarded": {
+                    "req": req, "status": 413, "error": error, "code": code,
+                }})));
+            }
             let (status, error) = match b["kid"].as_str().unwrap_or_default() {
                 "full" => (413, "la cuenta ya tiene 2000 objetos"),
                 "full5000" => (413, "la cuenta ya tiene 5000 objetos"),
@@ -2085,6 +2172,11 @@ mod tests {
         };
         assert_eq!(put("full").await, Err(BoardError::Full));
         assert_eq!(put("big").await, Err(BoardError::TooBig));
+        assert_eq!(put("code-full").await, Err(BoardError::Full));
+        assert_eq!(put("code-big").await, Err(BoardError::TooBig));
+        // Un `code` que no se conoce (de un hub de después): por el texto, como sin él.
+        assert_eq!(put("code-new-full").await, Err(BoardError::Full));
+        assert_eq!(put("code-new-big").await, Err(BoardError::TooBig));
         assert_eq!(put("rate").await, Err(BoardError::Busy));
         assert_eq!(put("many").await, Err(BoardError::Busy));
         assert_eq!(
@@ -2128,6 +2220,154 @@ mod tests {
         ));
         assert!(started.elapsed() < BOARD_WAIT, "{:?}", started.elapsed());
         assert!(hub.board_pending.lock().unwrap().is_empty());
+    }
+
+    /// Un hub sin tablero (uno de antes) no contesta a `board`. La primera petición espera el
+    /// plazo, y la conexión queda apuntada como sin tablero: las siguientes fallan al momento con
+    /// el mismo error, sin mandarse. Reconectar lo olvida, y la respuesta tardía a la petición
+    /// que venció también.
+    #[tokio::test]
+    async fn a_hub_without_a_board_is_not_waited_for_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Si contesta al tablero (con una página vacía) o no.
+        let answers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (hub, mut rec) = {
+            let answers = answers.clone();
+            recorded(tmp.path(), move |v| {
+                let req = v.get("board")?["req"].as_u64()?;
+                if !answers.load(Ordering::SeqCst) {
+                    return Some(Reply::Silent);
+                }
+                Some(Reply::Send(serde_json::json!({ "boarded": {
+                    "req": req, "status": 200, "items": [], "next": 0, "more": false,
+                    "after": null, "reset": false,
+                }})))
+            })
+            .await
+        };
+        let missing = || BoardError::Hub(BOARD_MISSING.into());
+        // La primera espera el plazo.
+        let started = std::time::Instant::now();
+        assert_eq!(hub.board_get(0, None).await, Err(missing()));
+        assert!(started.elapsed() >= BOARD_WAIT);
+        rec.next("board").await;
+        // Las siguientes, al momento y sin mandarse (también las escrituras).
+        let started = std::time::Instant::now();
+        assert_eq!(hub.board_get(0, None).await, Err(missing()));
+        assert_eq!(
+            hub.board_put(OBJ, 0, "0123456789abcdef", "QUJD").await,
+            Err(missing())
+        );
+        assert_eq!(hub.board_del(OBJ, 1).await, Err(missing()));
+        assert!(
+            started.elapsed() < BOARD_WAIT / 2,
+            "{:?}",
+            started.elapsed()
+        );
+        rec.quiet("board", Duration::from_millis(300)).await;
+
+        // Al reconectar se olvida: vuelve a esperar el plazo.
+        let mut status = hub.status.subscribe();
+        rec.tell(fake::Tell::Hangup);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.connected && s.connections == 2),
+        )
+        .await
+        .expect("no se volvió a conectar")
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(hub.board_get(0, None).await, Err(missing()));
+        assert!(started.elapsed() >= BOARD_WAIT);
+        let late = rec.next("board").await["req"].clone();
+        assert!(hub.boardless());
+
+        // La respuesta tardía a la petición que venció lo olvida: el hub sí tiene tablero.
+        answers.store(true, Ordering::SeqCst);
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "boarded": { "req": late, "status": 200 }
+        })));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while hub.board_get(0, None).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("no se olvidó con la respuesta");
+        assert!(!hub.boardless());
+    }
+
+    /// Un hub que ya contestó al tablero en esta conexión (una respuesta, o un aviso) y luego
+    /// calla no es uno de antes: «el hub no contestó», y no queda apuntado como sin tablero.
+    #[tokio::test]
+    async fn a_hub_that_answered_is_never_taken_for_an_old_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let answers = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (hub, rec) = {
+            let answers = answers.clone();
+            recorded(tmp.path(), move |v| {
+                let req = v.get("board")?["req"].as_u64()?;
+                if !answers.load(Ordering::SeqCst) {
+                    return Some(Reply::Silent);
+                }
+                Some(Reply::Send(serde_json::json!({ "boarded": {
+                    "req": req, "status": 200, "items": [], "next": 0, "more": false,
+                    "after": null, "reset": false,
+                }})))
+            })
+            .await
+        };
+        let silent = || Err(BoardError::Hub(BOARD_SILENT.into()));
+        // Contesta una vez; luego calla.
+        hub.board_get(0, None).await.unwrap();
+        answers.store(false, Ordering::SeqCst);
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            assert_eq!(hub.board_get(0, None).await, silent());
+            assert!(started.elapsed() >= BOARD_WAIT);
+            assert!(!hub.boardless());
+        }
+
+        // En otra conexión, un aviso del tablero también dice que lo tiene.
+        let mut status = hub.status.subscribe();
+        rec.tell(fake::Tell::Hangup);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.connected && s.connections == 2),
+        )
+        .await
+        .expect("no se volvió a conectar")
+        .unwrap();
+        let mut notices = hub.board_notices();
+        notices.borrow_and_update();
+        rec.tell(fake::Tell::Send(
+            serde_json::json!({ "board": { "at": 7 } }),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), notices.changed())
+            .await
+            .expect("no llegó el aviso")
+            .unwrap();
+        assert_eq!(hub.board_get(0, None).await, silent());
+        assert!(!hub.boardless());
+    }
+
+    /// Solo se apunta como sin tablero la conexión por la que salió la petición, si es la de
+    /// ahora y no ha contestado nunca al tablero.
+    #[tokio::test]
+    async fn only_the_current_connection_is_noted_as_boardless() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, _rec) = recorded(tmp.path(), |_| None).await;
+        let current = hub.control.lock().unwrap().clone().unwrap();
+        let (other, _keep) = mpsc::unbounded_channel::<Control>();
+        assert!(!hub.note_boardless(&other));
+        assert!(!hub.boardless());
+        assert!(hub.note_boardless(&current));
+        assert!(hub.boardless());
+        // Una respuesta: ya no; y con respuesta, aunque luego venza otra, tampoco.
+        hub.boarded(&mut serde_json::json!({ "boarded": { "req": 1 } }));
+        assert!(!hub.boardless());
+        assert!(!hub.note_boardless(&current));
+        assert!(!hub.boardless());
     }
 
     /// Las respuestas pueden llegar en otro orden: cada una va a quien la pidió, por su `req`.
@@ -2484,6 +2724,8 @@ pub(crate) mod fake {
         pub limit: usize,
         /// Los ids cuyo blob es «demasiado largo» (413).
         pub too_big: std::collections::BTreeSet<String>,
+        /// Los 413 sin `code`, como un hub de antes (solo con el texto).
+        pub uncoded: bool,
         /// Los ids que el hub no acepta (400).
         pub bad: std::collections::BTreeSet<String>,
         /// Lo menos que da como `next`: un hub cuyo reloj avanzó sin nada nuevo que enseñar.
@@ -2510,6 +2752,7 @@ pub(crate) mod fake {
                 writes: vec![],
                 limit: 2000,
                 too_big: Default::default(),
+                uncoded: false,
                 bad: Default::default(),
                 floor: 0,
                 account_ref: None,
@@ -2631,7 +2874,7 @@ pub(crate) mod fake {
                 return serde_json::json!({ "status": 400, "error": "el blob no es base64" });
             }
             if op == "put" && self.too_big.contains(&id) {
-                return serde_json::json!({ "status": 413, "error": "el blob pasa de 11000 bytes" });
+                return self.too_large("too_big", "el blob pasa de 11000 bytes".into());
             }
             if self.busy > 0 {
                 self.busy -= 1;
@@ -2658,8 +2901,8 @@ pub(crate) mod fake {
                     "error": "la versión no es la que hay", "current": current });
             }
             if op == "put" && v == 0 && self.items.len() >= self.limit {
-                return serde_json::json!({ "status": 413,
-                    "error": format!("la cuenta ya tiene {} objetos", self.limit) });
+                return self
+                    .too_large("full", format!("la cuenta ya tiene {} objetos", self.limit));
             }
             let item = if op == "put" {
                 let (kid, blob) = (b["kid"].as_str().unwrap(), b["blob"].as_str().unwrap());
@@ -2668,6 +2911,17 @@ pub(crate) mod fake {
                 self.write(&id, None)
             };
             serde_json::json!({ "status": 200, "v": item.v, "at": item.at })
+        }
+    }
+
+    impl Board {
+        /// Un 413 como el del hub: con su `code`, salvo con `uncoded`.
+        fn too_large(&self, code: &str, error: String) -> serde_json::Value {
+            let mut r = serde_json::json!({ "status": 413, "error": error });
+            if !self.uncoded {
+                r["code"] = code.into();
+            }
+            r
         }
     }
 
