@@ -561,6 +561,9 @@ async fn mcp_api_end_to_end() {
     )
     .await;
     assert_eq!(code, 200, "{max}");
+    // Su «shell» también escribe `args`: se espera a que lo haga antes de borrarlo, o podría
+    // escribirlo tarde y pasar por el de la siguiente.
+    assert!(wait_file(&work.join("args")).await, "la sesión no arrancó");
     let (code, _) = tool(addr, me, "close", json!({"session": max["session"]})).await;
     assert_eq!(code, 200);
     let _ = std::fs::remove_file(work.join("args"));
