@@ -1231,6 +1231,10 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("el hub no contestó", "the hub did not answer"),
     (
+        "el hub no tiene tablero; hace falta actualizarlo",
+        "the hub has no board; it needs to be updated",
+    ),
+    (
         "respuesta del tablero no válida",
         "invalid answer from the board",
     ),

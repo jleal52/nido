@@ -187,11 +187,12 @@ const SESSION_WAIT: Duration = Duration::from_secs(30);
 const SESSION_WAIT: Duration = Duration::from_secs(1);
 
 /// Cuánto se espera la respuesta a una petición del tablero: el hub contesta en 10 s como mucho
-/// (con un 503 si MongoDB no responde), y uno antiguo no contesta nunca.
+/// (con un 503 si MongoDB no responde), y uno antiguo no contesta nunca. Se espera una vez por
+/// conexión: tras un plazo vencido, las demás fallan al momento (`Sent::boardless`).
 #[cfg(not(test))]
 const BOARD_WAIT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const BOARD_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const BOARD_WAIT: Duration = Duration::from_secs(2);
 /// Peticiones del tablero sin contestar a la vez: el hub contesta 429 a la quinta.
 pub const BOARD_IN_FLIGHT: usize = 4;
 /// El `code` del 413 del hub cuando la cuenta ya tiene todos los objetos que caben, y el del
@@ -202,7 +203,10 @@ const BOARD_CODE_TOO_BIG: &str = "too_big";
 /// tiene 2000 objetos»; el otro 413 es el de un blob demasiado largo).
 const BOARD_FULL: &str = "la cuenta ya tiene";
 const BOARD_NO_HUB: &str = "sin conexión con el hub";
-const BOARD_SILENT: &str = "el hub no contestó";
+/// Lo que se dice cuando el hub no contestó a tiempo a una petición del tablero, y luego a las
+/// demás de esa conexión: uno de antes del tablero no contesta a `board` (uno que lo tiene
+/// contesta en 10 s como mucho, aunque sea con un 503).
+const BOARD_MISSING: &str = "el hub no tiene tablero; hace falta actualizarlo";
 /// Una respuesta del tablero que no es como dice el protocolo.
 const BOARD_ODD: &str = "respuesta del tablero no válida";
 
@@ -402,8 +406,9 @@ pub struct Hub {
     /// Los avisos del hub de que el tablero de la cuenta cambió (`{"board":{"at"}}`). El valor es
     /// la marca del aviso, que solo es una pista: se sincroniza siempre desde la guardada.
     board_notice: watch::Sender<i64>,
-    /// Lo mandado en esta conexión (se vacía al conectar y al desconectar, así que al reconectar
-    /// se manda siempre). Va con `control`: se cogen en ese orden.
+    /// Lo mandado en esta conexión, y lo que se sabe del hub en ella (se vacía al conectar y al
+    /// desconectar, así que al reconectar se manda y se mira todo otra vez). Va con `control`:
+    /// cuando hacen falta los dos, se cogen en ese orden.
     sent: Mutex<Sent>,
     next_req: AtomicU64,
     /// Cuántas escrituras del tablero (`board_put`, `board_del`) se han pedido: para que quien
@@ -681,10 +686,31 @@ impl Hub {
             .is_some_and(|r| answered(&self.session_pending, r))
     }
 
-    /// Lo mismo con `{"boarded":{"req":N,…}}`, las respuestas del tablero.
+    /// Lo mismo con `{"boarded":{"req":N,…}}`, las respuestas del tablero. Una cualquiera dice
+    /// que el hub sí tiene tablero: se olvida que no lo tenía (`boardless`).
     fn boarded(&self, v: &mut serde_json::Value) -> bool {
-        v.get_mut("boarded")
-            .is_some_and(|r| answered(&self.board_pending, r))
+        let Some(r) = v.get_mut("boarded") else {
+            return false;
+        };
+        self.sent.lock().expect("hub").boardless = false;
+        answered(&self.board_pending, r)
+    }
+
+    /// Si el hub de esta conexión no contestó a una petición del tablero (ver `board_ask`).
+    fn boardless(&self) -> bool {
+        self.sent.lock().expect("hub").boardless
+    }
+
+    /// Apunta que el hub no tiene tablero, si la conexión por la que salió la petición
+    /// (`asked`, su cola de control) es todavía la de ahora: una petición de una conexión que
+    /// ya acabó no dice nada de la nueva.
+    fn note_boardless(&self, asked: Option<&mpsc::UnboundedSender<Control>>) {
+        let control = self.control.lock().expect("hub");
+        if let (Some(now), Some(asked)) = (control.as_ref(), asked)
+            && now.same_channel(asked)
+        {
+            self.sent.lock().expect("hub").boardless = true;
+        }
     }
 
     /// Si es el aviso `{"board":{"at":…}}` (el tablero de la cuenta cambió): despierta a quien
@@ -709,19 +735,36 @@ impl Hub {
     /// Manda una petición del tablero y espera su respuesta: con 200, lo que da el hub; con otro
     /// estado, su error. Antes coge un hueco de los `BOARD_IN_FLIGHT` (el plazo empieza a contar
     /// al encolarla, así que no se gasta esperando el hueco).
+    ///
+    /// Si el hub no contesta a tiempo, la conexión queda apuntada como sin tablero (`Sent::
+    /// boardless`): las peticiones siguientes fallan al momento con el mismo error, sin mandarse
+    /// ni esperar otro plazo entero. Se olvida al reconectar y con cualquier respuesta `boarded`.
     async fn board_ask(
         &self,
         body: serde_json::Map<String, serde_json::Value>,
     ) -> Result<serde_json::Value, BoardError> {
+        let missing = || BoardError::Hub(BOARD_MISSING.into());
+        if self.boardless() {
+            return Err(missing());
+        }
         let _slot = self
             .board_slots
             .acquire()
             .await
             .map_err(|_| BoardError::Hub(BOARD_NO_HUB.into()))?;
+        // Otra pudo apuntarlo mientras se esperaba el hueco.
+        if self.boardless() {
+            return Err(missing());
+        }
+        // La conexión por la que sale: solo de ella se apunta que no tiene tablero.
+        let asked = self.control.lock().expect("hub").clone();
         let v = match self.ask(Asking::Board, body, BOARD_WAIT).await {
             Ok(v) => v,
             Err(Unanswered::NoHub) => return Err(BoardError::Hub(BOARD_NO_HUB.into())),
-            Err(Unanswered::Silent) => return Err(BoardError::Hub(BOARD_SILENT.into())),
+            Err(Unanswered::Silent) => {
+                self.note_boardless(asked.as_ref());
+                return Err(missing());
+            }
         };
         let error = || v["error"].as_str().unwrap_or_default().to_owned();
         match v["status"].as_u64() {
@@ -890,13 +933,15 @@ fn account_lang(lang: &str) -> bool {
     matches!(lang, "es" | "en")
 }
 
-/// Lo mandado al hub en una conexión.
+/// Lo mandado al hub en una conexión, y lo que se sabe de él en ella.
 #[derive(Default)]
 struct Sent {
     /// Los ids del grupo de la última vez.
     group: Option<Vec<String>>,
     /// Si ya se mandó la lista de dispositivos.
     devices: bool,
+    /// El hub no contestó a tiempo a una petición del tablero: no tiene tablero (uno de antes).
+    boardless: bool,
 }
 
 /// Le entrega `reply` (lo de dentro de `{"voiced":…}`, `{"sessioned":…}`) a quien espera su
@@ -2150,6 +2195,79 @@ mod tests {
         ));
         assert!(started.elapsed() < BOARD_WAIT, "{:?}", started.elapsed());
         assert!(hub.board_pending.lock().unwrap().is_empty());
+    }
+
+    /// Un hub sin tablero (uno de antes) no contesta a `board`. La primera petición espera el
+    /// plazo, y la conexión queda apuntada como sin tablero: las siguientes fallan al momento con
+    /// el mismo error, sin mandarse. Una respuesta `boarded` cualquiera lo olvida, y reconectar
+    /// también.
+    #[tokio::test]
+    async fn a_hub_without_a_board_is_not_waited_for_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Si contesta al tablero (con una página vacía) o no.
+        let answers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (hub, mut rec) = {
+            let answers = answers.clone();
+            recorded(tmp.path(), move |v| {
+                let req = v.get("board")?["req"].as_u64()?;
+                if !answers.load(Ordering::SeqCst) {
+                    return Some(Reply::Silent);
+                }
+                Some(Reply::Send(serde_json::json!({ "boarded": {
+                    "req": req, "status": 200, "items": [], "next": 0, "more": false,
+                    "after": null, "reset": false,
+                }})))
+            })
+            .await
+        };
+        let missing = || BoardError::Hub(BOARD_MISSING.into());
+        // La primera espera el plazo.
+        let started = std::time::Instant::now();
+        assert_eq!(hub.board_get(0, None).await, Err(missing()));
+        assert!(started.elapsed() >= BOARD_WAIT);
+        rec.next("board").await;
+        // Las siguientes, al momento y sin mandarse (también las escrituras).
+        let started = std::time::Instant::now();
+        assert_eq!(hub.board_get(0, None).await, Err(missing()));
+        assert_eq!(
+            hub.board_put(OBJ, 0, "0123456789abcdef", "QUJD").await,
+            Err(missing())
+        );
+        assert_eq!(hub.board_del(OBJ, 1).await, Err(missing()));
+        assert!(
+            started.elapsed() < BOARD_WAIT / 2,
+            "{:?}",
+            started.elapsed()
+        );
+        rec.quiet("board", Duration::from_millis(300)).await;
+
+        // Al reconectar se olvida: vuelve a esperar el plazo.
+        let mut status = hub.status.subscribe();
+        rec.tell(fake::Tell::Hangup);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.connected && s.connections == 2),
+        )
+        .await
+        .expect("no se volvió a conectar")
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(hub.board_get(0, None).await, Err(missing()));
+        assert!(started.elapsed() >= BOARD_WAIT);
+        rec.next("board").await;
+
+        // Una respuesta `boarded` cualquiera (aquí, una que no espera nadie) también lo olvida.
+        answers.store(true, Ordering::SeqCst);
+        rec.tell(fake::Tell::Send(serde_json::json!({
+            "boarded": { "req": 1_000_000, "status": 200 }
+        })));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while hub.board_get(0, None).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("no se olvidó con la respuesta");
     }
 
     /// Las respuestas pueden llegar en otro orden: cada una va a quien la pidió, por su `req`.

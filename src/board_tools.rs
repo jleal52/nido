@@ -2258,6 +2258,71 @@ pub(crate) mod tests {
         }
     }
 
+    /// Un hub sin tablero (uno de antes) no contesta: la primera herramienta espera el plazo del
+    /// hub, y las siguientes fallan al momento con el mismo error, hasta que se reconecta.
+    #[tokio::test]
+    async fn a_hub_without_a_board_makes_us_wait_once_per_connection() {
+        let _limit = crate::watchdog::limit(Duration::from_secs(60));
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let s = st
+            .registry
+            .lock()
+            .await
+            .add(session(tmp.path(), "api"))
+            .unwrap();
+        let mut rec = hub::fake::recording(|v| {
+            v.get("board")?;
+            Some(hub::fake::Reply::Silent)
+        })
+        .await;
+        hub::fake::connect(&st.hub, st.clone(), rec.addr).await;
+        let missing = "el tablero no está disponible: el hub no tiene tablero; hace falta \
+                       actualizarlo";
+        let call = |tool: &'static str, args: Value| {
+            let (st, s) = (st.clone(), s.clone());
+            async move {
+                let started = std::time::Instant::now();
+                let e = match tool {
+                    "project" => tool_project(&st, &s, args).await,
+                    "objective" => tool_objective(&st, &s, args).await,
+                    "join" => tool_join(&st, &s, args).await,
+                    _ => tool_project(&st, &s, args).await,
+                }
+                .unwrap_err();
+                assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{tool}: {}", e.1);
+                assert_eq!(e.1, missing, "{tool}");
+                started.elapsed()
+            }
+        };
+        assert!(call("project", json!({"name": "P"})).await >= hub::BOARD_WAIT);
+        rec.next("board").await;
+        for (tool, args) in [
+            ("project", json!({"name": "P"})),
+            ("objective", json!({"project": "P", "name": "O"})),
+            ("join", json!({"objective": "O"})),
+        ] {
+            assert!(call(tool, args).await < hub::BOARD_WAIT / 2, "{tool}");
+        }
+        rec.quiet("board", Duration::from_millis(300)).await;
+        assert_eq!(
+            i18n::english(missing),
+            "the board is not available: the hub has no board; it needs to be updated"
+        );
+
+        // Tras reconectar, vuelve a esperar.
+        let mut status = st.hub.status.subscribe();
+        rec.tell(hub::fake::Tell::Hangup);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.connected && s.connections == 2),
+        )
+        .await
+        .expect("no se volvió a conectar")
+        .unwrap();
+        assert!(call("project", json!({"name": "P"})).await >= hub::BOARD_WAIT);
+    }
+
     // ---------- `render`, sin hub ----------
 
     fn project(name: &str, state: ProjectState, created: u64) -> Object {
