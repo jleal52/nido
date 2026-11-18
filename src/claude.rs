@@ -745,20 +745,10 @@ pub fn channels_supported(program: &Path) -> Option<bool> {
         home: None,
         cwd: Some(std::env::temp_dir()),
     };
-    // Recién escrito (Claude Code se acaba de actualizar, o en las pruebas), lanzarlo puede dar
-    // «Text file busy» un momento: se reintenta. Y si no se pudo lanzar, no se recuerda: la próxima
-    // vez se vuelve a preguntar (si no, sus sesiones irían sin el MCP de nido hasta que cambiara).
-    let mut ran = cli.run(None, &["--version"]);
-    for _ in 0..20 {
-        match &ran {
-            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-                ran = cli.run(None, &["--version"]);
-            }
-            _ => break,
-        }
-    }
-    let Ok(ran) = ran else {
+    // Recién escrito, lanzarlo puede dar «Text file busy» un momento: lo reintenta `run`. Y si no
+    // se pudo lanzar, no se recuerda: la próxima vez se vuelve a preguntar (si no, sus sesiones
+    // irían sin el MCP de nido hasta que cambiara).
+    let Ok(ran) = cli.run(None, &["--version"]) else {
         return None;
     };
     let version = Some(ran)
@@ -954,6 +944,12 @@ const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// Terminado `claude`, lo más que se espera a que se cierre su salida: un nieto que siguiera
 /// con ella abierta dejaría esperando a nido.
 const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Cuántas veces se vuelve a probar a lanzar `claude` si da «Text file busy», y cuánto se espera
+/// entre una y otra: alguien lo tiene abierto para escribir. Claude Code que se acaba de
+/// actualizar, o, en las pruebas, el guion recién escrito mientras otro hilo lanza un proceso
+/// (su hijo hereda el descriptor hasta su `exec`).
+const BUSY_TRIES: usize = 20;
+const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
 
 impl ClaudeCli for Program {
     fn run(&self, config_dir: Option<&Path>, args: &[&str]) -> std::io::Result<(bool, String)> {
@@ -977,7 +973,19 @@ impl ClaudeCli for Program {
         if let Some(d) = &self.cwd {
             cmd.current_dir(d);
         }
-        let mut child = cmd.spawn()?;
+        // «Text file busy» es que no llegó a ejecutarse: volver a probar no repite nada.
+        let mut tries = 0;
+        let mut child = loop {
+            match cmd.spawn() {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < BUSY_TRIES =>
+                {
+                    tries += 1;
+                    std::thread::sleep(BUSY_WAIT);
+                }
+                r => break r?,
+            }
+        };
         // Cada salida, a medida que llega: si no se cierra, se queda con lo que haya.
         let read = |r: Option<Box<dyn Read + Send>>| {
             let text = Arc::new(Mutex::new(Vec::new()));
@@ -2087,6 +2095,40 @@ mod tests {
             &ensure_mcp_registered(&gone, Path::new("/x/nido"), &[None])[..],
             [(None, Registration::Failed(_))]
         ));
+    }
+
+    /// Un programa abierto para escribir (recién escrito: Claude Code que se acaba de actualizar,
+    /// o el guion de una prueba mientras otro hilo lanza un proceso y su hijo hereda el
+    /// descriptor hasta su `exec`) no se puede lanzar un momento («Text file busy»): se
+    /// reintenta, y en cuanto se cierra, va. Solo en Linux: es donde lanzar un fichero abierto
+    /// para escribir da «Text file busy» seguro.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_busy_for_a_moment_still_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("claude");
+        std::fs::write(&script, "#!/bin/sh\necho hecho\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let open = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
+        let cli = Program {
+            path: script,
+            home: None,
+            cwd: None,
+        };
+        let e = std::process::Command::new(&cli.path).output().unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(open);
+        });
+        let (ok, text) = cli.run(None, &["--version"]).unwrap();
+        closer.join().unwrap();
+        assert!(ok);
+        assert!(text.contains("hecho"), "{text:?}");
     }
 
     /// Un nieto que se queda con la salida abierta no deja esperando a nido.
