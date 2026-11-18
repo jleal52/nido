@@ -219,6 +219,26 @@ pub struct BoardItem {
     pub at: i64,
 }
 
+impl BoardItem {
+    /// ¿Puede venir así del hub? Su `kid` son 16 hex en minúsculas (en una lápida puede ir
+    /// vacío), el blob no pasa de `MAX_BLOB` y `v` no es negativa (0 es «no existe», en un 409).
+    /// El id no se mira aquí: es `board::is_id`.
+    pub fn fits(&self) -> bool {
+        let kid_ok = (self.gone && self.kid.is_empty())
+            || (self.kid.len() == 16
+                && self
+                    .kid
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        kid_ok
+            && self
+                .blob
+                .as_ref()
+                .is_none_or(|b| b.len() <= crate::board::MAX_BLOB)
+            && self.v >= 0
+    }
+}
+
 /// Un texto que puede venir a `null`: vacío.
 fn null_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
@@ -703,8 +723,8 @@ impl Hub {
         match v["status"].as_u64() {
             Some(200) => Ok(v),
             Some(409) => match serde_json::from_value::<BoardItem>(v["current"].clone()) {
-                Ok(current) => Err(BoardError::Conflict(current)),
-                Err(_) => Err(BoardError::Hub(BOARD_ODD.into())),
+                Ok(current) if current.fits() => Err(BoardError::Conflict(current)),
+                _ => Err(BoardError::Hub(BOARD_ODD.into())),
             },
             Some(413)
                 if v["error"]
@@ -1896,6 +1916,105 @@ mod tests {
         assert_eq!(
             hub.board_get(0, None).await.unwrap_err(),
             BoardError::Hub(BOARD_ODD.into())
+        );
+    }
+
+    /// Un objeto del tablero que no puede venir así del hub: un `kid` que no es de 16 hex en
+    /// minúsculas (en una lápida puede venir vacío), un blob de más de `MAX_BLOB` o una `v`
+    /// negativa.
+    #[test]
+    fn a_board_item_that_does_not_fit() {
+        let ok = BoardItem {
+            id: OBJ.into(),
+            v: 1,
+            kid: KID.into(),
+            blob: Some("QUJD".into()),
+            gone: false,
+            at: 1,
+        };
+        assert!(ok.fits());
+        let tomb = BoardItem {
+            v: 2,
+            kid: String::new(),
+            blob: None,
+            gone: true,
+            ..ok.clone()
+        };
+        assert!(tomb.fits(), "una lápida sin kid");
+        assert!(
+            BoardItem {
+                v: 0,
+                ..tomb.clone()
+            }
+            .fits(),
+            "lo que no existe"
+        );
+        assert!(
+            BoardItem {
+                kid: KID.into(),
+                ..tomb.clone()
+            }
+            .fits()
+        );
+        let long = "A".repeat(crate::board::MAX_BLOB);
+        assert!(
+            BoardItem {
+                blob: Some(long.clone()),
+                ..ok.clone()
+            }
+            .fits()
+        );
+        for bad in [
+            BoardItem {
+                kid: String::new(),
+                ..ok.clone()
+            },
+            BoardItem {
+                kid: KID.to_uppercase(),
+                ..ok.clone()
+            },
+            BoardItem {
+                kid: format!("{KID}0"),
+                ..ok.clone()
+            },
+            BoardItem {
+                kid: "z".repeat(16),
+                ..ok.clone()
+            },
+            BoardItem {
+                kid: "x".into(),
+                ..tomb.clone()
+            },
+            BoardItem {
+                blob: Some(format!("{long}A")),
+                ..ok.clone()
+            },
+            BoardItem {
+                v: -1,
+                ..ok.clone()
+            },
+            BoardItem {
+                v: -1,
+                ..tomb.clone()
+            },
+        ] {
+            assert!(!bad.fits(), "{bad:?}");
+        }
+    }
+
+    /// Un 409 con un objeto que no puede ser no es un conflicto que se pueda resolver.
+    #[tokio::test]
+    async fn a_conflict_that_does_not_fit_is_odd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = fake::Board::default();
+        b.write(OBJ, Some((KID, "QUJD")));
+        b.items.get_mut(OBJ).unwrap().v = -1;
+        let board = shared(b);
+        let rec = fake::board(board.clone()).await;
+        let hub = connected(tmp.path(), rec.addr).await;
+        assert_eq!(
+            hub.board_put(OBJ, 0, KID, "REVG").await,
+            Err(BoardError::Hub(BOARD_ODD.into()))
         );
     }
 

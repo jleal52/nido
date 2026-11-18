@@ -549,9 +549,10 @@ impl Copy {
     /// volver a empezar, pero la marca es nueva. Lo que ya se tiene (mismo `v` y marca, como lo
     /// del solape) no cambia nada. Uno que faltaba por resubir, o que no estaba en el hub, ya
     /// está: se toma tal cual. Un id que no es un id se ignora, y uno nuevo no entra si la copia
-    /// ya tiene `MAX_COPY`. Devuelve si cambió algo.
+    /// ya tiene `MAX_COPY`. Lo que no puede venir así del hub (`BoardItem::fits`) tampoco entra,
+    /// ni toca sus marcas. Devuelve si cambió algo.
     fn apply(&mut self, item: BoardItem) -> bool {
-        if !is_id(&item.id) {
+        if !is_id(&item.id) || !item.fits() {
             return false;
         }
         let pending = self.reupload.remove(&item.id);
@@ -568,8 +569,12 @@ impl Copy {
     }
 
     /// Deja `item` (una lápida) tal cual, aunque pierda frente a lo que hay: es lo que dice el
-    /// hub ahora. Devuelve si cambió algo.
+    /// hub ahora. Una que no puede venir así del hub (`BoardItem::fits`) no entra, como en
+    /// `apply`. Devuelve si cambió algo.
     fn bury(&mut self, item: &BoardItem) -> bool {
+        if !is_id(&item.id) || !item.fits() {
+            return false;
+        }
         let pending = self.reupload.remove(&item.id);
         let missing = self.missing.remove(&item.id);
         let stored = Stored::from(item);
@@ -3038,6 +3043,83 @@ mod tests {
         assert!(r.cache.sync().await.unwrap());
         assert_eq!(r.cache.item(&bid(6)).unwrap().v, six.v);
         assert_eq!(r.cache.next(), six.at);
+    }
+
+    /// Lo que no puede venir así del hub (un `kid` que no es de 16 hex, un blob de más de
+    /// `MAX_BLOB`, una `v` negativa) se deja fuera, objeto a objeto: el resto de la página entra,
+    /// `next` avanza igual y lo que ya se tenía de ese id se queda como estaba.
+    #[tokio::test]
+    async fn sync_leaves_out_what_does_not_fit() {
+        let r = rig(fake::Board {
+            page: 2,
+            ..Default::default()
+        })
+        .await;
+        let kept = r.write(&K_CUR, &bid(1), &project("p1"));
+        r.cache.sync().await.unwrap();
+        let (k, blob) = sealed(&K_CUR, &bid(1), &project("otro"));
+        {
+            let mut b = r.board.lock().unwrap();
+            // Lo que ya se tiene, con un `kid` que no vale.
+            b.write(&bid(1), Some(("NO-ES-UN-KID-HEX", &blob)));
+            b.write(&bid(2), Some((&k.to_uppercase(), &blob)));
+            b.write(&bid(3), Some((&k, &"A".repeat(MAX_BLOB + 1))));
+            b.write(&bid(4), Some((&k, &blob)));
+            b.items.get_mut(&bid(4)).unwrap().v = -3;
+            // Una lápida sin `kid`: vale.
+            b.write(&bid(5), Some((&k, &blob)));
+            b.write(&bid(5), None);
+        }
+        r.write(&K_CUR, &bid(6), &project("p6"));
+        assert!(r.cache.sync().await.unwrap());
+        assert_eq!(r.cache.ids(), vec![bid(1), bid(5), bid(6)]);
+        assert_eq!(r.cache.item(&bid(1)), Some(Stored::from(&kept)));
+        let tomb = r.cache.item(&bid(5)).unwrap();
+        assert!(tomb.gone && tomb.kid.is_empty() && tomb.blob.is_none());
+        assert_eq!(r.cache.next(), r.board.lock().unwrap().clock);
+    }
+
+    /// `Copy` descarta lo que no cabe antes de tocar nada: ni el objeto ni sus marcas de
+    /// resubida o de que falta en el hub.
+    #[test]
+    fn the_copy_takes_nothing_that_does_not_fit() {
+        let ok = BoardItem {
+            id: bid(1),
+            v: 1,
+            kid: kid(&K_CUR),
+            blob: Some("QUJD".into()),
+            gone: false,
+            at: 1,
+        };
+        let mut c = Copy::default();
+        c.reupload.insert(bid(1));
+        c.missing.insert(bid(2));
+        let bad = BoardItem {
+            v: -1,
+            ..ok.clone()
+        };
+        assert!(!c.apply(bad.clone()));
+        assert!(!c.bury(&BoardItem {
+            gone: true,
+            blob: None,
+            ..bad
+        }));
+        assert!(!c.apply(BoardItem {
+            id: bid(2),
+            kid: "x".into(),
+            ..ok.clone()
+        }));
+        assert!(!c.bury(&BoardItem {
+            id: bid(2),
+            kid: "x".into(),
+            gone: true,
+            blob: None,
+            ..ok.clone()
+        }));
+        assert!(c.items.is_empty());
+        assert!(c.reupload.contains(&bid(1)) && c.missing.contains(&bid(2)));
+        assert!(c.apply(ok));
+        assert!(c.items.contains_key(&bid(1)) && c.reupload.is_empty());
     }
 
     /// Con `reset` la copia se rehace desde 0: lo que ya no está en el hub (una lápida caducada)
