@@ -344,7 +344,9 @@ fichero, cierra todos los enlaces de este equipo. Nada los vuelve a abrir solo: 
 tienen que volver a hacer `join`, y los enlaces cerrados se borran a los 30 días. Tampoco hay que
 arrancar nido con otra carpeta de datos (por ejemplo al cambiar `XDG_DATA_HOME` en un servicio):
 además del registro, guarda el grupo (`group.json`, con el llavero del tablero) y la copia del
-tablero, así que nido arrancaría sin el grupo ni el llavero, sin poder leer el tablero.
+tablero, así que nido arrancaría sin el grupo ni el llavero, sin poder leer el tablero. Si nido no
+entiende `group.json`, lo aparta como `group.json.bad-<ms>` y arranca sin grupo: ese fichero
+lleva las claves del tablero, así que bórralo cuando ya no te haga falta.
 
 Cada nido guarda una copia del tablero en `board.json`, en su carpeta de datos
 (`~/.local/share/nido`, `$XDG_DATA_HOME/nido` o `$NIDO_HOME/data`; en Windows,

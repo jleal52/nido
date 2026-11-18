@@ -223,6 +223,16 @@ pub struct State {
     pub keys: Vec<BoardKey>,
 }
 
+/// Por qué no se entiende un group.json, sin el texto de serde_json, que puede repetir un valor
+/// (y ahí van las claves del llavero): solo dónde.
+fn unreadable_json(e: &serde_json::Error) -> String {
+    format!(
+        "JSON no válido en la línea {}, columna {}",
+        e.line(),
+        e.column()
+    )
+}
+
 /// La entrada más reciente; a igual hora, la baja gana (no resucita lo quitado).
 fn newer(a_at: u64, a_removed: bool, b_at: u64, b_removed: bool) -> bool {
     b_at > a_at || (b_at == a_at && b_removed && !a_removed)
@@ -376,7 +386,7 @@ impl Group {
             State::default()
         };
         let state = match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| broken(e.to_string())),
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| broken(unreadable_json(&e))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => broken(e.to_string()),
             Err(e) => {
@@ -2084,6 +2094,19 @@ mod tests {
             k,
             "la que ya había no hace falta guardarla"
         );
+    }
+
+    /// Lo que se dice de un group.json que no se entiende es dónde, no qué: el texto de
+    /// serde_json puede repetir un valor, y ahí hay claves del llavero.
+    #[test]
+    fn a_broken_group_file_is_told_without_its_values() {
+        let body = "{\"keys\": [{\"kid\": \"0123456789abcdef\",\n  \"at\": \"c2VjcmV0by1kZWwtbGxhdmVybw==\"}]}";
+        let e = serde_json::from_str::<State>(body).unwrap_err();
+        assert!(e.to_string().contains("c2VjcmV0by"), "{e}");
+        let said = unreadable_json(&e);
+        assert!(!said.contains("c2VjcmV0by"), "{said}");
+        assert!(said.contains(&format!("línea {}", e.line())), "{said}");
+        assert!(said.contains(&format!("columna {}", e.column())), "{said}");
     }
 
     /// Un group.json que no se entiende (roto o vacío) no se pisa en silencio: se aparta como

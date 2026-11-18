@@ -360,7 +360,9 @@ closes every link of this computer. Nothing opens them again by itself: the sess
 `join` again, and the closed links are deleted after 30 days. Don't start nido with another data
 folder either (for instance by changing `XDG_DATA_HOME` in a service): besides the registry, it
 holds the group (`group.json`, with the board's keyring) and the copy of the board, so nido would
-start without the group or the keyring, unable to read the board.
+start without the group or the keyring, unable to read the board. If nido can't understand
+`group.json`, it sets it aside as `group.json.bad-<ms>` and starts without a group: that file
+holds the board's keys, so delete it once you no longer need it.
 
 Each nido keeps a copy of the board in `board.json`, in its data folder (`~/.local/share/nido`,
 `$XDG_DATA_HOME/nido` or `$NIDO_HOME/data`; on Windows, `%USERPROFILE%\.local\share\nido`),
