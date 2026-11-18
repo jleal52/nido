@@ -2021,8 +2021,9 @@ impl crate::board::KeyHolder for AppState {
 }
 
 impl AppState {
-    /// Lo que el grupo ha dado de baja, fuera también de aquí (sin cambiar la clave del tablero:
-    /// ya la cambió el equipo que lo quitó).
+    /// Lo que el grupo ha dado de baja, fuera también de aquí. Por la baja en sí no se cambia la
+    /// clave del tablero (ya la cambió el equipo que lo quitó); solo si el dispositivo se llevó
+    /// de aquí la actual (`rotate_if_given`).
     fn apply_group(&self) {
         self.retry_owed();
         for key in self.group.removed_devices() {
