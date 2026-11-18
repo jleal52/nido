@@ -3332,7 +3332,7 @@ mod tests {
         let _limit = crate::watchdog::limit(Duration::from_secs(60));
         let tmp = tempfile::tempdir().unwrap();
         let (st, s) = with_plan_session(tmp.path()).await;
-        st.group.add_member("mac-id", "bWFj", "Mac");
+        st.group.add_member("lejano-id", "bWFj", "Lejano");
         type Asked = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
         let answer: Arc<std::sync::Mutex<e2e::PeerResult>> =
             Arc::new(std::sync::Mutex::new(Ok(json!({"plan": null}))));
@@ -3345,7 +3345,7 @@ mod tests {
         })));
         let me = Machine::of(&st);
         let caller = Caller::local(&me, &s.id, &s.name);
-        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Lejano/abcd1234"}))
             .await
             .unwrap();
         assert_eq!(r, json!({"plan": null}));
@@ -3358,7 +3358,7 @@ mod tests {
         );
         let plan = json!({"plan": {"phases": [], "updated": 1}, "progress": "0/0"});
         *answer.lock().unwrap() = Ok(plan.clone());
-        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+        let r = tool_plan_get(&st, &me, &caller, json!({"session": "Lejano/abcd1234"}))
             .await
             .unwrap();
         assert_eq!(r, plan);
@@ -3371,14 +3371,14 @@ mod tests {
             (404, "no hay ninguna herramienta \"plan_get\"".to_owned()),
         ] {
             *answer.lock().unwrap() = Err(old);
-            let e = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+            let e = tool_plan_get(&st, &me, &caller, json!({"session": "Lejano/abcd1234"}))
                 .await
                 .unwrap_err();
             assert_eq!(e.1, "ese equipo no tiene planes (su nido es anterior)");
         }
         // Otro error, tal cual.
         *answer.lock().unwrap() = Err((404, "no existe esa sesión".to_owned()));
-        let e = tool_plan_get(&st, &me, &caller, json!({"session": "Mac/abcd1234"}))
+        let e = tool_plan_get(&st, &me, &caller, json!({"session": "Lejano/abcd1234"}))
             .await
             .unwrap_err();
         assert_eq!(
