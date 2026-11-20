@@ -186,7 +186,8 @@ async fn a_session_parked_in_the_background() {
     let shell = bin.join("shell");
     executable(&shell, "#!/bin/sh\nshift 3\nexec \"$@\"\n");
     // El `claude` falso: `--version` (lo pregunta nido para el channel), `stop <id>` (lo apunta
-    // con su perfil y para el trabajo) y, si no, se queda en marcha como el Claude de la sesión,
+    // con su perfil, para el trabajo, salvo con `stop-fails`, y el Claude de la sesión deja de
+    // estar aparcado) y, si no, se queda en marcha como el Claude de la sesión,
     // apuntando su pid y su orden.
     executable(
         &bin.join("claude"),
@@ -194,7 +195,11 @@ async fn a_session_parked_in_the_background() {
          case \"$1\" in\n\
          --version) echo '2.1.329 (Claude Code)'; exit 0;;\n\
          stop) echo \"stop $2 ${CLAUDE_CONFIG_DIR:-}\" >> \"$FAKE_DIR/stops\";\n\
-               for f in \"$FAKE_DIR\"/job-*.pid; do [ -f \"$f\" ] && kill \"$(cat \"$f\")\"; done; exit 0;;\n\
+               [ -f \"$FAKE_DIR/stop-fails\" ] && { echo 'no se pudo' >&2; exit 1; };\n\
+               for f in \"$FAKE_DIR\"/job-*.pid; do [ -f \"$f\" ] && kill \"$(cat \"$f\")\"; done;\n\
+               if [ -f \"$FAKE_DIR/viewer.pid\" ]; then v=$(cat \"$FAKE_DIR/viewer.pid\");\n\
+                 printf '{\"sessionId\":\"conv-vieja\",\"kind\":\"interactive\",\"status\":\"idle\"}' \
+                   > \"$CLAUDE_CONFIG_DIR/sessions/$v.json\"; sleep 0.3; fi; exit 0;;\n\
          esac\n\
          echo \"$*\" >> \"$FAKE_DIR/runs\"\n\
          echo $$ > \"$FAKE_DIR/viewer.pid\"\n\
@@ -322,4 +327,75 @@ async fn a_session_parked_in_the_background() {
     let (_, list) = tool(addr, &caller, "sessions", json!({})).await;
     assert!(listed(&list).get("channel_error").is_none(), "{list}");
     assert!(alive(job));
+
+    // Sin trabajo aparcado, reiniciarla no le pide nada a `claude`, ni toca un trabajo que lleva
+    // otra conversación.
+    let _ = std::fs::remove_file(fake.join("viewer.pid"));
+    let session_path = |what: &str| format!("/api/v1/sessions/{id}/{what}");
+    let (code, r) = call(addr, "POST", &session_path("restart"), None, None).await;
+    assert_eq!(code, 200, "{r}");
+    assert!(
+        wait_for(|| viewer_pid().is_some()).await,
+        "no volvió a arrancar"
+    );
+    assert!(!fake.join("stops").exists());
+    assert!(alive(job));
+
+    // Aparcada otra vez, se para (sin escanear antes): primero su trabajo, con su perfil, y la
+    // conversación que queda para retomarla (también al arrancar el equipo) es la del trabajo.
+    // Mientras se para, el escaneo sigue (y el visor ya no dice que está aparcado): no le vuelve
+    // a cambiar la conversación.
+    let viewer = viewer_pid().unwrap();
+    viewer_file(&config, viewer, true);
+    let scanning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let scans = {
+        let (st, scanning) = (st.clone(), scanning.clone());
+        tokio::spawn(async move {
+            let mut n = 0;
+            while scanning.load(std::sync::atomic::Ordering::Relaxed) {
+                st.scan().await;
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            n
+        })
+    };
+    let (code, r) = call(addr, "POST", &session_path("stop"), None, None).await;
+    assert_eq!(code, 200, "{r}");
+    scanning.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(scans.await.unwrap() > 5);
+    assert_eq!(
+        std::fs::read_to_string(fake.join("stops")).unwrap(),
+        format!("stop {JOB} {}\n", config.display())
+    );
+    assert!(wait_for(|| !alive(job)).await, "el trabajo sigue");
+    assert!(!nido::launch::is_alive(&paths, &id));
+    st.scan().await;
+    assert_eq!(link_now(&st), "conv-nueva");
+    assert_eq!(st.inbox.refusal(&id), None);
+
+    // Al arrancarla, si un trabajo vivo sigue con esa conversación (su demonio no colgaba de la
+    // sesión, o lo relanzó), se para antes de retomarla. Si no se puede, no se arranca.
+    std::fs::create_dir_all(config.join("projects/-w")).unwrap();
+    std::fs::write(config.join("projects/-w/conv-nueva.jsonl"), "{}\n").unwrap();
+    let job = spawn_job(&config, "conv-nueva");
+    cleanup.1.push(job);
+    std::fs::write(fake.join("job-1.pid"), job.to_string()).unwrap();
+    std::fs::write(fake.join("stop-fails"), "").unwrap();
+    let _ = std::fs::remove_file(fake.join("viewer.pid"));
+    let (code, r) = call(addr, "POST", &session_path("start"), None, None).await;
+    assert_eq!(code, 500, "{r}");
+    assert!(r["error"].as_str().unwrap().contains(JOB), "{r}");
+    assert!(alive(job));
+    assert!(!nido::launch::is_alive(&paths, &id));
+    std::fs::remove_file(fake.join("stop-fails")).unwrap();
+    let (code, r) = call(addr, "POST", &session_path("start"), None, None).await;
+    assert_eq!(code, 200, "{r}");
+    assert!(!alive(job));
+    assert!(wait_for(|| viewer_pid().is_some()).await, "no arrancó");
+    let runs = std::fs::read_to_string(fake.join("runs")).unwrap();
+    let last = runs.lines().last().unwrap();
+    assert!(last.contains("--resume conv-nueva"), "{runs}");
+    let stops = std::fs::read_to_string(fake.join("stops")).unwrap();
+    assert_eq!(stops.lines().count(), 3, "{stops}");
 }

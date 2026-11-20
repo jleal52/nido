@@ -548,6 +548,26 @@ pub fn running_job(procfs: &Procfs, config_dir: &Path, session_id: &str) -> Opti
         .map(|(pid, info)| job_of(pid, info))
 }
 
+/// Para el trabajo en segundo plano `job` (`claude stop <id>`, con el perfil `config_dir`;
+/// `None`: `~/.claude`). Según la ayuda de Claude Code conserva su conversación, y luego
+/// `claude --resume` la retoma. Error si el id no vale o si `claude` dice que no.
+pub fn stop_job(cli: &dyn ClaudeCli, config_dir: Option<&Path>, job: &str) -> std::io::Result<()> {
+    if !valid_job_id(job) {
+        return Err(std::io::Error::other(format!(
+            "id de trabajo no válido: {job}"
+        )));
+    }
+    let (ok, text) = cli.run(config_dir, &["stop", job])?;
+    if ok {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "claude stop {job}: {}",
+            text.trim()
+        )))
+    }
+}
+
 /// El primer Claude en el árbol del proceso de la sesión (él mismo o un descendiente). El proceso
 /// de un trabajo en segundo plano no lo es, aunque cuelgue de ella (el demonio de Claude Code
 /// puede ser su hijo). Si el suyo pasó su conversación a un trabajo en segundo plano
@@ -1750,6 +1770,40 @@ mod tests {
             running_job(&p, &config, "conv").map(|j| j.pid),
             Some(Some(900))
         );
+    }
+
+    #[test]
+    fn stopping_a_background_job() {
+        /// Contesta siempre lo mismo y apunta lo que le piden.
+        struct Answers(bool, std::sync::Mutex<Vec<(Option<PathBuf>, Vec<String>)>>);
+        impl ClaudeCli for Answers {
+            fn run(&self, dir: Option<&Path>, args: &[&str]) -> std::io::Result<(bool, String)> {
+                let args = args.iter().map(|a| a.to_string()).collect();
+                self.1.lock().unwrap().push((dir.map(Path::to_owned), args));
+                Ok((self.0, "no existe ese trabajo\n".into()))
+            }
+        }
+        let ok = Answers(true, Default::default());
+        let profile = PathBuf::from("/perfil");
+        stop_job(&ok, Some(&profile), "ab12cd34").unwrap();
+        stop_job(&ok, None, "ee12cd34").unwrap();
+        assert_eq!(
+            *ok.1.lock().unwrap(),
+            [
+                (
+                    Some(profile),
+                    vec!["stop".to_owned(), "ab12cd34".to_owned()]
+                ),
+                (None, vec!["stop".to_owned(), "ee12cd34".to_owned()]),
+            ]
+        );
+        // Un id raro no llega a `claude` (sería una opción).
+        assert!(stop_job(&ok, None, "--all").is_err());
+        assert_eq!(ok.1.lock().unwrap().len(), 2);
+        // Si `claude` dice que no, es un error, con lo que dijo.
+        let no = Answers(false, Default::default());
+        let e = stop_job(&no, None, "ab12cd34").unwrap_err();
+        assert!(e.to_string().contains("no existe ese trabajo"), "{e}");
     }
 
     #[test]

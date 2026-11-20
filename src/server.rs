@@ -133,6 +133,9 @@ pub struct AppState {
     searching: Arc<Mutex<()>>,
     /// La cola de Claude de cada transcripción, leída poco a poco (ver `transcript::Queue`).
     queues: std::sync::Mutex<std::collections::HashMap<PathBuf, crate::transcript::Queue>>,
+    /// Las sesiones que se están parando con su conversación en un trabajo en segundo plano (ver
+    /// `stop_and_wait`): mientras, el escaneo no les cambia la conversación del registro.
+    stopping: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Los modelos que se ofrecen si nido aún no ha visto el menú de `/model` (también valen como
@@ -695,6 +698,7 @@ impl AppState {
             search: Default::default(),
             searching: Default::default(),
             queues: Default::default(),
+            stopping: Default::default(),
         }))
     }
 
@@ -727,21 +731,15 @@ impl AppState {
                 .and_then(|pid| u32::try_from(pid).ok())
                 .and_then(|pid| claude::find_claude(&procfs, pid, &self.paths.home));
             let mut link = s.claude.clone();
-            if let Some(f) = &found {
-                let inside_shell = !claude::is_claude(&s.argv);
-                let account = link.as_ref().and_then(|l| l.account.clone());
-                let fresh = ClaudeLink {
-                    session_id: f.info.session_id.clone(),
-                    config_dir: f.config_dir.clone(),
-                    account,
-                    inside_shell,
-                };
-                if link.as_ref() != Some(&fresh) {
-                    link = Some(fresh);
-                }
-            } else if alive && link.as_ref().is_some_and(|l| l.inside_shell) {
+            // Parándose con su conversación en un trabajo en segundo plano: el registro ya tiene
+            // la del trabajo, y el Claude que se apaga no la cambia (ver `stop_and_wait`).
+            let pinned = self.stopping.lock().expect("parando").contains(&s.id);
+            match &found {
+                _ if pinned => {}
+                Some(f) => link = Some(fresh_link(&s, f)),
                 // Salió de Claude y sigue en la shell: al restaurar, solo la shell.
-                link = None;
+                None if alive && link.as_ref().is_some_and(|l| l.inside_shell) => link = None,
+                None => {}
             }
             if link != s.claude {
                 let _ = reg.update(&s.id, |x| x.claude = link.clone());
@@ -872,6 +870,10 @@ impl AppState {
         let sessions: Vec<Session> = self.registry.lock().await.sessions().to_vec();
         for s in sessions.iter().filter(|s| s.autostart) {
             if !launch::is_alive(&self.paths, &s.id) {
+                if let Err(e) = stop_running_job(self, &s.id).await {
+                    eprintln!("nido: no se restaura {}: {e}", s.name);
+                    continue;
+                }
                 let hold = self.launching(&s.id);
                 match launch::start(&self.paths, self.launcher, &s.id) {
                     Ok(()) => self.launched(&s.id, hold),
@@ -1523,6 +1525,60 @@ where
         Err(prompt::Unread::Slow) => Ready::Reconnect,
         // Se cerró: nada que retener.
         Err(prompt::Unread::Closed) => Ready::Release,
+    }
+}
+
+/// El enlace de la sesión `s` con el Claude `f` que corre en ella: su conversación (la de su
+/// trabajo en segundo plano, si la pasó a uno) y su perfil; la cuenta, la que tuviera.
+fn fresh_link(s: &Session, f: &claude::FoundClaude) -> ClaudeLink {
+    ClaudeLink {
+        session_id: f.info.session_id.clone(),
+        config_dir: f.config_dir.clone(),
+        account: s.claude.as_ref().and_then(|l| l.account.clone()),
+        inside_shell: !claude::is_claude(&s.argv),
+    }
+}
+
+/// El `claude` de este equipo para pedirle cosas, en una carpeta neutra (la del estado de nido:
+/// el `.mcp.json` de donde se arrancó nido no cuenta).
+fn claude_program(paths: &Paths) -> Option<claude::Program> {
+    let path = std::env::var_os("PATH");
+    let program = claude::find_program(path.as_deref(), &paths.home)?;
+    let _ = std::fs::create_dir_all(&paths.state);
+    Some(claude::Program {
+        path: program,
+        home: None,
+        cwd: Some(paths.state.clone()),
+    })
+}
+
+/// Lo más que se espera a que acabe el proceso de un trabajo en segundo plano tras
+/// `claude stop`.
+const JOB_STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// Para el trabajo en segundo plano `job`, vivo, que lleva la conversación `session_id` del
+/// perfil `config_dir` (`None`: `~/.claude`), y espera a que su proceso acabe. Bloquea.
+fn stop_live_job(
+    paths: &Paths,
+    config_dir: Option<&std::path::Path>,
+    session_id: &str,
+    job: &str,
+) -> std::io::Result<()> {
+    let cli = claude_program(paths).ok_or_else(|| std::io::Error::other("no encuentro claude"))?;
+    claude::stop_job(&cli, config_dir, job)?;
+    let dir = config_dir
+        .map(std::path::Path::to_owned)
+        .unwrap_or_else(|| claude::default_config_dir(&paths.home));
+    let procfs = Procfs::default();
+    if launch::wait_until(
+        || claude::running_job(&procfs, &dir, session_id).is_none(),
+        JOB_STOP_WAIT,
+    ) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "el trabajo {job} sigue en marcha tras claude stop"
+        )))
     }
 }
 
@@ -3564,6 +3620,7 @@ async fn api_order_folders(
 pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
     // Lo que le llegue a su `nido mcp` mientras se muere se perdería.
     st.inbox.stopped(id);
+    let pinned = stop_parked_job(st, id).await;
     // Bloquea un momento (en Windows espera a que el guardián recoja la orden): fuera del hilo
     // de tokio.
     let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
@@ -3571,10 +3628,106 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
     // Hasta que el proceso termine del todo, no solo hasta que deje el socket.
     for _ in 0..240 {
         if !launch::is_alive(&st.paths, id) && !launch::holder_running(&st.paths, id) {
-            return;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    if pinned {
+        st.stopping.lock().expect("parando").remove(id);
+    }
+}
+
+/// Antes de parar la sesión `id`: si su Claude pasó la conversación a un trabajo en segundo
+/// plano de Claude Code, el registro se queda con la del trabajo (para retomarla, también tras
+/// reiniciar el equipo) y el escaneo no la cambia hasta acabar de parar (`stopping`: el visor,
+/// al irse el trabajo, podría volver a decir la de antes). Y el trabajo, si sigue vivo, se para
+/// (`claude stop`): puede no colgar de la sesión, y se quedaría trabajando con la conversación
+/// que se retomará. `true` si quedó fijada.
+async fn stop_parked_job(st: &AppState, id: &str) -> bool {
+    let (paths, sid) = (st.paths.clone(), id.to_owned());
+    let found = tokio::task::spawn_blocking(move || {
+        let holder = u32::try_from(launch::holder_pid(&paths, &sid)?).ok()?;
+        claude::find_claude(&Procfs::default(), holder, &paths.home)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((f, job)) = found.and_then(|f| f.parked.clone().map(|j| (f, j))) else {
+        return false;
+    };
+    st.stopping.lock().expect("parando").insert(id.to_owned());
+    {
+        let mut reg = st.registry.lock().await;
+        if let Some(s) = reg.get(id).cloned() {
+            let link = fresh_link(&s, &f);
+            if s.claude.as_ref() != Some(&link)
+                && let Err(e) = reg.update(id, |x| x.claude = Some(link))
+            {
+                eprintln!("nido: no se pudo guardar la conversación de {id}: {e}");
+            }
+        }
+    }
+    if job.pid.is_some() {
+        let paths = st.paths.clone();
+        let (config, name) = (f.config_dir.clone(), id.to_owned());
+        let done = tokio::task::spawn_blocking(move || {
+            stop_live_job(&paths, config.as_deref(), &job.session_id, &job.id)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        if let Err(e) = done {
+            eprintln!(
+                "nido: {name}: no se pudo parar su trabajo en segundo plano ({e}); no se retomará \
+                 mientras siga"
+            );
+        }
+    }
+    true
+}
+
+/// Antes de arrancar la sesión `id`: si un trabajo en segundo plano de Claude Code sigue vivo con
+/// su conversación (su demonio no cuelga de la sesión, o lo relanzó), se para primero: retomarla
+/// a la vez dejaría dos Claude con la misma. Si no se puede parar, no se arranca.
+pub(crate) async fn stop_running_job(st: &AppState, id: &str) -> std::io::Result<()> {
+    let Some(link) = st
+        .registry
+        .lock()
+        .await
+        .get(id)
+        .and_then(|s| s.claude.clone())
+    else {
+        return Ok(());
+    };
+    let paths = st.paths.clone();
+    tokio::task::spawn_blocking(move || {
+        let dir = link
+            .config_dir
+            .clone()
+            .unwrap_or_else(|| claude::default_config_dir(&paths.home));
+        let Some(job) = claude::running_job(&Procfs::default(), &dir, &link.session_id) else {
+            return Ok(());
+        };
+        eprintln!(
+            "nido: la conversación {} sigue en el trabajo en segundo plano {} de Claude Code: se \
+             para antes de retomarla",
+            link.session_id, job.id
+        );
+        stop_live_job(
+            &paths,
+            link.config_dir.as_deref(),
+            &link.session_id,
+            &job.id,
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "su conversación sigue en el trabajo en segundo plano {} de Claude Code, que no \
+                 se pudo parar: {e}",
+                job.id
+            ))
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
 }
 
 /// Contesta el menú que Claude tiene en pantalla (sus preguntas, un permiso, el plan…) pulsando
@@ -3885,6 +4038,7 @@ pub(crate) async fn remember_running(st: &AppState, id: &str, running: bool) {
 pub(crate) async fn start_session(st: &AppState, id: &str) -> std::io::Result<bool> {
     let mut alive = launch::is_alive(&st.paths, id);
     if !alive {
+        stop_running_job(st, id).await?;
         let hold = st.launching(id);
         launch::start(&st.paths, st.launcher, id)?;
         alive = wait_alive(st, id).await;
@@ -3932,6 +4086,9 @@ async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) ->
     // Retenida ya antes de pararla: el `nido mcp` de antes aún recoge.
     let hold = st.launching(&s.id);
     stop_and_wait(&st, &s.id).await;
+    if let Err(e) = stop_running_job(&st, &s.id).await {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
     if let Err(e) = launch::start(&st.paths, st.launcher, &s.id) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
