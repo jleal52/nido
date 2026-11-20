@@ -796,6 +796,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_session_without_the_daemon_costs_almost_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (procfs, cgroup) = fake_session(tmp.path());
+        // Sin demonio (otro Claude cualquiera): nada, y sin recorrer todos los procesos.
+        std::fs::write(tmp.path().join("proc/50/cmdline"), "claude\0--resume\0x\0").unwrap();
+        assert!(claude::daemon_procs(&procfs, &cgroup_members(&cgroup)).is_empty());
+        // Con él, tampoco hace falta.
+        std::fs::write(tmp.path().join("proc/50/cmdline"), "claude\0daemon\0run\0").unwrap();
+        assert_eq!(
+            claude::daemon_procs(&procfs, &cgroup_members(&cgroup)).len(),
+            3
+        );
+        assert_eq!(
+            procfs.full_scans.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn what_is_born_while_the_daemon_leaves_also_leaves() {
         let tmp = tempfile::tempdir().unwrap();
         let (procfs, cgroup) = fake_session(tmp.path());

@@ -119,19 +119,35 @@ pub fn claude_comm(name: &str) -> bool {
 /// Acceso a `/proc` (en las pruebas, uno falso).
 pub struct Procfs {
     root: PathBuf,
+    /// Cuántas veces se recorrieron todos los procesos (`parents`): para las pruebas.
+    #[cfg(test)]
+    pub(crate) full_scans: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for Procfs {
     fn default() -> Self {
-        Self {
-            root: "/proc".into(),
-        }
+        Self::at("/proc")
     }
 }
 
 impl Procfs {
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(test)]
+            full_scans: Default::default(),
+        }
+    }
+
+    /// El padre de `pid`, leyendo solo lo suyo (`parents` los lee todos).
+    pub fn ppid(&self, pid: u32) -> Option<u32> {
+        #[cfg(any(target_os = "macos", windows))]
+        if self.native() {
+            return self.parents().get(&pid).copied();
+        }
+        let stat = std::fs::read_to_string(self.root.join(pid.to_string()).join("stat")).ok()?;
+        let after = &stat[stat.rfind(')')? + 1..];
+        after.split_whitespace().nth(1)?.parse().ok()
     }
 
     /// En macOS no hay `/proc`: se pregunta al núcleo (`sysctl`). En Windows, a la instantánea
@@ -143,6 +159,9 @@ impl Procfs {
 
     /// `pid → ppid` de todos los procesos.
     fn parents(&self) -> HashMap<u32, u32> {
+        #[cfg(test)]
+        self.full_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "macos")]
         if self.native() {
             return mac::parents();
@@ -611,30 +630,41 @@ fn is_daemon(procfs: &Procfs, pid: u32) -> bool {
 /// Se busca entre ellos y no en el árbol del guardián: si el Claude que lo lanzó acaba, el
 /// demonio pasa a colgar de systemd, pero sigue en el cgroup. Cada uno con su demonio:
 /// `(demonio, proceso)`, en el orden de los pids.
+///
+/// Sube desde cada uno leyendo solo sus antecesores (y recordando lo ya visto), sin recorrer
+/// todos los procesos: lo hace el escaneo cada 2 s con cada sesión viva, casi siempre sin demonio.
 pub fn daemon_procs(procfs: &Procfs, members: &[u32]) -> Vec<(u32, u32)> {
-    let parents = procfs.parents();
-    let mut known: HashMap<u32, bool> = HashMap::new();
-    let mut daemon = |pid: u32| {
-        *known.entry(pid).or_insert_with(|| {
-            procfs.comm(pid).is_some_and(|n| claude_comm(&n)) && is_daemon(procfs, pid)
-        })
-    };
+    // De cada proceso visto, el demonio del que cuelga (o él mismo), si hay.
+    let mut known: HashMap<u32, Option<u32>> = HashMap::new();
     let mut sorted = members.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     let mut out = Vec::new();
     for pid in sorted {
+        let mut chain = Vec::new();
         let mut at = pid;
+        let mut found = None;
         // Con tope: un árbol raro (pids reusados) no deja dando vueltas.
         for _ in 0..64 {
-            if daemon(at) {
-                out.push((at, pid));
+            if let Some(&k) = known.get(&at) {
+                found = k;
                 break;
             }
-            match parents.get(&at) {
-                Some(&up) if up != 0 && up != at => at = up,
+            chain.push(at);
+            if procfs.comm(at).is_some_and(|n| claude_comm(&n)) && is_daemon(procfs, at) {
+                found = Some(at);
+                break;
+            }
+            match procfs.ppid(at) {
+                Some(up) if up != 0 && up != at => at = up,
                 _ => break,
             }
+        }
+        for c in chain {
+            known.insert(c, found);
+        }
+        if let Some(d) = found {
+            out.push((d, pid));
         }
     }
     out
