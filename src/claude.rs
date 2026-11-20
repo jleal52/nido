@@ -36,6 +36,10 @@ pub struct ClaudeInfo {
     /// otro que herede su pid.
     #[serde(default, deserialize_with = "lenient")]
     pub proc_start: Option<String>,
+    /// Cuándo empezó (ms desde 1970), según Claude Code: donde no se sabe `procStart` (macOS,
+    /// Windows), para lo mismo.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub started_at: Option<u64>,
 }
 
 /// Un campo de texto que, si viene de otra forma (otra versión de Claude Code), no estropea la
@@ -46,6 +50,11 @@ fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::
         serde_json::Value::Number(n) => Some(n.to_string()),
         _ => None,
     })
+}
+
+/// Como `lenient`, para un número.
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_u64())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,8 +83,37 @@ pub struct Job {
     pub session_id: String,
     /// Su estado, si su proceso está vivo.
     pub status: Option<String>,
-    /// Su proceso, si está vivo.
-    pub pid: Option<u32>,
+    /// Su proceso, si está vivo (ver `job_alive`).
+    pub process: Option<ProcId>,
+}
+
+/// Un proceso de Claude Code tal como lo apuntó él (o su demonio): para saber si el que tiene
+/// ahora ese pid es el mismo (ver `Procfs::is_claude_process`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcId {
+    pub pid: u32,
+    /// El campo 22 de `/proc/<pid>/stat` cuando arrancó (`procStart`; solo en Linux).
+    pub proc_start: Option<String>,
+    /// Cuándo empezó, en ms desde 1970 (`startedAt`).
+    pub started_at: Option<u64>,
+}
+
+/// Lo que se tolera entre el arranque del proceso según el sistema y el `startedAt` que apunta
+/// Claude Code (el de `/proc` va en segundos y centésimas, y Claude lo apunta ya arrancado).
+const STARTED_SLACK_MS: u64 = 3000;
+
+/// ¿Es `name` el nombre de un proceso de Claude Code? `claude` (ver `is_claude`) o, lanzado por
+/// su ruta, el nombre de su versión: el instalador deja el binario así
+/// (`…/claude/versions/2.1.329`), y así se llaman los procesos que lanza su demonio.
+pub fn claude_comm(name: &str) -> bool {
+    if is_claude(&[name.to_owned()]) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    let v = lower.strip_suffix(".exe").unwrap_or(&lower);
+    v.starts_with(|c: char| c.is_ascii_digit())
+        && v.contains('.')
+        && v.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// Acceso a `/proc` (en las pruebas, uno falso).
@@ -206,6 +244,48 @@ impl Procfs {
         self.comm(pid).is_some()
     }
 
+    /// ¿Es el que tiene ahora `p.pid` ese proceso de Claude Code? Vivo, con nombre de Claude
+    /// (`claude_comm`), y no otro que heredó el número: el mismo `procStart` (Linux) y, donde se
+    /// sabe cuándo arrancó, no después de su `startedAt`.
+    pub fn is_claude_process(&self, p: &ProcId) -> bool {
+        if !self.comm(p.pid).is_some_and(|n| claude_comm(&n)) {
+            return false;
+        }
+        if let (Some(want), Some(have)) = (&p.proc_start, self.start_time(p.pid))
+            && *want != have
+        {
+            return false;
+        }
+        if let (Some(at), Some(began)) = (p.started_at, self.started_ms(p.pid))
+            && began > at + STARTED_SLACK_MS
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Cuándo arrancó el proceso, en ms desde 1970, si se sabe: en Linux, el arranque del equipo
+    /// (`btime` de `/proc/stat`) más su campo 22; en macOS y Windows, lo que diga el sistema.
+    pub fn started_ms(&self, pid: u32) -> Option<u64> {
+        #[cfg(target_os = "macos")]
+        if self.native() {
+            return mac::started_ms(pid);
+        }
+        #[cfg(windows)]
+        if self.native() {
+            return crate::sys::win::started_ms(pid);
+        }
+        let stat = std::fs::read_to_string(self.root.join("stat")).ok()?;
+        let btime: u64 = stat
+            .lines()
+            .find_map(|l| l.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()?;
+        let ticks: u64 = self.start_time(pid)?.parse().ok()?;
+        Some(btime * 1000 + ticks * 1000 / clock_ticks())
+    }
+
     /// Cuándo arrancó (el campo 22 de `/proc/<pid>/stat`, en tics desde el arranque del equipo),
     /// tal cual. `None` si no se puede leer; en macOS y Windows, siempre.
     pub fn start_time(&self, pid: u32) -> Option<String> {
@@ -238,6 +318,19 @@ impl Procfs {
             kv.strip_prefix(key)?.strip_prefix('=').map(str::to_owned)
         })
     }
+}
+
+/// Los tics por segundo de `/proc/<pid>/stat`.
+pub fn clock_ticks() -> u64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: sin argumentos que apunten a nada.
+        let n = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if n > 0 {
+            return n as u64;
+        }
+    }
+    100
 }
 
 /// Lo mismo que `/proc` en macOS, con `sysctl`: la lista de procesos (`KERN_PROC_ALL`) y los
@@ -293,6 +386,23 @@ mod mac {
 
     pub fn parents() -> HashMap<u32, u32> {
         all().into_iter().map(|(p, pp, _)| (p, pp)).collect()
+    }
+
+    /// Cuándo arrancó (ms desde 1970).
+    pub fn started_ms(pid: u32) -> Option<u64> {
+        // SAFETY: proc_bsdinfo es POD; proc_pidinfo escribe como mucho su tamaño.
+        let mut bsd: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let r = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut bsd as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (r == size).then(|| bsd.pbi_start_tvsec * 1000 + bsd.pbi_start_tvusec / 1000)
     }
 
     /// El nombre con el que se lanzó (`argv[0]`, sin ruta) y, si no se puede leer, el del
@@ -460,40 +570,41 @@ pub fn valid_job_id(id: &str) -> bool {
 }
 
 /// Los procesos de trabajos en segundo plano vivos según `<config>/sessions/*.json` (`kind: bg`
-/// con su `jobId`): su pid y lo que apuntan. Los ficheros se quedan cuando el proceso muere: solo
-/// cuentan los de un pid vivo y, si se sabe cuándo arrancó, el mismo proceso.
-fn live_jobs(procfs: &Procfs, config_dir: &Path) -> Vec<(u32, ClaudeInfo)> {
+/// con su `jobId`): lo que apuntan. Los ficheros se quedan cuando el proceso muere (en un perfil
+/// usado mucho tiempo hay cientos): solo se leen los de un pid vivo que digan `bg`, y cuentan si
+/// el proceso es el mismo (ver `Procfs::is_claude_process`).
+fn live_jobs(procfs: &Procfs, config_dir: &Path) -> Vec<Job> {
     let Ok(dir) = std::fs::read_dir(config_dir.join("sessions")) else {
         return Vec::new();
     };
-    let mut out: Vec<(u32, ClaudeInfo)> = dir
+    let live = procfs.parents();
+    let mut out: Vec<Job> = dir
         .flatten()
         .filter_map(|e| {
             let name = e.file_name();
             let pid = name.to_str()?.strip_suffix(".json")?.parse::<u32>().ok()?;
-            let info = live_info(config_dir, pid)?;
+            live.contains_key(&pid).then_some(())?;
+            let raw = std::fs::read(e.path()).ok()?;
+            raw.windows(4).any(|w| w == b"\"bg\"").then_some(())?;
+            let info: ClaudeInfo = serde_json::from_slice(&raw).ok()?;
             (info.kind.as_deref() == Some("bg")).then_some(())?;
-            info.job_id.as_deref().filter(|j| valid_job_id(j))?;
-            procfs.alive(pid).then_some(())?;
-            if let (Some(want), Some(have)) = (&info.proc_start, procfs.start_time(pid))
-                && *want != have
-            {
-                return None;
-            }
-            Some((pid, info))
+            let id = info.job_id.clone().filter(|j| valid_job_id(j))?;
+            let process = ProcId {
+                pid,
+                proc_start: info.proc_start.clone(),
+                started_at: info.started_at,
+            };
+            procfs.is_claude_process(&process).then_some(())?;
+            Some(Job {
+                id,
+                session_id: info.session_id,
+                status: info.status,
+                process: Some(process),
+            })
         })
         .collect();
-    out.sort_by_key(|(pid, _)| *pid);
+    out.sort_by_key(|j| j.process.as_ref().map(|p| p.pid));
     out
-}
-
-fn job_of(pid: u32, info: ClaudeInfo) -> Job {
-    Job {
-        id: info.job_id.unwrap_or_default(),
-        session_id: info.session_id,
-        status: info.status,
-        pid: Some(pid),
-    }
 }
 
 /// Un campo de texto de un JSON de Claude Code, si lo es.
@@ -509,33 +620,92 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// Los trabajos que apunta el demonio de Claude Code (`daemon/roster.json`, `workers`): su id,
+/// su conversación y, si sigue vivo, su proceso (`replPid`, el de Claude; si no, `pid`, el que lo
+/// tiene en su terminal), aunque no se lea su `sessions/<pid>.json`.
+fn roster_jobs(procfs: &Procfs, config_dir: &Path) -> Vec<Job> {
+    let Some(roster) = read_json(&config_dir.join("daemon/roster.json")) else {
+        return Vec::new();
+    };
+    let Some(workers) = roster.get("workers").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let num = |w: &serde_json::Value, k: &str| w.get(k).and_then(serde_json::Value::as_u64);
+    let text = |w: &serde_json::Value, k: &str| {
+        w.get(k).and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    };
+    workers
+        .iter()
+        .filter(|(id, _)| valid_job_id(id))
+        .filter_map(|(id, w)| {
+            let session_id = json_str(w, &["sessionId"])?;
+            let candidates = [
+                num(w, "replPid").map(|pid| ProcId {
+                    pid: pid as u32,
+                    proc_start: text(w, "replProcStart"),
+                    started_at: None,
+                }),
+                num(w, "pid").map(|pid| ProcId {
+                    pid: pid as u32,
+                    proc_start: text(w, "procStart"),
+                    started_at: num(w, "startedAt"),
+                }),
+            ];
+            let process = candidates
+                .into_iter()
+                .flatten()
+                .find(|p| procfs.is_claude_process(p));
+            Some(Job {
+                id: id.clone(),
+                session_id,
+                status: None,
+                process,
+            })
+        })
+        .collect()
+}
+
+/// ¿Sigue vivo el proceso del trabajo `job`? Si no se sabe cuál es, o el que tiene ahora su pid
+/// no es él, no.
+pub fn job_alive(procfs: &Procfs, job: &Job) -> bool {
+    job.process
+        .as_ref()
+        .is_some_and(|p| procfs.is_claude_process(p))
+}
+
 /// El trabajo en segundo plano `id` del perfil `config_dir` y la conversación en la que sigue.
 /// Manda su proceso, si está vivo (`sessions/<pid>.json` con ese `jobId`: la conversación y el
-/// estado); si no, lo que apunta el demonio (`daemon/roster.json`) y, si tampoco, el propio
-/// trabajo (`jobs/<id>/state.json`), y entonces sin estado: sin proceso no está trabajando. Todo
-/// es formato interno de Claude Code: lo que no se entiende, como si no estuviera. `None`: no
-/// queda nada de él (el demonio lo borró).
+/// estado); si no, lo que apunta el demonio (`daemon/roster.json`, con su proceso si está vivo)
+/// y, si tampoco, el propio trabajo (`jobs/<id>/state.json`). Sin su `sessions/<pid>.json` no se
+/// sabe su estado. Todo es formato interno de Claude Code: lo que no se entiende, como si no
+/// estuviera. `None`: no queda nada de él (el demonio lo borró).
 pub fn parked_job(procfs: &Procfs, config_dir: &Path, id: &str) -> Option<Job> {
     if !valid_job_id(id) {
         return None;
     }
-    if let Some((pid, info)) = live_jobs(procfs, config_dir)
+    if let Some(job) = live_jobs(procfs, config_dir)
         .into_iter()
-        .find(|(_, i)| i.job_id.as_deref() == Some(id))
+        .find(|j| j.id == id)
     {
-        return Some(job_of(pid, info));
+        return Some(job);
     }
-    let session_id = read_json(&config_dir.join("daemon/roster.json"))
-        .and_then(|r| json_str(&r, &["workers", id, "sessionId"]))
-        .or_else(|| {
-            read_json(&config_dir.join("jobs").join(id).join("state.json"))
-                .and_then(|s| json_str(&s, &["sessionId"]))
-        })?;
+    if let Some(job) = roster_jobs(procfs, config_dir)
+        .into_iter()
+        .find(|j| j.id == id)
+    {
+        return Some(job);
+    }
+    let session_id = read_json(&config_dir.join("jobs").join(id).join("state.json"))
+        .and_then(|s| json_str(&s, &["sessionId"]))?;
     Some(Job {
         id: id.to_owned(),
         session_id,
         status: None,
-        pid: None,
+        process: None,
     })
 }
 
@@ -544,8 +714,12 @@ pub fn parked_job(procfs: &Procfs, config_dir: &Path, id: &str) -> Option<Job> {
 pub fn running_job(procfs: &Procfs, config_dir: &Path, session_id: &str) -> Option<Job> {
     live_jobs(procfs, config_dir)
         .into_iter()
-        .find(|(_, i)| i.session_id == session_id)
-        .map(|(pid, info)| job_of(pid, info))
+        .chain(
+            roster_jobs(procfs, config_dir)
+                .into_iter()
+                .filter(|j| j.process.is_some()),
+        )
+        .find(|j| j.session_id == session_id)
 }
 
 /// Para el trabajo en segundo plano `job` (`claude stop <id>`, con el perfil `config_dir`;
@@ -1526,6 +1700,14 @@ mod tests {
         assert_eq!(session_claude(&p, 99, &home), None);
     }
 
+    fn proc_id(pid: u32) -> ProcId {
+        ProcId {
+            pid,
+            proc_start: None,
+            started_at: None,
+        }
+    }
+
     /// Un `sessions/<pid>.json` inventado en el perfil `config`.
     fn session_file(config: &Path, pid: u32, json: &str) {
         std::fs::create_dir_all(config.join("sessions")).unwrap();
@@ -1580,7 +1762,7 @@ mod tests {
                 id: "ab12cd34".into(),
                 session_id: "conv-nueva".into(),
                 status: Some("busy".into()),
-                pid: Some(900),
+                process: Some(proc_id(900)),
             })
         );
     }
@@ -1597,7 +1779,7 @@ mod tests {
             id: "ab12cd34".into(),
             session_id: sid.into(),
             status: None,
-            pid: None,
+            process: None,
         };
         // Sin nada del trabajo (el demonio lo borró): lo de siempre, lo del Claude de la sesión.
         let found = find_claude(&p, 30, &home).unwrap();
@@ -1729,7 +1911,7 @@ mod tests {
                 id: "ab12cd34".into(),
                 session_id: "conv-nueva".into(),
                 status: Some("idle".into()),
-                pid: Some(900),
+                process: Some(proc_id(900)),
             })
         );
         assert_eq!(running_job(&p, &config, "conv-vieja"), None);
@@ -1747,10 +1929,10 @@ mod tests {
         let config = tmp.path().join("perfil");
         let d = root.join("900");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("comm"), "bash\n").unwrap();
+        std::fs::write(d.join("comm"), "2.1.329\n").unwrap();
         std::fs::write(
             d.join("stat"),
-            "900 (bash) S 1 900 900 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 5555 0 0",
+            "900 (2.1.329) S 1 900 900 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 5555 0 0",
         )
         .unwrap();
         let p = Procfs::at(&root);
@@ -1767,8 +1949,8 @@ mod tests {
             r#"{"sessionId":"conv","kind":"bg","jobId":"ab12cd34","procStart":"5555"}"#,
         );
         assert_eq!(
-            running_job(&p, &config, "conv").map(|j| j.pid),
-            Some(Some(900))
+            running_job(&p, &config, "conv").and_then(|j| j.process.map(|p| p.pid)),
+            Some(900)
         );
     }
 
@@ -1804,6 +1986,105 @@ mod tests {
         let no = Answers(false, Default::default());
         let e = stop_job(&no, None, "ab12cd34").unwrap_err();
         assert!(e.to_string().contains("no existe ese trabajo"), "{e}");
+    }
+
+    #[test]
+    fn names_of_claude_processes() {
+        for n in ["claude", "claude.exe", "2.1.329", "2.1.329.exe", "10.0.1"] {
+            assert!(claude_comm(n), "{n}");
+        }
+        for n in ["bash", "node", "nido", "2", "v2.1", "1.2-beta", ""] {
+            assert!(!claude_comm(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_job_file_with_the_pid_of_another_process_is_not_the_job() {
+        // Fuera de Linux no hay `procStart`: el nombre del proceso y cuándo arrancó.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proc");
+        let config = tmp.path().join("perfil");
+        let job = |pid: u32, started_at: u64| {
+            session_file(
+                &config,
+                pid,
+                &format!(
+                    r#"{{"sessionId":"conv-{pid}","kind":"bg","jobId":"ab12cd34","startedAt":{started_at}}}"#
+                ),
+            )
+        };
+        // Otro programa con ese pid.
+        fake_proc(&root, 900, 1, "bash", &[]);
+        job(900, 1);
+        // Un Claude, pero arrancado después de lo que apunta el fichero: heredó el número. El
+        // equipo arrancó en el segundo 1000; con `clock_ticks()` tics por segundo, el 901 a los
+        // 50 s y el 902 a los 10 s.
+        std::fs::write(root.join("stat"), "cpu 1 2 3\nbtime 1000\n").unwrap();
+        let hz = clock_ticks();
+        let started = |pid: u32, secs: u64| {
+            std::fs::create_dir_all(root.join(pid.to_string())).unwrap();
+            std::fs::write(root.join(format!("{pid}/comm")), "claude\n").unwrap();
+            std::fs::write(
+                root.join(format!("{pid}/stat")),
+                format!(
+                    "{pid} (claude) S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {} 0 0",
+                    secs * hz
+                ),
+            )
+            .unwrap();
+        };
+        started(901, 50);
+        started(902, 10);
+        let p = Procfs::at(&root);
+        assert_eq!(p.started_ms(901), Some(1_050_000));
+        job(901, 1_020_000);
+        job(902, 1_011_000);
+        assert_eq!(running_job(&p, &config, "conv-900"), None);
+        assert_eq!(running_job(&p, &config, "conv-901"), None);
+        assert!(running_job(&p, &config, "conv-902").is_some());
+        // Y un trabajo así no se da por vivo para pararlo ni para esperarlo.
+        let gone = Job {
+            id: "ab12cd34".into(),
+            session_id: "conv-901".into(),
+            status: None,
+            process: Some(ProcId {
+                pid: 901,
+                proc_start: None,
+                started_at: Some(1_020_000),
+            }),
+        };
+        assert!(!job_alive(&p, &gone));
+    }
+
+    #[test]
+    fn the_daemon_list_gives_the_live_process_of_a_job() {
+        // Sin el `sessions/<pid>.json` del trabajo, el de su demonio: también se sabe que vive.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proc");
+        let home = tmp.path().join("home");
+        let config = home.join(".claude");
+        parked_viewer(&root, &home, "ab12cd34");
+        fake_proc(&root, 950, 1, "2.1.329", &[]);
+        std::fs::create_dir_all(config.join("daemon")).unwrap();
+        std::fs::write(
+            config.join("daemon/roster.json"),
+            r#"{"workers":{"ab12cd34":{"pid":949,"procStart":"1","sessionId":"conv-nueva","replPid":950}}}"#,
+        )
+        .unwrap();
+        let p = Procfs::at(&root);
+        let found = find_claude(&p, 30, &home).unwrap();
+        assert_eq!(found.info.session_id, "conv-nueva");
+        let job = found.parked.unwrap();
+        assert_eq!(job.process.as_ref().map(|p| p.pid), Some(950));
+        assert!(job_alive(&p, &job));
+        assert_eq!(
+            running_job(&p, &config, "conv-nueva").map(|j| j.id),
+            Some("ab12cd34".into())
+        );
+        // Muerto su proceso, ya no.
+        std::fs::remove_dir_all(root.join("950")).unwrap();
+        assert!(!job_alive(&p, &job));
+        assert_eq!(running_job(&p, &config, "conv-nueva"), None);
     }
 
     #[test]

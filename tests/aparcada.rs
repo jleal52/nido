@@ -92,12 +92,23 @@ fn executable(path: &Path, text: &str) {
 }
 
 /// Un proceso dormido que hace del trabajo en segundo plano, con su `sessions/<pid>.json`. Se
-/// recoge en cuanto muere (si no, quedaría zombi y seguiría «vivo» en `/proc`).
+/// llama como los de verdad (con el nombre de la versión de Claude Code: ver
+/// `claude::claude_comm`), y se recoge en cuanto muere (si no, quedaría zombi y seguiría «vivo»
+/// en `/proc`).
 fn spawn_job(config: &Path, session_id: &str) -> u32 {
-    let mut child = std::process::Command::new("sleep")
-        .arg("120")
-        .spawn()
-        .unwrap();
+    let program = config.join("2.1.329");
+    if !program.exists() {
+        executable(&program, "#!/bin/sh\nwhile :; do sleep 1; done\n");
+    }
+    // Recién escrito, otro hilo que lanza un proceso puede tenerlo abierto un momento.
+    let mut child = loop {
+        match std::process::Command::new(&program).spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            r => break r.unwrap(),
+        }
+    };
     let pid = child.id();
     std::thread::spawn(move || {
         let _ = child.wait();

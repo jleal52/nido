@@ -1556,28 +1556,23 @@ fn claude_program(paths: &Paths) -> Option<claude::Program> {
 /// `claude stop`.
 const JOB_STOP_WAIT: Duration = Duration::from_secs(10);
 
-/// Para el trabajo en segundo plano `job`, vivo, que lleva la conversación `session_id` del
-/// perfil `config_dir` (`None`: `~/.claude`), y espera a que su proceso acabe. Bloquea.
+/// Para el trabajo en segundo plano `job`, vivo, del perfil `config_dir` (`None`: `~/.claude`),
+/// y espera a que su proceso acabe. Bloquea.
 fn stop_live_job(
     paths: &Paths,
     config_dir: Option<&std::path::Path>,
-    session_id: &str,
-    job: &str,
+    job: &claude::Job,
 ) -> std::io::Result<()> {
     let cli = claude_program(paths).ok_or_else(|| std::io::Error::other("no encuentro claude"))?;
-    claude::stop_job(&cli, config_dir, job)?;
-    let dir = config_dir
-        .map(std::path::Path::to_owned)
-        .unwrap_or_else(|| claude::default_config_dir(&paths.home));
+    claude::stop_job(&cli, config_dir, &job.id)?;
+    // Solo se espera a su proceso mientras sea él (ver `claude::job_alive`).
     let procfs = Procfs::default();
-    if launch::wait_until(
-        || claude::running_job(&procfs, &dir, session_id).is_none(),
-        JOB_STOP_WAIT,
-    ) {
+    if launch::wait_until(|| !claude::job_alive(&procfs, job), JOB_STOP_WAIT) {
         Ok(())
     } else {
         Err(std::io::Error::other(format!(
-            "el trabajo {job} sigue en marcha tras claude stop"
+            "el trabajo {} sigue en marcha tras claude stop",
+            job.id
         )))
     }
 }
@@ -3667,14 +3662,13 @@ async fn stop_parked_job(st: &AppState, id: &str) -> bool {
             }
         }
     }
-    if job.pid.is_some() {
+    if job.process.is_some() {
         let paths = st.paths.clone();
         let (config, name) = (f.config_dir.clone(), id.to_owned());
-        let done = tokio::task::spawn_blocking(move || {
-            stop_live_job(&paths, config.as_deref(), &job.session_id, &job.id)
-        })
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        let done =
+            tokio::task::spawn_blocking(move || stop_live_job(&paths, config.as_deref(), &job))
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
         if let Err(e) = done {
             eprintln!(
                 "nido: {name}: no se pudo parar su trabajo en segundo plano ({e}); no se retomará \
@@ -3712,13 +3706,7 @@ pub(crate) async fn stop_running_job(st: &AppState, id: &str) -> std::io::Result
              para antes de retomarla",
             link.session_id, job.id
         );
-        stop_live_job(
-            &paths,
-            link.config_dir.as_deref(),
-            &link.session_id,
-            &job.id,
-        )
-        .map_err(|e| {
+        stop_live_job(&paths, link.config_dir.as_deref(), &job).map_err(|e| {
             std::io::Error::other(format!(
                 "su conversación sigue en el trabajo en segundo plano {} de Claude Code, que no \
                  se pudo parar: {e}",
