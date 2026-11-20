@@ -245,16 +245,17 @@ impl Procfs {
     }
 
     /// ¿Es el que tiene ahora `p.pid` ese proceso de Claude Code? Vivo, con nombre de Claude
-    /// (`claude_comm`), y no otro que heredó el número: el mismo `procStart` (Linux) y, donde se
-    /// sabe cuándo arrancó, no después de su `startedAt`.
+    /// (`claude_comm`), y no otro que heredó el número: el mismo `procStart` (Linux) o, sin él,
+    /// donde se sabe cuándo arrancó, no después de su `startedAt`. Con `procStart` no se mira la
+    /// hora: la de arranque que se calcula se mueve si el reloj salta (WSL2 tras suspender).
     pub fn is_claude_process(&self, p: &ProcId) -> bool {
         if !self.comm(p.pid).is_some_and(|n| claude_comm(&n)) {
             return false;
         }
-        if let (Some(want), Some(have)) = (&p.proc_start, self.start_time(p.pid))
-            && *want != have
+        if let Some(want) = &p.proc_start
+            && let Some(have) = self.start_time(p.pid)
         {
-            return false;
+            return *want == have;
         }
         if let (Some(at), Some(began)) = (p.started_at, self.started_ms(p.pid))
             && began > at + STARTED_SLACK_MS
@@ -2140,6 +2141,22 @@ mod tests {
             running_job(&p, &config, "conv").and_then(|j| j.process.map(|p| p.pid)),
             Some(900)
         );
+        // Con el mismo `procStart`, la hora no cuenta: la calculada se mueve si el reloj salta.
+        std::fs::write(root.join("stat"), "cpu 0 0 0 0\nbtime 1700000000\n").unwrap();
+        assert!(p.started_ms(900).is_some());
+        session_file(
+            &config,
+            900,
+            r#"{"sessionId":"conv","kind":"bg","jobId":"ab12cd34","procStart":"5555","startedAt":1000}"#,
+        );
+        assert!(running_job(&p, &config, "conv").is_some());
+        // Sin él, sí: arrancó mucho después de lo que dice el fichero.
+        session_file(
+            &config,
+            900,
+            r#"{"sessionId":"conv","kind":"bg","jobId":"ab12cd34","startedAt":1000}"#,
+        );
+        assert_eq!(running_job(&p, &config, "conv"), None);
     }
 
     #[test]
