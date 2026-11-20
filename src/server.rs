@@ -139,6 +139,7 @@ pub struct AppState {
     stopping: std::sync::Mutex<std::collections::HashMap<String, StopPin>>,
     /// Los demonios de Claude Code que no se pudieron sacar de su sesión (ver `adopt_daemons`).
     /// Cogido mientras se sacan: uno a la vez.
+    #[cfg(target_os = "linux")]
     daemon_moves: Arc<std::sync::Mutex<launch::DaemonMoves>>,
     /// Una parada a la vez por sesión (ver `stop_and_wait`).
     stop_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -742,6 +743,7 @@ impl AppState {
             queues: Default::default(),
             stopping: Default::default(),
             stop_locks: Default::default(),
+            #[cfg(target_os = "linux")]
             daemon_moves: Default::default(),
         }))
     }
