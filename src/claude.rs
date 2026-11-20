@@ -534,6 +534,11 @@ pub fn background_viewer(procfs: &Procfs, pid: u32, home: &Path) -> Option<Optio
         if !procfs.comm(up).is_some_and(|n| claude_comm(&n)) {
             continue;
         }
+        // Por debajo del demonio sin haber visto el fichero del trabajo: aún no lo ha escrito
+        // (su `nido mcp` arranca antes). Es un trabajo, sin saber cuál todavía.
+        if is_daemon(procfs, up) {
+            return Some(None);
+        }
         let dir = procfs
             .env_var(up, "CLAUDE_CONFIG_DIR")
             .filter(|v| !v.is_empty())
@@ -591,6 +596,13 @@ fn parking_viewer(
     })
 }
 
+/// ¿Es `pid` el demonio de Claude Code (`claude daemon run`)?
+fn is_daemon(procfs: &Procfs, pid: u32) -> bool {
+    procfs
+        .args(pid)
+        .is_some_and(|a| a.get(1..3) == Some(&["daemon".to_owned(), "run".to_owned()][..]))
+}
+
 /// El demonio de Claude Code (`claude daemon run`, el que lleva los trabajos en segundo plano de
 /// todas las sesiones) si cuelga del árbol de `root` (lo lanza el primer Claude que pasa algo a
 /// segundo plano, y queda dentro de su sesión), con todo lo suyo: sus procesos, del demonio a
@@ -601,10 +613,7 @@ pub fn daemon_trees(procfs: &Procfs, root: u32) -> Vec<u32> {
         if out.contains(&pid) || !procfs.comm(pid).is_some_and(|n| claude_comm(&n)) {
             continue;
         }
-        let daemon = procfs
-            .args(pid)
-            .is_some_and(|a| a.get(1..3) == Some(&["daemon".to_owned(), "run".to_owned()][..]));
-        if daemon {
+        if is_daemon(procfs, pid) {
             out.extend(procfs.tree(pid));
         }
     }
@@ -1875,17 +1884,24 @@ mod tests {
         // El demonio cuelga del Claude de la sesión; de él, el anfitrión de la terminal y el
         // trabajo, y de este su `nido mcp` (o una orden de Bash, tras una shell).
         fake_proc(&root, 50, 40, "claude", &[]);
+        std::fs::write(
+            root.join("50/cmdline"),
+            "/opt/claude\0daemon\0run\0--origin\0transient\0",
+        )
+        .unwrap();
         fake_proc(&root, 60, 50, "2.1.329", &[]);
         fake_proc(&root, 70, 60, "2.1.329", &[]);
+        fake_proc(&root, 80, 70, "nido", &[]);
+        fake_proc(&root, 81, 70, "bash", &[]);
+        fake_proc(&root, 82, 81, "nido", &[]);
+        let p = Procfs::at(&root);
+        // El trabajo aún no ha escrito su fichero: es un trabajo, sin saber de quién.
+        assert_eq!(background_viewer(&p, 80, &home), Some(None));
         session_file(
             &config,
             70,
             r#"{"pid":70,"sessionId":"conv-nueva","kind":"bg","jobId":"ab12cd34"}"#,
         );
-        fake_proc(&root, 80, 70, "nido", &[]);
-        fake_proc(&root, 81, 70, "bash", &[]);
-        fake_proc(&root, 82, 81, "nido", &[]);
-        let p = Procfs::at(&root);
         assert_eq!(background_viewer(&p, 80, &home), Some(Some(40)));
         assert_eq!(background_viewer(&p, 82, &home), Some(Some(40)));
         // El `nido mcp` del Claude de la sesión: no es de un trabajo.
@@ -3115,6 +3131,7 @@ mod tests {
         assert!(text.contains("hecho"), "{text:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_claude_that_does_not_answer_in_time_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
