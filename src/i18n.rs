@@ -490,8 +490,23 @@ const TABLE: &[(&str, &str)] = &[
         "this session does not accept messages (no channel): its Claude Code predates channels",
     ),
     (
-        "esa sesión no admite mensajes ahora (no tiene channel): Claude Code pasó su conversación a un trabajo en segundo plano, que no tiene el channel de nido; vuelve a probar cuando vuelva al primer plano",
+        "esa sesión no admite mensajes ahora (no tiene channel): Claude Code pasó su conversación a un trabajo en segundo plano, que no tiene el channel de nido; prueba otra vez cuando esté de nuevo en primer plano",
         "this session does not accept messages now (no channel): Claude Code moved its conversation to a background job, which does not have nido's channel; try again when it is back in the foreground",
+    ),
+    ("no encuentro claude", "claude not found"),
+    ("id de trabajo no válido: {}", "invalid job id: {0}"),
+    ("claude stop {}: {}", "claude stop {0}: {1}"),
+    (
+        "el trabajo {} sigue en marcha tras claude stop",
+        "job {0} is still running after claude stop",
+    ),
+    (
+        "no se pudo parar el trabajo en segundo plano {} de Claude Code ({}): sigue en marcha, y su conversación no se retomará mientras siga",
+        "could not stop Claude Code's background job {0} ({1}): it is still running, and its conversation will not be resumed while it is",
+    ),
+    (
+        "su conversación sigue en el trabajo en segundo plano {} de Claude Code, que no se pudo parar: {}",
+        "its conversation is still in Claude Code's background job {0}, which could not be stopped: {1}",
     ),
     (
         "la bandeja de esa sesión está llena",
@@ -1362,6 +1377,36 @@ mod tests {
         assert_eq!(
             english("Claude no ha dado la sesión (400 Bad Request, invalid_request)"),
             "Claude did not grant the session (400 Bad Request, invalid_request)"
+        );
+    }
+
+    #[test]
+    fn background_jobs() {
+        assert_eq!(english("no encuentro claude"), "claude not found");
+        assert_eq!(
+            english("id de trabajo no válido: --x"),
+            "invalid job id: --x"
+        );
+        assert_eq!(
+            english("el trabajo ab12cd34 sigue en marcha tras claude stop"),
+            "job ab12cd34 is still running after claude stop"
+        );
+        // Lo de dentro también se traduce.
+        assert_eq!(
+            english(
+                "no se pudo parar el trabajo en segundo plano ab12cd34 de Claude Code (no \
+                 encuentro claude): sigue en marcha, y su conversación no se retomará mientras siga"
+            ),
+            "could not stop Claude Code's background job ab12cd34 (claude not found): it is still \
+             running, and its conversation will not be resumed while it is"
+        );
+        assert_eq!(
+            english(
+                "su conversación sigue en el trabajo en segundo plano ab12cd34 de Claude Code, que \
+                 no se pudo parar: claude stop ab12cd34: no existe"
+            ),
+            "its conversation is still in Claude Code's background job ab12cd34, which could not \
+             be stopped: claude stop ab12cd34: no existe"
         );
     }
 

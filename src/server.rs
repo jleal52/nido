@@ -3695,10 +3695,13 @@ async fn api_order_folders(
     }
 }
 
-pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
+/// Para la sesión `id` y espera a que termine. Devuelve los avisos de lo que no salió del todo
+/// bien (en español, para `tr`), que se dicen en la respuesta.
+pub(crate) async fn stop_and_wait(st: &AppState, id: &str) -> Vec<String> {
     // Lo que le llegue a su `nido mcp` mientras se muere se perdería.
     st.inbox.stopped(id);
-    let mut pin = stop_parked_job(st, id).await;
+    let mut warnings = Vec::new();
+    let mut pin = stop_parked_job(st, id, &mut warnings).await;
     // Desde aquí el guardián se para aunque se cancele la petición (`spawn_blocking` sigue): la
     // marca se queda hasta que el escaneo lo vea ido.
     if let Some(p) = pin.as_mut() {
@@ -3717,6 +3720,16 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(pin);
+    warnings
+}
+
+/// La respuesta de parar (o reiniciar, o borrar) con sus avisos, si los hubo (`warning`).
+pub(crate) fn warned(mut v: serde_json::Value, warnings: &[String]) -> serde_json::Value {
+    if !warnings.is_empty() {
+        let text: Vec<String> = warnings.iter().map(|w| tr(w)).collect();
+        v["warning"] = text.join("; ").into();
+    }
+    v
 }
 
 /// Antes de parar la sesión `id`: si su Claude pasó la conversación a un trabajo en segundo
@@ -3725,7 +3738,11 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
 /// al irse el trabajo, podría volver a decir la de antes). Y el trabajo, si sigue vivo, se para
 /// (`claude stop`): puede no colgar de la sesión, y se quedaría trabajando con la conversación
 /// que se retomará. Con la marca puesta, su guardia.
-async fn stop_parked_job<'a>(st: &'a AppState, id: &str) -> Option<PinGuard<'a>> {
+async fn stop_parked_job<'a>(
+    st: &'a AppState,
+    id: &str,
+    warnings: &mut Vec<String>,
+) -> Option<PinGuard<'a>> {
     let (paths, sid) = (st.paths.clone(), id.to_owned());
     let found = tokio::task::spawn_blocking(move || {
         let holder = u32::try_from(launch::holder_pid(&paths, &sid)?).ok()?;
@@ -3763,16 +3780,18 @@ async fn stop_parked_job<'a>(st: &'a AppState, id: &str) -> Option<PinGuard<'a>>
     }
     if job.process.is_some() {
         let paths = st.paths.clone();
-        let (config, name) = (f.config_dir.clone(), id.to_owned());
+        let (config, name, job_id) = (f.config_dir.clone(), id.to_owned(), job.id.clone());
         let done =
             tokio::task::spawn_blocking(move || stop_live_job(&paths, config.as_deref(), &job))
                 .await
                 .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
         if let Err(e) = done {
-            eprintln!(
-                "nido: {name}: no se pudo parar su trabajo en segundo plano ({e}); no se retomará \
-                 mientras siga"
+            let w = format!(
+                "no se pudo parar el trabajo en segundo plano {job_id} de Claude Code ({e}): sigue \
+                 en marcha, y su conversación no se retomará mientras siga"
             );
+            eprintln!("nido: {name}: {w}");
+            warnings.push(w);
         }
     }
     Some(guard)
@@ -4148,10 +4167,12 @@ async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
 }
 
 /// Para la sesión y apunta que se queda parada (no vuelve a arrancar con el equipo).
-pub async fn stop_session(st: &AppState, id: &str) {
-    stop_and_wait(st, id).await;
+/// Con los avisos de `stop_and_wait`.
+pub async fn stop_session(st: &AppState, id: &str) -> Vec<String> {
+    let warnings = stop_and_wait(st, id).await;
     remember_running(st, id, false).await;
     st.refresh.notify_one();
+    warnings
 }
 
 async fn api_stop(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -4159,8 +4180,8 @@ async fn api_stop(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Re
         Ok(s) => s,
         Err(r) => return r,
     };
-    stop_session(&st, &s.id).await;
-    Json(serde_json::json!({ "ok": true })).into_response()
+    let warnings = stop_session(&st, &s.id).await;
+    Json(warned(serde_json::json!({ "ok": true }), &warnings)).into_response()
 }
 
 async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -4172,7 +4193,7 @@ async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) ->
     st.scan().await;
     // Retenida ya antes de pararla: el `nido mcp` de antes aún recoge.
     let hold = st.launching(&s.id);
-    stop_and_wait(&st, &s.id).await;
+    let warnings = stop_and_wait(&st, &s.id).await;
     if let Err(e) = stop_running_job(&st, &s.id).await {
         return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
@@ -4183,7 +4204,7 @@ async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) ->
     st.launched(&s.id, hold);
     remember_running(&st, &s.id, true).await;
     st.refresh.notify_one();
-    Json(serde_json::json!({ "ok": true })).into_response()
+    Json(warned(serde_json::json!({ "ok": true }), &warnings)).into_response()
 }
 
 async fn api_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -4192,14 +4213,15 @@ async fn api_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> 
         Err(r) => return r,
     };
     match delete_session(&st, &s.id).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(warnings) => Json(warned(serde_json::json!({ "ok": true }), &warnings)).into_response(),
         Err(e) => registry_error(e),
     }
 }
 
 /// La para, la quita del registro y borra su estado (historial, registro del guardián).
-pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), RegistryError> {
-    stop_and_wait(st, id).await;
+/// Con los avisos de `stop_and_wait`.
+pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<Vec<String>, RegistryError> {
+    let warnings = stop_and_wait(st, id).await;
     // El último resumen de su plan, para sus enlaces del tablero, que se cierran (parada, ya no
     // cambia). Puede leer del disco: fuera del hilo.
     let last = {
@@ -4240,7 +4262,7 @@ pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), Regist
     })
     .await;
     st.refresh.notify_one();
-    res.map(|_| ())
+    res.map(|_| warnings)
 }
 
 /// `GET /api/v1/sessions/{id}/plan`: el plan de la sesión, con sus horas (ms desde 1970); 404 si

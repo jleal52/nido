@@ -441,4 +441,29 @@ async fn a_session_parked_in_the_background() {
     .unwrap();
     st.scan().await;
     assert_eq!(link_now(&st), "conv-otra");
+
+    // Si `claude stop` no puede, la sesión se para igual y la respuesta lo dice.
+    assert!(
+        wait_for(
+            || std::fs::read_to_string(fake.join("stops")).is_ok_and(|s| s.lines().count() == 4)
+        )
+        .await
+    );
+    std::fs::remove_file(fake.join("stop-slow")).unwrap();
+    let job = spawn_job(&config, "conv-nueva");
+    cleanup.1.push(job);
+    std::fs::write(fake.join("job-1.pid"), job.to_string()).unwrap();
+    viewer_file(&config, viewer, true);
+    std::fs::write(fake.join("stop-fails"), "").unwrap();
+    let (code, r) = call(addr, "POST", &session_path("stop"), None, None).await;
+    assert_eq!(code, 200, "{r}");
+    let warning = r["warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.starts_with(&format!(
+            "could not stop Claude Code's background job {JOB}"
+        )),
+        "{r}"
+    );
+    assert!(alive(job));
+    assert!(!nido::launch::is_alive(&paths, &id));
 }

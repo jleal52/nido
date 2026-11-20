@@ -773,7 +773,7 @@ pub fn decide(d: &Dest) -> Result<Decision, Fail> {
             inbox::Refusal::Parked => {
                 "esa sesión no admite mensajes ahora (no tiene channel): Claude Code pasó su \
                  conversación a un trabajo en segundo plano, que no tiene el channel de nido; \
-                 vuelve a probar cuando vuelva al primer plano"
+                 prueba otra vez cuando esté de nuevo en primer plano"
             }
         };
         return Err(fail(StatusCode::CONFLICT, msg));
@@ -2470,10 +2470,10 @@ async fn tool_close(st: &AppState, me: &Machine, caller: &Caller, args: Value) -
             "solo puedes cerrar las sesiones que abriste",
         ));
     }
-    server::delete_session(st, &s.id)
+    let warnings = server::delete_session(st, &s.id)
         .await
         .map_err(Fail::from)?;
-    Ok(json!({ "ok": true }))
+    Ok(server::warned(json!({ "ok": true }), &warnings))
 }
 
 /// `start`: arranca una sesión de Claude parada de cualquier equipo del grupo, retomando su
@@ -2578,12 +2578,18 @@ async fn tool_stop(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         // Se apunta que se queda parada: la que salió sola volvería a arrancar con el equipo.
         // Y se para igual, por si su guardián quedó a medio arrancar (`launch::stop` no manda
         // nada a un pidfile viejo cuyo número es ya de otro proceso).
-        server::stop_session(st, &s.id).await;
-        return Ok(json!({ "state": Status::Stopped, "note": i18n::tr("ya estaba parada") }));
+        let warnings = server::stop_session(st, &s.id).await;
+        return Ok(server::warned(
+            json!({ "state": Status::Stopped, "note": i18n::tr("ya estaba parada") }),
+            &warnings,
+        ));
     }
     may_stop(state, background, a.force)?;
-    server::stop_session(st, &s.id).await;
-    Ok(json!({ "state": Status::Stopped }))
+    let warnings = server::stop_session(st, &s.id).await;
+    Ok(server::warned(
+        json!({ "state": Status::Stopped }),
+        &warnings,
+    ))
 }
 
 /// Solo desde una sesión de aquí: no está entre las de `PEER_TOOLS`.
