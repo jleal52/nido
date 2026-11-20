@@ -1227,7 +1227,12 @@ pub fn own_session() -> (Option<String>, bool) {
         match crate::claude::background_viewer(&procfs, me, &home) {
             None => return (session_from(inherited), false),
             Some(Some(viewer)) => {
-                let viewer = procfs.env_var(viewer, "NIDO_SESSION");
+                // En Windows no se puede leer el entorno de otro proceso: la heredada, como antes.
+                let viewer = if cfg!(windows) {
+                    inherited.clone()
+                } else {
+                    procfs.env_var(viewer, "NIDO_SESSION")
+                };
                 return (session_through(inherited, Some(viewer)), true);
             }
             Some(None) if start.elapsed() < VIEWER_WAIT => {
