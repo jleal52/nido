@@ -770,6 +770,11 @@ pub fn decide(d: &Dest) -> Result<Decision, Fail> {
                 "esa sesión no admite mensajes (no tiene channel): su Claude Code es anterior a \
                  los channels"
             }
+            inbox::Refusal::Parked => {
+                "esa sesión no admite mensajes ahora (no tiene channel): Claude Code pasó su \
+                 conversación a un trabajo en segundo plano, que no tiene el channel de nido; \
+                 vuelve a probar cuando vuelva al primer plano"
+            }
         };
         return Err(fail(StatusCode::CONFLICT, msg));
     }
@@ -3902,6 +3907,18 @@ mod tests {
             Err((
                 StatusCode::CONFLICT,
                 "this session does not accept messages (no channel): its Claude is not running"
+                    .to_owned()
+            ))
+        );
+        // Su conversación sigue en un trabajo en segundo plano: tampoco, y que se sepa por qué
+        // (no se escribe en su consola: el mensaje llegaría como si lo tecleara el usuario).
+        assert_eq!(
+            refused(inbox::Refusal::Parked),
+            Err((
+                StatusCode::CONFLICT,
+                "this session does not accept messages now (no channel): Claude Code moved its \
+                 conversation to a background job, which does not have nido's channel; try again \
+                 when it is back in the foreground"
                     .to_owned()
             ))
         );

@@ -311,7 +311,8 @@ const TOOLS: &[Tool] = &[
                 (whether this session opened it with `open`; false for this session itself). \
                 plan, if present, is the progress of its plan (done/total; see plan_get). \
                 channel_error, if present, says why it has no \
-                channel (e.g. blocked by org policy, or its Claude Code predates channels); \
+                channel (e.g. blocked by org policy, its Claude Code predates channels, or \
+                Claude Code moved its conversation to the background); \
                 delivery_error, if present, says that messages sent to it never showed up in \
                 its conversation (they stay queued). Machines that don't answer are listed in \
                 unreachable, with the error.",

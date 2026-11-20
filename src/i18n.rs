@@ -490,6 +490,10 @@ const TABLE: &[(&str, &str)] = &[
         "this session does not accept messages (no channel): its Claude Code predates channels",
     ),
     (
+        "esa sesión no admite mensajes ahora (no tiene channel): Claude Code pasó su conversación a un trabajo en segundo plano, que no tiene el channel de nido; vuelve a probar cuando vuelva al primer plano",
+        "this session does not accept messages now (no channel): Claude Code moved its conversation to a background job, which does not have nido's channel; try again when it is back in the foreground",
+    ),
+    (
         "la bandeja de esa sesión está llena",
         "the inbox of that session is full",
     ),

@@ -746,6 +746,22 @@ impl AppState {
             if link != s.claude {
                 let _ = reg.update(&s.id, |x| x.claude = link.clone());
             }
+            // Claude Code pasó su conversación a un trabajo en segundo plano: se sigue ahí (lo de
+            // arriba), y los mensajes esperan a que vuelva (su `nido mcp` no le llega).
+            let job = found.as_ref().and_then(|f| f.parked.as_ref());
+            if self.inbox.parked(&s.id, job.is_some()) {
+                match job {
+                    Some(j) => eprintln!(
+                        "nido: {}: Claude Code pasó la conversación al trabajo en segundo plano {} \
+                         ({}); sin channel mientras siga ahí",
+                        s.name, j.id, j.session_id
+                    ),
+                    None => eprintln!(
+                        "nido: {}: la conversación ya no está en segundo plano",
+                        s.name
+                    ),
+                }
+            }
             // Ha terminado de trabajar (de «busy» a cualquier otro estado): queda «sin leer»
             // hasta que el usuario la abra.
             let status = found.as_ref().and_then(|f| f.info.status.clone());
@@ -1533,6 +1549,8 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
             "nido: {name} ({id}): su Claude ya no está en marcha; queda sin channel hasta que se \
              vuelva a lanzar"
         ),
+        // No sale de la pantalla de arranque: lo apunta el escaneo.
+        crate::inbox::Refusal::Parked => {}
     }
 }
 
