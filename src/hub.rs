@@ -1115,6 +1115,18 @@ impl Hub {
     /// Un ida y vuelta con otro nido a través del hub (como un móvil): manda `first` y devuelve
     /// su respuesta. Para unirse al grupo y sincronizarlo.
     pub async fn exchange(&self, nido_id: &str, first: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.exchange_within(nido_id, first, Duration::from_secs(15))
+            .await
+    }
+
+    /// `exchange`, esperando la respuesta hasta `wait` (lo que el otro equipo puede tardar en
+    /// hacerlo: parar una sesión, más que mirar una lista).
+    pub async fn exchange_within(
+        &self,
+        nido_id: &str,
+        first: Vec<u8>,
+        wait: Duration,
+    ) -> Result<Vec<u8>, String> {
         let (url, address) = {
             let c = self.config.borrow();
             (c.url.clone(), c.address.clone())
@@ -1125,7 +1137,7 @@ impl Hub {
             .await
             .map_err(|e| e.to_string())?;
         let reply = loop {
-            match tokio::time::timeout(Duration::from_secs(15), ws.next()).await {
+            match tokio::time::timeout(wait, ws.next()).await {
                 Ok(Some(Ok(Message::Binary(b)))) => break b.to_vec(),
                 Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
                 Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {

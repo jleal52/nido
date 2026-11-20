@@ -1803,6 +1803,27 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_copied_to_a_background_job_reads_like_any_other() {
+        // La conversación de un trabajo en segundo plano (`--fork-session`) empieza con líneas
+        // propias de Claude Code y sigue desde la última compactación de la de antes: el chat
+        // no enseña esas líneas y lo demás sale como siempre (ids y textos inventados).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let lines = [
+            serde_json::json!({"type":"history-suppression","cause":"fork_inherit","sessionId":"conv-nueva","ts":1}),
+            serde_json::json!({"type":"custom-title","customTitle":"prueba","sessionId":"conv-nueva"}),
+            serde_json::json!({"type":"mode","mode":"normal","sessionId":"conv-nueva"}),
+            serde_json::json!({"type":"session-owner","accountUuid":"cuenta","sessionId":"conv-nueva"}),
+            serde_json::json!({"type":"queue-operation","operation":"enqueue","content":"x","sessionId":"conv-nueva"}),
+            serde_json::json!({"type":"user","uuid":"u1","message":{"content":"hola"}}),
+            serde_json::json!({"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"sigo"}]}}),
+        ];
+        std::fs::write(&path, lines.map(line).concat()).unwrap();
+        let c = read_chunk(&path, 0, None).unwrap();
+        assert_eq!(ids(&c.items), ["u1", "a1"], "{:?}", c.items);
+    }
+
+    #[test]
     fn usage_limit_is_a_notice() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");

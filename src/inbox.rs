@@ -74,6 +74,9 @@ pub enum Refusal {
     /// Su Claude Code es anterior a los channels (ver `claude::channels_supported`): se lanzó sin
     /// el MCP de nido.
     OldClaude,
+    /// Claude Code pasó su conversación a un trabajo en segundo plano (ver `Inbox::parked`): su
+    /// Claude solo enseña ese trabajo, y el trabajo no tiene el channel de nido.
+    Parked,
 }
 
 impl Refusal {
@@ -84,6 +87,7 @@ impl Refusal {
             Refusal::Blocked => "blocked by org policy",
             Refusal::NoClaude => "claude not running",
             Refusal::OldClaude => "claude too old for channels",
+            Refusal::Parked => "claude moved to the background",
         }
     }
 }
@@ -253,12 +257,15 @@ struct Channel {
     stopped: bool,
     /// Ya se dijo que su bandeja va sin proteger (`unguarded`). Lo quita `relaunched`.
     unguarded: bool,
+    /// Su conversación sigue en un trabajo en segundo plano (ver `Inbox::parked`). Lo pone y lo
+    /// quita el escaneo; también lo quita `relaunched`.
+    parked: bool,
 }
 
 impl Channel {
     /// No se le da nada a su `nido mcp` (ver `Inbox::held`).
     fn is_held(&self) -> bool {
-        self.refused.is_some() || self.holding > 0 || self.stopped
+        self.refused.is_some() || self.holding > 0 || self.stopped || self.parked
     }
 }
 
@@ -568,6 +575,17 @@ impl Inbox {
     /// trabajaba). Los que toca se vuelven a dar (y despiertan a quien recoge) o se dejan (ver
     /// `step`). Devuelve cuántos se vuelven a dar y cuántos se dejan.
     pub fn tick(&self, id: &str, quiet: bool, elapsed: Duration) -> (usize, usize) {
+        // Con la conversación en un trabajo en segundo plano, lo dado no puede verse en ella (el
+        // trabajo no tiene el channel): el tiempo no cuenta, ni gasta intentos.
+        if self
+            .channels
+            .lock()
+            .expect("channels")
+            .get(id)
+            .is_some_and(|c| c.parked)
+        {
+            return (0, 0);
+        }
         let limit = Duration::from_millis(self.confirm_ms.load(Ordering::Relaxed));
         let (mut again, mut failed) = (0, 0);
         {
@@ -719,13 +737,30 @@ impl Inbox {
         self.arrived.send_replace(());
     }
 
-    /// Por qué no tiene channel la sesión `id`, si su pantalla lo dijo en este arranque.
+    /// Su Claude pasó (`true`) su conversación a un trabajo en segundo plano de Claude Code, o
+    /// ya no (`false`). Mientras, su `nido mcp` (el del Claude de la sesión, que solo enseña el
+    /// trabajo) no recoge nada: el trabajo no lo vería. Lo que haya se queda en la cola hasta que
+    /// vuelva al primer plano. `true` si cambió.
+    pub fn parked(&self, id: &str, parked: bool) -> bool {
+        let mut channels = self.channels.lock().expect("channels");
+        let was = channels.get(id).is_some_and(|c| c.parked);
+        if was == parked {
+            return false;
+        }
+        channels.entry(id.to_owned()).or_default().parked = parked;
+        drop(channels);
+        self.arrived.send_replace(());
+        true
+    }
+
+    /// Por qué no tiene channel la sesión `id`: si su pantalla lo dijo en este arranque, eso; si
+    /// no, si su conversación está en un trabajo en segundo plano.
     pub fn refusal(&self, id: &str) -> Option<Refusal> {
         self.channels
             .lock()
             .expect("channels")
             .get(id)
-            .and_then(|c| c.refused)
+            .and_then(|c| c.refused.or(c.parked.then_some(Refusal::Parked)))
     }
 
     /// ¿Se le retiene la bandeja a su `nido mcp`? Sin channel (Claude tiraría los mensajes),
@@ -776,6 +811,7 @@ impl Inbox {
             c.refused = None;
             c.stopped = false;
             c.unguarded = false;
+            c.parked = false;
         }
         let mut queues = self.queues.lock().expect("bandeja");
         let mut changed = false;
@@ -1304,6 +1340,74 @@ mod tests {
         inbox.relaunched("s");
         // Lo metido al arranque de antes sin verse en su transcripción, otra vez al nuevo.
         assert_eq!(ids(&inbox.poll("s").await), ["m1", "m2", "m3"]);
+    }
+
+    #[tokio::test]
+    async fn a_session_in_the_background_keeps_its_messages() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = std::sync::Arc::new(Inbox::load(dir.path().join("inbox.json")));
+        inbox.set_poll_wait(Duration::from_millis(1500));
+        inbox.push("s", msg("m1", "uno")).unwrap();
+        // Su Claude pasó la conversación a un trabajo en segundo plano: su `nido mcp` ya no le
+        // llega a nadie que lo lea. Ni channel ni se le da nada; queda en la cola.
+        inbox.parked("s", true);
+        assert_eq!(inbox.refusal("s"), Some(Refusal::Parked));
+        assert_eq!(Refusal::Parked.code(), "claude moved to the background");
+        assert!(inbox.held("s"));
+        assert!(!inbox.channel("s"));
+        let waiting = {
+            let inbox = inbox.clone();
+            tokio::spawn(async move { inbox.poll("s").await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!inbox.channel("s"), "aunque recoja");
+        // Vuelve al primer plano: lo que esperaba lo recoge ya.
+        let start = Instant::now();
+        inbox.parked("s", false);
+        assert_eq!(ids(&waiting.await.unwrap()), ["m1"]);
+        assert!(start.elapsed() < Duration::from_millis(1000));
+        assert_eq!(inbox.refusal("s"), None);
+        assert!(!inbox.held("s"));
+        // Lo que dijo su pantalla al arrancar no lo tapa ni lo quita.
+        inbox.refuse("s", Refusal::Blocked);
+        inbox.parked("s", true);
+        assert_eq!(inbox.refusal("s"), Some(Refusal::Blocked));
+        inbox.parked("s", false);
+        assert_eq!(inbox.refusal("s"), Some(Refusal::Blocked));
+        assert!(inbox.held("s"));
+        // Al volver a lanzarla, lo de antes no vale (si sigue así, lo dirá el siguiente escaneo).
+        inbox.parked("s", true);
+        inbox.relaunched("s");
+        assert_eq!(inbox.refusal("s"), None);
+        assert!(!inbox.held("s"));
+    }
+
+    #[tokio::test]
+    async fn in_the_background_the_clock_of_a_message_stops() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Inbox::load(dir.path().join("inbox.json"));
+        inbox.push("s", msg("m1", "uno")).unwrap();
+        assert_eq!(ids(&inbox.poll("s").await), ["m1"]);
+        inbox.ack("s", &["m1".into()], true);
+        // Dado al Claude de la sesión justo antes de que pasara a segundo plano: mientras siga
+        // ahí no se vuelve a dar ni se deja, por mucho que pase.
+        inbox.parked("s", true);
+        for _ in 0..MAX_TRIES + 2 {
+            assert_eq!(inbox.tick("s", true, CONFIRM_WAIT * 10), (0, 0));
+        }
+        assert_eq!(inbox.undelivered("s"), 0);
+        // De vuelta, cuenta desde donde iba: el segundo intento, no el último.
+        inbox.parked("s", false);
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT), (1, 0));
+        let got = inbox.poll_from("s", None).await;
+        assert_eq!(
+            got.iter()
+                .map(|(m, n)| (m.id.clone(), *n))
+                .collect::<Vec<_>>(),
+            [("m1".to_owned(), 2)]
+        );
     }
 
     #[test]

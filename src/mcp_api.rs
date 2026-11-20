@@ -770,6 +770,11 @@ pub fn decide(d: &Dest) -> Result<Decision, Fail> {
                 "esa sesión no admite mensajes (no tiene channel): su Claude Code es anterior a \
                  los channels"
             }
+            inbox::Refusal::Parked => {
+                "esa sesión no admite mensajes ahora (no tiene channel): Claude Code pasó su \
+                 conversación a un trabajo en segundo plano, que no tiene el channel de nido; \
+                 prueba otra vez cuando esté de nuevo en primer plano"
+            }
         };
         return Err(fail(StatusCode::CONFLICT, msg));
     }
@@ -1458,8 +1463,10 @@ pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
         Err(f) => return f.into_response(),
     }
     // Sin channel (Claude tiraría los mensajes), o mientras se mira su arranque: nada, y sin
-    // contar como channel. Lo que espera sigue en la cola.
-    if st.inbox.held(&caller.id) {
+    // contar como channel. Lo que espera sigue en la cola. Con la conversación en segundo plano,
+    // en cambio, se espera como siempre (`poll_from` no da nada mientras esté retenida): al volver
+    // al primer plano se entrega enseguida, sin esperar a la siguiente recogida.
+    if st.inbox.held(&caller.id) && st.inbox.refusal(&caller.id) != Some(inbox::Refusal::Parked) {
         let wait = match st.inbox.refusal(&caller.id) {
             Some(_) => st.inbox.poll_wait(),
             None => st.inbox.poll_wait().min(WAIT_UNKNOWN),
@@ -2465,10 +2472,10 @@ async fn tool_close(st: &AppState, me: &Machine, caller: &Caller, args: Value) -
             "solo puedes cerrar las sesiones que abriste",
         ));
     }
-    server::delete_session(st, &s.id)
+    let warnings = server::delete_session(st, &s.id)
         .await
         .map_err(Fail::from)?;
-    Ok(json!({ "ok": true }))
+    Ok(server::warned(json!({ "ok": true }), &warnings))
 }
 
 /// `start`: arranca una sesión de Claude parada de cualquier equipo del grupo, retomando su
@@ -2573,12 +2580,18 @@ async fn tool_stop(st: &AppState, me: &Machine, caller: &Caller, args: Value) ->
         // Se apunta que se queda parada: la que salió sola volvería a arrancar con el equipo.
         // Y se para igual, por si su guardián quedó a medio arrancar (`launch::stop` no manda
         // nada a un pidfile viejo cuyo número es ya de otro proceso).
-        server::stop_session(st, &s.id).await;
-        return Ok(json!({ "state": Status::Stopped, "note": i18n::tr("ya estaba parada") }));
+        let warnings = server::stop_session(st, &s.id).await;
+        return Ok(server::warned(
+            json!({ "state": Status::Stopped, "note": i18n::tr("ya estaba parada") }),
+            &warnings,
+        ));
     }
     may_stop(state, background, a.force)?;
-    server::stop_session(st, &s.id).await;
-    Ok(json!({ "state": Status::Stopped }))
+    let warnings = server::stop_session(st, &s.id).await;
+    Ok(server::warned(
+        json!({ "state": Status::Stopped }),
+        &warnings,
+    ))
 }
 
 /// Solo desde una sesión de aquí: no está entre las de `PEER_TOOLS`.
@@ -3902,6 +3915,18 @@ mod tests {
             Err((
                 StatusCode::CONFLICT,
                 "this session does not accept messages (no channel): its Claude is not running"
+                    .to_owned()
+            ))
+        );
+        // Su conversación sigue en un trabajo en segundo plano: tampoco, y que se sepa por qué
+        // (no se escribe en su consola: el mensaje llegaría como si lo tecleara el usuario).
+        assert_eq!(
+            refused(inbox::Refusal::Parked),
+            Err((
+                StatusCode::CONFLICT,
+                "this session does not accept messages now (no channel): Claude Code moved its \
+                 conversation to a background job, which does not have nido's channel; try again \
+                 when it is back in the foreground"
                     .to_owned()
             ))
         );

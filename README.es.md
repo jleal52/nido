@@ -216,6 +216,11 @@ Lo que nido cambia en tu configuración de Claude:
 gestionados). Mientras tanto las herramientas funcionan pero los mensajes no llegan: nido lee el
 aviso de Claude y `sessions` enseña `channel_error: "blocked by org policy"` en esa sesión.
 
+**Sesiones en segundo plano**: si Claude Code pasa una sesión a segundo plano, nido sigue
+la conversación del trabajo (chat, búsqueda, `read`, estado); mientras siga ahí no recibe mensajes
+(`channel_error: "claude moved to the background"`), y pararla o reiniciarla para antes el trabajo
+(`claude stop`) y retoma su conversación.
+
 ### Secretos, textos y ficheros
 
 Cuando una sesión llama a `secret`, se abre un diálogo en la web y la app de nido con el nombre

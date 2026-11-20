@@ -133,6 +133,52 @@ pub struct AppState {
     searching: Arc<Mutex<()>>,
     /// La cola de Claude de cada transcripción, leída poco a poco (ver `transcript::Queue`).
     queues: std::sync::Mutex<std::collections::HashMap<PathBuf, crate::transcript::Queue>>,
+    /// Las sesiones que se están parando con su conversación en un trabajo en segundo plano (ver
+    /// `stop_and_wait` y `StopPin`): mientras, el escaneo no les cambia la conversación del
+    /// registro.
+    stopping: std::sync::Mutex<std::collections::HashMap<String, StopPin>>,
+    /// Los demonios de Claude Code que no se pudieron sacar de su sesión (ver `adopt_daemons`).
+    /// Cogido mientras se sacan: uno a la vez.
+    #[cfg(target_os = "linux")]
+    daemon_moves: Arc<std::sync::Mutex<launch::DaemonMoves>>,
+    /// Una parada a la vez por sesión (ver `stop_and_wait`).
+    stop_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// La conversación de una sesión, fijada en el registro mientras se para (ver `stop_and_wait`):
+/// el visor, al irse su trabajo en segundo plano, puede volver a decir la de antes. Se pone con
+/// el registro cogido, junto con la conversación; la quita el escaneo, también con el registro
+/// cogido, cuando su guardián (`holder`) ya no está o es otro (parada o relanzada de verdad), o
+/// si la parada se dejó a medias (`released`: ver `PinGuard`).
+#[derive(Debug)]
+struct StopPin {
+    holder: u32,
+    released: bool,
+}
+
+/// Mientras dura la parada. Si se suelta antes de mandar parar al guardián (se canceló la
+/// petición o algo falló), la marca queda soltada y el escaneo la quita; si no (`commit`), sigue
+/// hasta que el guardián se va.
+struct PinGuard<'a> {
+    st: &'a AppState,
+    id: String,
+    committed: bool,
+}
+
+impl PinGuard<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PinGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(p) = self.st.stopping.lock().expect("parando").get_mut(&self.id)
+        {
+            p.released = true;
+        }
+    }
 }
 
 /// Los modelos que se ofrecen si nido aún no ha visto el menú de `/model` (también valen como
@@ -695,6 +741,10 @@ impl AppState {
             search: Default::default(),
             searching: Default::default(),
             queues: Default::default(),
+            stopping: Default::default(),
+            stop_locks: Default::default(),
+            #[cfg(target_os = "linux")]
+            daemon_moves: Default::default(),
         }))
     }
 
@@ -715,36 +765,51 @@ impl AppState {
             .map(|v| v.id.clone())
             .collect();
         let models = self.models();
+        let mut alive_ids = Vec::new();
         for s in sessions {
             let alive = launch::is_alive(&self.paths, &s.id);
+            if alive {
+                alive_ids.push(s.id.clone());
+            }
             let stopped = stop_time(s.stopped, alive, was_alive.contains(&s.id), now_ms());
             if stopped != s.stopped {
                 let _ = reg.update(&s.id, |x| x.stopped = stopped);
             }
-            let found = alive
+            let holder = alive
                 .then(|| launch::holder_pid(&self.paths, &s.id))
                 .flatten()
-                .and_then(|pid| u32::try_from(pid).ok())
-                .and_then(|pid| claude::find_claude(&procfs, pid, &self.paths.home));
+                .and_then(|pid| u32::try_from(pid).ok());
+            // Parándose con su conversación en un trabajo en segundo plano: el registro ya tiene
+            // la del trabajo, y el Claude que se apaga no la cambia (ver `StopPin`). Se mira antes
+            // de buscar su Claude, con el registro cogido: la marca no cambia entre medias.
+            let pinned = self.pinned(&s.id, holder);
+            let found = holder.and_then(|pid| claude::find_claude(&procfs, pid, &self.paths.home));
             let mut link = s.claude.clone();
-            if let Some(f) = &found {
-                let inside_shell = !claude::is_claude(&s.argv);
-                let account = link.as_ref().and_then(|l| l.account.clone());
-                let fresh = ClaudeLink {
-                    session_id: f.info.session_id.clone(),
-                    config_dir: f.config_dir.clone(),
-                    account,
-                    inside_shell,
-                };
-                if link.as_ref() != Some(&fresh) {
-                    link = Some(fresh);
-                }
-            } else if alive && link.as_ref().is_some_and(|l| l.inside_shell) {
+            match &found {
+                _ if pinned => {}
+                Some(f) => link = Some(fresh_link(&s, f)),
                 // Salió de Claude y sigue en la shell: al restaurar, solo la shell.
-                link = None;
+                None if alive && link.as_ref().is_some_and(|l| l.inside_shell) => link = None,
+                None => {}
             }
             if link != s.claude {
                 let _ = reg.update(&s.id, |x| x.claude = link.clone());
+            }
+            // Claude Code pasó su conversación a un trabajo en segundo plano: se sigue ahí (lo de
+            // arriba), y los mensajes esperan a que vuelva (su `nido mcp` no le llega).
+            let job = found.as_ref().and_then(|f| f.parked.as_ref());
+            if self.inbox.parked(&s.id, job.is_some()) {
+                match job {
+                    Some(j) => eprintln!(
+                        "nido: {}: Claude Code pasó la conversación al trabajo en segundo plano {} \
+                         ({}); sin channel mientras siga ahí",
+                        s.name, j.id, j.session_id
+                    ),
+                    None => eprintln!(
+                        "nido: {}: la conversación ya no está en segundo plano",
+                        s.name
+                    ),
+                }
             }
             // Ha terminado de trabajar (de «busy» a cualquier otro estado): queda «sin leer»
             // hasta que el usuario la abra.
@@ -833,7 +898,53 @@ impl AppState {
             changed
         });
         drop(reg);
+        self.adopt_daemons(alive_ids);
         self.refresh_models(targets).await;
+    }
+
+    /// Con systemd: el demonio de Claude Code que aparezca en una sesión viva (`alive`) se saca a
+    /// su propia unidad en cuanto se ve (ver `launch::move_daemon_out`): así sobrevive a que se
+    /// pare la sesión o se salga de su Claude, y no cuenta para su límite de memoria. Fuera del
+    /// hilo y de uno en uno; si no se puede, se vuelve a probar cada vez más espaciado.
+    fn adopt_daemons(&self, alive: Vec<String>) {
+        #[cfg(target_os = "linux")]
+        if self.launcher == launch::Launcher::Systemd {
+            let (paths, moves) = (self.paths.clone(), self.daemon_moves.clone());
+            tokio::task::spawn_blocking(move || {
+                // Otro escaneo ya está en ello.
+                let Ok(mut moves) = moves.try_lock() else {
+                    return;
+                };
+                let now = std::time::Instant::now();
+                let mut seen = Vec::new();
+                for id in alive {
+                    let Some(daemon) = launch::daemon_in_unit(&paths, &id) else {
+                        continue;
+                    };
+                    seen.push(daemon);
+                    if !moves.due(daemon, now) {
+                        continue;
+                    }
+                    match launch::move_daemon_out(&paths, &id) {
+                        Ok(n) => eprintln!(
+                            "nido: {id}: el demonio de Claude Code ({n} procesos) sale de la \
+                             sesión a su propia unidad"
+                        ),
+                        Err(e) => {
+                            let wait = moves.failed(daemon, now);
+                            eprintln!(
+                                "nido: {id}: no se pudo sacar de la sesión el demonio de Claude \
+                                 Code ({e}); se vuelve a probar en {} s",
+                                wait.as_secs()
+                            );
+                        }
+                    }
+                }
+                moves.forget_except(&seen);
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = alive;
     }
 
     /// Al arrancar el equipo: vuelve a abrir las sesiones con autoarranque que no estén vivas.
@@ -856,6 +967,10 @@ impl AppState {
         let sessions: Vec<Session> = self.registry.lock().await.sessions().to_vec();
         for s in sessions.iter().filter(|s| s.autostart) {
             if !launch::is_alive(&self.paths, &s.id) {
+                if let Err(e) = stop_running_job(self, &s.id).await {
+                    eprintln!("nido: no se restaura {}: {e}", s.name);
+                    continue;
+                }
                 let hold = self.launching(&s.id);
                 match launch::start(&self.paths, self.launcher, &s.id) {
                     Ok(()) => self.launched(&s.id, hold),
@@ -898,6 +1013,30 @@ impl AppState {
 }
 
 impl AppState {
+    /// ¿Está fijada la conversación de `id` mientras se para (ver `StopPin`)? Con su guardián de
+    /// ahora (`holder`): si ya no es el de la parada, o la parada se dejó, la marca se quita.
+    /// Se llama con el registro cogido.
+    fn pinned(&self, id: &str, holder: Option<u32>) -> bool {
+        let mut stopping = self.stopping.lock().expect("parando");
+        match stopping.get(id) {
+            None => false,
+            Some(p) if !p.released && holder == Some(p.holder) => true,
+            Some(_) => {
+                stopping.remove(id);
+                false
+            }
+        }
+    }
+
+    /// ¿Se está parando `id` con su conversación fijada (ver `StopPin`)?
+    pub fn stopping(&self, id: &str) -> bool {
+        self.stopping
+            .lock()
+            .expect("parando")
+            .get(id)
+            .is_some_and(|p| !p.released)
+    }
+
     /// Los modelos que se pueden elegir (ver `models`).
     pub fn models(&self) -> Vec<String> {
         self.models.lock().expect("modelos").clone()
@@ -1018,6 +1157,7 @@ pub async fn register_mcp(st: Arc<AppState>) {
         path: program,
         home: None,
         cwd: Some(neutral),
+        timeout: None,
     };
     let done =
         tokio::task::spawn_blocking(move || claude::ensure_mcp_registered(&cli, &nido, &dirs))
@@ -1510,6 +1650,87 @@ where
     }
 }
 
+/// El enlace de la sesión `s` con el Claude `f` que corre en ella: su conversación (la de su
+/// trabajo en segundo plano, si la pasó a uno) y su perfil; la cuenta, la que tuviera.
+fn fresh_link(s: &Session, f: &claude::FoundClaude) -> ClaudeLink {
+    ClaudeLink {
+        session_id: f.info.session_id.clone(),
+        config_dir: f.config_dir.clone(),
+        account: s.claude.as_ref().and_then(|l| l.account.clone()),
+        inside_shell: !claude::is_claude(&s.argv),
+    }
+}
+
+/// El `claude` de este equipo para pedirle cosas, en una carpeta neutra (la del estado de nido:
+/// el `.mcp.json` de donde se arrancó nido no cuenta).
+fn claude_program(paths: &Paths) -> Option<claude::Program> {
+    let path = std::env::var_os("PATH");
+    let program = claude::find_program(path.as_deref(), &paths.home)?;
+    let _ = std::fs::create_dir_all(&paths.state);
+    Some(claude::Program {
+        path: program,
+        home: None,
+        cwd: Some(paths.state.clone()),
+        timeout: Some(CLAUDE_STOP_TIMEOUT),
+    })
+}
+
+/// Lo que se espera la respuesta de otro equipo a `method`: lo de siempre y, para arrancar,
+/// parar o cerrar una de sus sesiones, lo que puede tardar con margen (como la CLI).
+pub fn peer_wait(method: &str) -> Duration {
+    match method {
+        "start" | "stop" | "restart" | "close" => SESSION_OP_WORST * 2,
+        _ => Duration::from_secs(15),
+    }
+}
+
+// Los tiempos de parar y arrancar una sesión. La CLI espera `client::SESSION_OP_TIMEOUT`, que
+// tiene que cubrir el peor caso (`SESSION_OP_WORST`, el de reiniciar) con margen.
+
+/// Lo más que se espera a `claude stop` (con lo que se espera luego su salida, `OUTPUT_GRACE`).
+const CLAUDE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Lo más que se espera a que acabe el proceso de un trabajo en segundo plano tras
+/// `claude stop`.
+const JOB_STOP_WAIT: Duration = Duration::from_secs(5);
+/// Lo más que se espera a que acabe el guardián de una sesión que se para.
+const HOLDER_STOP_WAIT: Duration = Duration::from_secs(12);
+/// Lo más que se espera a que esté viva una sesión que se arranca.
+const ALIVE_WAIT: Duration = Duration::from_secs(3);
+/// Parar un trabajo en segundo plano, como mucho.
+const JOB_STOP_WORST: Duration = Duration::from_secs(
+    CLAUDE_STOP_TIMEOUT.as_secs() + claude::OUTPUT_GRACE.as_secs() + JOB_STOP_WAIT.as_secs(),
+);
+/// Lo más que tarda reiniciar una sesión, lo más largo: sacar el demonio de Claude Code de ella,
+/// parar su trabajo, su guardián, otra vez
+/// su trabajo si no se paró a la primera (antes de retomarla) y esperar a que arranque.
+pub const SESSION_OP_WORST: Duration = Duration::from_secs(
+    2 * JOB_STOP_WORST.as_secs()
+        + launch::DAEMON_MOVE_WORST.as_secs()
+        + HOLDER_STOP_WAIT.as_secs()
+        + ALIVE_WAIT.as_secs(),
+);
+
+/// Para el trabajo en segundo plano `job`, vivo, del perfil `config_dir` (`None`: `~/.claude`),
+/// y espera a que su proceso acabe. Bloquea.
+fn stop_live_job(
+    paths: &Paths,
+    config_dir: Option<&std::path::Path>,
+    job: &claude::Job,
+) -> std::io::Result<()> {
+    let cli = claude_program(paths).ok_or_else(|| std::io::Error::other("no encuentro claude"))?;
+    claude::stop_job(&cli, config_dir, &job.id)?;
+    // Solo se espera a su proceso mientras sea él (ver `claude::job_alive`).
+    let procfs = Procfs::default();
+    if launch::wait_until(|| !claude::job_alive(&procfs, job), JOB_STOP_WAIT) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "el trabajo {} sigue en marcha tras claude stop",
+            job.id
+        )))
+    }
+}
+
 /// Por qué no tiene channel, según lo que se vio (`Blocked` o `NoServer`).
 fn refusal_of(r: &prompt::Startup) -> crate::inbox::Refusal {
     match r {
@@ -1533,6 +1754,8 @@ fn log_refusal(why: crate::inbox::Refusal, name: &str, id: &str) {
             "nido: {name} ({id}): su Claude ya no está en marcha; queda sin channel hasta que se \
              vuelva a lanzar"
         ),
+        // No sale de la pantalla de arranque: lo apunta el escaneo.
+        crate::inbox::Refusal::Parked => {}
     }
 }
 
@@ -2198,8 +2421,9 @@ impl AppState {
             .ok()
             .and_then(|k| <[u8; 32]>::try_from(k).ok())
             .ok_or_else(|| unknown_member(&m.id))?;
+        let wait = peer_wait(method);
         e2e::peer_request(&self.identity, &key, method, params, |first| {
-            self.hub.exchange(&m.id, first)
+            self.hub.exchange_within(&m.id, first, wait)
         })
         .await
     }
@@ -3434,13 +3658,14 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
 }
 
 pub(crate) async fn wait_alive(st: &AppState, id: &str) -> bool {
-    for _ in 0..60 {
+    let until = tokio::time::Instant::now() + ALIVE_WAIT;
+    while tokio::time::Instant::now() < until {
         if launch::is_alive(&st.paths, id) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+    launch::is_alive(&st.paths, id)
 }
 
 pub(crate) async fn find_session(st: &AppState, key: &str) -> Result<Session, Response> {
@@ -3543,20 +3768,187 @@ async fn api_order_folders(
     }
 }
 
-pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
+/// Para la sesión `id` y espera a que termine. Devuelve los avisos de lo que no salió del todo
+/// bien (en español, para `tr`), que se dicen en la respuesta.
+pub(crate) async fn stop_and_wait(st: &AppState, id: &str) -> Vec<String> {
+    // Una a la vez: dos a la vez se pisarían la conversación fijada (`StopPin`) y pararían dos
+    // veces su trabajo. La segunda espera a la primera, y ya la encuentra parada.
+    let lock = st
+        .stop_locks
+        .lock()
+        .expect("paradas")
+        .entry(id.to_owned())
+        .or_default()
+        .clone();
+    let _one = lock.lock().await;
     // Lo que le llegue a su `nido mcp` mientras se muere se perdería.
     st.inbox.stopped(id);
+    let mut warnings = Vec::new();
+    // Antes que nada, el demonio de Claude Code, si sigue en la sesión (normalmente ya lo sacó el
+    // escaneo): parar su trabajo puede hacer que acabe su Claude, y con él la unidad.
+    warnings.extend(move_daemon(st, id).await);
+    let mut pin = stop_parked_job(st, id, &mut warnings).await;
+    // Desde aquí el guardián se para aunque se cancele la petición (`spawn_blocking` sigue): la
+    // marca se queda hasta que el escaneo lo vea ido.
+    if let Some(p) = pin.as_mut() {
+        p.commit();
+    }
     // Bloquea un momento (en Windows espera a que el guardián recoja la orden): fuera del hilo
     // de tokio.
     let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
     let _ = tokio::task::spawn_blocking(move || launch::stop(&paths, launcher, &sid)).await;
     // Hasta que el proceso termine del todo, no solo hasta que deje el socket.
-    for _ in 0..240 {
+    let until = tokio::time::Instant::now() + HOLDER_STOP_WAIT;
+    while tokio::time::Instant::now() < until {
         if !launch::is_alive(&st.paths, id) && !launch::holder_running(&st.paths, id) {
-            return;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    drop(pin);
+    warnings
+}
+
+/// Con systemd, saca de la sesión `id` el demonio de Claude Code (ver
+/// `launch::move_daemon_out`). El aviso, si no se pudo: la sesión se para igual.
+async fn move_daemon(st: &AppState, id: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if st.launcher == launch::Launcher::Systemd {
+        let (paths, sid) = (st.paths.clone(), id.to_owned());
+        let moved = tokio::task::spawn_blocking(move || launch::move_daemon_out(&paths, &sid))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        match moved {
+            Ok(0) => {}
+            Ok(n) => {
+                eprintln!("nido: {id}: el demonio de Claude Code ({n} procesos) sale de la sesión")
+            }
+            Err(e) => {
+                let w = format!(
+                    "no se pudo sacar de la sesión el demonio de Claude Code ({e}): al pararla se \
+                     paran también los trabajos en segundo plano de las demás sesiones"
+                );
+                eprintln!("nido: {id}: {w}");
+                return Some(w);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (st, id);
+    None
+}
+
+/// La respuesta de parar (o reiniciar, o borrar) con sus avisos, si los hubo (`warning`).
+pub(crate) fn warned(mut v: serde_json::Value, warnings: &[String]) -> serde_json::Value {
+    if !warnings.is_empty() {
+        let text: Vec<String> = warnings.iter().map(|w| tr(w)).collect();
+        v["warning"] = text.join("; ").into();
+    }
+    v
+}
+
+/// Antes de parar la sesión `id`: si su Claude pasó la conversación a un trabajo en segundo
+/// plano de Claude Code, el registro se queda con la del trabajo (para retomarla, también tras
+/// reiniciar el equipo) y el escaneo no la cambia hasta acabar de parar (`stopping`: el visor,
+/// al irse el trabajo, podría volver a decir la de antes). Y el trabajo, si sigue vivo, se para
+/// (`claude stop`): puede no colgar de la sesión, y se quedaría trabajando con la conversación
+/// que se retomará. Con la marca puesta, su guardia.
+async fn stop_parked_job<'a>(
+    st: &'a AppState,
+    id: &str,
+    warnings: &mut Vec<String>,
+) -> Option<PinGuard<'a>> {
+    let (paths, sid) = (st.paths.clone(), id.to_owned());
+    let found = tokio::task::spawn_blocking(move || {
+        let holder = u32::try_from(launch::holder_pid(&paths, &sid)?).ok()?;
+        Some((
+            holder,
+            claude::find_claude(&Procfs::default(), holder, &paths.home)?,
+        ))
+    })
+    .await
+    .ok()
+    .flatten();
+    let (holder, f, job) = found.and_then(|(h, f)| f.parked.clone().map(|j| (h, f, j)))?;
+    let guard = PinGuard {
+        st,
+        id: id.to_owned(),
+        committed: false,
+    };
+    {
+        let mut reg = st.registry.lock().await;
+        st.stopping.lock().expect("parando").insert(
+            id.to_owned(),
+            StopPin {
+                holder,
+                released: false,
+            },
+        );
+        if let Some(s) = reg.get(id).cloned() {
+            let link = fresh_link(&s, &f);
+            if s.claude.as_ref() != Some(&link)
+                && let Err(e) = reg.update(id, |x| x.claude = Some(link))
+            {
+                eprintln!("nido: no se pudo guardar la conversación de {id}: {e}");
+            }
+        }
+    }
+    if job.process.is_some() {
+        let paths = st.paths.clone();
+        let (config, name, job_id) = (f.config_dir.clone(), id.to_owned(), job.id.clone());
+        let done =
+            tokio::task::spawn_blocking(move || stop_live_job(&paths, config.as_deref(), &job))
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        if let Err(e) = done {
+            let w = format!(
+                "no se pudo parar el trabajo en segundo plano {job_id} de Claude Code ({e}): sigue \
+                 en marcha, y su conversación no se retomará mientras siga"
+            );
+            eprintln!("nido: {name}: {w}");
+            warnings.push(w);
+        }
+    }
+    Some(guard)
+}
+
+/// Antes de arrancar la sesión `id`: si un trabajo en segundo plano de Claude Code sigue vivo con
+/// su conversación (su demonio no cuelga de la sesión, o lo relanzó), se para primero: retomarla
+/// a la vez dejaría dos Claude con la misma. Si no se puede parar, no se arranca.
+pub(crate) async fn stop_running_job(st: &AppState, id: &str) -> std::io::Result<()> {
+    let Some(link) = st
+        .registry
+        .lock()
+        .await
+        .get(id)
+        .and_then(|s| s.claude.clone())
+    else {
+        return Ok(());
+    };
+    let paths = st.paths.clone();
+    tokio::task::spawn_blocking(move || {
+        let dir = link
+            .config_dir
+            .clone()
+            .unwrap_or_else(|| claude::default_config_dir(&paths.home));
+        let Some(job) = claude::running_job(&Procfs::default(), &dir, &link.session_id) else {
+            return Ok(());
+        };
+        eprintln!(
+            "nido: la conversación {} sigue en el trabajo en segundo plano {} de Claude Code: se \
+             para antes de retomarla",
+            link.session_id, job.id
+        );
+        stop_live_job(&paths, link.config_dir.as_deref(), &job).map_err(|e| {
+            std::io::Error::other(format!(
+                "su conversación sigue en el trabajo en segundo plano {} de Claude Code, que no \
+                 se pudo parar: {e}",
+                job.id
+            ))
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
 }
 
 /// Contesta el menú que Claude tiene en pantalla (sus preguntas, un permiso, el plan…) pulsando
@@ -3867,6 +4259,7 @@ pub(crate) async fn remember_running(st: &AppState, id: &str, running: bool) {
 pub(crate) async fn start_session(st: &AppState, id: &str) -> std::io::Result<bool> {
     let mut alive = launch::is_alive(&st.paths, id);
     if !alive {
+        stop_running_job(st, id).await?;
         let hold = st.launching(id);
         launch::start(&st.paths, st.launcher, id)?;
         alive = wait_alive(st, id).await;
@@ -3889,10 +4282,12 @@ async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
 }
 
 /// Para la sesión y apunta que se queda parada (no vuelve a arrancar con el equipo).
-pub(crate) async fn stop_session(st: &AppState, id: &str) {
-    stop_and_wait(st, id).await;
+/// Con los avisos de `stop_and_wait`.
+pub async fn stop_session(st: &AppState, id: &str) -> Vec<String> {
+    let warnings = stop_and_wait(st, id).await;
     remember_running(st, id, false).await;
     st.refresh.notify_one();
+    warnings
 }
 
 async fn api_stop(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -3900,8 +4295,8 @@ async fn api_stop(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Re
         Ok(s) => s,
         Err(r) => return r,
     };
-    stop_session(&st, &s.id).await;
-    Json(serde_json::json!({ "ok": true })).into_response()
+    let warnings = stop_session(&st, &s.id).await;
+    Json(warned(serde_json::json!({ "ok": true }), &warnings)).into_response()
 }
 
 async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -3913,7 +4308,10 @@ async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) ->
     st.scan().await;
     // Retenida ya antes de pararla: el `nido mcp` de antes aún recoge.
     let hold = st.launching(&s.id);
-    stop_and_wait(&st, &s.id).await;
+    let warnings = stop_and_wait(&st, &s.id).await;
+    if let Err(e) = stop_running_job(&st, &s.id).await {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
     if let Err(e) = launch::start(&st.paths, st.launcher, &s.id) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
@@ -3921,7 +4319,7 @@ async fn api_restart(State(st): State<Arc<AppState>>, Path(id): Path<String>) ->
     st.launched(&s.id, hold);
     remember_running(&st, &s.id, true).await;
     st.refresh.notify_one();
-    Json(serde_json::json!({ "ok": true })).into_response()
+    Json(warned(serde_json::json!({ "ok": true }), &warnings)).into_response()
 }
 
 async fn api_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -3930,14 +4328,15 @@ async fn api_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> 
         Err(r) => return r,
     };
     match delete_session(&st, &s.id).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(warnings) => Json(warned(serde_json::json!({ "ok": true }), &warnings)).into_response(),
         Err(e) => registry_error(e),
     }
 }
 
 /// La para, la quita del registro y borra su estado (historial, registro del guardián).
-pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), RegistryError> {
-    stop_and_wait(st, id).await;
+/// Con los avisos de `stop_and_wait`.
+pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<Vec<String>, RegistryError> {
+    let warnings = stop_and_wait(st, id).await;
     // El último resumen de su plan, para sus enlaces del tablero, que se cierran (parada, ya no
     // cambia). Puede leer del disco: fuera del hilo.
     let last = {
@@ -3978,7 +4377,7 @@ pub(crate) async fn delete_session(st: &AppState, id: &str) -> Result<(), Regist
     })
     .await;
     st.refresh.notify_one();
-    res.map(|_| ())
+    res.map(|_| warnings)
 }
 
 /// `GET /api/v1/sessions/{id}/plan`: el plan de la sesión, con sus horas (ms desde 1970); 404 si
@@ -8197,6 +8596,22 @@ mod tests {
         assert_eq!(alert_text("\u{1b}[0m\u{7}"), None);
         // Un ESC suelto al final no rompe nada.
         assert_eq!(alert_text("fin\u{1b}"), Some("fin".to_owned()));
+    }
+
+    #[test]
+    fn the_cli_waits_long_enough_for_a_session_to_stop() {
+        // Parar una sesión con su trabajo en segundo plano (y reiniciarla) cabe con margen en lo
+        // que espera `nido stop|restart|start|rm`.
+        assert!(SESSION_OP_WORST * 2 <= crate::client::SESSION_OP_TIMEOUT);
+        // Y lo mismo, pedido a otro equipo.
+        for m in ["start", "stop", "close"] {
+            assert!(peer_wait(m) >= SESSION_OP_WORST * 2, "{m}");
+        }
+        assert_eq!(peer_wait("read"), Duration::from_secs(15));
+        assert!(
+            SESSION_OP_WORST >= Duration::from_secs(40),
+            "{SESSION_OP_WORST:?}"
+        );
     }
 
     // ---------- Buscar y el chat alrededor de un mensaje ----------

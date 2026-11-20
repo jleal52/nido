@@ -412,6 +412,11 @@ pub mod win {
         }
     }
 
+    /// Cuándo se creó el proceso, en ms desde 1970 (`created` va desde 1601).
+    pub fn started_ms(pid: u32) -> Option<u64> {
+        (created(pid)? / 10_000).checked_sub(11_644_473_600_000)
+    }
+
     /// Cuándo se creó el proceso (en unidades de 100 ns).
     fn created(pid: u32) -> Option<u64> {
         // SAFETY: se abre para preguntar y se cierra.

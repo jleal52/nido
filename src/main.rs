@@ -932,25 +932,27 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             );
         }
         Cmd::Start { name } => {
-            api.call(
+            api.call_session_op(
                 "POST",
                 &format!("/api/v1/sessions/{}/start", id_of(&name)?),
                 None,
             )?;
         }
         Cmd::Stop { name } => {
-            api.call(
+            let r = api.call_session_op(
                 "POST",
                 &format!("/api/v1/sessions/{}/stop", id_of(&name)?),
                 None,
             )?;
+            print_warning(&r);
         }
         Cmd::Restart { name } => {
-            api.call(
+            let r = api.call_session_op(
                 "POST",
                 &format!("/api/v1/sessions/{}/restart", id_of(&name)?),
                 None,
             )?;
+            print_warning(&r);
         }
         Cmd::Mv { name, folder } => {
             let body = serde_json::json!({ "folder": folder.unwrap_or_default() });
@@ -961,11 +963,12 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             )?;
         }
         Cmd::Rm { name } => {
-            api.call(
+            let r = api.call_session_op(
                 "DELETE",
                 &format!("/api/v1/sessions/{}", id_of(&name)?),
                 None,
             )?;
+            print_warning(&r);
         }
         Cmd::ImportTmux { dry_run } => {
             let found = import::scan(std::path::Path::new("/proc"), &paths.home);
@@ -1064,7 +1067,7 @@ fn clip_send(
 ) -> io::Result<u64> {
     use nido::outbox::{self, MAX_TEXT};
     use std::io::{IsTerminal, Read};
-    let Some(session) = nido::mcp::session_from(std::env::var("NIDO_SESSION").ok()) else {
+    let Some(session) = nido::mcp::own_session().0 else {
         return Err(io::Error::other(
             "falta o no es válida NIDO_SESSION: `nido clip` es para las órdenes de una sesión de nido",
         ));
@@ -1375,6 +1378,14 @@ fn windows_service(action: ServiceCmd) -> io::Result<()> {
 /// se guardan 10 alertas y el 🔔 ocupa dos columnas).
 const STATE_WIDTH: usize = 16;
 
+/// El aviso de una respuesta (`warning`: p. ej., no se pudo parar el trabajo en segundo plano de
+/// la sesión), si lo trae.
+fn print_warning(r: &serde_json::Value) {
+    if let Some(w) = r.get("warning").and_then(|w| w.as_str()) {
+        eprintln!("aviso: {w}");
+    }
+}
+
 /// Una línea de `nido ls`: nombre, estado (con 🔔 si hay alertas sin ver), orden y carpeta.
 fn ls_line(name: &str, state: &str, alerts: usize, what: &str, cwd: &str) -> String {
     let state = match alerts {
@@ -1417,7 +1428,7 @@ fn secrets_run(paths: &Paths, name: &str, var: &str, command: &[String]) -> Exit
         return fail("falta la orden, tras `--`");
     };
     let store = nido::secrets::Store::new(paths.state.join("secrets"));
-    let session = std::env::var("NIDO_SESSION").ok();
+    let session = nido::mcp::own_session().0;
     let path = match store.usable(session.as_deref(), name, registry::now_ms()) {
         Ok(p) => p,
         Err(e) => return fail(e),
