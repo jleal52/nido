@@ -134,8 +134,45 @@ pub struct AppState {
     /// La cola de Claude de cada transcripción, leída poco a poco (ver `transcript::Queue`).
     queues: std::sync::Mutex<std::collections::HashMap<PathBuf, crate::transcript::Queue>>,
     /// Las sesiones que se están parando con su conversación en un trabajo en segundo plano (ver
-    /// `stop_and_wait`): mientras, el escaneo no les cambia la conversación del registro.
-    stopping: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// `stop_and_wait` y `StopPin`): mientras, el escaneo no les cambia la conversación del
+    /// registro.
+    stopping: std::sync::Mutex<std::collections::HashMap<String, StopPin>>,
+}
+
+/// La conversación de una sesión, fijada en el registro mientras se para (ver `stop_and_wait`):
+/// el visor, al irse su trabajo en segundo plano, puede volver a decir la de antes. Se pone con
+/// el registro cogido, junto con la conversación; la quita el escaneo, también con el registro
+/// cogido, cuando su guardián (`holder`) ya no está o es otro (parada o relanzada de verdad), o
+/// si la parada se dejó a medias (`released`: ver `PinGuard`).
+#[derive(Debug)]
+struct StopPin {
+    holder: u32,
+    released: bool,
+}
+
+/// Mientras dura la parada. Si se suelta antes de mandar parar al guardián (se canceló la
+/// petición o algo falló), la marca queda soltada y el escaneo la quita; si no (`commit`), sigue
+/// hasta que el guardián se va.
+struct PinGuard<'a> {
+    st: &'a AppState,
+    id: String,
+    committed: bool,
+}
+
+impl PinGuard<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PinGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(p) = self.st.stopping.lock().expect("parando").get_mut(&self.id)
+        {
+            p.released = true;
+        }
+    }
 }
 
 /// Los modelos que se ofrecen si nido aún no ha visto el menú de `/model` (también valen como
@@ -725,15 +762,16 @@ impl AppState {
             if stopped != s.stopped {
                 let _ = reg.update(&s.id, |x| x.stopped = stopped);
             }
-            let found = alive
+            let holder = alive
                 .then(|| launch::holder_pid(&self.paths, &s.id))
                 .flatten()
-                .and_then(|pid| u32::try_from(pid).ok())
-                .and_then(|pid| claude::find_claude(&procfs, pid, &self.paths.home));
-            let mut link = s.claude.clone();
+                .and_then(|pid| u32::try_from(pid).ok());
             // Parándose con su conversación en un trabajo en segundo plano: el registro ya tiene
-            // la del trabajo, y el Claude que se apaga no la cambia (ver `stop_and_wait`).
-            let pinned = self.stopping.lock().expect("parando").contains(&s.id);
+            // la del trabajo, y el Claude que se apaga no la cambia (ver `StopPin`). Se mira antes
+            // de buscar su Claude, con el registro cogido: la marca no cambia entre medias.
+            let pinned = self.pinned(&s.id, holder);
+            let found = holder.and_then(|pid| claude::find_claude(&procfs, pid, &self.paths.home));
+            let mut link = s.claude.clone();
             match &found {
                 _ if pinned => {}
                 Some(f) => link = Some(fresh_link(&s, f)),
@@ -916,6 +954,30 @@ impl AppState {
 }
 
 impl AppState {
+    /// ¿Está fijada la conversación de `id` mientras se para (ver `StopPin`)? Con su guardián de
+    /// ahora (`holder`): si ya no es el de la parada, o la parada se dejó, la marca se quita.
+    /// Se llama con el registro cogido.
+    fn pinned(&self, id: &str, holder: Option<u32>) -> bool {
+        let mut stopping = self.stopping.lock().expect("parando");
+        match stopping.get(id) {
+            None => false,
+            Some(p) if !p.released && holder == Some(p.holder) => true,
+            Some(_) => {
+                stopping.remove(id);
+                false
+            }
+        }
+    }
+
+    /// ¿Se está parando `id` con su conversación fijada (ver `StopPin`)?
+    pub fn stopping(&self, id: &str) -> bool {
+        self.stopping
+            .lock()
+            .expect("parando")
+            .get(id)
+            .is_some_and(|p| !p.released)
+    }
+
     /// Los modelos que se pueden elegir (ver `models`).
     pub fn models(&self) -> Vec<String> {
         self.models.lock().expect("modelos").clone()
@@ -3636,7 +3698,12 @@ async fn api_order_folders(
 pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
     // Lo que le llegue a su `nido mcp` mientras se muere se perdería.
     st.inbox.stopped(id);
-    let pinned = stop_parked_job(st, id).await;
+    let mut pin = stop_parked_job(st, id).await;
+    // Desde aquí el guardián se para aunque se cancele la petición (`spawn_blocking` sigue): la
+    // marca se queda hasta que el escaneo lo vea ido.
+    if let Some(p) = pin.as_mut() {
+        p.commit();
+    }
     // Bloquea un momento (en Windows espera a que el guardián recoja la orden): fuera del hilo
     // de tokio.
     let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
@@ -3649,9 +3716,7 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    if pinned {
-        st.stopping.lock().expect("parando").remove(id);
-    }
+    drop(pin);
 }
 
 /// Antes de parar la sesión `id`: si su Claude pasó la conversación a un trabajo en segundo
@@ -3659,22 +3724,34 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
 /// reiniciar el equipo) y el escaneo no la cambia hasta acabar de parar (`stopping`: el visor,
 /// al irse el trabajo, podría volver a decir la de antes). Y el trabajo, si sigue vivo, se para
 /// (`claude stop`): puede no colgar de la sesión, y se quedaría trabajando con la conversación
-/// que se retomará. `true` si quedó fijada.
-async fn stop_parked_job(st: &AppState, id: &str) -> bool {
+/// que se retomará. Con la marca puesta, su guardia.
+async fn stop_parked_job<'a>(st: &'a AppState, id: &str) -> Option<PinGuard<'a>> {
     let (paths, sid) = (st.paths.clone(), id.to_owned());
     let found = tokio::task::spawn_blocking(move || {
         let holder = u32::try_from(launch::holder_pid(&paths, &sid)?).ok()?;
-        claude::find_claude(&Procfs::default(), holder, &paths.home)
+        Some((
+            holder,
+            claude::find_claude(&Procfs::default(), holder, &paths.home)?,
+        ))
     })
     .await
     .ok()
     .flatten();
-    let Some((f, job)) = found.and_then(|f| f.parked.clone().map(|j| (f, j))) else {
-        return false;
+    let (holder, f, job) = found.and_then(|(h, f)| f.parked.clone().map(|j| (h, f, j)))?;
+    let guard = PinGuard {
+        st,
+        id: id.to_owned(),
+        committed: false,
     };
-    st.stopping.lock().expect("parando").insert(id.to_owned());
     {
         let mut reg = st.registry.lock().await;
+        st.stopping.lock().expect("parando").insert(
+            id.to_owned(),
+            StopPin {
+                holder,
+                released: false,
+            },
+        );
         if let Some(s) = reg.get(id).cloned() {
             let link = fresh_link(&s, &f);
             if s.claude.as_ref() != Some(&link)
@@ -3698,7 +3775,7 @@ async fn stop_parked_job(st: &AppState, id: &str) -> bool {
             );
         }
     }
-    true
+    Some(guard)
 }
 
 /// Antes de arrancar la sesión `id`: si un trabajo en segundo plano de Claude Code sigue vivo con
@@ -4071,7 +4148,7 @@ async fn api_start(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
 }
 
 /// Para la sesión y apunta que se queda parada (no vuelve a arrancar con el equipo).
-pub(crate) async fn stop_session(st: &AppState, id: &str) {
+pub async fn stop_session(st: &AppState, id: &str) {
     stop_and_wait(st, id).await;
     remember_running(st, id, false).await;
     st.refresh.notify_one();

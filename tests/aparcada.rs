@@ -205,7 +205,8 @@ async fn a_session_parked_in_the_background() {
         "#!/bin/sh\n\
          case \"$1\" in\n\
          --version) echo '2.1.329 (Claude Code)'; exit 0;;\n\
-         stop) echo \"stop $2 ${CLAUDE_CONFIG_DIR:-}\" >> \"$FAKE_DIR/stops\";\n\
+         stop) [ -f \"$FAKE_DIR/stop-slow\" ] && sleep 3;\n\
+               echo \"stop $2 ${CLAUDE_CONFIG_DIR:-}\" >> \"$FAKE_DIR/stops\";\n\
                [ -f \"$FAKE_DIR/stop-fails\" ] && { echo 'no se pudo' >&2; exit 1; };\n\
                for f in \"$FAKE_DIR\"/job-*.pid; do [ -f \"$f\" ] && kill \"$(cat \"$f\")\"; done;\n\
                if [ -f \"$FAKE_DIR/viewer.pid\" ]; then v=$(cat \"$FAKE_DIR/viewer.pid\");\n\
@@ -409,4 +410,35 @@ async fn a_session_parked_in_the_background() {
     assert!(last.contains("--resume conv-nueva"), "{runs}");
     let stops = std::fs::read_to_string(fake.join("stops")).unwrap();
     assert_eq!(stops.lines().count(), 3, "{stops}");
+
+    // Una parada que se cancela a medias (la petición se cortó) no deja la conversación fijada:
+    // el escaneo vuelve a seguir a su Claude.
+    let viewer = viewer_pid().unwrap();
+    let job = spawn_job(&config, "conv-nueva");
+    cleanup.1.push(job);
+    std::fs::write(fake.join("job-1.pid"), job.to_string()).unwrap();
+    viewer_file(&config, viewer, true);
+    std::fs::write(fake.join("stop-slow"), "").unwrap();
+    let cut =
+        tokio::time::timeout(Duration::from_millis(500), server::stop_session(&st, &id)).await;
+    assert!(cut.is_err(), "no se cortó");
+    assert!(!st.stopping(&id));
+    assert!(nido::launch::is_alive(&paths, &id));
+    let other = spawn_job(&config, "conv-otra");
+    cleanup.1.push(other);
+    std::fs::write(
+        config.join(format!("sessions/{viewer}.json")),
+        json!({"sessionId": "conv-vieja", "kind": "interactive", "status": "idle",
+               "parkedJobId": "ee12cd34"})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        config.join(format!("sessions/{other}.json")),
+        json!({"sessionId": "conv-otra", "kind": "bg", "jobId": "ee12cd34", "status": "idle"})
+            .to_string(),
+    )
+    .unwrap();
+    st.scan().await;
+    assert_eq!(link_now(&st), "conv-otra");
 }
