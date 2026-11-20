@@ -4,6 +4,11 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+/// Lo más que la CLI espera a que el gestor arranque, pare, reinicie o borre una sesión: con su
+/// conversación en un trabajo en segundo plano de Claude Code, parar ese trabajo cuenta (ver
+/// `server::SESSION_OP_WORST`, de menos de un minuto; esto, más del doble).
+pub const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct Api {
     pub addr: SocketAddr,
@@ -94,6 +99,28 @@ impl Api {
         body: Option<&serde_json::Value>,
         headers: &[(&str, &str)],
     ) -> io::Result<serde_json::Value> {
+        self.call_within(method, path, body, headers, Duration::from_secs(30))
+    }
+
+    /// Como `call`, para arrancar, parar, reiniciar o borrar una sesión: puede tardar más (ver
+    /// `SESSION_OP_TIMEOUT`).
+    pub fn call_session_op(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> io::Result<serde_json::Value> {
+        self.call_within(method, path, body, &[], SESSION_OP_TIMEOUT)
+    }
+
+    fn call_within(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        headers: &[(&str, &str)],
+        timeout: Duration,
+    ) -> io::Result<serde_json::Value> {
         let mut all = headers.to_vec();
         if !headers
             .iter()
@@ -101,8 +128,7 @@ impl Api {
         {
             all.push(("Accept-Language", "es"));
         }
-        let (code, json) =
-            self.request_with(method, path, body, &all, Some(Duration::from_secs(30)))?;
+        let (code, json) = self.request_with(method, path, body, &all, Some(timeout))?;
         ok_or_message(code, json)
     }
 }

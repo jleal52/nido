@@ -1120,6 +1120,7 @@ pub fn channels_supported(program: &Path) -> Option<bool> {
         path: program.to_owned(),
         home: None,
         cwd: Some(std::env::temp_dir()),
+        timeout: None,
     };
     // Recién escrito, lanzarlo puede dar «Text file busy» un momento: lo reintenta `run`. Y si no
     // se pudo lanzar, no se recuerda: la próxima vez se vuelve a preguntar (si no, sus sesiones
@@ -1313,13 +1314,15 @@ pub struct Program {
     /// Dónde se ejecuta: una carpeta neutra, para que no cuente el `.mcp.json` de la carpeta en
     /// la que se arrancó nido.
     pub cwd: Option<PathBuf>,
+    /// Lo más que se le espera (`None`: `CLI_TIMEOUT`); pasado, se mata y es un error.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// Lo más que se espera a `claude mcp …` (`get` arranca el servidor para ver si conecta).
 const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// Terminado `claude`, lo más que se espera a que se cierre su salida: un nieto que siguiera
 /// con ella abierta dejaría esperando a nido.
-const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Cuántas veces se vuelve a probar a lanzar `claude` si da «Text file busy», y cuánto se espera
 /// entre una y otra: alguien lo tiene abierto para escribir. Claude Code que se acaba de
 /// actualizar, o, en las pruebas, el guion recién escrito mientras otro hilo lanza un proceso
@@ -1390,7 +1393,7 @@ impl ClaudeCli for Program {
             if let Some(s) = child.try_wait()? {
                 break s;
             }
-            if start.elapsed() > CLI_TIMEOUT {
+            if start.elapsed() > self.timeout.unwrap_or(CLI_TIMEOUT) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(std::io::Error::other("claude no ha contestado"));
@@ -2833,6 +2836,7 @@ mod tests {
             path: script,
             home: Some(home.clone()),
             cwd: Some(neutral.clone()),
+            timeout: None,
         };
         let profile = tmp.path().join("perfil");
         let got = ensure_mcp_registered(&cli, Path::new("/x/nido"), &[None, Some(profile.clone())]);
@@ -2858,6 +2862,7 @@ mod tests {
             path: tmp.path().join("no-existe"),
             home: None,
             cwd: None,
+            timeout: None,
         };
         assert!(matches!(
             &ensure_mcp_registered(&gone, Path::new("/x/nido"), &[None])[..],
@@ -2887,6 +2892,7 @@ mod tests {
             path: script,
             home: None,
             cwd: None,
+            timeout: None,
         };
         let e = std::process::Command::new(&cli.path).output().unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}");
@@ -2921,6 +2927,7 @@ mod tests {
             path: script,
             home: None,
             cwd: None,
+            timeout: None,
         };
         let start = std::time::Instant::now();
         let got = cli.run(None, &["mcp", "get", "nido"]);
@@ -2937,6 +2944,24 @@ mod tests {
         let (ok, text) = got.unwrap();
         assert!(ok);
         assert!(text.contains("hecho"), "{text:?}");
+    }
+
+    #[test]
+    fn a_claude_that_does_not_answer_in_time_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("claude");
+        std::fs::write(&script, "#!/bin/sh\nsleep 20\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let cli = Program {
+            path: script,
+            home: None,
+            cwd: None,
+            timeout: Some(std::time::Duration::from_millis(300)),
+        };
+        let start = std::time::Instant::now();
+        assert!(cli.run(None, &["stop", "ab12cd34"]).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

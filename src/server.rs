@@ -1036,6 +1036,7 @@ pub async fn register_mcp(st: Arc<AppState>) {
         path: program,
         home: None,
         cwd: Some(neutral),
+        timeout: None,
     };
     let done =
         tokio::task::spawn_blocking(move || claude::ensure_mcp_registered(&cli, &nido, &dirs))
@@ -1549,12 +1550,31 @@ fn claude_program(paths: &Paths) -> Option<claude::Program> {
         path: program,
         home: None,
         cwd: Some(paths.state.clone()),
+        timeout: Some(CLAUDE_STOP_TIMEOUT),
     })
 }
 
+// Los tiempos de parar y arrancar una sesión. La CLI espera `client::SESSION_OP_TIMEOUT`, que
+// tiene que cubrir el peor caso (`SESSION_OP_WORST`, el de reiniciar) con margen.
+
+/// Lo más que se espera a `claude stop` (con lo que se espera luego su salida, `OUTPUT_GRACE`).
+const CLAUDE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Lo más que se espera a que acabe el proceso de un trabajo en segundo plano tras
 /// `claude stop`.
-const JOB_STOP_WAIT: Duration = Duration::from_secs(10);
+const JOB_STOP_WAIT: Duration = Duration::from_secs(5);
+/// Lo más que se espera a que acabe el guardián de una sesión que se para.
+const HOLDER_STOP_WAIT: Duration = Duration::from_secs(12);
+/// Lo más que se espera a que esté viva una sesión que se arranca.
+const ALIVE_WAIT: Duration = Duration::from_secs(3);
+/// Parar un trabajo en segundo plano, como mucho.
+const JOB_STOP_WORST: Duration = Duration::from_secs(
+    CLAUDE_STOP_TIMEOUT.as_secs() + claude::OUTPUT_GRACE.as_secs() + JOB_STOP_WAIT.as_secs(),
+);
+/// Lo más que tarda reiniciar una sesión, lo más largo: parar su trabajo, su guardián, otra vez
+/// su trabajo si no se paró a la primera (antes de retomarla) y esperar a que arranque.
+pub const SESSION_OP_WORST: Duration = Duration::from_secs(
+    2 * JOB_STOP_WORST.as_secs() + HOLDER_STOP_WAIT.as_secs() + ALIVE_WAIT.as_secs(),
+);
 
 /// Para el trabajo en segundo plano `job`, vivo, del perfil `config_dir` (`None`: `~/.claude`),
 /// y espera a que su proceso acabe. Bloquea.
@@ -3503,13 +3523,14 @@ async fn api_create(State(st): State<Arc<AppState>>, Json(req): Json<CreateReque
 }
 
 pub(crate) async fn wait_alive(st: &AppState, id: &str) -> bool {
-    for _ in 0..60 {
+    let until = tokio::time::Instant::now() + ALIVE_WAIT;
+    while tokio::time::Instant::now() < until {
         if launch::is_alive(&st.paths, id) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+    launch::is_alive(&st.paths, id)
 }
 
 pub(crate) async fn find_session(st: &AppState, key: &str) -> Result<Session, Response> {
@@ -3621,7 +3642,8 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) {
     let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
     let _ = tokio::task::spawn_blocking(move || launch::stop(&paths, launcher, &sid)).await;
     // Hasta que el proceso termine del todo, no solo hasta que deje el socket.
-    for _ in 0..240 {
+    let until = tokio::time::Instant::now() + HOLDER_STOP_WAIT;
+    while tokio::time::Instant::now() < until {
         if !launch::is_alive(&st.paths, id) && !launch::holder_running(&st.paths, id) {
             break;
         }
@@ -8360,6 +8382,17 @@ mod tests {
         assert_eq!(alert_text("\u{1b}[0m\u{7}"), None);
         // Un ESC suelto al final no rompe nada.
         assert_eq!(alert_text("fin\u{1b}"), Some("fin".to_owned()));
+    }
+
+    #[test]
+    fn the_cli_waits_long_enough_for_a_session_to_stop() {
+        // Parar una sesión con su trabajo en segundo plano (y reiniciarla) cabe con margen en lo
+        // que espera `nido stop|restart|start|rm`.
+        assert!(SESSION_OP_WORST * 2 <= crate::client::SESSION_OP_TIMEOUT);
+        assert!(
+            SESSION_OP_WORST >= Duration::from_secs(40),
+            "{SESSION_OP_WORST:?}"
+        );
     }
 
     // ---------- Buscar y el chat alrededor de un mensaje ----------

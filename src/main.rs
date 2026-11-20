@@ -932,21 +932,21 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             );
         }
         Cmd::Start { name } => {
-            api.call(
+            api.call_session_op(
                 "POST",
                 &format!("/api/v1/sessions/{}/start", id_of(&name)?),
                 None,
             )?;
         }
         Cmd::Stop { name } => {
-            api.call(
+            api.call_session_op(
                 "POST",
                 &format!("/api/v1/sessions/{}/stop", id_of(&name)?),
                 None,
             )?;
         }
         Cmd::Restart { name } => {
-            api.call(
+            api.call_session_op(
                 "POST",
                 &format!("/api/v1/sessions/{}/restart", id_of(&name)?),
                 None,
@@ -961,7 +961,7 @@ fn client_cmd(api: &Api, paths: &Paths, cmd: Cmd) -> io::Result<()> {
             )?;
         }
         Cmd::Rm { name } => {
-            api.call(
+            api.call_session_op(
                 "DELETE",
                 &format!("/api/v1/sessions/{}", id_of(&name)?),
                 None,
