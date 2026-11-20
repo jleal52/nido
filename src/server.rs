@@ -137,6 +137,9 @@ pub struct AppState {
     /// `stop_and_wait` y `StopPin`): mientras, el escaneo no les cambia la conversación del
     /// registro.
     stopping: std::sync::Mutex<std::collections::HashMap<String, StopPin>>,
+    /// Los demonios de Claude Code que no se pudieron sacar de su sesión (ver `adopt_daemons`).
+    /// Cogido mientras se sacan: uno a la vez.
+    daemon_moves: Arc<std::sync::Mutex<launch::DaemonMoves>>,
     /// Una parada a la vez por sesión (ver `stop_and_wait`).
     stop_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -739,6 +742,7 @@ impl AppState {
             queues: Default::default(),
             stopping: Default::default(),
             stop_locks: Default::default(),
+            daemon_moves: Default::default(),
         }))
     }
 
@@ -759,8 +763,12 @@ impl AppState {
             .map(|v| v.id.clone())
             .collect();
         let models = self.models();
+        let mut alive_ids = Vec::new();
         for s in sessions {
             let alive = launch::is_alive(&self.paths, &s.id);
+            if alive {
+                alive_ids.push(s.id.clone());
+            }
             let stopped = stop_time(s.stopped, alive, was_alive.contains(&s.id), now_ms());
             if stopped != s.stopped {
                 let _ = reg.update(&s.id, |x| x.stopped = stopped);
@@ -888,7 +896,53 @@ impl AppState {
             changed
         });
         drop(reg);
+        self.adopt_daemons(alive_ids);
         self.refresh_models(targets).await;
+    }
+
+    /// Con systemd: el demonio de Claude Code que aparezca en una sesión viva (`alive`) se saca a
+    /// su propia unidad en cuanto se ve (ver `launch::move_daemon_out`): así sobrevive a que se
+    /// pare la sesión o se salga de su Claude, y no cuenta para su límite de memoria. Fuera del
+    /// hilo y de uno en uno; si no se puede, se vuelve a probar cada vez más espaciado.
+    fn adopt_daemons(&self, alive: Vec<String>) {
+        #[cfg(target_os = "linux")]
+        if self.launcher == launch::Launcher::Systemd {
+            let (paths, moves) = (self.paths.clone(), self.daemon_moves.clone());
+            tokio::task::spawn_blocking(move || {
+                // Otro escaneo ya está en ello.
+                let Ok(mut moves) = moves.try_lock() else {
+                    return;
+                };
+                let now = std::time::Instant::now();
+                let mut seen = Vec::new();
+                for id in alive {
+                    let Some(daemon) = launch::daemon_in_unit(&paths, &id) else {
+                        continue;
+                    };
+                    seen.push(daemon);
+                    if !moves.due(daemon, now) {
+                        continue;
+                    }
+                    match launch::move_daemon_out(&paths, &id) {
+                        Ok(n) => eprintln!(
+                            "nido: {id}: el demonio de Claude Code ({n} procesos) sale de la \
+                             sesión a su propia unidad"
+                        ),
+                        Err(e) => {
+                            let wait = moves.failed(daemon, now);
+                            eprintln!(
+                                "nido: {id}: no se pudo sacar de la sesión el demonio de Claude \
+                                 Code ({e}); se vuelve a probar en {} s",
+                                wait.as_secs()
+                            );
+                        }
+                    }
+                }
+                moves.forget_except(&seen);
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = alive;
     }
 
     /// Al arrancar el equipo: vuelve a abrir las sesiones con autoarranque que no estén vivas.
@@ -1644,8 +1698,8 @@ const ALIVE_WAIT: Duration = Duration::from_secs(3);
 const JOB_STOP_WORST: Duration = Duration::from_secs(
     CLAUDE_STOP_TIMEOUT.as_secs() + claude::OUTPUT_GRACE.as_secs() + JOB_STOP_WAIT.as_secs(),
 );
-/// Lo más que tarda reiniciar una sesión, lo más largo: parar su trabajo, sacar el demonio de
-/// Claude Code de ella, su guardián, otra vez
+/// Lo más que tarda reiniciar una sesión, lo más largo: sacar el demonio de Claude Code de ella,
+/// parar su trabajo, su guardián, otra vez
 /// su trabajo si no se paró a la primera (antes de retomarla) y esperar a que arranque.
 pub const SESSION_OP_WORST: Duration = Duration::from_secs(
     2 * JOB_STOP_WORST.as_secs()
@@ -3728,6 +3782,9 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) -> Vec<String> {
     // Lo que le llegue a su `nido mcp` mientras se muere se perdería.
     st.inbox.stopped(id);
     let mut warnings = Vec::new();
+    // Antes que nada, el demonio de Claude Code, si sigue en la sesión (normalmente ya lo sacó el
+    // escaneo): parar su trabajo puede hacer que acabe su Claude, y con él la unidad.
+    warnings.extend(move_daemon(st, id).await);
     let mut pin = stop_parked_job(st, id, &mut warnings).await;
     // Desde aquí el guardián se para aunque se cancele la petición (`spawn_blocking` sigue): la
     // marca se queda hasta que el escaneo lo vea ido.
@@ -3737,35 +3794,7 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) -> Vec<String> {
     // Bloquea un momento (en Windows espera a que el guardián recoja la orden): fuera del hilo
     // de tokio.
     let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
-    let moved = tokio::task::spawn_blocking(move || {
-        // Con systemd, parar la sesión mata todo su cgroup: el demonio de Claude Code, si
-        // cuelga de ella, se saca antes (ver `launch::move_daemon_out`).
-        #[cfg(target_os = "linux")]
-        let moved = match launcher {
-            launch::Launcher::Systemd => launch::move_daemon_out(&paths, &sid),
-            launch::Launcher::Detached => Ok(0),
-        };
-        #[cfg(not(target_os = "linux"))]
-        let moved: std::io::Result<usize> = Ok(0);
-        let _ = launch::stop(&paths, launcher, &sid);
-        moved
-    })
-    .await
-    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
-    match moved {
-        Ok(0) => {}
-        Ok(n) => {
-            eprintln!("nido: {id}: el demonio de Claude Code ({n} procesos) sale de la sesión")
-        }
-        Err(e) => {
-            let w = format!(
-                "no se pudo sacar de la sesión el demonio de Claude Code ({e}): al pararla se \
-                 paran también los trabajos en segundo plano de las demás sesiones"
-            );
-            eprintln!("nido: {id}: {w}");
-            warnings.push(w);
-        }
-    }
+    let _ = tokio::task::spawn_blocking(move || launch::stop(&paths, launcher, &sid)).await;
     // Hasta que el proceso termine del todo, no solo hasta que deje el socket.
     let until = tokio::time::Instant::now() + HOLDER_STOP_WAIT;
     while tokio::time::Instant::now() < until {
@@ -3776,6 +3805,35 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) -> Vec<String> {
     }
     drop(pin);
     warnings
+}
+
+/// Con systemd, saca de la sesión `id` el demonio de Claude Code (ver
+/// `launch::move_daemon_out`). El aviso, si no se pudo: la sesión se para igual.
+async fn move_daemon(st: &AppState, id: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if st.launcher == launch::Launcher::Systemd {
+        let (paths, sid) = (st.paths.clone(), id.to_owned());
+        let moved = tokio::task::spawn_blocking(move || launch::move_daemon_out(&paths, &sid))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        match moved {
+            Ok(0) => {}
+            Ok(n) => {
+                eprintln!("nido: {id}: el demonio de Claude Code ({n} procesos) sale de la sesión")
+            }
+            Err(e) => {
+                let w = format!(
+                    "no se pudo sacar de la sesión el demonio de Claude Code ({e}): al pararla se \
+                     paran también los trabajos en segundo plano de las demás sesiones"
+                );
+                eprintln!("nido: {id}: {w}");
+                return Some(w);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (st, id);
+    None
 }
 
 /// La respuesta de parar (o reiniciar, o borrar) con sus avisos, si los hubo (`warning`).

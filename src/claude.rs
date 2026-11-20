@@ -605,17 +605,25 @@ fn is_daemon(procfs: &Procfs, pid: u32) -> bool {
 }
 
 /// El demonio de Claude Code (`claude daemon run`, el que lleva los trabajos en segundo plano de
-/// todas las sesiones) si cuelga del árbol de `root` (lo lanza el primer Claude que pasa algo a
-/// segundo plano, y queda dentro de su sesión), con todo lo suyo: sus procesos, del demonio a
-/// los más lejanos.
-pub fn daemon_trees(procfs: &Procfs, root: u32) -> Vec<u32> {
+/// todas las sesiones) entre los procesos `members` (los del cgroup de una sesión: lo lanza el
+/// primer Claude que pasa algo a segundo plano, y se queda en su sesión), con lo suyo que también
+/// esté ahí: del demonio a lo más lejano. Se busca entre ellos y no en el árbol del guardián: si
+/// el Claude que lo lanzó acaba, el demonio pasa a colgar de systemd, pero sigue en el cgroup.
+pub fn daemon_procs(procfs: &Procfs, members: &[u32]) -> Vec<u32> {
+    let mut sorted = members.to_vec();
+    sorted.sort_unstable();
     let mut out: Vec<u32> = Vec::new();
-    for pid in procfs.tree(root).into_iter().skip(1) {
-        if out.contains(&pid) || !procfs.comm(pid).is_some_and(|n| claude_comm(&n)) {
+    for pid in sorted {
+        if out.contains(&pid)
+            || !procfs.comm(pid).is_some_and(|n| claude_comm(&n))
+            || !is_daemon(procfs, pid)
+        {
             continue;
         }
-        if is_daemon(procfs, pid) {
-            out.extend(procfs.tree(pid));
+        for p in procfs.tree(pid) {
+            if members.contains(&p) && !out.contains(&p) {
+                out.push(p);
+            }
         }
     }
     out
@@ -1939,7 +1947,7 @@ mod tests {
         };
         cmdline(40, &["claude", "--resume", "conv-vieja"]);
         let p = Procfs::at(&root);
-        assert!(daemon_trees(&p, 30).is_empty());
+        assert!(daemon_procs(&p, &[30, 40]).is_empty());
         // Un Claude que se llama `daemon` en su conversación no es el demonio.
         fake_proc(&root, 45, 40, "claude", &[]);
         cmdline(45, &["claude", "-n", "daemon", "run"]);
@@ -1951,9 +1959,15 @@ mod tests {
         fake_proc(&root, 60, 50, "2.1.329", &[]);
         fake_proc(&root, 70, 60, "2.1.329", &[]);
         fake_proc(&root, 80, 70, "nido", &[]);
-        assert_eq!(daemon_trees(&p, 30), [50, 60, 70, 80]);
-        // Fuera del árbol de la sesión no es cosa suya.
-        assert!(daemon_trees(&p, 60).is_empty());
+        let session = [30, 40, 45, 50, 60, 70, 80];
+        assert_eq!(daemon_procs(&p, &session), [50, 60, 70, 80]);
+        // Lo suyo que ya no esté en la sesión (ya movido) no cuenta.
+        assert_eq!(daemon_procs(&p, &[30, 40, 50, 70]), [50, 70]);
+        // Sin el Claude que lo lanzó, el demonio cuelga de systemd: sigue siendo el de la sesión.
+        std::fs::remove_dir_all(root.join("40")).unwrap();
+        fake_proc(&root, 50, 1, "claude", &[]);
+        cmdline(50, &["/opt/claude", "daemon", "run"]);
+        assert_eq!(daemon_procs(&p, &[30, 50, 60, 70, 80]), [50, 60, 70, 80]);
     }
 
     #[test]

@@ -391,54 +391,61 @@ pub fn scope_call(name: &str, pids: &[u32]) -> Vec<String> {
 
 /// Cuántas veces se pide a systemd, como mucho, sacar el demonio de una sesión.
 const DAEMON_MOVE_ROUNDS: u64 = 3;
-/// Lo más que tarda `move_daemon_out`: sus llamadas a systemd, de `--timeout=5` cada una.
-pub const DAEMON_MOVE_WORST: Duration = Duration::from_secs(5 * DAEMON_MOVE_ROUNDS);
+/// Lo que se espera, tras pedirlo, a que los procesos salgan de verdad del cgroup.
+const DAEMON_MOVE_SETTLE: Duration = Duration::from_secs(1);
+/// Lo más que tarda `move_daemon_out`: sus llamadas a systemd (`--timeout=5`) y sus esperas.
+pub const DAEMON_MOVE_WORST: Duration =
+    Duration::from_secs((5 + DAEMON_MOVE_SETTLE.as_secs()) * DAEMON_MOVE_ROUNDS);
 
-/// ¿Está el proceso `pid` en el cgroup de la unidad de la sesión `id`?
-#[cfg(target_os = "linux")]
-fn in_unit(pid: u32, id: &str) -> bool {
-    let unit = format!("/{}.service", unit_name(id));
-    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .is_ok_and(|c| c.lines().any(|l| l.trim_end().ends_with(&unit)))
+/// El cgroup (v2) de `/proc/<pid>/cgroup` si es el de la unidad `unit` (`nido-s-<id>`).
+pub fn cgroup_of<'a>(content: &'a str, unit: &str) -> Option<&'a str> {
+    let end = format!("/{unit}.service");
+    content
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim_end)
+        .filter(|p| p.ends_with(&end))
 }
 
-/// Con systemd, antes de parar la sesión `id`: si el demonio de Claude Code cuelga de ella (ver
-/// `claude::daemon_trees`), se pasa con todo lo suyo a una unidad propia. Si no, parar la sesión
-/// (que mata lo que quede en su cgroup) pararía también los trabajos en segundo plano de las
-/// demás sesiones. Cuántos procesos se movieron; error si el demonio o un Claude suyo sigue en
-/// la sesión.
-#[cfg(target_os = "linux")]
-pub fn move_daemon_out(paths: &Paths, id: &str) -> io::Result<usize> {
-    let Some(holder) = holder_pid(paths, id).and_then(|p| u32::try_from(p).ok()) else {
-        return Ok(0);
-    };
-    let procfs = claude::Procfs::default();
-    let inside = || -> Vec<u32> {
-        claude::daemon_trees(&procfs, holder)
-            .into_iter()
-            .filter(|&p| in_unit(p, id))
-            .collect()
-    };
-    let stamp = crate::registry::now_ms();
+/// Los procesos de un cgroup (su carpeta en `/sys/fs/cgroup`).
+pub fn cgroup_members(dir: &Path) -> Vec<u32> {
+    std::fs::read_to_string(dir.join("cgroup.procs"))
+        .map(|c| c.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Saca del cgroup `cgroup` el demonio de Claude Code con lo suyo (ver
+/// `claude::daemon_procs`), pidiéndolo con `call` (a systemd, ver `move_daemon_out`). Cuántos
+/// procesos se movieron; error si el demonio o un Claude suyo sigue dentro.
+pub fn move_out(
+    procfs: &claude::Procfs,
+    cgroup: &Path,
+    call: &mut dyn FnMut(&[u32]) -> io::Result<()>,
+) -> io::Result<usize> {
+    let inside = || claude::daemon_procs(procfs, &cgroup_members(cgroup));
     let mut moved = 0;
     let mut failed = None;
     // Un proceso que acaba entre medias (lo de un trabajo que trabaja) hace fallar la llamada
     // entera, y lo que nace entre medias se queda: otra vuelta con lo que quede.
-    for round in 0..DAEMON_MOVE_ROUNDS {
+    for _ in 0..DAEMON_MOVE_ROUNDS {
         let pids = inside();
-        let Some(&first) = pids.first() else {
+        if pids.is_empty() {
             return Ok(moved);
-        };
-        let name = format!("nido-claude-daemon-{first}-{stamp}-{round}.scope");
-        let out = Command::new("busctl")
-            .args(scope_call(&name, &pids))
-            .stdin(Stdio::null())
-            .output()?;
-        if out.status.success() {
-            moved += pids.len();
-        } else {
-            let err = String::from_utf8_lossy(&out.stderr);
-            failed = Some(format!("busctl: {}", err.trim()));
+        }
+        match call(&pids) {
+            Ok(()) => {
+                moved += pids.len();
+                // systemd los mueve tras contestar: hasta que salgan, antes de mirar otra vez
+                // (si no, se pedirían otra vez, en otra unidad).
+                wait_until(
+                    || {
+                        let now = cgroup_members(cgroup);
+                        !pids.iter().any(|p| now.contains(p))
+                    },
+                    DAEMON_MOVE_SETTLE,
+                );
+            }
+            Err(e) => failed = Some(e),
         }
     }
     // Lo que quede de paso (una orden que lanzó un trabajo) da igual; el demonio y sus Claude, no.
@@ -447,8 +454,86 @@ pub fn move_daemon_out(paths: &Paths, id: &str) -> io::Result<usize> {
         .any(|p| procfs.comm(p).is_some_and(|n| claude::claude_comm(&n)));
     match (claudes, failed) {
         (false, _) => Ok(moved),
-        (true, Some(e)) => Err(io::Error::other(e)),
+        (true, Some(e)) => Err(e),
         (true, None) => Err(io::Error::other("el demonio sigue en la sesión")),
+    }
+}
+
+/// La carpeta del cgroup de la unidad de la sesión `id`, según su guardián.
+#[cfg(target_os = "linux")]
+fn unit_cgroup(paths: &Paths, id: &str) -> Option<PathBuf> {
+    let holder = holder_pid(paths, id)?;
+    let content = std::fs::read_to_string(format!("/proc/{holder}/cgroup")).ok()?;
+    let path = cgroup_of(&content, &unit_name(id))?;
+    Some(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
+}
+
+/// El demonio de Claude Code en la unidad de la sesión `id`, si está ahí (ver `move_daemon_out`).
+#[cfg(target_os = "linux")]
+pub fn daemon_in_unit(paths: &Paths, id: &str) -> Option<u32> {
+    let dir = unit_cgroup(paths, id)?;
+    claude::daemon_procs(&claude::Procfs::default(), &cgroup_members(&dir))
+        .first()
+        .copied()
+}
+
+/// Con systemd: si el demonio de Claude Code está en la unidad de la sesión `id`, se pasa con lo
+/// suyo a una unidad propia (un scope transitorio, pedido con `busctl`). Si no, parar la sesión
+/// (que mata lo que quede en su cgroup) pararía también los trabajos en segundo plano de las
+/// demás sesiones, y cuentan para su `MemoryMax`. Lo hace el escaneo en cuanto lo ve
+/// (`AppState::adopt_daemons`) y, por si acaso, también al parar.
+#[cfg(target_os = "linux")]
+pub fn move_daemon_out(paths: &Paths, id: &str) -> io::Result<usize> {
+    let Some(dir) = unit_cgroup(paths, id) else {
+        return Ok(0);
+    };
+    let stamp = crate::registry::now_ms();
+    let mut round = 0;
+    move_out(&claude::Procfs::default(), &dir, &mut |pids| {
+        round += 1;
+        let name = format!("nido-claude-daemon-{}-{stamp}-{round}.scope", pids[0]);
+        let out = Command::new("busctl")
+            .args(scope_call(&name, pids))
+            .stdin(Stdio::null())
+            .output()?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(io::Error::other(format!("busctl: {}", err.trim())))
+    })
+}
+
+/// Los demonios de Claude Code que el escaneo intentó sacar de una sesión sin conseguirlo: no
+/// se vuelve a probar con cada escaneo, sino cada vez más espaciado.
+#[derive(Default)]
+pub struct DaemonMoves {
+    failed: std::collections::HashMap<u32, (u32, std::time::Instant)>,
+}
+
+/// La primera espera tras fallar y la más larga.
+const DAEMON_RETRY_FIRST: Duration = Duration::from_secs(30);
+const DAEMON_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
+impl DaemonMoves {
+    /// ¿Toca intentarlo con el demonio `pid`?
+    pub fn due(&self, pid: u32, now: std::time::Instant) -> bool {
+        self.failed.get(&pid).is_none_or(|&(_, next)| now >= next)
+    }
+
+    /// No se pudo: la próxima vez, más tarde (el doble cada vez). Lo que se espera.
+    pub fn failed(&mut self, pid: u32, now: std::time::Instant) -> Duration {
+        let n = self.failed.get(&pid).map_or(0, |&(n, _)| n);
+        let wait = DAEMON_RETRY_FIRST
+            .saturating_mul(1 << n.min(10))
+            .min(DAEMON_RETRY_MAX);
+        self.failed.insert(pid, (n + 1, now + wait));
+        wait
+    }
+
+    /// Salió, o ya no está en ninguna sesión: se olvida.
+    pub fn forget_except(&mut self, seen: &[u32]) {
+        self.failed.retain(|p, _| seen.contains(p));
     }
 }
 
@@ -618,6 +703,142 @@ mod tests {
             home: root.join("home"),
             server: None,
         }
+    }
+
+    #[test]
+    fn the_cgroup_of_a_session() {
+        let c = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/nido-s-ab12.service\n";
+        assert_eq!(
+            cgroup_of(c, "nido-s-ab12"),
+            Some("/user.slice/user-1000.slice/user@1000.service/app.slice/nido-s-ab12.service")
+        );
+        assert_eq!(cgroup_of(c, "nido-s-ab"), None);
+        assert_eq!(cgroup_of("0::/init.scope\n", "nido-s-ab12"), None);
+    }
+
+    /// Un cgroup de mentira con un demonio de Claude Code y lo suyo dentro.
+    #[cfg(unix)]
+    fn fake_session(tmp: &Path) -> (claude::Procfs, PathBuf) {
+        let root = tmp.join("proc");
+        let proc = |pid: u32, ppid: u32, comm: &str, args: &[&str]| {
+            let d = root.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("stat"), format!("{pid} ({comm}) S {ppid} 0 0 0")).unwrap();
+            std::fs::write(d.join("comm"), format!("{comm}\n")).unwrap();
+            let mut raw = args.join("\0");
+            raw.push('\0');
+            std::fs::write(d.join("cmdline"), raw).unwrap();
+        };
+        proc(30, 1, "nido", &["nido", "holder", "ab12"]);
+        proc(40, 30, "claude", &["claude"]);
+        proc(50, 40, "claude", &["claude", "daemon", "run"]);
+        proc(60, 50, "2.1.329", &["claude", "bg-pty-host"]);
+        proc(70, 60, "2.1.329", &["claude"]);
+        let cgroup = tmp.join("cgroup");
+        std::fs::create_dir_all(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), "30\n40\n50\n60\n70\n").unwrap();
+        (claude::Procfs::at(&root), cgroup)
+    }
+
+    #[cfg(unix)]
+    fn leave(cgroup: &Path, pids: &[u32]) {
+        let left: Vec<String> = cgroup_members(cgroup)
+            .into_iter()
+            .filter(|p| !pids.contains(p))
+            .map(|p| p.to_string())
+            .collect();
+        std::fs::write(cgroup.join("cgroup.procs"), left.join("\n")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_claude_code_daemon_leaves_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (procfs, cgroup) = fake_session(tmp.path());
+        let mut calls = Vec::new();
+        let moved = move_out(&procfs, &cgroup, &mut |pids| {
+            calls.push(pids.to_vec());
+            leave(&cgroup, pids);
+            Ok(())
+        });
+        assert_eq!(moved.unwrap(), 3);
+        assert_eq!(calls, [vec![50, 60, 70]]);
+        assert_eq!(cgroup_members(&cgroup), [30, 40]);
+        // Ya fuera: nada que hacer.
+        let moved = move_out(&procfs, &cgroup, &mut |_| panic!("otra vez"));
+        assert_eq!(moved.unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_ends_meanwhile_does_not_leave_the_daemon_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (procfs, cgroup) = fake_session(tmp.path());
+        let mut calls = 0;
+        // La primera vez, systemd dice que no (uno de la lista acabó); la segunda, sí.
+        let moved = move_out(&procfs, &cgroup, &mut |pids| {
+            calls += 1;
+            if calls == 1 {
+                leave(&cgroup, &[70]);
+                return Err(io::Error::other("No such process"));
+            }
+            leave(&cgroup, pids);
+            Ok(())
+        });
+        assert_eq!(moved.unwrap(), 2);
+        assert_eq!(calls, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn it_waits_until_systemd_has_moved_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (procfs, cgroup) = fake_session(tmp.path());
+        let mut calls = 0;
+        // systemd contesta antes de moverlos: no se pide otra vez mientras tanto.
+        let moved = move_out(&procfs, &cgroup, &mut |pids| {
+            calls += 1;
+            let (cgroup, pids) = (cgroup.clone(), pids.to_vec());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                leave(&cgroup, &pids);
+            });
+            Ok(())
+        });
+        assert_eq!(moved.unwrap(), 3);
+        assert_eq!(calls, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn if_systemd_says_no_the_daemon_stays_and_it_is_said() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (procfs, cgroup) = fake_session(tmp.path());
+        let mut calls = 0;
+        let moved = move_out(&procfs, &cgroup, &mut |_| {
+            calls += 1;
+            Err(io::Error::other("busctl: Access denied"))
+        });
+        assert_eq!(moved.unwrap_err().to_string(), "busctl: Access denied");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn a_daemon_that_could_not_leave_is_retried_less_and_less() {
+        let mut m = DaemonMoves::default();
+        let t = std::time::Instant::now();
+        assert!(m.due(50, t));
+        assert_eq!(m.failed(50, t), Duration::from_secs(30));
+        assert!(!m.due(50, t + Duration::from_secs(29)));
+        assert!(m.due(50, t + Duration::from_secs(30)));
+        assert!(m.due(51, t), "otro demonio");
+        assert_eq!(m.failed(50, t), Duration::from_secs(60));
+        for _ in 0..20 {
+            m.failed(50, t);
+        }
+        assert_eq!(m.failed(50, t), Duration::from_secs(30 * 60));
+        m.forget_except(&[51]);
+        assert!(m.due(50, t));
     }
 
     #[test]
