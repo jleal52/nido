@@ -1616,6 +1616,15 @@ fn claude_program(paths: &Paths) -> Option<claude::Program> {
     })
 }
 
+/// Lo que se espera la respuesta de otro equipo a `method`: lo de siempre y, para arrancar,
+/// parar o cerrar una de sus sesiones, lo que puede tardar con margen (como la CLI).
+pub fn peer_wait(method: &str) -> Duration {
+    match method {
+        "start" | "stop" | "restart" | "close" => SESSION_OP_WORST * 2,
+        _ => Duration::from_secs(15),
+    }
+}
+
 // Los tiempos de parar y arrancar una sesión. La CLI espera `client::SESSION_OP_TIMEOUT`, que
 // tiene que cubrir el peor caso (`SESSION_OP_WORST`, el de reiniciar) con margen.
 
@@ -2353,8 +2362,9 @@ impl AppState {
             .ok()
             .and_then(|k| <[u8; 32]>::try_from(k).ok())
             .ok_or_else(|| unknown_member(&m.id))?;
+        let wait = peer_wait(method);
         e2e::peer_request(&self.identity, &key, method, params, |first| {
-            self.hub.exchange(&m.id, first)
+            self.hub.exchange_within(&m.id, first, wait)
         })
         .await
     }
@@ -8520,6 +8530,11 @@ mod tests {
         // Parar una sesión con su trabajo en segundo plano (y reiniciarla) cabe con margen en lo
         // que espera `nido stop|restart|start|rm`.
         assert!(SESSION_OP_WORST * 2 <= crate::client::SESSION_OP_TIMEOUT);
+        // Y lo mismo, pedido a otro equipo.
+        for m in ["start", "stop", "close"] {
+            assert!(peer_wait(m) >= SESSION_OP_WORST * 2, "{m}");
+        }
+        assert_eq!(peer_wait("read"), Duration::from_secs(15));
         assert!(
             SESSION_OP_WORST >= Duration::from_secs(40),
             "{SESSION_OP_WORST:?}"
