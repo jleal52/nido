@@ -362,6 +362,92 @@ pub fn stop(paths: &Paths, launcher: Launcher, id: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// La orden para `busctl` que pide a systemd (el del usuario) una unidad propia, `name` (un
+/// scope), para los procesos `pids`: los saca del cgroup de su sesión, y parar la sesión ya no
+/// los mata.
+pub fn scope_call(name: &str, pids: &[u32]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--user",
+        "--timeout=5",
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "StartTransientUnit",
+        "ssa(sv)a(sa(sv))",
+        name,
+        "fail",
+        "1",
+        "PIDs",
+        "au",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    args.push(pids.len().to_string());
+    args.extend(pids.iter().map(u32::to_string));
+    args.push("0".into());
+    args
+}
+
+/// Lo más que tarda `move_daemon_out`: dos llamadas a systemd, de `--timeout=5` cada una.
+pub const DAEMON_MOVE_WORST: Duration = Duration::from_secs(10);
+
+/// ¿Está el proceso `pid` en el cgroup de la unidad de la sesión `id`?
+#[cfg(target_os = "linux")]
+fn in_unit(pid: u32, id: &str) -> bool {
+    let unit = format!("/{}.service", unit_name(id));
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .is_ok_and(|c| c.lines().any(|l| l.trim_end().ends_with(&unit)))
+}
+
+/// Con systemd, antes de parar la sesión `id`: si el demonio de Claude Code cuelga de ella (ver
+/// `claude::daemon_trees`), se pasa con todo lo suyo a una unidad propia. Si no, parar la sesión
+/// (que mata lo que quede en su cgroup) pararía también los trabajos en segundo plano de las
+/// demás sesiones. Cuántos procesos se movieron; error si no se pudo.
+#[cfg(target_os = "linux")]
+pub fn move_daemon_out(paths: &Paths, id: &str) -> io::Result<usize> {
+    let Some(holder) = holder_pid(paths, id).and_then(|p| u32::try_from(p).ok()) else {
+        return Ok(0);
+    };
+    let procfs = claude::Procfs::default();
+    let pids: Vec<u32> = claude::daemon_trees(&procfs, holder)
+        .into_iter()
+        .filter(|&p| in_unit(p, id))
+        .collect();
+    let Some(&daemon) = pids.first() else {
+        return Ok(0);
+    };
+    let name = format!(
+        "nido-claude-daemon-{daemon}-{}.scope",
+        crate::registry::now_ms()
+    );
+    let out = Command::new("busctl")
+        .args(scope_call(&name, &pids))
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(io::Error::other(format!("busctl: {}", err.trim())));
+    }
+    // Lo que nació entre medias se queda donde estaba: otra vuelta, con lo que quede.
+    let left: Vec<u32> = claude::daemon_trees(&procfs, daemon)
+        .into_iter()
+        .filter(|&p| in_unit(p, id))
+        .collect();
+    if left.is_empty() {
+        return Ok(pids.len());
+    }
+    let more = name.replace(".scope", "-b.scope");
+    let _ = Command::new("busctl")
+        .args(scope_call(&more, &left))
+        .stdin(Stdio::null())
+        .output();
+    if in_unit(daemon, id) || left.iter().any(|&p| in_unit(p, id)) {
+        return Err(io::Error::other("el demonio sigue en la sesión"));
+    }
+    Ok(pids.len() + left.len())
+}
+
 pub fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -528,6 +614,16 @@ mod tests {
             home: root.join("home"),
             server: None,
         }
+    }
+
+    #[test]
+    fn the_call_that_gives_the_claude_code_daemon_its_own_unit() {
+        assert_eq!(
+            scope_call("nido-claude-daemon-50-1.scope", &[50, 60, 70]).join(" "),
+            "--user --timeout=5 call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+             org.freedesktop.systemd1.Manager StartTransientUnit ssa(sv)a(sa(sv)) \
+             nido-claude-daemon-50-1.scope fail 1 PIDs au 3 50 60 70 0"
+        );
     }
 
     #[test]

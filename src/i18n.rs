@@ -494,6 +494,14 @@ const TABLE: &[(&str, &str)] = &[
         "this session does not accept messages now (no channel): Claude Code moved its conversation to a background job, which does not have nido's channel; try again when it is back in the foreground",
     ),
     ("no encuentro claude", "claude not found"),
+    (
+        "el demonio sigue en la sesión",
+        "the daemon is still in the session",
+    ),
+    (
+        "no se pudo sacar de la sesión el demonio de Claude Code ({}): al pararla se paran también los trabajos en segundo plano de las demás sesiones",
+        "could not move Claude Code's daemon out of the session ({0}): stopping it also stops the background jobs of the other sessions",
+    ),
     ("id de trabajo no válido: {}", "invalid job id: {0}"),
     ("claude stop {}: {}", "claude stop {0}: {1}"),
     (
@@ -1383,6 +1391,16 @@ mod tests {
     #[test]
     fn background_jobs() {
         assert_eq!(english("no encuentro claude"), "claude not found");
+        assert_eq!(
+            english(
+                "no se pudo sacar de la sesión el demonio de Claude Code (el demonio sigue en la \
+                 sesión): al \
+                 pararla se paran también los trabajos en segundo plano de las demás sesiones"
+            ),
+            "could not move Claude Code's daemon out of the session (the daemon is still in the \
+             session): \
+             stopping it also stops the background jobs of the other sessions"
+        );
         assert_eq!(
             english("id de trabajo no válido: --x"),
             "invalid job id: --x"

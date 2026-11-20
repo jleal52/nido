@@ -591,6 +591,26 @@ fn parking_viewer(
     })
 }
 
+/// El demonio de Claude Code (`claude daemon run`, el que lleva los trabajos en segundo plano de
+/// todas las sesiones) si cuelga del árbol de `root` (lo lanza el primer Claude que pasa algo a
+/// segundo plano, y queda dentro de su sesión), con todo lo suyo: sus procesos, del demonio a
+/// los más lejanos.
+pub fn daemon_trees(procfs: &Procfs, root: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    for pid in procfs.tree(root).into_iter().skip(1) {
+        if out.contains(&pid) || !procfs.comm(pid).is_some_and(|n| claude_comm(&n)) {
+            continue;
+        }
+        let daemon = procfs
+            .args(pid)
+            .is_some_and(|a| a.get(1..3) == Some(&["daemon".to_owned(), "run".to_owned()][..]));
+        if daemon {
+            out.extend(procfs.tree(pid));
+        }
+    }
+    out
+}
+
 /// El Claude de una sesión (su guardián, `holder`): el que apunta de sí mismo lo que hace
 /// (`find_claude`) y, si no lo hay (otra versión de Claude que lo guarde en otro sitio, o en
 /// Windows con su perfil propio), el primer Claude de su árbol. Instalado con npm su proceso es
@@ -1887,6 +1907,36 @@ mod tests {
             r#"{"pid":40,"sessionId":"conv-vieja","kind":"interactive","parkedJobId":"ab12cd34"}"#,
         );
         assert_eq!(background_viewer(&p, 80, &home), Some(None));
+    }
+
+    #[test]
+    fn the_claude_code_daemon_inside_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proc");
+        let home = tmp.path().join("home");
+        parked_viewer(&root, &home, "ab12cd34");
+        let cmdline = |pid: u32, args: &[&str]| {
+            let mut raw = args.join("\0");
+            raw.push('\0');
+            std::fs::write(root.join(pid.to_string()).join("cmdline"), raw).unwrap();
+        };
+        cmdline(40, &["claude", "--resume", "conv-vieja"]);
+        let p = Procfs::at(&root);
+        assert!(daemon_trees(&p, 30).is_empty());
+        // Un Claude que se llama `daemon` en su conversación no es el demonio.
+        fake_proc(&root, 45, 40, "claude", &[]);
+        cmdline(45, &["claude", "-n", "daemon", "run"]);
+        fake_proc(&root, 50, 40, "claude", &[]);
+        cmdline(
+            50,
+            &["/opt/claude", "daemon", "run", "--origin", "transient"],
+        );
+        fake_proc(&root, 60, 50, "2.1.329", &[]);
+        fake_proc(&root, 70, 60, "2.1.329", &[]);
+        fake_proc(&root, 80, 70, "nido", &[]);
+        assert_eq!(daemon_trees(&p, 30), [50, 60, 70, 80]);
+        // Fuera del árbol de la sesión no es cosa suya.
+        assert!(daemon_trees(&p, 60).is_empty());
     }
 
     #[test]

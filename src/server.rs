@@ -1632,10 +1632,14 @@ const ALIVE_WAIT: Duration = Duration::from_secs(3);
 const JOB_STOP_WORST: Duration = Duration::from_secs(
     CLAUDE_STOP_TIMEOUT.as_secs() + claude::OUTPUT_GRACE.as_secs() + JOB_STOP_WAIT.as_secs(),
 );
-/// Lo más que tarda reiniciar una sesión, lo más largo: parar su trabajo, su guardián, otra vez
+/// Lo más que tarda reiniciar una sesión, lo más largo: parar su trabajo, sacar el demonio de
+/// Claude Code de ella, su guardián, otra vez
 /// su trabajo si no se paró a la primera (antes de retomarla) y esperar a que arranque.
 pub const SESSION_OP_WORST: Duration = Duration::from_secs(
-    2 * JOB_STOP_WORST.as_secs() + HOLDER_STOP_WAIT.as_secs() + ALIVE_WAIT.as_secs(),
+    2 * JOB_STOP_WORST.as_secs()
+        + launch::DAEMON_MOVE_WORST.as_secs()
+        + HOLDER_STOP_WAIT.as_secs()
+        + ALIVE_WAIT.as_secs(),
 );
 
 /// Para el trabajo en segundo plano `job`, vivo, del perfil `config_dir` (`None`: `~/.claude`),
@@ -3710,7 +3714,35 @@ pub(crate) async fn stop_and_wait(st: &AppState, id: &str) -> Vec<String> {
     // Bloquea un momento (en Windows espera a que el guardián recoja la orden): fuera del hilo
     // de tokio.
     let (paths, launcher, sid) = (st.paths.clone(), st.launcher, id.to_owned());
-    let _ = tokio::task::spawn_blocking(move || launch::stop(&paths, launcher, &sid)).await;
+    let moved = tokio::task::spawn_blocking(move || {
+        // Con systemd, parar la sesión mata todo su cgroup: el demonio de Claude Code, si
+        // cuelga de ella, se saca antes (ver `launch::move_daemon_out`).
+        #[cfg(target_os = "linux")]
+        let moved = match launcher {
+            launch::Launcher::Systemd => launch::move_daemon_out(&paths, &sid),
+            launch::Launcher::Detached => Ok(0),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let moved: std::io::Result<usize> = Ok(0);
+        let _ = launch::stop(&paths, launcher, &sid);
+        moved
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+    match moved {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!("nido: {id}: el demonio de Claude Code ({n} procesos) sale de la sesión")
+        }
+        Err(e) => {
+            let w = format!(
+                "no se pudo sacar de la sesión el demonio de Claude Code ({e}): al pararla se \
+                 paran también los trabajos en segundo plano de las demás sesiones"
+            );
+            eprintln!("nido: {id}: {w}");
+            warnings.push(w);
+        }
+    }
     // Hasta que el proceso termine del todo, no solo hasta que deje el socket.
     let until = tokio::time::Instant::now() + HOLDER_STOP_WAIT;
     while tokio::time::Instant::now() < until {
