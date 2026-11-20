@@ -354,6 +354,20 @@ async fn a_session_parked_in_the_background() {
     };
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!polling.is_finished(), "no se da nada en segundo plano");
+    // Y que esté esperando no hace que parezca tener channel.
+    let (code, list) = tool(addr, &caller, "sessions", json!({})).await;
+    assert_eq!(code, 200, "{list}");
+    let s = listed(&list);
+    assert_eq!(s["channel"], false, "{s}");
+    assert_eq!(s["channel_error"], "claude moved to the background", "{s}");
+    let (code, e) = tool(
+        addr,
+        &caller,
+        "send",
+        json!({"session": id, "text": "hola"}),
+    )
+    .await;
+    assert_eq!(code, 409, "{e}");
 
     // Vuelve al primer plano: lo del Claude de la sesión.
     viewer_file(&config, viewer, false);
