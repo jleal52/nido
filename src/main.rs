@@ -1067,7 +1067,7 @@ fn clip_send(
 ) -> io::Result<u64> {
     use nido::outbox::{self, MAX_TEXT};
     use std::io::{IsTerminal, Read};
-    let Some(session) = nido::mcp::session_from(std::env::var("NIDO_SESSION").ok()) else {
+    let Some(session) = nido::mcp::own_session().0 else {
         return Err(io::Error::other(
             "falta o no es válida NIDO_SESSION: `nido clip` es para las órdenes de una sesión de nido",
         ));
@@ -1428,7 +1428,7 @@ fn secrets_run(paths: &Paths, name: &str, var: &str, command: &[String]) -> Exit
         return fail("falta la orden, tras `--`");
     };
     let store = nido::secrets::Store::new(paths.state.join("secrets"));
-    let session = std::env::var("NIDO_SESSION").ok();
+    let session = nido::mcp::own_session().0;
     let path = match store.usable(session.as_deref(), name, registry::now_ms()) {
         Ok(p) => p,
         Err(e) => return fail(e),

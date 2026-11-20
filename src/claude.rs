@@ -516,6 +516,81 @@ pub fn claude_ancestor(procfs: &Procfs, pid: u32) -> Option<u32> {
     None
 }
 
+/// ¿Corre `pid` (un `nido mcp`, una orden de Bash) dentro de un trabajo en segundo plano de
+/// Claude Code? `None` si no: su primer Claude con fichero en `sessions/` no es uno (`kind: bg`).
+/// Si sí, `Some` con el Claude que tiene ese trabajo aparcado (`parkedJobId`), si sigue: el de la
+/// sesión de nido de la que salió. El trabajo hereda el entorno de ese Claude (`NIDO_SESSION`),
+/// pero puede seguir sin él (lo lanzó otro Claude, o su demonio sobrevivió a la sesión).
+pub fn background_viewer(procfs: &Procfs, pid: u32, home: &Path) -> Option<Option<u32>> {
+    let parents = procfs.parents();
+    let mut at = pid;
+    for _ in 0..64 {
+        let up = *parents.get(&at)?;
+        if up == 0 || up == at {
+            return None;
+        }
+        at = up;
+        // El demonio y el anfitrión de la terminal del trabajo también son Claude, sin fichero.
+        if !procfs.comm(up).is_some_and(|n| claude_comm(&n)) {
+            continue;
+        }
+        let dir = procfs
+            .env_var(up, "CLAUDE_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| default_config_dir(home), PathBuf::from);
+        let Some(info) = live_info(&dir, up) else {
+            continue;
+        };
+        let me = ProcId {
+            pid: up,
+            proc_start: info.proc_start.clone(),
+            started_at: info.started_at,
+        };
+        if !procfs.is_claude_process(&me) {
+            continue;
+        }
+        if info.kind.as_deref() != Some("bg") {
+            return None;
+        }
+        return Some(
+            info.job_id
+                .filter(|j| valid_job_id(j))
+                .and_then(|job| parking_viewer(procfs, &parents, &dir, &job)),
+        );
+    }
+    None
+}
+
+/// El Claude vivo (no un trabajo) que tiene el trabajo `job` aparcado.
+fn parking_viewer(
+    procfs: &Procfs,
+    live: &HashMap<u32, u32>,
+    config_dir: &Path,
+    job: &str,
+) -> Option<u32> {
+    let dir = std::fs::read_dir(config_dir.join("sessions")).ok()?;
+    let needle = format!("\"{job}\"");
+    dir.flatten().find_map(|e| {
+        let name = e.file_name();
+        let pid = name.to_str()?.strip_suffix(".json")?.parse::<u32>().ok()?;
+        live.contains_key(&pid).then_some(())?;
+        let raw = std::fs::read(e.path()).ok()?;
+        raw.windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+            .then_some(())?;
+        let info: ClaudeInfo = serde_json::from_slice(&raw).ok()?;
+        (info.kind.as_deref() != Some("bg") && info.parked_job_id.as_deref() == Some(job))
+            .then_some(())?;
+        (procfs.comm(pid).as_deref() == Some("claude")).then_some(())?;
+        let me = ProcId {
+            pid,
+            proc_start: info.proc_start,
+            started_at: info.started_at,
+        };
+        procfs.is_claude_process(&me).then_some(pid)
+    })
+}
+
 /// El Claude de una sesión (su guardián, `holder`): el que apunta de sí mismo lo que hace
 /// (`find_claude`) y, si no lo hay (otra versión de Claude que lo guarde en otro sitio, o en
 /// Windows con su perfil propio), el primer Claude de su árbol. Instalado con npm su proceso es
@@ -1768,6 +1843,50 @@ mod tests {
                 process: Some(proc_id(900)),
             })
         );
+    }
+
+    #[test]
+    fn what_runs_inside_a_background_job_belongs_to_the_claude_that_parked_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proc");
+        let home = tmp.path().join("home");
+        let config = home.join(".claude");
+        parked_viewer(&root, &home, "ab12cd34");
+        // El demonio cuelga del Claude de la sesión; de él, el anfitrión de la terminal y el
+        // trabajo, y de este su `nido mcp` (o una orden de Bash, tras una shell).
+        fake_proc(&root, 50, 40, "claude", &[]);
+        fake_proc(&root, 60, 50, "2.1.329", &[]);
+        fake_proc(&root, 70, 60, "2.1.329", &[]);
+        session_file(
+            &config,
+            70,
+            r#"{"pid":70,"sessionId":"conv-nueva","kind":"bg","jobId":"ab12cd34"}"#,
+        );
+        fake_proc(&root, 80, 70, "nido", &[]);
+        fake_proc(&root, 81, 70, "bash", &[]);
+        fake_proc(&root, 82, 81, "nido", &[]);
+        let p = Procfs::at(&root);
+        assert_eq!(background_viewer(&p, 80, &home), Some(Some(40)));
+        assert_eq!(background_viewer(&p, 82, &home), Some(Some(40)));
+        // El `nido mcp` del Claude de la sesión: no es de un trabajo.
+        fake_proc(&root, 41, 40, "nido", &[]);
+        assert_eq!(background_viewer(&p, 41, &home), None);
+        // Fuera de todo Claude, tampoco.
+        assert_eq!(background_viewer(&p, 30, &home), None);
+        // Si el Claude que lo aparcó ya no lo tiene (lo retomó otro, o se fue), nadie.
+        session_file(
+            &config,
+            40,
+            r#"{"pid":40,"sessionId":"conv-vieja","kind":"interactive","parkedJobId":"ff00"}"#,
+        );
+        assert_eq!(background_viewer(&p, 80, &home), Some(None));
+        std::fs::remove_dir_all(root.join("40")).unwrap();
+        session_file(
+            &config,
+            40,
+            r#"{"pid":40,"sessionId":"conv-vieja","kind":"interactive","parkedJobId":"ab12cd34"}"#,
+        );
+        assert_eq!(background_viewer(&p, 80, &home), Some(None));
     }
 
     #[test]

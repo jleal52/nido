@@ -1194,9 +1194,53 @@ pub fn starts_inbox(st: &State, msg: &Value) -> bool {
         && msg.get("method").and_then(Value::as_str) == Some("notifications/initialized")
 }
 
+/// La sesión de nido de lo que corre dentro de un trabajo en segundo plano de Claude Code
+/// (`background`, ver `claude::background_viewer`): la del Claude que lo tiene aparcado
+/// (`viewer`, la suya de `NIDO_SESSION`), no la heredada, que puede ser de otra o de ninguna.
+/// Fuera de un trabajo (`None`), la heredada.
+pub fn session_through(
+    inherited: Option<String>,
+    background: Option<Option<String>>,
+) -> Option<String> {
+    match background {
+        None => session_from(inherited),
+        Some(viewer) => session_from(viewer),
+    }
+}
+
+/// Lo que espera a que el Claude que pasa a segundo plano apunte su trabajo (`parkedJobId`): el
+/// `nido mcp` del trabajo puede arrancar antes.
+const VIEWER_WAIT: Duration = Duration::from_secs(3);
+
+/// La sesión de nido de este proceso (`nido mcp`, `nido clip`, `nido secrets run`) y si corre
+/// dentro de un trabajo en segundo plano de Claude Code (ver `session_through`).
+pub fn own_session() -> (Option<String>, bool) {
+    let inherited = std::env::var("NIDO_SESSION").ok();
+    // Sin sesión heredada no hay nada que resolver (ni procesos que mirar).
+    let (Some(_), Some(home)) = (session_from(inherited.clone()), crate::sys::home()) else {
+        return (session_from(inherited), false);
+    };
+    let procfs = crate::claude::Procfs::default();
+    let me = std::process::id();
+    let start = Instant::now();
+    loop {
+        match crate::claude::background_viewer(&procfs, me, &home) {
+            None => return (session_from(inherited), false),
+            Some(Some(viewer)) => {
+                let viewer = procfs.env_var(viewer, "NIDO_SESSION");
+                return (session_through(inherited, Some(viewer)), true);
+            }
+            Some(None) if start.elapsed() < VIEWER_WAIT => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Some(None) => return (None, true),
+        }
+    }
+}
+
 /// `nido mcp`: lee mensajes de stdin hasta que se cierra.
 pub fn run(api: client::Api) -> ! {
-    let session = session_from(std::env::var("NIDO_SESSION").ok());
+    let (session, background) = own_session();
     let local = Arc::new(LocalApi {
         client: api,
         session: session.clone().unwrap_or_default(),
@@ -1206,7 +1250,8 @@ pub fn run(api: client::Api) -> ! {
     });
     let mut st = State {
         session,
-        channel: channel_from(std::env::var("NIDO_CHANNEL").ok()),
+        // Un trabajo en segundo plano no tiene el channel de nido, aunque lo herede.
+        channel: !background && channel_from(std::env::var("NIDO_CHANNEL").ok()),
         api: local.clone(),
     };
     let calls = Calls::default();
@@ -1320,6 +1365,19 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["id"], 5);
         out[0]["result"].clone()
+    }
+
+    #[test]
+    fn inside_a_background_job_the_session_is_that_of_the_claude_that_parked_it() {
+        let own = || Some("abc12345".to_owned());
+        assert_eq!(session_through(own(), None).as_deref(), Some("abc12345"));
+        assert_eq!(
+            session_through(own(), Some(Some("def67890".into()))).as_deref(),
+            Some("def67890")
+        );
+        // Aparcado por un Claude fuera de nido, o por nadie: sin sesión, aunque la herede.
+        assert_eq!(session_through(own(), Some(None)), None);
+        assert_eq!(session_through(own(), Some(Some("../x".into()))), None);
     }
 
     #[test]
