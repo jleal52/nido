@@ -331,9 +331,37 @@ async fn a_session_parked_in_the_background() {
         "{e}"
     );
 
+    // Lo que esperaba en su bandeja se queda ahí; su `nido mcp` lo recoge en cuanto vuelve al
+    // primer plano, sin esperar a la siguiente recogida.
+    st.inbox
+        .push(
+            &id,
+            nido::inbox::Msg {
+                id: "m1".into(),
+                from: "otra".into(),
+                from_id: format!("Prueba/{caller}"),
+                machine: "Prueba".into(),
+                text: "hola".into(),
+                at: 1,
+            },
+        )
+        .unwrap();
+    st.inbox.set_poll_wait(Duration::from_secs(20));
+    let started = std::time::Instant::now();
+    let polling = {
+        let id = id.clone();
+        tokio::spawn(async move { call(addr, "GET", "/api/v1/mcp/inbox", Some(&id), None).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!polling.is_finished(), "no se da nada en segundo plano");
+
     // Vuelve al primer plano: lo del Claude de la sesión.
     viewer_file(&config, viewer, false);
     st.scan().await;
+    let (code, got) = polling.await.unwrap();
+    assert_eq!(code, 200, "{got}");
+    assert_eq!(got["messages"][0]["id"], "m1", "{got}");
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(link_now(&st), "conv-vieja");
     assert_eq!(st.inbox.refusal(&id), None);
     let (_, list) = tool(addr, &caller, "sessions", json!({})).await;

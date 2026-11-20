@@ -1463,8 +1463,10 @@ pub async fn api_inbox(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
         Err(f) => return f.into_response(),
     }
     // Sin channel (Claude tiraría los mensajes), o mientras se mira su arranque: nada, y sin
-    // contar como channel. Lo que espera sigue en la cola.
-    if st.inbox.held(&caller.id) {
+    // contar como channel. Lo que espera sigue en la cola. Con la conversación en segundo plano,
+    // en cambio, se espera como siempre (`poll_from` no da nada mientras esté retenida): al volver
+    // al primer plano se entrega enseguida, sin esperar a la siguiente recogida.
+    if st.inbox.held(&caller.id) && st.inbox.refusal(&caller.id) != Some(inbox::Refusal::Parked) {
         let wait = match st.inbox.refusal(&caller.id) {
             Some(_) => st.inbox.poll_wait(),
             None => st.inbox.poll_wait().min(WAIT_UNKNOWN),

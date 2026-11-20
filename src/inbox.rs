@@ -575,6 +575,17 @@ impl Inbox {
     /// trabajaba). Los que toca se vuelven a dar (y despiertan a quien recoge) o se dejan (ver
     /// `step`). Devuelve cuántos se vuelven a dar y cuántos se dejan.
     pub fn tick(&self, id: &str, quiet: bool, elapsed: Duration) -> (usize, usize) {
+        // Con la conversación en un trabajo en segundo plano, lo dado no puede verse en ella (el
+        // trabajo no tiene el channel): el tiempo no cuenta, ni gasta intentos.
+        if self
+            .channels
+            .lock()
+            .expect("channels")
+            .get(id)
+            .is_some_and(|c| c.parked)
+        {
+            return (0, 0);
+        }
         let limit = Duration::from_millis(self.confirm_ms.load(Ordering::Relaxed));
         let (mut again, mut failed) = (0, 0);
         {
@@ -1370,6 +1381,33 @@ mod tests {
         inbox.relaunched("s");
         assert_eq!(inbox.refusal("s"), None);
         assert!(!inbox.held("s"));
+    }
+
+    #[tokio::test]
+    async fn in_the_background_the_clock_of_a_message_stops() {
+        let _limit = crate::watchdog::limit(std::time::Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Inbox::load(dir.path().join("inbox.json"));
+        inbox.push("s", msg("m1", "uno")).unwrap();
+        assert_eq!(ids(&inbox.poll("s").await), ["m1"]);
+        inbox.ack("s", &["m1".into()], true);
+        // Dado al Claude de la sesión justo antes de que pasara a segundo plano: mientras siga
+        // ahí no se vuelve a dar ni se deja, por mucho que pase.
+        inbox.parked("s", true);
+        for _ in 0..MAX_TRIES + 2 {
+            assert_eq!(inbox.tick("s", true, CONFIRM_WAIT * 10), (0, 0));
+        }
+        assert_eq!(inbox.undelivered("s"), 0);
+        // De vuelta, cuenta desde donde iba: el segundo intento, no el último.
+        inbox.parked("s", false);
+        assert_eq!(inbox.tick("s", true, CONFIRM_WAIT), (1, 0));
+        let got = inbox.poll_from("s", None).await;
+        assert_eq!(
+            got.iter()
+                .map(|(m, n)| (m.id.clone(), *n))
+                .collect::<Vec<_>>(),
+            [("m1".to_owned(), 2)]
+        );
     }
 
     #[test]
