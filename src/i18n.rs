@@ -494,6 +494,7 @@ const TABLE: &[(&str, &str)] = &[
         "this session does not accept messages now (no channel): Claude Code moved its conversation to a background job, which does not have nido's channel; try again when it is back in the foreground",
     ),
     ("no encuentro claude", "claude not found"),
+    ("claude no ha contestado", "claude did not answer"),
     (
         "el demonio sigue en la sesión",
         "the daemon is still in the session",
@@ -1391,6 +1392,10 @@ mod tests {
     #[test]
     fn background_jobs() {
         assert_eq!(english("no encuentro claude"), "claude not found");
+        assert_eq!(
+            english("claude stop ab12cd34: claude no ha contestado"),
+            "claude stop ab12cd34: claude did not answer"
+        );
         assert_eq!(
             english(
                 "no se pudo sacar de la sesión el demonio de Claude Code (el demonio sigue en la \
