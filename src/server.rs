@@ -137,6 +137,8 @@ pub struct AppState {
     /// `stop_and_wait` y `StopPin`): mientras, el escaneo no les cambia la conversación del
     /// registro.
     stopping: std::sync::Mutex<std::collections::HashMap<String, StopPin>>,
+    /// Una parada a la vez por sesión (ver `stop_and_wait`).
+    stop_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// La conversación de una sesión, fijada en el registro mientras se para (ver `stop_and_wait`):
@@ -736,6 +738,7 @@ impl AppState {
             searching: Default::default(),
             queues: Default::default(),
             stopping: Default::default(),
+            stop_locks: Default::default(),
         }))
     }
 
@@ -3712,6 +3715,16 @@ async fn api_order_folders(
 /// Para la sesión `id` y espera a que termine. Devuelve los avisos de lo que no salió del todo
 /// bien (en español, para `tr`), que se dicen en la respuesta.
 pub(crate) async fn stop_and_wait(st: &AppState, id: &str) -> Vec<String> {
+    // Una a la vez: dos a la vez se pisarían la conversación fijada (`StopPin`) y pararían dos
+    // veces su trabajo. La segunda espera a la primera, y ya la encuentra parada.
+    let lock = st
+        .stop_locks
+        .lock()
+        .expect("paradas")
+        .entry(id.to_owned())
+        .or_default()
+        .clone();
+    let _one = lock.lock().await;
     // Lo que le llegue a su `nido mcp` mientras se muere se perdería.
     st.inbox.stopped(id);
     let mut warnings = Vec::new();

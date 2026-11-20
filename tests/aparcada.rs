@@ -508,4 +508,36 @@ async fn a_session_parked_in_the_background() {
     );
     assert!(alive(job));
     assert!(!nido::launch::is_alive(&paths, &id));
+
+    // Dos paradas a la vez de la misma sesión: una detrás de otra, y la segunda ya la encuentra
+    // parada (no vuelve a parar su trabajo ni le cambia la conversación fijada).
+    std::fs::remove_file(fake.join("stop-fails")).unwrap();
+    let _ = std::fs::remove_file(fake.join("viewer.pid"));
+    let (code, r) = call(addr, "POST", &session_path("start"), None, None).await;
+    assert_eq!(code, 200, "{r}");
+    assert!(wait_for(|| viewer_pid().is_some()).await, "no arrancó");
+    let viewer = viewer_pid().unwrap();
+    let job = spawn_job(&config, "conv-nueva");
+    cleanup.1.push(job);
+    std::fs::write(fake.join("job-1.pid"), job.to_string()).unwrap();
+    viewer_file(&config, viewer, true);
+    std::fs::write(fake.join("stop-slow"), "").unwrap();
+    let stops = || {
+        std::fs::read_to_string(fake.join("stops"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    let before = stops();
+    let (a, b) = tokio::join!(
+        server::stop_session(&st, &id),
+        server::stop_session(&st, &id)
+    );
+    assert!(a.is_empty() && b.is_empty(), "{a:?} {b:?}");
+    assert_eq!(stops(), before + 1);
+    assert!(!alive(job));
+    assert!(!nido::launch::is_alive(&paths, &id));
+    st.scan().await;
+    assert!(!st.stopping(&id));
+    assert_eq!(link_now(&st), "conv-nueva");
 }
