@@ -422,7 +422,12 @@ pub fn move_out(
     cgroup: &Path,
     call: &mut dyn FnMut(&[u32]) -> io::Result<()>,
 ) -> io::Result<usize> {
-    let inside = || claude::daemon_procs(procfs, &cgroup_members(cgroup));
+    let inside = || -> Vec<u32> {
+        claude::daemon_procs(procfs, &cgroup_members(cgroup))
+            .into_iter()
+            .map(|(_, pid)| pid)
+            .collect()
+    };
     let mut moved = 0;
     let mut failed = None;
     // Un proceso que acaba entre medias (lo de un trabajo que trabaja) hace fallar la llamada
@@ -474,7 +479,7 @@ pub fn daemon_in_unit(paths: &Paths, id: &str) -> Option<u32> {
     let dir = unit_cgroup(paths, id)?;
     claude::daemon_procs(&claude::Procfs::default(), &cgroup_members(&dir))
         .first()
-        .copied()
+        .map(|&(daemon, _)| daemon)
 }
 
 /// Con systemd: si el demonio de Claude Code está en la unidad de la sesión `id`, se pasa con lo
@@ -491,7 +496,7 @@ pub fn move_daemon_out(paths: &Paths, id: &str) -> io::Result<usize> {
     let mut round = 0;
     move_out(&claude::Procfs::default(), &dir, &mut |pids| {
         round += 1;
-        let name = format!("nido-claude-daemon-{}-{stamp}-{round}.scope", pids[0]);
+        let name = format!("nido-claude-daemon-{stamp}-{round}.scope");
         let out = Command::new("busctl")
             .args(scope_call(&name, pids))
             .stdin(Stdio::null())
@@ -787,6 +792,32 @@ mod tests {
         });
         assert_eq!(moved.unwrap(), 2);
         assert_eq!(calls, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_is_born_while_the_daemon_leaves_also_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (procfs, cgroup) = fake_session(tmp.path());
+        let mut calls = Vec::new();
+        // Mientras se saca, el trabajo lanza algo (90): nace en la sesión, ya sin su demonio.
+        let moved = move_out(&procfs, &cgroup, &mut |pids| {
+            calls.push(pids.to_vec());
+            leave(&cgroup, pids);
+            if calls.len() == 1 {
+                let d = tmp.path().join("proc/90");
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("stat"), "90 (2.1.329) S 70 0 0 0").unwrap();
+                std::fs::write(d.join("comm"), "2.1.329\n").unwrap();
+                let mut now = std::fs::read_to_string(cgroup.join("cgroup.procs")).unwrap();
+                now.push_str("\n90\n");
+                std::fs::write(cgroup.join("cgroup.procs"), now).unwrap();
+            }
+            Ok(())
+        });
+        assert_eq!(moved.unwrap(), 4);
+        assert_eq!(calls, [vec![50, 60, 70], vec![90]]);
+        assert_eq!(cgroup_members(&cgroup), [30, 40]);
     }
 
     #[cfg(unix)]

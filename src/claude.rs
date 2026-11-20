@@ -604,25 +604,36 @@ fn is_daemon(procfs: &Procfs, pid: u32) -> bool {
         .is_some_and(|a| a.get(1..3) == Some(&["daemon".to_owned(), "run".to_owned()][..]))
 }
 
-/// El demonio de Claude Code (`claude daemon run`, el que lleva los trabajos en segundo plano de
-/// todas las sesiones) entre los procesos `members` (los del cgroup de una sesión: lo lanza el
-/// primer Claude que pasa algo a segundo plano, y se queda en su sesión), con lo suyo que también
-/// esté ahí: del demonio a lo más lejano. Se busca entre ellos y no en el árbol del guardián: si
-/// el Claude que lo lanzó acaba, el demonio pasa a colgar de systemd, pero sigue en el cgroup.
-pub fn daemon_procs(procfs: &Procfs, members: &[u32]) -> Vec<u32> {
+/// Lo del demonio de Claude Code (`claude daemon run`, el que lleva los trabajos en segundo plano
+/// de todas las sesiones) entre los procesos `members` (los del cgroup de una sesión: lo lanza el
+/// primer Claude que pasa algo a segundo plano, y se queda en su sesión): el demonio y lo que
+/// cuelga de él, esté donde esté el demonio (lo que nace mientras se saca se queda en la sesión).
+/// Se busca entre ellos y no en el árbol del guardián: si el Claude que lo lanzó acaba, el
+/// demonio pasa a colgar de systemd, pero sigue en el cgroup. Cada uno con su demonio:
+/// `(demonio, proceso)`, en el orden de los pids.
+pub fn daemon_procs(procfs: &Procfs, members: &[u32]) -> Vec<(u32, u32)> {
+    let parents = procfs.parents();
+    let mut known: HashMap<u32, bool> = HashMap::new();
+    let mut daemon = |pid: u32| {
+        *known.entry(pid).or_insert_with(|| {
+            procfs.comm(pid).is_some_and(|n| claude_comm(&n)) && is_daemon(procfs, pid)
+        })
+    };
     let mut sorted = members.to_vec();
     sorted.sort_unstable();
-    let mut out: Vec<u32> = Vec::new();
+    sorted.dedup();
+    let mut out = Vec::new();
     for pid in sorted {
-        if out.contains(&pid)
-            || !procfs.comm(pid).is_some_and(|n| claude_comm(&n))
-            || !is_daemon(procfs, pid)
-        {
-            continue;
-        }
-        for p in procfs.tree(pid) {
-            if members.contains(&p) && !out.contains(&p) {
-                out.push(p);
+        let mut at = pid;
+        // Con tope: un árbol raro (pids reusados) no deja dando vueltas.
+        for _ in 0..64 {
+            if daemon(at) {
+                out.push((at, pid));
+                break;
+            }
+            match parents.get(&at) {
+                Some(&up) if up != 0 && up != at => at = up,
+                _ => break,
             }
         }
     }
@@ -1959,15 +1970,21 @@ mod tests {
         fake_proc(&root, 60, 50, "2.1.329", &[]);
         fake_proc(&root, 70, 60, "2.1.329", &[]);
         fake_proc(&root, 80, 70, "nido", &[]);
-        let session = [30, 40, 45, 50, 60, 70, 80];
-        assert_eq!(daemon_procs(&p, &session), [50, 60, 70, 80]);
+        let pids = |members: &[u32]| -> Vec<u32> {
+            let found = daemon_procs(&p, members);
+            assert!(found.iter().all(|&(d, _)| d == 50), "{found:?}");
+            found.into_iter().map(|(_, pid)| pid).collect()
+        };
+        assert_eq!(pids(&[30, 40, 45, 50, 60, 70, 80]), [50, 60, 70, 80]);
         // Lo suyo que ya no esté en la sesión (ya movido) no cuenta.
-        assert_eq!(daemon_procs(&p, &[30, 40, 50, 70]), [50, 70]);
+        assert_eq!(pids(&[30, 40, 50, 70]), [50, 70]);
+        // Lo que nació mientras se sacaba el demonio, sí, aunque él ya no esté.
+        assert_eq!(pids(&[30, 40, 80]), [80]);
         // Sin el Claude que lo lanzó, el demonio cuelga de systemd: sigue siendo el de la sesión.
         std::fs::remove_dir_all(root.join("40")).unwrap();
         fake_proc(&root, 50, 1, "claude", &[]);
         cmdline(50, &["/opt/claude", "daemon", "run"]);
-        assert_eq!(daemon_procs(&p, &[30, 50, 60, 70, 80]), [50, 60, 70, 80]);
+        assert_eq!(pids(&[30, 50, 60, 70, 80]), [50, 60, 70, 80]);
     }
 
     #[test]
