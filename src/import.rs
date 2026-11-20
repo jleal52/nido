@@ -25,6 +25,9 @@ struct Raw {
     cwd: Option<PathBuf>,
     name: Option<String>,
     tmux: Option<String>,
+    /// `bg`: el proceso de un trabajo en segundo plano (ver `claude::Job`).
+    #[serde(default)]
+    kind: Option<serde_json::Value>,
 }
 
 /// Un nombre válido para nido a partir del que tenga en Claude o en tmux.
@@ -88,6 +91,11 @@ pub fn scan(procfs_root: &Path, home: &Path) -> Vec<Found> {
             continue;
         };
         let Some(tmux) = raw.tmux else { continue };
+        // El trabajo en segundo plano de un Claude que corre en tmux no es otra sesión, aunque
+        // herede su `tmux`: ya se importa con la conversación de su Claude.
+        if raw.kind.as_ref().and_then(|k| k.as_str()) == Some("bg") {
+            continue;
+        }
         let name = resume_arg(procfs_root, pid)
             .or(raw.name)
             .unwrap_or_else(|| "claude".into());
@@ -144,6 +152,13 @@ mod tests {
         std::fs::write(
             sessions.join("11.json"),
             r#"{"sessionId":"s-11","cwd":"/w"}"#,
+        )
+        .unwrap();
+        // El trabajo en segundo plano de un Claude de tmux: tampoco.
+        mk(13, "claude", &["claude", "--session-id", "s-13"], "");
+        std::fs::write(
+            sessions.join("13.json"),
+            r#"{"sessionId":"s-13","cwd":"/w","kind":"bg","jobId":"ab12cd34","tmux":"trabajo:@1.%1"}"#,
         )
         .unwrap();
 
