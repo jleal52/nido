@@ -222,6 +222,11 @@ What nido changes in your Claude setup:
 Until then the tools work but messages don't arrive: nido reads Claude's warning and `sessions`
 shows `channel_error: "blocked by org policy"` for that session.
 
+**Background sessions**: if Claude Code moves a session to the background, nido follows
+the job's conversation (chat, search, `read`, state); while it stays there it doesn't receive
+messages (`channel_error: "claude moved to the background"`), and stopping or restarting it stops
+the job first (`claude stop`) and resumes its conversation.
+
 ### Secrets, texts and files
 
 When a session calls `secret`, a dialog opens in the nido web and app with the secret's name and
