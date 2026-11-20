@@ -6,8 +6,8 @@ use std::time::Duration;
 
 /// Lo más que la CLI espera a que el gestor arranque, pare, reinicie o borre una sesión: con su
 /// conversación en un trabajo en segundo plano de Claude Code, parar ese trabajo cuenta (ver
-/// `server::SESSION_OP_WORST`, de cerca de un minuto; esto, el doble).
-pub const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(120);
+/// `server::SESSION_OP_WORST`, de algo más de un minuto; esto, más del doble).
+pub const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(150);
 
 #[derive(Clone)]
 pub struct Api {

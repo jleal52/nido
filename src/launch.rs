@@ -389,8 +389,10 @@ pub fn scope_call(name: &str, pids: &[u32]) -> Vec<String> {
     args
 }
 
-/// Lo más que tarda `move_daemon_out`: dos llamadas a systemd, de `--timeout=5` cada una.
-pub const DAEMON_MOVE_WORST: Duration = Duration::from_secs(10);
+/// Cuántas veces se pide a systemd, como mucho, sacar el demonio de una sesión.
+const DAEMON_MOVE_ROUNDS: u64 = 3;
+/// Lo más que tarda `move_daemon_out`: sus llamadas a systemd, de `--timeout=5` cada una.
+pub const DAEMON_MOVE_WORST: Duration = Duration::from_secs(5 * DAEMON_MOVE_ROUNDS);
 
 /// ¿Está el proceso `pid` en el cgroup de la unidad de la sesión `id`?
 #[cfg(target_os = "linux")]
@@ -403,49 +405,51 @@ fn in_unit(pid: u32, id: &str) -> bool {
 /// Con systemd, antes de parar la sesión `id`: si el demonio de Claude Code cuelga de ella (ver
 /// `claude::daemon_trees`), se pasa con todo lo suyo a una unidad propia. Si no, parar la sesión
 /// (que mata lo que quede en su cgroup) pararía también los trabajos en segundo plano de las
-/// demás sesiones. Cuántos procesos se movieron; error si no se pudo.
+/// demás sesiones. Cuántos procesos se movieron; error si el demonio o un Claude suyo sigue en
+/// la sesión.
 #[cfg(target_os = "linux")]
 pub fn move_daemon_out(paths: &Paths, id: &str) -> io::Result<usize> {
     let Some(holder) = holder_pid(paths, id).and_then(|p| u32::try_from(p).ok()) else {
         return Ok(0);
     };
     let procfs = claude::Procfs::default();
-    let pids: Vec<u32> = claude::daemon_trees(&procfs, holder)
-        .into_iter()
-        .filter(|&p| in_unit(p, id))
-        .collect();
-    let Some(&daemon) = pids.first() else {
-        return Ok(0);
+    let inside = || -> Vec<u32> {
+        claude::daemon_trees(&procfs, holder)
+            .into_iter()
+            .filter(|&p| in_unit(p, id))
+            .collect()
     };
-    let name = format!(
-        "nido-claude-daemon-{daemon}-{}.scope",
-        crate::registry::now_ms()
-    );
-    let out = Command::new("busctl")
-        .args(scope_call(&name, &pids))
-        .stdin(Stdio::null())
-        .output()?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(io::Error::other(format!("busctl: {}", err.trim())));
+    let stamp = crate::registry::now_ms();
+    let mut moved = 0;
+    let mut failed = None;
+    // Un proceso que acaba entre medias (lo de un trabajo que trabaja) hace fallar la llamada
+    // entera, y lo que nace entre medias se queda: otra vuelta con lo que quede.
+    for round in 0..DAEMON_MOVE_ROUNDS {
+        let pids = inside();
+        let Some(&first) = pids.first() else {
+            return Ok(moved);
+        };
+        let name = format!("nido-claude-daemon-{first}-{stamp}-{round}.scope");
+        let out = Command::new("busctl")
+            .args(scope_call(&name, &pids))
+            .stdin(Stdio::null())
+            .output()?;
+        if out.status.success() {
+            moved += pids.len();
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            failed = Some(format!("busctl: {}", err.trim()));
+        }
     }
-    // Lo que nació entre medias se queda donde estaba: otra vuelta, con lo que quede.
-    let left: Vec<u32> = claude::daemon_trees(&procfs, daemon)
+    // Lo que quede de paso (una orden que lanzó un trabajo) da igual; el demonio y sus Claude, no.
+    let claudes = inside()
         .into_iter()
-        .filter(|&p| in_unit(p, id))
-        .collect();
-    if left.is_empty() {
-        return Ok(pids.len());
+        .any(|p| procfs.comm(p).is_some_and(|n| claude::claude_comm(&n)));
+    match (claudes, failed) {
+        (false, _) => Ok(moved),
+        (true, Some(e)) => Err(io::Error::other(e)),
+        (true, None) => Err(io::Error::other("el demonio sigue en la sesión")),
     }
-    let more = name.replace(".scope", "-b.scope");
-    let _ = Command::new("busctl")
-        .args(scope_call(&more, &left))
-        .stdin(Stdio::null())
-        .output();
-    if in_unit(daemon, id) || left.iter().any(|&p| in_unit(p, id)) {
-        return Err(io::Error::other("el demonio sigue en la sesión"));
-    }
-    Ok(pids.len() + left.len())
 }
 
 pub fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
